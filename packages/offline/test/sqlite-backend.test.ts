@@ -172,6 +172,34 @@ describe("cold start reads one shard at a time", () => {
     expect(opened.length).toBe(3);
     await s.close();
   });
+
+  it("a shard whose retention drop fails stays unread: the next use reads it again and drops the stale records", async () => {
+    const dir = tmp();
+    let now = 1_000_000;
+    await seed(dir, ["org:a"], { now: () => now });
+    now += 40 * 86_400_000;
+    const s = sqliteStorage({ schema, queries: offlineQueries, name: "m", open: (n) => createNodeSqliteDriver(join(dir, `${n}.db`)), now: () => now });
+    await s.load();
+    const be = (s as unknown as { backend: SqliteBackend }).backend;
+    const commit = be.commit.bind(be);
+    let fail = true;
+    be.commit = (shard, c) => {
+      if (fail) throw new Error("disk busy");
+      return commit(shard, c);
+    };
+    await expect(s.runQueryLocally(req("org:a"))).rejects.toThrow("disk busy");
+    const inner = s as unknown as { records: Map<string, unknown>; refs: Map<string, number>; unloaded: Set<string> };
+    // Nothing of it stayed in memory: not its records, not their row counts.
+    expect(inner.unloaded.has("org:a")).toBe(true);
+    expect(inner.records.size).toBe(0);
+    expect(inner.refs.size).toBe(0);
+    fail = false;
+    expect((await s.runQueryLocally(req("org:a")))!.value).toEqual([]);
+    expect(inner.unloaded.has("org:a")).toBe(false);
+    expect(inner.records.size).toBe(0);
+    expect(inner.refs.size).toBe(0);
+    await s.close();
+  });
 });
 
 describe("empty shard databases go; new ones vacuum incrementally", () => {
@@ -222,6 +250,47 @@ describe("empty shard databases go; new ones vacuum incrementally", () => {
     await s2.close();
   });
 
+  it("a cleanup that fails after the commit does not fail the commit, and leaves the shard registered and usable", async () => {
+    const dir = tmp();
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hi" });
+    const list = srv.q("messages:list", { channel: "a" });
+    let breakAt: RegExp | null = null;
+    const open = (n: string): SqlDriver & { close?(): void } => {
+      const d = createNodeSqliteDriver(join(dir, `${n}.db`));
+      return {
+        exec: (sql, ...p) => {
+          if (breakAt?.test(sql)) throw new Error(`broken: ${sql}`);
+          return d.exec(sql, ...p);
+        },
+        transaction: (f) => d.transaction(f),
+        close: () => d.close?.(),
+      };
+    };
+    const removed: string[] = [];
+    const s = sqliteStorage({ schema, queries: offlineQueries, name: "m", open, remove: (n) => (removed.push(n), rmSync(join(dir, `${n}.db`), { force: true })) });
+    await s.load();
+    const be = (s as unknown as { backend: SqliteBackend }).backend;
+    const known = (be as unknown as { known: Map<string, string> }).known;
+    for (const step of [/DELETE FROM "_ember_local_shards"/, /SELECT 1 FROM "_ember_local_log"/]) {
+      await s.applyPatch(upd("org:1", list));
+      breakAt = step;
+      // The drop commits; the cleanup after it fails: the commit still succeeds.
+      await expect(s.clear()).resolves.toBeUndefined();
+      breakAt = null;
+      expect(removed).toEqual([]);
+      expect(known.has("org:1")).toBe(true);
+      expect((await s.runQueryLocally(req("org:1")))!.value).toEqual([]);
+    }
+    // Usable again, and removed by the next cleanup that works.
+    await s.applyPatch(upd("org:1", list, 2));
+    expect((await s.runQueryLocally(req("org:1")))!.value).toEqual(list);
+    await s.clear();
+    expect(removed).toHaveLength(1);
+    expect(known.has("org:1")).toBe(false);
+    await s.close();
+  });
+
   it("new databases use auto_vacuum = INCREMENTAL; one created before keeps its mode", async () => {
     const dir = tmp();
     // A database from before: tables already there with auto_vacuum NONE.
@@ -234,9 +303,11 @@ describe("empty shard databases go; new ones vacuum incrementally", () => {
     await s.load();
     await s.applyPatch(upd("org:1", srv.q("messages:list", { channel: "a" })));
     await s.close();
-    const [main, ...shard] = files(dir).sort((a, b) => a.length - b.length);
-    expect(autoVacuum(join(dir, main!))).toBe(0);
-    expect(autoVacuum(join(dir, shard[0]!))).toBe(2);
+    const shards = files(dir).filter((f) => f !== "m.db");
+    expect(files(dir)).toContain("m.db");
+    expect(shards).toHaveLength(1);
+    expect(autoVacuum(join(dir, "m.db"))).toBe(0);
+    expect(autoVacuum(join(dir, shards[0]!))).toBe(2);
   });
 
   it("freed pages go back to the file system every VACUUM_EVERY commits that free them", async () => {
@@ -252,7 +323,9 @@ describe("empty shard databases go; new ones vacuum incrementally", () => {
     await s.load();
     // Each new channel evicts the previous one (maxQueries 1): a commit that frees its rows, every time.
     for (let c = 0; c < VACUUM_EVERY + 2; c++) await s.applyPatch(upd("org:1", srv.q("messages:list", { channel: `c${c % 40}` }), 1));
-    expect(vacuums.filter((n) => n !== "m")).toHaveLength(1);
+    // Only the shard that freed pages, once (the main database freed none).
+    const shardDb = ((s as unknown as { backend: SqliteBackend }).backend as unknown as { known: Map<string, string> }).known.get("org:1");
+    expect(vacuums).toEqual([shardDb]);
     const driver = ((s as unknown as { backend: SqliteBackend }).backend as unknown as { shards: Map<string, { driver: SqlDriver }> }).shards.get("org:1")!.driver;
     expect(Number(driver.exec(`PRAGMA freelist_count`).rows[0]!.freelist_count)).toBe(0);
     await s.close();

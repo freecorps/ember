@@ -215,34 +215,40 @@ export class SqliteBackend implements OfflineBackend {
   /**
    * After a commit that removed something: a shard left with nothing (no records, log, rows, nor a pending mutation
    * for it) has its database closed, unregistered and deleted (with `remove`; a driver that cannot be closed stays).
-   * Returns whether it went.
+   * Returns whether it went. Never throws: the commit before it is durable, and a cleanup that fails leaves the shard
+   * registered and on disk (reopened by its next use), never half gone.
    */
   private removeIfEmpty(shard: string, s: ShardDb): boolean {
     const d = s.driver;
     const close = d.close?.bind(d);
-    if (!this.removeDb || !close) return false;
-    const hasRow = (sql: string) => d.exec(sql).rows.length > 0;
-    if (hasRow(`SELECT 1 FROM "_ember_local_queries" LIMIT 1`) || hasRow(`SELECT 1 FROM "_ember_local_log" LIMIT 1`)) return false;
-    for (const t of Object.keys(this.schema.manifest.tables)) if (hasRow(`SELECT 1 FROM "${t.replace(/"/g, '""')}" LIMIT 1`)) return false;
-    for (const r of this.db.exec(`SELECT "record" FROM "_ember_local_pending"`).rows) {
-      try {
-        if ((decodeJson(String(r.record)) as { shard?: unknown }).shard === shard) return false;
-      } catch {
-        return false;
-      }
-    }
     const dbName = this.known.get(shard);
-    if (!dbName) return false;
+    if (!this.removeDb || !close || !dbName) return false;
+    try {
+      const hasRow = (sql: string) => d.exec(sql).rows.length > 0;
+      if (hasRow(`SELECT 1 FROM "_ember_local_queries" LIMIT 1`) || hasRow(`SELECT 1 FROM "_ember_local_log" LIMIT 1`)) return false;
+      for (const t of Object.keys(this.schema.manifest.tables)) if (hasRow(`SELECT 1 FROM "${t.replace(/"/g, '""')}" LIMIT 1`)) return false;
+      for (const r of this.db.exec(`SELECT "record" FROM "_ember_local_pending"`).rows) {
+        if ((decodeJson(String(r.record)) as { shard?: unknown }).shard === shard) return false;
+      }
+    } catch {
+      return false;
+    }
     try {
       close();
     } catch {
       return false;
     }
+    // Closed: whatever comes next, the next use opens it again.
     this.shards.delete(shard);
     this.prepared.delete(shard);
+    try {
+      this.db.exec(`DELETE FROM "_ember_local_shards" WHERE "shard" = ?`, shard);
+    } catch {
+      // Still registered (and on disk): it stays known, reopened under the same name.
+      return false;
+    }
     this.known.delete(shard);
     this.freed.delete(dbName);
-    this.db.exec(`DELETE FROM "_ember_local_shards" WHERE "shard" = ?`, shard);
     try {
       this.removeDb(dbName);
     } catch {
