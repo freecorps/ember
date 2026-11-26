@@ -1,4 +1,4 @@
-// PR 3b (engine hot path): one transaction per group commit, a lazily built ctx, and `.filter()` evaluated by SQLite.
+// PR 3b (engine hot path): one transaction per group commit, a cheaper ctx, and the withIndex range builder.
 // Every shortcut is checked against the path it replaces: results, rows, read sets and usage must be what they were.
 
 import { describe, expect, it } from "vitest";
@@ -127,8 +127,8 @@ describe("commitMutationBatch: one transaction while no item fails", () => {
   });
 });
 
-describe("a mutation's ctx is built on first read", () => {
-  it("members are memoized, spread, assignable, and replaced members are what the handler reads", () => {
+describe("a mutation's ctx (built without intermediate objects)", () => {
+  it("members are the same object on every read, spread, assignable, and replaced members are what the handler reads", () => {
     const { engine } = counted();
     const out = (engine.runMutation(
       mutationGeneric({
@@ -148,7 +148,7 @@ describe("a mutation's ctx is built on first read", () => {
     expect(out).toEqual({ same: true, spread: true, wrapped: true, rq: "rq", sql: "sql", desc: true });
   });
 
-  it("a query's ctx.db.sql is built once per run and is assignable", () => {
+  it("a query's ctx.db.sql: one per run, assignable, reactive per table", () => {
     const { engine } = counted();
     const out = (engine.runQuery(
       queryGeneric({

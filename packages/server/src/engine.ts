@@ -45,7 +45,7 @@ import {
 } from "./migrate.ts";
 import { QueryImpl, sqlPluginQuery, sqlScan, type QueryEnv, type QueryProfile, type TableRuntime } from "./query.ts";
 import type { PrivateSql, SchemaDefinition, SchemaManifest } from "./schema.ts";
-import { makeSqlReader, SqlCache, type SqlReader } from "./sqlQuery.ts";
+import { makeSqlReader, SqlCache } from "./sqlQuery.ts";
 import { pushFilter, type PushedFilter } from "./pushdown.ts";
 import type { AuthCtx, Doc, FilterExpr, Job, ReadSet, RowChange } from "./types.ts";
 import { checkAccess, resolveReference, scopesOf, type ComponentScopes, type Scope } from "./components.ts";
@@ -1067,8 +1067,7 @@ class EngineImpl implements Engine {
       getById,
       ...(profile ? { profile } : {}),
     };
-    const engine = this;
-    let sql: SqlReader | undefined;
+    const scoped = this.scoped(scope);
     const db = {
       get: getById,
       query: (logical: string) => {
@@ -1106,27 +1105,21 @@ class EngineImpl implements Engine {
         }
         return readReplicaStatus(tx.exec, t.manifest.replica?.source ?? REPLICATED_SOURCE);
       },
-      // Read-only SQL; reactivity is table-level: the full key range of every table it references. Built on first
-      // read (most handlers never use it), then the same function; assignable like the other members.
-      get sql(): SqlReader {
-        return (sql ??= makeSqlReader(
-          (c) => {
-            if (profile) profile.sql++;
-            const { lo, hi } = rangeFor([]);
-            for (const logical of c.tables) {
-              const table = engine.phys(scope, logical);
-              touched?.add(table);
-              tx.readSet?.push({ table, index: "by_creation_time", lo, hi, kind: "db" });
-            }
-            return tx.exec(scope.path.length ? scopedSql(c.sql, c.tables, scope) : c.sql, ...c.params);
-          },
-          engine.scoped(scope).sql,
-          engine.scoped(scope).validate.tableOfId,
-        ));
-      },
-      set sql(x: SqlReader) {
-        sql = x;
-      },
+      // Read-only SQL; reactivity is table-level: the full key range of every table it references.
+      sql: makeSqlReader(
+        (c) => {
+          if (profile) profile.sql++;
+          const { lo, hi } = rangeFor([]);
+          for (const logical of c.tables) {
+            const table = this.phys(scope, logical);
+            touched?.add(table);
+            tx.readSet?.push({ table, index: "by_creation_time", lo, hi, kind: "db" });
+          }
+          return tx.exec(scope.path.length ? scopedSql(c.sql, c.tables, scope) : c.sql, ...c.params);
+        },
+        scoped.sql,
+        scoped.validate.tableOfId,
+      ),
     };
     return { db, getRaw };
   }
@@ -1911,75 +1904,36 @@ class EngineImpl implements Engine {
   }
 
   /**
-   * The ctx of a mutation handler (or of a trigger) running in `scope` on the shared state `st`. Its members are built
-   * on first read (once each, then the same object): a handler that never touches `ctx.storage` or `ctx.scheduler` does
-   * not pay for them. They are own enumerable properties (a spread `{ ...ctx }` copies them) and assignable (a
-   * middleware replacing `ctx.db` gets its value back).
+   * The ctx of a mutation handler (or of a trigger) running in `scope` on the shared state `st`. Plain data properties
+   * (an object literal with getters is built on V8's slow path: ~300 ns for the first accessor pair, more than the
+   * members cost), each built without intermediate objects; what is behind them (`FileStore`, the `ctx.sql` refusal
+   * cache) is created on first use.
    */
   private mutationCtx(scope: Scope, st: MutationState, applier = false): Record<string, unknown> {
-    const engine = this;
-    let filesExec: Tx["exec"] | undefined;
     // One exec for `_files` statements, shared by `ctx.db` (refcounts) and `ctx.storage`.
-    const files = () =>
-      (filesExec ??= (sql, ...params) => {
-        st.files.touched = true;
-        return st.tx.exec(sql, ...params);
-      });
-    let db: unknown, storage: unknown, scheduler: unknown, runQuery: unknown, runMutation: unknown, sql: unknown, auth: unknown;
+    const filesExec: Tx["exec"] = (sql, ...params) => {
+      st.files.touched = true;
+      return st.tx.exec(sql, ...params);
+    };
     const c: Record<string, unknown> = {
-      get db() {
-        return (db ??= engine.mutationDb(scope, st, applier, files()));
-      },
-      set db(x) {
-        db = x;
-      },
-      get auth() {
-        return (auth ??= engine.authOf(st.auth));
-      },
-      set auth(x) {
-        auth = x;
-      },
+      db: this.mutationDb(scope, st, applier, filesExec),
+      auth: this.authOf(st.auth),
       now: st.now,
       random: st.random,
-      get scheduler() {
-        return (scheduler ??= engine.mutationScheduler(scope, st));
-      },
-      set scheduler(x) {
-        scheduler = x;
-      },
-      get storage() {
-        return (storage ??= engine.mutationStorage(st, files()));
-      },
-      set storage(x) {
-        storage = x;
-      },
-      get runQuery() {
-        return (runQuery ??= (ref: unknown, a?: unknown) => {
-          engine.checkDepth(st);
-          const target = engine.resolveCall(scope, ref, "query");
-          return engine.query(target.name, target.fn, a ?? {}, { tx: st.tx, now: st.now, auth: st.auth, touched: undefined, depth: st.depth + 1 });
-        });
-      },
-      set runQuery(x) {
-        runQuery = x;
+      scheduler: this.mutationScheduler(scope, st),
+      storage: this.mutationStorage(st, filesExec),
+      runQuery: (ref: unknown, a?: unknown) => {
+        this.checkDepth(st);
+        const target = this.resolveCall(scope, ref, "query");
+        return this.query(target.name, target.fn, a ?? {}, { tx: st.tx, now: st.now, auth: st.auth, touched: undefined, depth: st.depth + 1 });
       },
       // Same transaction, inside a savepoint: a failing callee is undone alone (and the caller may catch).
-      get runMutation() {
-        return (runMutation ??= (ref: unknown, a?: unknown) => {
-          engine.checkDepth(st);
-          const target = engine.resolveCall(scope, ref, "mutation");
-          return engine.savepoint(st, () => engine.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
-        });
+      runMutation: (ref: unknown, a?: unknown) => {
+        this.checkDepth(st);
+        const target = this.resolveCall(scope, ref, "mutation");
+        return this.savepoint(st, () => this.mutateIn(target.name, target.fn, a ?? {}, { ...st, depth: st.depth + 1 }));
       },
-      set runMutation(x) {
-        runMutation = x;
-      },
-      get sql() {
-        return (sql ??= engine.privateSqlCtx(st));
-      },
-      set sql(x) {
-        sql = x;
-      },
+      sql: this.privateSqlCtx(st),
     };
     const component = this.componentInfo(scope);
     if (component) c.component = component;
@@ -1997,13 +1951,15 @@ class EngineImpl implements Engine {
     return this.writer(st.tx, st.now, st.random, st.changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
   }
 
-  /** `ctx.storage` of a mutation. */
+  /** `ctx.storage` of a mutation (its `FileStore` on first use). */
   private mutationStorage(st: MutationState, filesExec: Tx["exec"]): StorageWriter {
     const { now } = st;
     let fileStore: FileStore | undefined;
     const files = () => (fileStore ??= new FileStore(filesExec, this.storageOpts));
+    // `storageReader`'s two methods, written out: no object to spread.
     return {
-      ...this.storageReader(files, now),
+      getUrl: (id, o) => files().getUrl(id, o ?? {}, now),
+      getMetadata: (id) => files().getMetadata(id),
       generateUploadUrl: (o) => files().generateUploadUrl(o ?? {}, now),
       delete: (id) => files().delete(id, now),
     };
@@ -2029,6 +1985,7 @@ class EngineImpl implements Engine {
       scheduled.push({ id, fn: target, args: jobArgs ?? {}, runAt, kind: f.type });
       return id;
     };
+    const reader = this.schedulerReader(null, undefined, { scheduled, cancelled, now });
     return {
       runAfter: (delayMs: number, ref: unknown, jobArgs?: unknown) => schedule(now + Math.max(0, delayMs), ref, jobArgs),
       runAt: (ts: number | Date, ref: unknown, jobArgs?: unknown) => schedule(ts instanceof Date ? ts.getTime() : ts, ref, jobArgs),
@@ -2038,7 +1995,9 @@ class EngineImpl implements Engine {
         if (i >= 0) scheduled.splice(i, 1);
         else if (!cancelled.includes(id)) cancelled.push(id);
       },
-      ...this.schedulerReader(null, undefined, { scheduled, cancelled, now }),
+      // The reader's methods, not a spread of it (no copy of an object per mutation).
+      get: reader.get,
+      list: reader.list,
     };
   }
 

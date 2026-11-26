@@ -10,8 +10,11 @@
 // (three-valued: SQLite's AND/OR/NOT on 0/1/NULL is Kleene logic, so a definite answer is the one every evaluation
 // of the undecided parts would give). The field must be `_id`, `_creationTime` or a top-level typed column of class
 // text, real or boolean (layout.ts); the literal a primitive. Per row:
-//   - the field is in `_json` (an escaped value: NaN, -0, ±Infinity; or anything a column cannot hold): NULL;
-//   - the column is NULL: the field is `null` (nullable) or absent, compared in JS once, when the SQL is built;
+//   - the column is not NULL: it holds the value (a value the column cannot hold, NaN, -0 or ±Infinity, is written to
+//     `_json` with the column NULL: layout.ts `encodeJson`, engine.ts `patchValues`);
+//   - the column is NULL and `_json` may hold the field (its quoted name is in the text; a column added to a table
+//     whose old rows kept the field in `_json`): NULL;
+//   - the column is NULL otherwise: the field is `null` (nullable) or absent, compared in JS once, at build time;
 //   - the literal has another type than the column: the type order decides, also once, in JS;
 //   - same type: SQLite compares. Text with BINARY collation is UTF-8 byte order, which is the code point order of
 //     `compareStrings`; literals with a lone surrogate or a NUL, and stored texts that may hold one (WTF8), are left
@@ -19,6 +22,8 @@
 //     than -0 (columns never hold NaN, -0 or ±Infinity: those go to `_json`). Booleans: 0 / 1.
 // Anything else in the expression is NULL (left to JS). An expression with no decided part, a malformed one, or one
 // with a non-primitive literal or a non-string field path (whose JS evaluation could throw) is not pushed at all.
+//
+// Cost: the expression runs in C on rows SQLite reads anyway, a fraction of decoding them in JS (scripts/bench-hot-path.ts).
 
 import { compareValues } from "@freecorps/ember-values";
 import { lit, q, type SqlValue } from "./driver.ts";
@@ -156,11 +161,14 @@ class Builder {
       text = f.type === "string";
     }
     this.decided = true;
-    const exact = text ? `WHEN ${WTF8(col)} THEN NULL ` : "";
-    if (f.notNull) return text ? `(CASE ${exact}ELSE ${present} END)` : `(${present})`;
+    // Equality with a literal without U+FFFD cannot be turned by WTF-8 bytes: neither side matches such a row.
+    const wtf = text && ((op !== "eq" && op !== "neq") || (x as string).includes("\ufffd"));
+    const exact = wtf ? `WHEN ${WTF8(col)} THEN NULL ` : "";
+    if (f.notNull) return wtf ? `(CASE ${exact}ELSE ${present} END)` : `(${present})`;
     const absent = test(compareValues(f.nullValue, x)) ? "1" : "0";
-    // `_json` holds the field (an escaped value) only if its quoted name is in the text: otherwise the column decides.
-    return `(CASE WHEN instr("_json", ${lit(`"${f.column}"`)}) > 0 THEN NULL WHEN ${col} IS NULL THEN ${absent} ${exact}ELSE ${present} END)`;
+    // A non-NULL column is the value (an escaped one leaves the column NULL: layout.ts `encodeJson`). A NULL one is
+    // `null` / absent unless `_json` holds the field, which needs its quoted name in the text.
+    return `(CASE WHEN ${col} IS NULL THEN (CASE WHEN instr("_json", ${lit(`"${f.column}"`)}) > 0 THEN NULL ELSE ${absent} END) ${exact}ELSE ${present} END)`;
   }
 }
 

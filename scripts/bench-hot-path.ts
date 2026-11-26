@@ -147,5 +147,12 @@ const change = { table: "messages", id, before, after: { ...before, body: "y" } 
 bench("matchIndex.match update (non-key field)", () => mi.match([change as any]));
 const batchItems = Array.from({ length: 10 }, (_, i) => ({ name: mutationGeneric({ handler: ((ctx: any) => ctx.db.patch(id, { likes: i })) as any }) as any, args: {} }));
 bench("engine runMutationBatch 10 patches", () => engine.runMutationBatch(batchItems as any));
+// The shard's group commit: its own transaction around the batch (before PR 3b), or the engine's (`commitMutationBatch`).
+const group = (items: unknown[]) => {
+  const e = engine as any;
+  return e.commitMutationBatch ? e.commitMutationBatch(items, (r: unknown) => r) : driver.transaction(() => engine.runMutationBatch(items as any));
+};
+bench("group commit 1 patch (as the shard)", () => group(batchItems.slice(0, 1)));
+bench("group commit 10 patches (as the shard)", () => group(batchItems));
 bench("engine empty mutation", () => mutate(() => null));
 bench("engine empty query", () => query(() => null));

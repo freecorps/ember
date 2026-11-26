@@ -483,7 +483,7 @@ export type RawExec = (sql: string, ...params: SqlValue[]) => SqlValue[][];
  */
 export type ScanOptions = { raw?: RawExec | undefined; filter?: PushedFilter | undefined };
 
-/** At most this many bound values in a scan (DO SQLite allows 100 per statement). */
+/** At most this many bound values in a scan (DO SQLite allows 100 per statement): a wider filter stays in JS. */
 const MAX_PARAMS = 100;
 
 /** The SQL behind `QueryEnv.scan`: a range scan over the index's encoded key column (server and local SQLite). */
@@ -506,11 +506,11 @@ export function sqlScan(
   const filter = dataOnly === false ? undefined : fitFilter(opts?.filter, 5);
   const raw = dataOnly === true ? opts?.raw : undefined;
   if (t.v3 && index === "by_creation_time") return creationScan(exec, t, lo, hi, asc, limit, dataOnly, filter, raw);
-  const plan = scanSql(t, index, asc, dataOnly, filter);
+  const sql = scanSql(t, index, asc, dataOnly, filter);
   const range: SqlValue[] = t.compact && index === "by_creation_time" ? [rowidBound(lo, false), rowidBound(hi, true), lo, hi, limit] : [lo, hi, limit];
-  const params = filter ? [...repeat(filter.params, plan.copies), ...range] : range;
+  const params = filter ? [...filter.params, ...range] : range;
   if (raw) {
-    const rows = raw(plan.sql, ...params);
+    const rows = raw(sql, ...params);
     const n = t.layout.dataColumns.length;
     const out: ScannedRow[] = new Array(rows.length);
     for (let i = 0; i < rows.length; i++) {
@@ -520,7 +520,7 @@ export function sqlScan(
     return out;
   }
   const kc = keyColumn(index);
-  const rows = exec(plan.sql, ...params);
+  const rows = exec(sql, ...params);
   const out: ScannedRow[] = new Array(rows.length);
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
@@ -535,29 +535,23 @@ const VERDICT = "_ember_m";
 /** A verdict column's value: 1 passes, 0 does not, NULL is left to `passes`. */
 const verdict = (x: SqlValue | undefined): boolean | undefined => (x === 1 ? true : x === 0 ? false : undefined);
 
-/** The filter, if its values fit next to `others` bound values (at least once): else none (evaluated in JS). */
+/** The filter, if its values fit next to `others` bound values: else none (evaluated in JS). */
 const fitFilter = (f: PushedFilter | undefined, others: number): PushedFilter | undefined => (f && f.params.length + others <= MAX_PARAMS ? f : undefined);
 
-function repeat(xs: SqlValue[], n: number): SqlValue[] {
-  if (n === 1) return xs;
-  const out: SqlValue[] = [];
-  for (let i = 0; i < n; i++) for (const x of xs) out.push(x);
-  return out;
-}
-
 /**
- * The select list of a scan: `cols` (data columns, maybe after `_rowid`), then `tail`, then the verdict. In a query
- * (`hide`) the `_json` and TEXT/BLOB columns of a rejected row are NULL (each copy of the verdict binds its values
- * again: only while they fit). `copies`: how many times the verdict's values are bound, ahead of the range's.
+ * A scan statement: `cols` (data columns, maybe after `_rowid`) and `tail`, then the verdict of `filter`, then `rest`
+ * (`FROM ... LIMIT ?`). In a query (`hide`) the `_json` and TEXT/BLOB columns of a row the filter rejects come back
+ * NULL: the scan is a co-routine (an outer `LIMIT -1`: SQLite does not flatten a subquery with a LIMIT into a query
+ * with one), so the verdict is computed once per row and the outer select only reads it. Its `?` come first.
  */
-function selectList(t: TableRuntime, cols: readonly string[], tail: readonly string[], filter: PushedFilter | undefined, hide: boolean, others: number): { list: string; copies: number } {
-  if (!filter) return { list: [...cols, ...tail].map(q).join(", "), copies: 0 };
-  const v = filter.sql;
-  const heavy = hide ? cols.filter((c) => c === "_json" || HEAVY.has(t.layout.column(c)?.spec.cls ?? "")) : [];
-  const fits = heavy.length > 0 && filter.params.length * (heavy.length + 1) + others <= MAX_PARAMS;
-  const shown = fits ? new Set(heavy) : undefined;
-  const parts = cols.map((c) => (shown?.has(c) ? `CASE WHEN ${v} IS 0 THEN NULL ELSE ${q(c)} END AS ${q(c)}` : q(c)));
-  return { list: [...parts, ...tail.map(q), `${v} AS ${q(VERDICT)}`].join(", "), copies: fits ? heavy.length + 1 : 1 };
+function scanStatement(t: TableRuntime, cols: readonly string[], tail: readonly string[], filter: PushedFilter | undefined, hide: boolean, rest: string): string {
+  const list = [...cols, ...tail].map(q).join(", ");
+  if (!filter) return `SELECT ${list} ${rest}`;
+  const inner = `SELECT ${list}, ${filter.sql} AS ${q(VERDICT)} ${rest}`;
+  const heavy = hide ? new Set(cols.filter((c) => c === "_json" || HEAVY.has(t.layout.column(c)?.spec.cls ?? ""))) : undefined;
+  if (!heavy?.size) return inner;
+  const outer = [...cols.map((c) => (heavy.has(c) ? `CASE WHEN ${q(VERDICT)} IS 0 THEN NULL ELSE ${q(c)} END AS ${q(c)}` : q(c))), ...tail.map(q), q(VERDICT)];
+  return `SELECT ${outer.join(", ")} FROM (${inner}) LIMIT -1`;
 }
 
 /** Column classes worth not handing to JS for a row a pushed filter rejects. */
@@ -609,12 +603,12 @@ class RawScannedRow implements ScannedRow {
 const creationKey = (row: SqlRow): Uint8Array => encodeKey([Number(row._creationTime), String(row._id)]);
 
 /** Scan statements per table runtime (index, direction, columns, pushed filter): built once, not per call. */
-const scanSqlCache = new WeakMap<TableRuntime, Map<string, { sql: string; copies: number }>>();
+const scanSqlCache = new WeakMap<TableRuntime, Map<string, string>>();
 
 /** Distinct statements kept per table (pushed filters vary by expression shape, never by value). */
 const MAX_CACHED_SCANS = 256;
 
-function cached(cache: WeakMap<TableRuntime, Map<string, { sql: string; copies: number }>>, t: TableRuntime, k: string, build: () => { sql: string; copies: number }) {
+function cached(cache: WeakMap<TableRuntime, Map<string, string>>, t: TableRuntime, k: string, build: () => string): string {
   let byKey = cache.get(t);
   if (!byKey) cache.set(t, (byKey = new Map()));
   let plan = byKey.get(k);
@@ -625,23 +619,19 @@ function cached(cache: WeakMap<TableRuntime, Map<string, { sql: string; copies: 
   return plan;
 }
 
-function scanSql(t: TableRuntime, index: string, asc: boolean, dataOnly: boolean | "row", filter: PushedFilter | undefined): { sql: string; copies: number } {
+function scanSql(t: TableRuntime, index: string, asc: boolean, dataOnly: boolean | "row", filter: PushedFilter | undefined): string {
   const k = `${index}\u0000${asc ? 1 : 0}${dataOnly === "row" ? 2 : dataOnly ? 1 : 0}${t.compact ? 1 : 0}${filter ? `\u0000${filter.sql}` : ""}`;
   return cached(scanSqlCache, t, k, () => {
     const kc = keyColumn(index);
     const col = q(kc);
-    const others = t.compact && index === "by_creation_time" ? 5 : 3;
-    const { list: cols, copies } = !dataOnly
-      ? { list: "*", copies: 0 }
-      : selectList(t, dataOnly === "row" ? ["_rowid", ...t.layout.dataColumns] : t.layout.dataColumns, [kc], filter, dataOnly === true, others);
-    let sql: string;
-    if (t.compact && index === "by_creation_time") {
-      // `_rowid` is `_creationTime` in µs: a primary-key range around the bounds, the key column the exact filter.
-      sql = `SELECT ${cols} FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? AND ${col} >= ? AND ${col} < ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;
-    } else {
-      sql = `SELECT ${cols} FROM ${q(t.name)} INDEXED BY ${q(`${t.name}__${index}`)} WHERE ${col} >= ? AND ${col} < ? ORDER BY ${col} ${asc ? "ASC" : "DESC"} LIMIT ?`;
-    }
-    return { sql, copies };
+    // `_rowid` is `_creationTime` in µs on compact storage: a primary-key range around the bounds, the key column the
+    // exact filter.
+    const rest =
+      t.compact && index === "by_creation_time"
+        ? `FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? AND ${col} >= ? AND ${col} < ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`
+        : `FROM ${q(t.name)} INDEXED BY ${q(`${t.name}__${index}`)} WHERE ${col} >= ? AND ${col} < ? ORDER BY ${col} ${asc ? "ASC" : "DESC"} LIMIT ?`;
+    if (!dataOnly) return `SELECT * ${rest}`;
+    return scanStatement(t, dataOnly === "row" ? ["_rowid", ...t.layout.dataColumns] : t.layout.dataColumns, [kc], filter, dataOnly === true, rest);
   });
 }
 
@@ -728,18 +718,17 @@ function creationBound(key: Uint8Array, upper: boolean): CreationBound {
   return { value, strict, exact: finite && n !== 0 && (rest === "ff" || strict) };
 }
 
-const creationSqlCache = new WeakMap<TableRuntime, Map<string, { sql: string; copies: number }>>();
+const creationSqlCache = new WeakMap<TableRuntime, Map<string, string>>();
 
-function creationSql(t: TableRuntime, asc: boolean, dataOnly: boolean | "row", lo: CreationBound, hi: CreationBound, filter: PushedFilter | undefined): { sql: string; copies: number } {
+function creationSql(t: TableRuntime, asc: boolean, dataOnly: boolean | "row", lo: CreationBound, hi: CreationBound, filter: PushedFilter | undefined): string {
   // "row" selects what `true` does (`_rowid` is there already), unless a pushed filter hides rejected rows' columns.
   const k = `${asc ? 1 : 0}${dataOnly ? 1 : 0}${lo.strict ? 1 : 0}${hi.strict ? 1 : 0}${filter ? `${dataOnly === true ? 1 : 0}\u0000${filter.sql}` : ""}`;
   return cached(creationSqlCache, t, k, () => {
-    // `_rowid` (the loop below continues from the last one) and what the document needs: no `_k_*` BLOBs.
-    const { list: cols, copies } = dataOnly ? selectList(t, ["_rowid", ...t.layout.dataColumns], [], filter, dataOnly === true, 5) : { list: "*", copies: 0 };
-    const sql =
-      `SELECT ${cols} FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? ` +
+    const rest =
+      `FROM ${q(t.name)} WHERE "_rowid" >= ? AND "_rowid" <= ? ` +
       `AND "_creationTime" ${lo.strict ? ">" : ">="} ? AND "_creationTime" ${hi.strict ? "<" : "<="} ? ORDER BY "_rowid" ${asc ? "ASC" : "DESC"} LIMIT ?`;
-    return { sql, copies };
+    // `_rowid` (the loop below continues from the last one) and what the document needs: no `_k_*` BLOBs.
+    return dataOnly ? scanStatement(t, ["_rowid", ...t.layout.dataColumns], [], filter, dataOnly === true, rest) : `SELECT * ${rest}`;
   });
 }
 
@@ -766,8 +755,8 @@ function creationScan(
   if (!(limit > 0) || compareBytes(lo, hi) >= 0) return out;
   const cLo = creationBound(lo, false);
   const cHi = creationBound(hi, true);
-  const { sql, copies } = creationSql(t, asc, dataOnly, cLo, cHi, filter);
-  const ahead = filter ? repeat(filter.params, copies) : [];
+  const sql = creationSql(t, asc, dataOnly, cLo, cHi, filter);
+  const ahead = filter ? filter.params : [];
   const n = t.layout.dataColumns.length;
   let rLo = rowidBound(lo, false);
   let rHi = rowidBound(hi, true);
