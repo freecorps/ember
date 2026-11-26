@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import ts from "typescript";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { contractsFromApiDts, currentManifest } from "../src/codegen/current.ts";
 import { codegen, type CodegenResult } from "../src/codegen/index.ts";
 import type { Project } from "../src/config.ts";
 import { cleanup, sampleProject } from "./helpers.ts";
@@ -358,8 +359,8 @@ describe("codegen DX (docs/design/dx.md)", () => {
     expect((await codegen(project, { check: true })).stale).toEqual([]);
     writeFileSync(join(project.dir, "rooms.ts"), ROOMS.replace("count: number;", "count: number; extra: boolean;").replace("last: all.at(-1)?.body ?? null }", "last: all.at(-1)?.body ?? null, extra: true }"));
     const r = await codegen(project, { check: true });
-    // RoomSummary is printed by name: only its definition changes.
-    expect(r.stale).toEqual(["types.d.ts"]);
+    // RoomSummary is printed by name: only its definition changes (and manifest.json's hash of the sources).
+    expect(r.stale).toEqual(["types.d.ts", "manifest.json"]);
     expect(gen("types.d.ts")).not.toContain("extra");
     writeFileSync(join(project.dir, "rooms.ts"), ROOMS);
   });
@@ -384,5 +385,28 @@ describe("codegen DX (docs/design/dx.md)", () => {
 
   it("prints a function's contract (ember types)", () => {
     expect(result.contracts.get("rooms:post")).toBe("Mutation<{\n  channel: string;\n  author: string;\n  body: string;\n}, Id<\"messages\">, E.Banned | E.MessageTooLong>");
+  });
+
+  it("ember types / ember openapi reuse a current manifest.json (same contracts), and not a stale one", async () => {
+    const r = await codegen(project);
+    const cur = currentManifest(project);
+    expect(cur).not.toBeNull();
+    expect(cur!.manifest.functions).toEqual(r.manifest.functions);
+    expect(Object.fromEntries(contractsFromApiDts(cur!.api))).toEqual(Object.fromEntries(r.contracts));
+    // Any source under ember/ (a helper too), and a file outside it the functions import.
+    writeFileSync(join(project.dir, "lib", "guard.ts"), LIB + "\n// edited\n");
+    expect(currentManifest(project)).toBeNull();
+    writeFileSync(join(project.dir, "lib", "guard.ts"), LIB);
+    expect(currentManifest(project)).not.toBeNull();
+    writeFileSync(join(project.root, "shared.ts"), "export type Shared = { n: number };\n");
+    writeFileSync(join(project.dir, "shared_user.ts"), 'import type { Shared } from "../shared";\nimport { query } from "./_generated/server";\nexport const shared = query((): Shared => ({ n: 1 }));\n');
+    await codegen(project);
+    expect(currentManifest(project)?.manifest.sources?.files).toEqual(["shared.ts"]);
+    writeFileSync(join(project.root, "shared.ts"), "export type Shared = { n: number; m: string };\n");
+    expect(currentManifest(project)).toBeNull();
+    rmSync(join(project.dir, "shared_user.ts"));
+    rmSync(join(project.root, "shared.ts"));
+    await codegen(project);
+    expect(currentManifest(project)).not.toBeNull();
   });
 });

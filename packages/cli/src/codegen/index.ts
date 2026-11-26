@@ -18,6 +18,7 @@ import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
 import { aiGuidelines } from "./ai.ts";
+import { outsideFiles, sourcesHash, type SourcesStamp } from "./current.ts";
 import { relativeTo, TypeOracle, type FunctionTypeInfo, type NamedType } from "./returnTypes.ts";
 import { propKey, shapeToTs } from "./shapeToTs.ts";
 
@@ -71,6 +72,11 @@ export interface EmberManifest {
   routes?: TypedRouteSpec[];
   /** `local`: this project's Auth DO (read-only `auth:*` tables); `remote`: SSO against another project. */
   auth?: { mode: "local"; tables: AuthTableDescriptor[]; replicas?: ReplicaTableManifest[] } | { mode: "remote"; from: string };
+  /**
+   * manifest.json only: what it was generated from (a hash of the sources), so `ember types` and `ember openapi`
+   * reuse a current one without evaluating the project (codegen/current.ts).
+   */
+  sources?: SourcesStamp;
 }
 
 /** A replica table (`ember.replicate` in auth.config.ts, PLAN §22 L3) as codegen types it. */
@@ -255,7 +261,9 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   generated.set("api.d.ts", rendered.text);
   generated.set("api.d.ts.map", rendered.map);
   generated.set("types.d.ts", typesDts(named));
-  generated.set("manifest.json", JSON.stringify(manifest, null, 2) + "\n");
+  const outside = outsideFiles(project, oracle.programFiles());
+  const sources: SourcesStamp = { hash: sourcesHash(project, outside), ...(outside.length ? { files: outside } : {}) };
+  generated.set("manifest.json", JSON.stringify({ ...manifest, sources }, null, 2) + "\n");
   generated.set("ai/guidelines.md", aiGuidelines(manifest, rendered.contracts));
 
   // 5. Write (or compare).

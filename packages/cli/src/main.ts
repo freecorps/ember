@@ -229,9 +229,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case "openapi": {
       const { values } = parseArgs({ args: rest, options: { out: { type: "string" }, url: { type: "string" } } });
       const project = loadProject();
-      const r = await codegen(project, { check: true });
+      // A current manifest.json (generated from the sources as they are) is enough: no need to evaluate the project.
+      const { currentManifest } = await import("./codegen/current.ts");
+      const manifest = currentManifest(project)?.manifest ?? (await codegen(project, { check: true })).manifest;
       const { openApi } = await import("./codegen/openapi.ts");
-      const doc = JSON.stringify(openApi(r.manifest, { title: project.config.project, ...(values.url ? { url: values.url } : {}) }), null, 2) + "\n";
+      const doc = JSON.stringify(openApi(manifest, { title: project.config.project, ...(values.url ? { url: values.url } : {}) }), null, 2) + "\n";
       if (values.out) {
         writeFileSync(values.out, doc);
         console.log(`openapi: ${values.out}`);
@@ -243,7 +245,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const name = positionals[0];
       if (!name) throw new Error("usage: ember types <module:fn>");
       const project = loadProject();
-      const r = await codegen(project, { check: true });
+      // From a current manifest.json + api.d.ts when there is one; else codegen (in memory) works it out.
+      const { contractsFromApiDts, currentManifest } = await import("./codegen/current.ts");
+      const cur = currentManifest(project);
+      const r = cur ? { manifest: cur.manifest, contracts: contractsFromApiDts(cur.api) } : await codegen(project, { check: true });
       const fn = r.manifest.functions.find((f) => f.name === name || f.name === name.replace(/\.(?=[^.]*$)/, ":").replace(/\./g, "/"));
       const contract = fn && r.contracts.get(fn.name);
       if (!fn || !contract) throw new Error(`no function ${name} (known: ${r.manifest.functions.map((f) => f.name).join(", ")})`);

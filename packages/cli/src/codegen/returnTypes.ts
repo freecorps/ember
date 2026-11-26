@@ -117,6 +117,11 @@ export class TypeOracle {
     });
   }
 
+  /** The files of the last `infer`'s program (absolute). */
+  programFiles(): string[] {
+    return this.builder?.getProgram().getSourceFiles().map((sf) => sf.fileName) ?? [];
+  }
+
   infer(o: InferOptions): InferResult {
     const host = ts.createCompilerHost(COMPILER_OPTIONS, true);
     const read = host.readFile.bind(host);
