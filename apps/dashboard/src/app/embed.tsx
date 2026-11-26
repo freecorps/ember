@@ -89,7 +89,15 @@ export function EmbedBlock({ c, b, tab }: { c: EmbedHost; b: EmbedSpec; tab: str
     if (own.current === c.version) return;
     setGen((g) => g + 1);
   }, [c.version]);
-  return <EmbedTicket key={`${c.shard}#${gen}`} c={c} b={b} tab={tab} ownWrite={() => (own.current = seen.current + 1)} />;
+  const generation = `${c.shard}#${gen}`;
+  const current = useRef(generation);
+  current.current = generation;
+  // The exemption only for the page that is still the current one: a write answered after the page was replaced (by
+  // Refresh, another write or another shard) leaves the next version a normal refresh, for the page now shown.
+  const ownWrite = () => {
+    if (current.current === generation) own.current = seen.current + 1;
+  };
+  return <EmbedTicket key={generation} c={c} b={b} tab={tab} ownWrite={ownWrite} />;
 }
 
 function EmbedTicket({ c, b, tab, ownWrite }: { c: EmbedHost; b: EmbedSpec; tab: string; ownWrite: () => void }) {
