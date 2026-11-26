@@ -156,6 +156,18 @@ mesma máquina) e o teste `packages/cli/test/lazy-actions.test.ts`:
 - Iguais (ruído da máquina à parte): rajada de 20 queries mudadas, 10,1 → 2,6 ms (SQLite) e 2,0 → 1,4 ms (IndexedDB),
   como na 3B-1; bytes por patch na ponte, ~300 B.
 
+## Depois da 0.9.0: PR 3c (v0.10)
+
+Medido nos testes de contador (workerd), antes → depois:
+
+| Medida | Antes | Depois | Teste |
+|---|---|---|---|
+| RPCs de lease por lote da Queue (11 action jobs em 2 shards) | 22 (um claim + um settle por mensagem) | **4** (um `claimActionJobs` + um `settleActionJobs` por shard) | `runtime/test/lease-batch.test.ts` |
+| Linha do change log de um commit com documento de 141 KB | ~141 KB em `_ember_changes.changes` | **4 caracteres** (`null`: o resume cai para snapshot) | `runtime/test/change-log-cap.test.ts` |
+| Linhas escritas por commit, documento grande vs. pequeno | 4 / 4 | 4 / 4 (igual: o teto corta bytes, não linhas) | idem |
+| Linhas escritas por job de mutation agendado (agendar + rodar + liquidar) | 7,4 + o DELETE da manutenção | **6,4** com `retainMs: 0`, nada para a manutenção | `runtime/test/job-retain.test.ts` |
+| `GET /api/query/<fn>` anônimo de query com `cache`, cópia fresca | 1 RPC ao shard (DO request + linhas lidas) | **0** (resposta do `caches.default`) | `runtime/test/http-cache.test.ts` |
+
 ## Reproduzir
 
 ```sh

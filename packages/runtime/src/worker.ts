@@ -1,4 +1,4 @@
-import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, MAX_HTTP_BODY_BYTES as SERVER_MAX_HTTP_BODY_BYTES, replicaApplyFunction, replicatedTablesOf, REPLICATED_SOURCE, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
+import { claimShardOf, componentQueueName, type AnyRegisteredFunction, type QueryCache, composeApp, cronList, flattenFunctions, hookShard, matchRoute, MAX_HTTP_BODY_BYTES as SERVER_MAX_HTTP_BODY_BYTES, replicaApplyFunction, replicatedTablesOf, REPLICATED_SOURCE, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import type { AdminShardRpc } from "./admin-api.ts";
@@ -11,7 +11,7 @@ import { readLimited, readLimitedText } from "./body.ts";
 import { MAX_FRAME_BYTES } from "./protocol.ts";
 import { recordCall } from "./metrics.ts";
 import type { RestoreRpc } from "./restore.ts";
-import { MAX_QUERY_BATCH, revokeMatchError, type MutationOutcome, type QueryBatchItem, type RevokeMatch, type ShardStatus } from "./shard.ts";
+import { MAX_LEASE_BATCH, MAX_QUERY_BATCH, revokeMatchError, type ActionJobOutcome, type MutationOutcome, type QueryBatchItem, type RevokeMatch, type ShardStatus } from "./shard.ts";
 import { shardStub, systemStub } from "./stubs.ts";
 import type { RestoreJournalRow, System } from "./system.ts";
 import { CRON_HEARTBEAT_MINUTES, cronWakeDue } from "./cron.ts";
@@ -94,10 +94,30 @@ function bearer(request: Request, url: URL): string | null {
   return url.searchParams.get("token");
 }
 
+/**
+ * The shard a `shard: { kind: "argName" }` function derives from its arguments: `<kind>:<value>` for a string, number,
+ * bigint or boolean value, undefined without the argument (or without `fromArg`), null for any other value (an object,
+ * an array: never coerced, the caller gets a 400). Only consulted when no shard is named (`?shard=`, `x-ember-shard`).
+ */
+function shardFromArg(spec: ShardSpec | undefined, args: Record<string, unknown>): string | undefined | null {
+  if (spec?.fromArg === undefined) return undefined;
+  const v = args[spec.fromArg];
+  if (v === undefined) return undefined;
+  if (typeof v === "string" || typeof v === "number" || typeof v === "bigint" || typeof v === "boolean") return `${spec.kind}:${String(v)}`;
+  return null;
+}
+const badShardArg = (spec: ShardSpec) => error(400, "bad_shard", `argument ${spec.fromArg} names the shard: it must be a string or a number`);
+
 function knownShardKinds(config: EmberConfig): Set<string> | null {
   const s = config.schema.manifest.shards;
   if (!s) return null;
   return new Set(Array.isArray(s) ? s : Object.keys(s));
+}
+
+/** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`). */
+function deployVersion(env: EmberEnv): string | null {
+  const v = env.EMBER_VERSION as { id?: unknown } | undefined;
+  return v && typeof v.id === "string" && v.id ? v.id : null;
 }
 
 /** Constant-time string comparison (admin token). */
@@ -138,10 +158,134 @@ const NEVER_REVEALED = new Set(["BETTER_AUTH_SECRET"]);
  *   export { Shard, System } from "@freecorps/ember-runtime";
  *   export default createEmberWorker({ schema, functions, crons });
  */
-/** The Shard DO's lease surface for action jobs (`Shard.claimActionJob` / `settleActionJob`). */
+/**
+ * The Shard DO's lease surface for action jobs: `claimActionJobs` / `settleActionJobs` (one RPC per shard and Queue
+ * batch), and the one-job forms a shard instance of the runtime before them still has (mid-deploy).
+ */
 interface LeaseRpc {
   claimActionJob(shard: string, jobId: string): Promise<{ run: boolean }>;
   settleActionJob(shard: string, jobId: string, error: { code: string; message: string } | null): Promise<void>;
+  claimActionJobs(shard: string, jobIds: string[]): Promise<Array<{ run: boolean; leaseMs?: number; leaseUntil?: number }>>;
+  settleActionJobs(shard: string, outcomes: ActionJobOutcome[]): Promise<void>;
+}
+
+/**
+ * One leased job on a shard of the runtime before the batch RPCs: claim, run, settle, as that runtime's consumer did.
+ * A claim that fails retries the delivery; a settle that fails leaves the job to its lease (at least once).
+ */
+async function legacyLeasedJob(
+  owner: LeaseRpc,
+  shard: string,
+  msg: { ack(): void; retry(): void },
+  job: ActionJobMessage,
+  run: (job: ActionJobMessage) => Promise<{ code: string; message: string } | null>,
+): Promise<void> {
+  let claim: { run: boolean };
+  try {
+    claim = await owner.claimActionJob(shard, job.jobId);
+  } catch (e) {
+    console.error(`ember: could not claim action job ${job.jobId} (${job.fn}) on ${shard}: ${(e as Error).message}`);
+    msg.retry();
+    return;
+  }
+  if (!claim.run) {
+    msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
+    return;
+  }
+  let error: { code: string; message: string } | null;
+  try {
+    error = await run(job);
+  } catch (e) {
+    error = { code: "internal", message: (e as Error)?.message ?? String(e) };
+  }
+  if (error) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${error.code}: ${error.message}`);
+  try {
+    await owner.settleActionJob(shard, job.jobId, error);
+  } catch (e) {
+    console.error(`ember: could not report action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
+  }
+  msg.ack();
+}
+
+/** A shard instance of the runtime before the batch RPCs (mid-deploy) has no `name`: the error names the method. */
+const missingRpc = (e: unknown, name: string) => new RegExp(name).test(String((e as Error | null)?.message ?? ""));
+
+/**
+ * The longest a settled outcome waits for the rest of its shard's jobs of the batch before it is reported on its own
+ * (one slow action does not hold the others' rows `claimed` for its whole run).
+ */
+export const SETTLE_MAX_WAIT_MS = 5_000;
+
+/**
+ * When a claimed job's lease ends, as the consumer can tell: the shard's `leaseUntil` (its clock), kept within the
+ * claim's round trip (`sentAt + leaseMs` .. `receivedAt + leaseMs`: the lease was granted in between), so neither the
+ * claim's own latency nor a skewed clock moves it by more than that round trip. Without `leaseUntil` (a shard of the
+ * runtime before it), from when the claim was sent: the earliest the lease can have started.
+ */
+export function leaseDeadline(c: { leaseMs: number; leaseUntil?: number | undefined }, sentAt: number, receivedAt: number): number {
+  const lo = sentAt + c.leaseMs;
+  if (typeof c.leaseUntil !== "number" || !Number.isFinite(c.leaseUntil)) return lo;
+  return Math.min(Math.max(c.leaseUntil, lo), receivedAt + c.leaseMs);
+}
+
+/**
+ * The outcomes of one shard's claimed jobs of a Queue batch, reported together: one `settleActionJobs` once all
+ * `count` ran, or the ones waiting when the first of them has waited `SETTLE_MAX_WAIT_MS`, or sooner when an outcome
+ * waiting must reach the shard before its lease ends (`reportBy`: a quarter of the lease before it; an outcome
+ * without one goes at once). Each message is acked once its outcome was sent, reported or not (as with one job: an
+ * unreported job runs again when its lease runs out, at least once). The sends go into `settles`, which the batch
+ * awaits (`flush` sends what is left).
+ */
+function settleGroup(owner: LeaseRpc, shard: string, count: number, settles: Promise<void>[]) {
+  let remaining = count;
+  let pending: Array<{ o: ActionJobOutcome; msg: { ack(): void } }> = [];
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let flushAt = Infinity;
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    flushAt = Infinity;
+    const items = pending;
+    pending = [];
+    if (!items.length) return;
+    settles.push(
+      (async () => {
+        const outcomes = items.map((i) => i.o);
+        try {
+          try {
+            await owner.settleActionJobs(shard, outcomes);
+          } catch (e) {
+            if (!missingRpc(e, "settleActionJobs")) throw e;
+            // A shard of the runtime before it: one RPC each, every one tried (one refused does not leave the others
+            // unreported). A released job stays `claimed` there (its lease brings it back).
+            const each = await Promise.allSettled(outcomes.map((o) => ("error" in o ? owner.settleActionJob(shard, o.jobId, o.error) : undefined)));
+            each.forEach((r, k) => {
+              if (r.status === "rejected") console.error(`ember: could not report action job ${outcomes[k]!.jobId} on ${shard}: ${(r.reason as Error)?.message ?? String(r.reason)}`);
+            });
+          }
+        } catch (e) {
+          // Not reported: the lease runs out and the shard runs the jobs again (at least once).
+          console.error(`ember: could not report ${outcomes.length} action job(s) on ${shard} (${outcomes.map((o) => o.jobId).join(", ")}): ${(e as Error).message}`);
+        }
+        for (const i of items) i.msg.ack();
+      })(),
+    );
+  };
+  return {
+    flush,
+    done(o: ActionJobOutcome, msg: { ack(): void }, reportBy?: number) {
+      const now = Date.now();
+      pending.push({ o, msg });
+      remaining--;
+      const at = Math.min(flushAt, pending.length === 1 ? now + SETTLE_MAX_WAIT_MS : Infinity, reportBy ?? now);
+      if (remaining === 0 || at <= now) return flush();
+      if (at < flushAt) {
+        if (timer) clearTimeout(timer);
+        flushAt = at;
+        timer = setTimeout(flush, at - now);
+      }
+    },
+  };
 }
 
 export function createEmberWorker(input: EmberConfig): EmberWorker {
@@ -317,6 +461,115 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     return json({ ok: true, results });
   };
 
+  /** Edge copies being refreshed from this isolate (a stale hit starts one refresh per key, not one per hit). */
+  const refreshing = new Set<string>();
+  /** Cache-key version when `EMBER_VERSION` is absent: this isolate's (made on first use: no random at startup). */
+  let isolateVersion: string | undefined;
+
+  /**
+   * `GET /api/query/<module:fn>?args=<JSON>&shard=<shard>` (contracts.md "Queries HTTP cacheáveis"): only for public
+   * queries declared with `cache: { maxAge, swr? }` (any other function: 405, as before). `args`: the arguments as
+   * wire JSON (int64/bytes tagged), URL-encoded; absent = `{}`. The shard as in `POST /api/query/<fn>`.
+   *
+   * Anonymous calls (no bearer token, no session cookie) get `Cache-Control: public, max-age, stale-while-revalidate`
+   * and go through `caches.default`: the key is the function, the shard, the canonical args (keys sorted) and the
+   * Worker version (`EMBER_VERSION.id`, else a key of the isolate), so a deploy starts from an empty cache. A copy
+   * younger than `maxAge` answers without waking the shard; one younger than `maxAge + swr` answers stale while one
+   * refresh runs in the background (`waitUntil`). Only `ok: true` answers are stored. Signed-in calls are never cached
+   * (`Cache-Control: private, no-store`) and run exactly as `POST /api/query/<fn>` does.
+   */
+  const getQuery = async (request: Request, url: URL, env: EmberEnv, ctx: ExecutionContext, rawFn: string): Promise<Response> => {
+    let fnName: string;
+    try {
+      fnName = decodeURIComponent(rawFn);
+    } catch {
+      return error(400, "bad_request", "malformed percent-encoding in the function name");
+    }
+    fns ??= flattenFunctions(config.functions);
+    const f = fns.get(fnName) as AnyRegisteredFunction | undefined;
+    const cache = f && f.type === "query" && f.visibility === "public" ? f.cache : undefined;
+    // Not revealing whether the function exists: the same answer as any GET before this route.
+    if (!cache) return error(405, "method_not_allowed", "use POST (GET is only for queries declared with cache)");
+    const raw = url.searchParams.get("args");
+    if (raw !== null && raw.length > MAX_GET_ARGS_CHARS) return error(414, "too_large", `args in the URL are at most ${MAX_GET_ARGS_CHARS} characters: use POST`);
+    let args: unknown = {};
+    try {
+      if (raw !== null && raw !== "") args = parse(raw);
+    } catch {
+      return error(400, "bad_request", "args must be URL-encoded JSON (an object)");
+    }
+    if (typeof args !== "object" || args === null || Array.isArray(args)) return error(400, "bad_request", "args must be an object");
+    const spec = f!.shard;
+    // A named shard first; the argument only without one (and never coerced from an object).
+    const named = url.searchParams.get("shard") ?? request.headers.get("x-ember-shard");
+    const routed = named === null ? shardFromArg(spec, args as Record<string, unknown>) : undefined;
+    if (routed === null) return badShardArg(spec!);
+    const shard = checkShard(named ?? routed ?? "global:main");
+    if (!shard) return error(400, "bad_shard", "shard must be <kind>:<key>");
+    const s = stub(env, shard);
+    const tok = bearer(request, url);
+    const run = async (identity: Identity | null) => {
+      reached(shard);
+      const t0 = performance.now();
+      const out = await s.query(shard, fnName, args, identity, false, { caller: true });
+      recordCall(env, "query", fnName, shard, out, performance.now() - t0);
+      const { metrics: _m, ...reply } = out;
+      return { ok: out.ok, body: stringify(reply) };
+    };
+    const send = (body: string, ok: boolean, headers: Record<string, string>) => new Response(body, { status: ok ? 200 : 400, headers: { "content-type": "application/json", ...headers } });
+
+    // Anonymous = no `Authorization` header (of any scheme), no `?token=` and no session cookie.
+    if (tok || request.headers.has("authorization") || SESSION_COOKIE.test(request.headers.get("cookie") ?? "")) {
+      // Signed in (or claiming to be): never cached, anywhere; the same checks as POST (revocation in the shard). A
+      // session cookie or another scheme only takes the call off the cache: the identity comes from a bearer token.
+      prewarm(env, ctx, shard, tok, false);
+      const identity = await verify(tok, false, ctx);
+      if (identity === null) return new Response(stringify({ ok: false, error: { code: "unauthenticated", message: "invalid token" } }), { status: 401, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
+      const r = await run(identity ?? null);
+      return send(r.body, r.ok, { "cache-control": "private, no-store" });
+    }
+
+    const edge = (globalThis as { caches?: { default?: Cache } }).caches?.default;
+    // Without the version binding (a deploy not made by `ember deploy`, `wrangler dev`), the code version is unknown: a
+    // key of this isolate, so no copy written by other code is ever served (fewer hits, never stale code).
+    const version = deployVersion(env) ?? (isolateVersion ??= `isolate-${manifest.version}-${crypto.randomUUID()}`);
+    const key = new Request(`${url.origin}/__ember/query-cache/${encodeURIComponent(fnName)}?shard=${encodeURIComponent(shard)}&args=${encodeURIComponent(stringify(canonical(args)))}&v=${encodeURIComponent(version)}`);
+    const swr = cache.swr ?? 0;
+    /** Writes the copy; the promise settles (never rejects) once the cache has it (or refused it). */
+    const store = (body: string): Promise<void> => {
+      if (!edge) return Promise.resolve();
+      const copy = new Response(body, { headers: { "content-type": "application/json", "cache-control": `public, max-age=${cache.maxAge + swr}`, [CACHED_AT]: String(Date.now()) } });
+      return edge.put(key, copy).catch(() => undefined);
+    };
+    const answer = (body: string, state: "HIT" | "STALE" | "MISS", ageS: number) =>
+      send(body, true, { "cache-control": publicCacheControl(cache), vary: QUERY_CACHE_VARY, "x-ember-cache": state, age: String(Math.max(0, Math.floor(ageS))) });
+    if (edge) {
+      const hit = await edge.match(key).catch(() => undefined);
+      if (hit) {
+        const age = (Date.now() - Number(hit.headers.get(CACHED_AT) ?? 0)) / 1000;
+        if (age < cache.maxAge) return answer(await hit.text(), "HIT", age);
+        if (age < cache.maxAge + swr) {
+          if (!refreshing.has(key.url)) {
+            refreshing.add(key.url);
+            // The mark stays until the new copy is in the cache (a stale hit meanwhile starts no second refresh), and
+            // goes on failure too (a later stale hit retries).
+            ctx.waitUntil(
+              run(null)
+                .then((r) => (r.ok ? store(r.body) : undefined))
+                .catch(() => undefined)
+                .finally(() => refreshing.delete(key.url)),
+            );
+          }
+          return answer(await hit.text(), "STALE", age);
+        }
+      }
+    }
+    const r = await run(null);
+    if (!r.ok) return send(r.body, false, { "cache-control": "no-store" });
+    ctx.waitUntil(store(r.body));
+    return answer(r.body, "MISS", 0);
+  };
+
   return {
     handles(request) {
       return mounted(new URL(request.url).pathname);
@@ -470,6 +723,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
       // shard from `?shard=`, the function's routing argument, or global:main): the form OpenAPI describes.
       const perFn = /^\/api\/(query|mutation|action)\/(.+)$/.exec(url.pathname);
       if (url.pathname === "/api/query" || url.pathname === "/api/mutation" || url.pathname === "/api/action" || perFn) {
+        // `GET /api/query/<fn>?args=`: queries declared with `cache` (edge-cached when anonymous); POST for the rest.
+        if (request.method === "GET" && perFn?.[1] === "query") return getQuery(request, url, env, ctx, perFn[2]!);
         if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
         let body: Record<string, unknown>;
         try {
@@ -493,8 +748,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
             return error(400, "bad_request", "malformed percent-encoding in the function name");
           }
           const spec = specOf(fn);
-          const routed = spec?.fromArg !== undefined && body[spec.fromArg] !== undefined ? `${spec.kind}:${String(body[spec.fromArg])}` : undefined;
-          const named = url.searchParams.get("shard") ?? request.headers.get("x-ember-shard") ?? routed;
+          const explicit = url.searchParams.get("shard") ?? request.headers.get("x-ember-shard");
+          const routed = explicit === null ? shardFromArg(spec, body) : undefined;
+          if (routed === null) return badShardArg(spec!);
+          const named = explicit ?? routed;
           // A `fromAuth` function without a named shard goes to its caller's claim (below, once the token is verified).
           body = { fn, args: body, ...(named !== undefined || spec?.fromClaim === undefined ? { shard: named ?? "global:main" } : {}) };
         }
@@ -645,33 +902,6 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         msg.ack(); // malformed: retrying cannot help
         return;
       }
-      if (job.lease === true && typeof job.jobId === "string") {
-        // The shard keeps the job under a lease and owns its retries: claim it, run it, report the outcome.
-        const owner = stub(env, job.shard) as unknown as LeaseRpc;
-        let claim: { run: boolean };
-        try {
-          claim = await owner.claimActionJob(job.shard, job.jobId);
-        } catch (e) {
-          // The shard is out of reach: try the delivery again (the lease brings the job back if it never comes).
-          console.error(`ember: could not claim action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
-          msg.retry();
-          return;
-        }
-        if (!claim.run) {
-          msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
-          return;
-        }
-        const out = await runner.run(job.fn, jobArgs(job), job.shard, null, { internal: true, system: true });
-        if (!out.ok) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${out.error.code}: ${out.error.message}`);
-        try {
-          await owner.settleActionJob(job.shard, job.jobId, out.ok ? null : out.error);
-        } catch (e) {
-          // Not reported: the lease runs out and the shard runs the job again (at least once).
-          console.error(`ember: could not report action job ${job.jobId} (${job.fn}): ${(e as Error).message}`);
-        }
-        msg.ack();
-        return;
-      }
       const out = await runner.run(job.fn, jobArgs(job), job.shard, null, { internal: true, system: true });
       if (out.ok) msg.ack();
       else {
@@ -679,22 +909,118 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         msg.retry();
       }
       };
-      // Messages are independent (each one claims, confirms or indexes on its own): a bounded number at a time, not
-      // one after the other. An unexpected throw retries that message alone.
+      // Leased action jobs (`lease: true`) are claimed and settled per shard: one `claimActionJobs` RPC for the batch's
+      // jobs of a shard, one `settleActionJobs` once they ran (or sooner: `SETTLE_MAX_WAIT_MS`, or before a lease ends).
+      // The rest go one by one.
       const msgs = [...batch.messages];
+      const byShard = new Map<string, Array<{ msg: (typeof msgs)[number]; job: ActionJobMessage }>>();
+      const tasks: Array<() => Promise<void>> = [];
+      const runJob = async (j: ActionJobMessage): Promise<{ code: string; message: string } | null> => {
+        const out = await runner.run(j.fn, jobArgs(j), j.shard, null, { internal: true, system: true });
+        return out.ok ? null : { code: out.error.code, message: out.error.message };
+      };
+      for (const msg of msgs) {
+        const job = msg.body as ActionJobMessage;
+        const leased = !!job && typeof job === "object" && !isIndexMessage(msg.body) && !isR2Event(msg.body) && job.lease === true && typeof job.jobId === "string" && typeof job.fn === "string" && typeof job.shard === "string" && isValidShardName(job.shard);
+        if (!leased) {
+          tasks.push(async () => {
+            try {
+              await handle(msg);
+            } catch (e) {
+              console.error(`ember: queue message failed: ${(e as Error).message}`);
+              msg.retry();
+            }
+          });
+          continue;
+        }
+        let l = byShard.get(job.shard);
+        if (!l) byShard.set(job.shard, (l = []));
+        l.push({ msg, job });
+      }
+      const settles: Promise<void>[] = [];
+      const settlers: Array<{ flush(): void }> = [];
+      await Promise.all(
+        [...byShard].map(async ([shard, all]) => {
+          for (let i = 0; i < all.length; i += MAX_LEASE_BATCH) {
+            const group = all.slice(i, i + MAX_LEASE_BATCH);
+            const owner = stub(env, shard) as unknown as LeaseRpc;
+            const sentAt = Date.now();
+            // null: that job's claim failed (one RPC each, a shard of the runtime before the batch): its delivery is
+            // tried again on its own, and the claims granted next to it run.
+            let claims: Array<{ run: boolean; leaseMs?: number; leaseUntil?: number } | null>;
+            try {
+              const ids = group.map((g) => g.job.jobId);
+              try {
+                claims = await owner.claimActionJobs(shard, ids);
+              } catch (e) {
+                if (!missingRpc(e, "claimActionJobs")) throw e;
+                // A shard of the runtime before the batch RPCs (mid-deploy): as before them, each job is claimed when
+                // its turn comes, run right after its own claim (its lease is unknown here, so no other shard's claim
+                // may delay its start) and settled on its own.
+                for (const g of group) tasks.push(() => legacyLeasedJob(owner, shard, g.msg, g.job, runJob));
+                continue;
+              }
+            } catch (e) {
+              // The shard is out of reach: try the deliveries again (the lease brings a job back if it never comes).
+              console.error(`ember: could not claim ${group.length} action job(s) on ${shard}: ${(e as Error).message}`);
+              for (const g of group) g.msg.retry();
+              continue;
+            }
+            const receivedAt = Date.now();
+            const run = group.filter((g, k) => {
+              if (claims[k] === null) {
+                g.msg.retry();
+                return false;
+              }
+              if (claims[k]?.run === true) return true;
+              g.msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
+              return false;
+            });
+            if (!run.length) continue;
+            const settler = settleGroup(owner, shard, run.length, settles);
+            settlers.push(settler);
+            run.forEach((g) => {
+              const claim = claims[group.indexOf(g)]!;
+              const leaseMs = typeof claim.leaseMs === "number" && Number.isFinite(claim.leaseMs) ? claim.leaseMs : undefined;
+              // Unknown lease (a shard before `leaseMs`): no start check, and its outcome is reported at once.
+              const deadline = leaseMs !== undefined ? leaseDeadline({ leaseMs, leaseUntil: claim.leaseUntil }, sentAt, receivedAt) : undefined;
+              // The settle must reach the shard before the lease ends: from the earliest that can be (`sentAt +
+              // leaseMs`, never after the real end), so the quarter lease is all left for the settle's own transit.
+              const reportBy = leaseMs !== undefined ? sentAt + leaseMs - leaseMs / 4 : undefined;
+              tasks.push(async () => {
+                const { msg, job } = g;
+                // Claimed with the batch, not reached before half its lease went by (a long batch): left to the shard
+                // now rather than started this close to the end of the lease.
+                if (deadline !== undefined && Date.now() > deadline - leaseMs! / 2) {
+                  console.warn(`ember: action job ${job.jobId} (${job.fn}) not started within half its lease; released to the shard`);
+                  settler.done({ jobId: job.jobId, released: true }, msg, reportBy);
+                  return;
+                }
+                let error: { code: string; message: string } | null;
+                try {
+                  const out = await runner.run(job.fn, jobArgs(job), job.shard, null, { internal: true, system: true });
+                  error = out.ok ? null : { code: out.error.code, message: out.error.message };
+                } catch (e) {
+                  error = { code: "internal", message: (e as Error)?.message ?? String(e) };
+                }
+                if (error) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${error.code}: ${error.message}`);
+                settler.done({ jobId: job.jobId, error }, msg, reportBy);
+              });
+            });
+          }
+        }),
+      );
+      // Messages are independent (each one runs, confirms or indexes on its own): a bounded number at a time, not
+      // one after the other.
       let next = 0;
       const lane = async () => {
-        while (next < msgs.length) {
-          const msg = msgs[next++]!;
-          try {
-            await handle(msg);
-          } catch (e) {
-            console.error(`ember: queue message failed: ${(e as Error).message}`);
-            msg.retry();
-          }
-        }
+        while (next < tasks.length) await tasks[next++]!();
       };
-      await Promise.all(Array.from({ length: Math.min(QUEUE_CONCURRENCY, msgs.length) }, lane));
+      await Promise.all(Array.from({ length: Math.min(QUEUE_CONCURRENCY, tasks.length) }, lane));
+      // Every settle sent and finished before the batch returns: what still waits goes now (each group's last outcome
+      // already sent its own; this is the backstop), and a send pushed while awaiting is awaited too.
+      for (const g of settlers) g.flush();
+      while (settles.length) await Promise.all(settles.splice(0));
     },
 
     async email(message, env) {
@@ -729,6 +1055,37 @@ export const MAX_HTTP_BODY_BYTES: number = SERVER_MAX_HTTP_BODY_BYTES;
 export const MAX_QUERY_BATCH_BYTES = MAX_FRAME_BYTES;
 
 const tooLarge = () => error(413, "too_large", `the request body is at most ${MAX_HTTP_BODY_BYTES} bytes`);
+
+/** Longest `args` (characters of the URL-decoded JSON) of `GET /api/query/<fn>`: past it, 414 (use POST). */
+export const MAX_GET_ARGS_CHARS = 8 * 1024;
+
+/**
+ * A cookie whose name says it is a session (`<prefix>.session_token`, `session_data`, `__Secure-…`): the call is not
+ * anonymous for the edge cache of `GET /api/query/<fn>`, even though queries authenticate by bearer token only.
+ */
+const SESSION_COOKIE = /(?:^|;)\s*[^=;]*session[^=;]*=/i;
+
+/** `v` with every plain object's keys sorted: two spellings of the same args share one cache entry. */
+function canonical(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonical);
+  if (v === null || typeof v !== "object" || Object.getPrototypeOf(v) !== Object.prototype) return v;
+  const out: Record<string, unknown> = {};
+  // Own data properties, `__proto__` included (the wire decoder keeps it as one): never the inherited setter, which
+  // would drop it and give `{ __proto__: "x" }` the key of `{}`.
+  for (const k of Object.keys(v).sort()) Object.defineProperty(out, k, { value: canonical((v as Record<string, unknown>)[k]), enumerable: true, writable: true, configurable: true });
+  return out;
+}
+
+/**
+ * `Vary` of a cacheable query's anonymous answer: the headers that change it for the same URL (who calls, and the
+ * shard when it comes from `x-ember-shard`), so a cache in front never answers one shard's call with another's copy.
+ */
+const QUERY_CACHE_VARY = "authorization, cookie, x-ember-shard";
+
+/** The `Cache-Control` a cacheable query's anonymous answer carries (`swr` only when set). */
+const publicCacheControl = (c: QueryCache) => `public, max-age=${c.maxAge}${c.swr ? `, stale-while-revalidate=${c.swr}` : ""}`;
+/** Header of the edge copy: when it was computed (ms), for its age (the Cache API keeps it `maxAge + swr`). */
+const CACHED_AT = "x-ember-cached-at";
 
 /** `resume` of a `POST /api/query` body (the value the caller holds): `{ version, epoch, ik }`, else ignored. */
 function resumeOf(r: unknown): { resume: { version: number; epoch: string; ik: string } } | undefined {

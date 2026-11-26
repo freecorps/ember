@@ -1,0 +1,191 @@
+/**
+ * Cacheable public queries over HTTP: `query({ cache: { maxAge, swr } })` answers anonymous
+ * `GET /api/query/<fn>?args=<json>` with `Cache-Control: public` and keeps it in `caches.default`, keyed by the canonical
+ * args, the shard and the Worker version. Signed-in calls are never cached; functions without `cache` refuse GET.
+ */
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { describe, expect, it, vi } from "vitest";
+import { api } from "./helpers.ts";
+import { getEmberConfig } from "../src/config.ts";
+import worker from "./worker.ts";
+
+type Env = typeof env;
+
+/** One `GET /api/query/<fn>` through the Worker, its `waitUntil` work (the cache writes) awaited. */
+async function get(fn: string, args: unknown, opts: { shard?: string; token?: string; cookie?: string; env?: Env; raw?: string; headers?: Record<string, string> } = {}) {
+  const q = new URLSearchParams();
+  if (opts.raw !== undefined) q.set("args", opts.raw);
+  else if (args !== undefined) q.set("args", JSON.stringify(args));
+  if (opts.shard) q.set("shard", opts.shard);
+  const headers: Record<string, string> = { ...opts.headers };
+  if (opts.token) headers.authorization = `Bearer ${opts.token}`;
+  if (opts.cookie) headers.cookie = opts.cookie;
+  const ctx = createExecutionContext();
+  const res = await worker.fetch(new Request(`http://ember.test/api/query/${fn}?${q}`, { headers }), (opts.env ?? env) as never, ctx);
+  const body = (await res.json()) as { ok: boolean; value?: unknown; error?: { code: string } };
+  await waitOnExecutionContext(ctx);
+  return { status: res.status, body, cache: res.headers.get("x-ember-cache"), cacheControl: res.headers.get("cache-control"), vary: res.headers.get("vary") };
+}
+
+const send = async (shard: string, channel: string, body: string) => expect((await api("mutation", { fn: "messages:send", args: { channel, body }, shard })).body.ok).toBe(true);
+/** The test env with the Shard stubs' `query` RPCs counted. */
+function counting(): { env: Env; queries: () => number } {
+  let n = 0;
+  const ns = env.SHARD;
+  const SHARD = {
+    idFromName: (x: string) => ns.idFromName(x),
+    get: (id: DurableObjectId, o?: DurableObjectNamespaceGetDurableObjectOptions) =>
+      new Proxy(ns.get(id, o) as unknown as Record<string, unknown>, {
+        get(t, p) {
+          const v = Reflect.get(t, p);
+          if (p !== "query") return v;
+          return (...a: unknown[]) => {
+            n++;
+            return (v as (...x: unknown[]) => unknown)(...a);
+          };
+        },
+      }),
+  };
+  return { env: { ...env, SHARD } as unknown as Env, queries: () => n };
+}
+
+describe("GET /api/query/<fn> (cache)", () => {
+  it("anonymous: a miss runs the query and stores it; a hit answers without the shard, even after a write", async () => {
+    const shard = "hc:hit";
+    await send(shard, "c", "one");
+    const miss = await get("cached:list", { channel: "c" }, { shard });
+    expect(miss).toMatchObject({ status: 200, body: { ok: true, value: ["one"] }, cache: "MISS", cacheControl: "public, max-age=60", vary: "authorization, cookie, x-ember-shard" });
+    await send(shard, "c", "two");
+    const counted = counting();
+    const hit = await get("cached:list", { channel: "c" }, { shard, env: counted.env });
+    expect(hit).toMatchObject({ status: 200, body: { ok: true, value: ["one"] }, cache: "HIT", cacheControl: "public, max-age=60" });
+    // The same args spelled with other whitespace / key order share the entry.
+    expect(await get("cached:list", undefined, { shard, raw: ' { "channel" : "c" } ', env: counted.env })).toMatchObject({ cache: "HIT", body: { value: ["one"] } });
+    // No shard RPC for a hit (no DO request, no rows read).
+    expect(counted.queries()).toBe(0);
+    expect(await get("cached:list", { channel: "zz" }, { shard, env: counted.env })).toMatchObject({ cache: "MISS" });
+    expect(counted.queries()).toBe(1);
+    // Other args, other shard: their own entries.
+    expect(await get("cached:list", { channel: "d" }, { shard })).toMatchObject({ cache: "MISS", body: { value: [] } });
+    expect(await get("cached:list", { channel: "c" }, { shard: "hc:other" })).toMatchObject({ cache: "MISS", body: { value: [] } });
+  });
+
+  it("stale-while-revalidate: past maxAge the stale copy answers and one refresh stores the new value", async () => {
+    const shard = "hc:swr";
+    await send(shard, "s", "old");
+    // The copy's age from a controlled clock (`Date` only): fresh, stale and refreshed without racing a real second.
+    const t0 = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(t0);
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "MISS", cacheControl: "public, max-age=1, stale-while-revalidate=60", body: { value: ["old"] } });
+      await send(shard, "s", "new");
+      vi.setSystemTime(t0 + 900);
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "HIT", body: { value: ["old"] } });
+      vi.setSystemTime(t0 + 1500);
+      // Stale: answered from the copy, refreshed in the background (awaited by `get`).
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "STALE", body: { value: ["old"] } });
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "HIT", body: { value: ["old", "new"] } });
+      // Past maxAge + swr: a miss.
+      vi.setSystemTime(t0 + 1500 + 62_000);
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "MISS", body: { value: ["old", "new"] } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("signed-in calls are never cached (private, no-store) and see their own identity", async () => {
+    expect(await get("cached:who", {})).toMatchObject({ cache: "MISS", body: { value: "anonymous" } });
+    const amy = await get("cached:who", {}, { token: "good:amy" });
+    expect(amy).toMatchObject({ status: 200, body: { value: "amy" }, cache: null, cacheControl: "private, no-store" });
+    expect(await get("cached:who", {}, { token: "good:bob" })).toMatchObject({ body: { value: "bob" }, cacheControl: "private, no-store" });
+    // A session cookie counts as signed in for the cache (never stored, never served from it).
+    expect(await get("cached:who", {}, { cookie: "theme=dark; app.session_token=abc" })).toMatchObject({ cache: null, cacheControl: "private, no-store" });
+    // Any Authorization header (another scheme too) is not anonymous: off the cache, with no identity from it.
+    expect(await get("cached:who", {}, { headers: { authorization: "Basic YTpi" } })).toMatchObject({ status: 200, body: { value: "anonymous" }, cache: null, cacheControl: "private, no-store" });
+    // An invalid token: 401, not the anonymous copy.
+    expect(await get("cached:who", {}, { token: "bad" })).toMatchObject({ status: 401, cacheControl: "private, no-store" });
+    // The anonymous copy is still the anonymous one.
+    expect(await get("cached:who", {})).toMatchObject({ cache: "HIT", body: { value: "anonymous" } });
+  });
+
+  it("an error is never stored", async () => {
+    const first = await get("cached:members", {});
+    expect(first).toMatchObject({ status: 400, body: { ok: false, error: { code: "Unauthenticated" } }, cache: null, cacheControl: "no-store" });
+    expect((await get("cached:members", {})).cache).toBeNull();
+    expect(await get("cached:members", {}, { token: "good:amy" })).toMatchObject({ body: { value: "amy" } });
+  });
+
+  it("functions without cache, mutations and actions refuse GET (405); bad args are 400/414", async () => {
+    for (const path of ["messages:list", "nope:nope", "messages:send"]) expect((await get(path, { channel: "x" })).status).toBe(405);
+    const ctx = createExecutionContext();
+    for (const kind of ["mutation", "action"]) {
+      const res = await worker.fetch(new Request(`http://ember.test/api/${kind}/cached:list?args={}`), env as never, ctx);
+      expect(res.status).toBe(405);
+    }
+    expect((await get("cached:list", undefined, { raw: "{nope" })).status).toBe(400);
+    expect((await get("cached:list", undefined, { raw: "[1]" })).status).toBe(400);
+    expect((await get("cached:list", undefined, { raw: JSON.stringify({ channel: "x".repeat(9000) }) })).status).toBe(414);
+    // Validation errors come from the shard as for POST (and are not stored).
+    expect(await get("cached:list", { channel: 1 })).toMatchObject({ status: 400, body: { ok: false, error: { code: "ValidationError" } } });
+  });
+
+  it("routes by the function's argument, ?shard= or global:main", async () => {
+    await send("room:r1", "r1", "in r1");
+    expect(await get("cached:room", { room: "r1" })).toMatchObject({ body: { value: ["in r1"] } });
+    expect(await get("cached:room", { room: "r1" }, { shard: "room:r2" })).toMatchObject({ status: 400, body: { error: { code: "WrongShard" } } });
+    await send("global:main", "g", "in main");
+    expect(await get("cached:list", { channel: "g" })).toMatchObject({ body: { value: ["in main"] } });
+    expect((await get("cached:list", { channel: "g" }, { shard: "bad" })).status).toBe(400);
+    // A routing argument that is not a string or number: 400, never coerced (an object without toString threw before).
+    expect(await get("cached:room", undefined, { raw: '{"room":{"toString":1}}' })).toMatchObject({ status: 400, body: { error: { code: "bad_shard" } } });
+    expect(await get("cached:room", { room: ["r1"] })).toMatchObject({ status: 400, body: { error: { code: "bad_shard" } } });
+    // A named shard wins and the argument is not read for routing: the shard validates it.
+    expect(await get("cached:room", undefined, { raw: '{"room":{"toString":1}}', shard: "room:r1" })).toMatchObject({ status: 400, body: { error: { code: "ValidationError" } } });
+    const post = await worker.fetch(new Request("http://ember.test/api/query/cached:room", { method: "POST", headers: { "content-type": "application/json" }, body: '{"room":{"toString":1}}' }), env as never, createExecutionContext());
+    expect(post.status).toBe(400);
+    expect(((await post.json()) as { error: { code: string } }).error.code).toBe("bad_shard");
+  });
+
+  it("a new Worker version starts from an empty cache", async () => {
+    const shard = "hc:deploy";
+    await send(shard, "v", "before");
+    expect(await get("cached:list", { channel: "v" }, { shard })).toMatchObject({ cache: "MISS" });
+    await send(shard, "v", "after");
+    expect(await get("cached:list", { channel: "v" }, { shard })).toMatchObject({ cache: "HIT", body: { value: ["before"] } });
+    const next = { ...env, EMBER_VERSION: { id: "test-version-2" } } as Env;
+    expect(await get("cached:list", { channel: "v" }, { shard, env: next })).toMatchObject({ cache: "MISS", body: { value: ["before", "after"] } });
+    expect(await get("cached:list", { channel: "v" }, { shard, env: next })).toMatchObject({ cache: "HIT", body: { value: ["before", "after"] } });
+    // The old version's entry is its own (the new one's write did not replace it): still served under the old version.
+    expect(await get("cached:list", { channel: "v" }, { shard })).toMatchObject({ cache: "HIT", body: { value: ["before"] } });
+  });
+
+  it("without the version binding the key is the isolate's: never a copy stored under the schema version alone", async () => {
+    const shard = "hc:nobinding";
+    await send(shard, "n", "one");
+    // A copy under a version id equal to the schema version (what a key without the binding would have been).
+    const asSchema = { ...env, EMBER_VERSION: { id: getEmberConfig().schema.manifest.version } } as Env;
+    expect(await get("cached:list", { channel: "n" }, { shard, env: asSchema })).toMatchObject({ cache: "MISS", body: { value: ["one"] } });
+    await send(shard, "n", "two");
+    const unbound = { ...env, EMBER_VERSION: undefined } as Env;
+    expect(await get("cached:list", { channel: "n" }, { shard, env: unbound })).toMatchObject({ cache: "MISS", body: { value: ["one", "two"] } });
+    // Same isolate, same code: its own copy is served.
+    expect(await get("cached:list", { channel: "n" }, { shard, env: unbound })).toMatchObject({ cache: "HIT", body: { value: ["one", "two"] } });
+  });
+
+  it("the shard from x-ember-shard: its own entry, and Vary names the header", async () => {
+    await send("hc:hdr1", "h", "in 1");
+    const one = await get("cached:list", { channel: "h" }, { headers: { "x-ember-shard": "hc:hdr1" } });
+    expect(one).toMatchObject({ cache: "MISS", body: { value: ["in 1"] } });
+    expect(one.vary).toContain("x-ember-shard");
+    expect(await get("cached:list", { channel: "h" }, { headers: { "x-ember-shard": "hc:hdr2" } })).toMatchObject({ cache: "MISS", body: { value: [] } });
+    expect(await get("cached:list", { channel: "h" }, { headers: { "x-ember-shard": "hc:hdr1" } })).toMatchObject({ cache: "HIT", body: { value: ["in 1"] } });
+  });
+
+  it("a __proto__ key of the args is part of the cache key (not dropped)", async () => {
+    const shard = "hc:proto";
+    expect(await get("cached:keys", undefined, { shard, raw: '{"data":{"__proto__":"x"}}' })).toMatchObject({ cache: "MISS", body: { value: ["__proto__"] } });
+    expect(await get("cached:keys", { data: {} }, { shard })).toMatchObject({ cache: "MISS", body: { value: [] } });
+    expect(await get("cached:keys", undefined, { shard, raw: '{"data":{"__proto__":"x"}}' })).toMatchObject({ cache: "HIT", body: { value: ["__proto__"] } });
+  });
+});

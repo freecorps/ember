@@ -66,7 +66,7 @@ import {
   type LocalOp,
   type LocalSearch,
 } from "./ai-indexes.ts";
-import { ActionRunner, actionDispatch, type ShardApi } from "./actions.ts";
+import { ActionRunner, ephemeralJobs, actionDispatch, type ShardApi } from "./actions.ts";
 import {
   ANON,
   DEFAULT_CREATE_ENGINE,
@@ -280,6 +280,27 @@ const dedupDdl = (name: string) =>
 
 /** Change-log ring size (`changeLogVersions`, at least 1: the newest entry also carries the shard's version). */
 const ringSize = (cfg: EmberConfig): number => Math.max(1, Math.floor(cfg.changeLogVersions ?? 256));
+
+/** Default `changeLogEntryMaxBytes`: the largest `changes` a change-log row holds (UTF-8 bytes of its JSON). */
+export const CHANGE_LOG_ENTRY_MAX_BYTES = 128 * 1024;
+/**
+ * The `changes` of a version whose changes did not fit (`changeLogEntryMaxBytes`): JSON `null`. A resume that needs
+ * that version answers with a full snapshot (`changesSince` → null), as for a version the ring no longer holds.
+ *
+ * Rollback: runtimes before the ceiling parse every row of a resume's range as an array. So the version also gets a
+ * second row, out of the ring (`slot = -version`, `oversizedSlot`): their `changesSince` then counts one row more than
+ * versions in any range that holds it, the check they already make for a ring that lost a version, and answers with a
+ * snapshot before parsing anything. The extra row goes once the ring slot of its version is reused (`dropOversized`);
+ * until then it is outside every range a resume can ask for once that version is out of the ring.
+ */
+const OVERSIZED_CHANGES = "null";
+const oversizedSlot = (version: number): number => -version;
+const entryCap = (cfg: EmberConfig): number => {
+  const c = cfg.changeLogEntryMaxBytes;
+  return c !== undefined && Number.isFinite(c) && c >= 0 ? Math.floor(c) : CHANGE_LOG_ENTRY_MAX_BYTES;
+};
+/** Whether `text` (JSON) is more than `cap` UTF-8 bytes: from its length alone unless it may be either (1–3 bytes a unit). */
+const overCap = (text: string, cap: number): boolean => text.length > cap || (text.length * 3 > cap && UTF8.encode(text).byteLength > cap);
 
 const RUNTIME_DDL = `
 CREATE TABLE IF NOT EXISTS _ember_rt_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT;
@@ -527,6 +548,8 @@ export interface ShardInspection {
     gateRuns: number;
     /** Subscriptions whose first run came from the HTTP query just before them (`warm`), not from SQLite again. */
     prefetchHits: number;
+    /** Commits whose changes were over `changeLogEntryMaxBytes`: their change-log row only marks the version. */
+    changeLogOversized: number;
     /** `armAlarm` calls, and the subsystem reads they made (the rest came from the in-memory cache). */
     alarmArms: number;
     alarmJobReads: number;
@@ -641,6 +664,14 @@ export const PREFETCH_TTL_MS = 10_000;
 export const MAX_QUERY_BATCH = 32;
 /** One query of `Shard.queryBatch`. */
 export type QueryBatchItem = { fn: string; args: unknown; resume?: { version: number; epoch: string; ik: string }; warm?: boolean };
+
+/** Most action jobs one `claimActionJobs` / `settleActionJobs` RPC carries (a Queue batch is at most 100 messages). */
+export const MAX_LEASE_BATCH = 100;
+/**
+ * One outcome of `Shard.settleActionJobs`: the claimed job ran (`error` null: done; else failed and retried by the
+ * shard), or was `released` unstarted (the consumer ran out of lease time before reaching it).
+ */
+export type ActionJobOutcome = { jobId: string; error: { code: string; message: string } | null } | { jobId: string; released: true };
 
 /** Changes of one delivery pass, per socket; `skip`: subscribers handled at the end of the pass. */
 type Delivery = { perSocket: Map<string, string[]>; skip: Set<string>; diffs?: Map<QueryEntry, { from: EntrySnapshot; json: string | null }> };
@@ -851,7 +882,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0, prefetchHits: 0, zframes: 0, zframeBytesIn: 0, zframeBytesOut: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0, prefetchHits: 0, changeLogOversized: 0, zframes: 0, zframeBytesIn: 0, zframeBytesOut: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   /** Tables with an external index (Vectorize, AI Search): only a commit touching one may have written the outbox. */
@@ -1037,6 +1068,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.version = Math.max(Number(this.getMeta("version") ?? "0"), Number(newest ?? 0));
     this.loadDedup();
     if (!cached) this.trimRing();
+    this.loadOversized();
     this.ring = null;
     this.volatile.clear();
     this.volatileSizes.clear();
@@ -1296,7 +1328,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly volatileSizes = new Map<string, number>();
   private volatileUnits = 0;
   /** The ring update of the commit in progress, applied to `ring` once its transaction commits. */
-  private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[]; maint?: true } | null = null;
+  private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[]; maint?: true; oversized?: number } | null = null;
   /** `next_maint` is known to be set (null: not known). Set once a commit that wrote or saw it is durable in memory. */
   private maintArmed: boolean | null = null;
   /** This commit set `next_maint` (the alarm must pick it up). */
@@ -1372,6 +1404,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const p = this.ringPending;
     this.ringPending = null;
     if (p?.maint) this.maintArmed = true;
+    // The commit's changes are not in its row: no resume is answered from memory for that version either.
+    if (p?.oversized !== undefined) this.parsedChanges.set(p.oversized, null);
     if (!p || !this.ring) return;
     const ring = this.ring;
     const old = ring.bySlot.get(p.slot);
@@ -1457,6 +1491,28 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.driver.exec("DELETE FROM _ember_changes WHERE slot >= ?", size);
       this.driver.exec("UPDATE _ember_changes SET dedup = NULL, acks = NULL WHERE dedup IS NOT NULL OR acks IS NOT NULL");
     });
+  }
+
+  /**
+   * Versions with an out-of-ring row (`OVERSIZED_CHANGES`), oldest first. Read once per load; one whose ring slot no
+   * longer holds it (a ring that grew or shrank since) goes then.
+   */
+  private oversizedRows: number[] = [];
+
+  private loadOversized(): void {
+    const read = () => this.driver.exec("SELECT version FROM _ember_changes WHERE slot < 0 ORDER BY version").rows.map((r) => Number(r.version));
+    this.oversizedRows = read();
+    if (!this.oversizedRows.length) return;
+    this.driver.exec("DELETE FROM _ember_changes WHERE slot < 0 AND version NOT IN (SELECT version FROM _ember_changes WHERE slot >= 0)");
+    this.oversizedRows = read();
+  }
+
+  /** At the commit of version `v` (in its transaction): out-of-ring rows of versions the ring no longer holds go. */
+  private dropOversized(v: number): void {
+    const gone = v - ringSize(this.cfg);
+    while (this.oversizedRows.length && this.oversizedRows[0]! <= gone) {
+      this.driver.exec("DELETE FROM _ember_changes WHERE slot = ?", oversizedSlot(this.oversizedRows.shift()!));
+    }
   }
 
   // ------------------------------------------------------------------ meta
@@ -2570,9 +2626,21 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // One upsert per commit: the ring slot of version v replaces version v - ring (and carries the version, the
       // socket mutations' outcomes and the pending acks).
       const ring = this.ringColumns(v, outcomes, now);
+      // Changes over `changeLogEntryMaxBytes` (a huge document) are not written: the row only marks the version, and
+      // a client resuming across it gets a full snapshot (the subscription's value, read once, instead of the commit).
+      let text = stringify(changes);
+      if (overCap(text, entryCap(this.cfg))) {
+        text = OVERSIZED_CHANGES;
+        this.ringPending!.oversized = v;
+        this.stats.changeLogOversized++;
+        // The row that makes a runtime before the ceiling see the gap (`OVERSIZED_CHANGES`).
+        this.driver.exec("INSERT OR REPLACE INTO _ember_changes(slot, version, at, changes) VALUES (?, ?, ?, ?)", oversizedSlot(v), v, now, OVERSIZED_CHANGES);
+        this.oversizedRows.push(v);
+      }
+      this.dropOversized(v);
       this.driver.exec(
         "INSERT INTO _ember_changes(slot, version, at, changes, dedup, acks) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(slot) DO UPDATE SET version = excluded.version, at = excluded.at, changes = excluded.changes, dedup = excluded.dedup, acks = excluded.acks",
-        v % ringSize(this.cfg), v, now, stringify(changes), ring.dedup, ring.acks,
+        v % ringSize(this.cfg), v, now, text, ring.dedup, ring.acks,
       );
       // Once known set (most commits), no meta read per commit; the in-memory flag follows the commit (applyRing).
       if (this.maintArmed !== true) {
@@ -2761,11 +2829,22 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return r !== undefined && Number.isFinite(r) && r >= 0 ? r : JOB_RETENTION_MS;
   }
 
+  /** Whether a finished run of `fn` keeps its `_jobs` row: `scheduler.retainMs` above 0 and not `retainMs: 0` on `fn`. */
+  private retains(fn: string | undefined): boolean {
+    if (this.retainMs() <= 0) return false;
+    const ephemeral = ephemeralJobs(this.cfg);
+    return !ephemeral.size || fn === undefined || !ephemeral.has(fn);
+  }
+
   /** A pending job (or one handed to the Queue and not claimed) is cancelled: kept as `canceled`, or deleted. */
   private cancelRow(jobId: string): boolean {
     this.warmAll();
     const now = Date.now();
-    const r = this.retainMs() > 0
+    // With functions declared `retainMs: 0`, the row's function decides (one read; none otherwise).
+    const fn = this.retainMs() > 0 && ephemeralJobs(this.cfg).size
+      ? (this.driver.exec("SELECT fn FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched')", jobId).rows[0]?.fn as string | undefined)
+      : undefined;
+    const r = this.retains(fn)
       ? this.driver.exec("UPDATE _jobs SET state = 'canceled', dedup_key = NULL, run_at = ?, updated_at = ? WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", now, now, jobId)
       : this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", jobId);
     if (r.rows.length) this.jobChanged(jobId);
@@ -2776,7 +2855,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private succeedJob(job: Record<string, unknown>): void {
     this.warmAll();
     const now = Date.now();
-    if (this.retainMs() > 0) this.driver.exec("UPDATE _jobs SET state = 'success', dedup_key = NULL, run_at = ?, updated_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?", now, now, job.id as number);
+    if (this.retains(job.fn as string)) this.driver.exec("UPDATE _jobs SET state = 'success', dedup_key = NULL, run_at = ?, updated_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?", now, now, job.id as number);
     else this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
     this.jobChanged(job.job_id as string | null);
   }
@@ -3233,56 +3312,111 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * The queue consumer claims a leased action job before running it: true when the job is still waiting for it
    * (`dispatched`), which then becomes `claimed` with a fresh lease. False when it was cancelled, already ran here
    * after its lease ran out, or another delivery claimed it: the consumer acks the message without running it.
+   * One job: `claimActionJobs` with one id (kept for Workers of the runtime before it, mid-deploy).
    */
   async claimActionJob(shard: string, jobId: string): Promise<{ run: boolean }> {
+    const [r] = await this.claimActionJobs(shard, [jobId]);
+    return { run: r?.run === true };
+  }
+
+  /**
+   * `claimActionJob` for every job of a Queue batch that belongs to this shard: one RPC (one DO request) for all of
+   * them, each claimed or refused on its own, in order. `leaseMs`: the lease each claim got, `leaseUntil` when it ends
+   * (this DO's clock, ms): the consumer leaves a job it could not start in time to the shard (see `settleActionJobs`)
+   * and reports the outcomes before the lease ends.
+   */
+  async claimActionJobs(shard: string, jobIds: string[]): Promise<Array<{ run: boolean; leaseMs?: number; leaseUntil?: number }>> {
     this.setShardName(shard);
+    if (!Array.isArray(jobIds) || jobIds.length > MAX_LEASE_BATCH || !jobIds.every((j) => typeof j === "string")) {
+      throw new EmberError("InvalidArgument", `claimActionJobs: at most ${MAX_LEASE_BATCH} job ids`);
+    }
     if (this.refused) {
       // Nothing runs on a refused shard (a refused migration: the old schema under the new code; RuntimeSchemaTooNew).
       // Never `run: true` here, and the message is acked: the row is left as it is (`dispatched`, its lease in
       // `run_at`), and once a fixed deploy serves the shard the lease runs out and the alarm (kept armed while refused,
       // see `alarm`) runs the job in the shard (at least once).
-      console.warn(`ember: action job ${jobId} not claimed: shard ${shard} is refused (${this.refused.code}); its lease brings it back`);
-      return { run: false };
+      console.warn(`ember: action jobs ${jobIds.join(", ")} not claimed: shard ${shard} is refused (${this.refused.code}); their lease brings them back`);
+      return jobIds.map(() => ({ run: false }));
     }
-    const row = this.driver.exec("SELECT fn, run_at FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
-    if (!row) return { run: false };
-    this.warmAll();
-    const now = Date.now();
     const known = this.nextJobAt;
-    const lease = now + this.actionLease(row.fn as string);
-    this.driver.exec("UPDATE _jobs SET state = 'claimed', run_at = ?, updated_at = ? WHERE job_id = ? AND state = 'dispatched'", lease, now, jobId);
-    this.jobChanged(jobId);
-    // A lease shorter than the dispatched one (a deploy shortened `leaseMs` in between): the alarm must come sooner.
-    if (lease < (row.run_at as number)) {
-      this.armAlarm(undefined, true);
-      return { run: true };
-    }
-    // No arm: the claim moves this row's time later (its fresh lease). The alarm armed for the dispatched lease (or
+    let sooner = false;
+    let earliestOld = Infinity;
+    const out = jobIds.map((jobId): { run: boolean; leaseMs?: number; leaseUntil?: number } => {
+      const row = this.driver.exec("SELECT fn, run_at FROM _jobs WHERE job_id = ? AND state = 'dispatched'", jobId).rows[0];
+      if (!row) return { run: false };
+      this.warmAll();
+      const now = Date.now();
+      const leaseMs = this.actionLease(row.fn as string);
+      const lease = now + leaseMs;
+      this.driver.exec("UPDATE _jobs SET state = 'claimed', run_at = ?, updated_at = ? WHERE job_id = ? AND state = 'dispatched'", lease, now, jobId);
+      this.jobChanged(jobId);
+      // A lease shorter than the dispatched one (a deploy shortened `leaseMs` in between): the alarm must come sooner.
+      if (lease < (row.run_at as number)) sooner = true;
+      earliestOld = Math.min(earliestOld, row.run_at as number);
+      return { run: true, leaseMs, leaseUntil: lease };
+    });
+    if (sooner) this.armAlarm(undefined, true);
+    // No arm: a claim moves its row's time later (its fresh lease). The alarm armed for the dispatched leases (or
     // anything sooner) stays; an early alarm finds nothing due and arms again from the tables. Another job sooner
-    // than this row's old lease keeps the cached next time exact.
-    if (known !== undefined && known !== null && known < (row.run_at as number)) this.nextJobAt = known;
-    return { run: true };
+    // than every claimed row's old lease keeps the cached next time exact (`known` is the MIN over every row, the
+    // refused ones included, and a refused row's time did not move: it is never sooner than `known`).
+    else if (known !== undefined && known !== null && known < earliestOld) this.nextJobAt = known;
+    return out;
   }
 
   /**
    * The outcome of a claimed action job: done (the row goes), or failed (retried here with backoff, or `failed` after
    * `maxAttempts`, like any job). A job no longer claimed (its lease ran out and it ran here) is left alone.
+   * One job: `settleActionJobs` with one outcome (kept for Workers of the runtime before it, mid-deploy).
    */
   async settleActionJob(shard: string, jobId: string, error: { code: string; message: string } | null): Promise<void> {
+    await this.settleActionJobs(shard, [{ jobId, error }]);
+  }
+
+  /**
+   * `settleActionJob` for the outcomes of a Queue batch on this shard, in one RPC, each settled on its own and in
+   * order (one alarm arm at most for all). `released`: the consumer claimed the job but did not start it before half
+   * its lease was gone (a long batch); its lease ends now, and the alarm runs it in the shard (as when the lease runs
+   * out, without waiting for it), with no attempt counted.
+   */
+  async settleActionJobs(shard: string, outcomes: ActionJobOutcome[]): Promise<void> {
     this.setShardName(shard);
-    // The consumer logs it and acks: the job is still `claimed`, and runs again when its lease runs out (at least once).
+    // The consumer logs it and acks: the jobs are still `claimed`, and run again when their lease runs out (at least once).
     this.assertNotAhead();
-    const job = this.driver.exec("SELECT * FROM _jobs WHERE job_id = ? AND state = 'claimed'", jobId).rows[0];
-    if (!job) return;
-    if (error === null) {
-      const known = this.nextJobAt;
-      this.succeedJob(job);
-      // The row leaves the queue: when another job comes sooner than its lease, the next time is unchanged (no arm).
-      if (known !== undefined && known !== null && known < (job.run_at as number) && this.lastArmed !== undefined) {
-        this.nextJobAt = known;
-        return;
+    if (!Array.isArray(outcomes) || outcomes.length > MAX_LEASE_BATCH) throw new EmberError("InvalidArgument", `settleActionJobs: at most ${MAX_LEASE_BATCH} outcomes`);
+    const known = this.nextJobAt;
+    const cached = known !== undefined && known !== null && this.lastArmed !== undefined;
+    let settled = false;
+    let arm = false;
+    for (const o of outcomes) {
+      if (!o || typeof o.jobId !== "string") continue;
+      const job = this.driver.exec("SELECT * FROM _jobs WHERE job_id = ? AND state = 'claimed'", o.jobId).rows[0];
+      if (!job) continue;
+      settled = true;
+      if ("released" in o && o.released === true) {
+        this.warmAll();
+        const now = Date.now();
+        // Its lease ends now: this alarm runs it in the shard, as a lease that ran out (no attempt counted).
+        this.driver.exec("UPDATE _jobs SET run_at = ?, updated_at = ? WHERE id = ? AND state = 'claimed'", now, now, job.id as number);
+        this.jobChanged(o.jobId);
+        arm = true;
+        continue;
       }
-    } else this.driver.transaction(() => this.failJob(job, error));
+      const error = "error" in o ? o.error : null;
+      if (error === null) {
+        this.succeedJob(job);
+        // The row leaves the queue: when another job comes sooner than its lease, the next time is unchanged (no arm).
+        if (!cached || !(known! < (job.run_at as number))) arm = true;
+      } else {
+        this.driver.transaction(() => this.failJob(job, error));
+        arm = true;
+      }
+    }
+    if (!settled) return;
+    if (!arm) {
+      this.nextJobAt = known;
+      return;
+    }
     this.armAlarm(undefined, true);
   }
 
@@ -4060,23 +4194,27 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * Parsed change-log rows by version (a version's changes never change; a ring slot is reused only for a newer one):
    * resumes read and parse each row once, not once per subscription.
    */
-  private readonly parsedChanges = new Map<number, RowChange[]>();
+  private readonly parsedChanges = new Map<number, RowChange[] | null>();
   private parsedSize = 0;
 
   /** Every change after `version`, or null when the change log no longer covers them all (too old: full snapshot). */
   private rememberChanges(version: number, changes: RowChange[]): void {
+    // A version over `changeLogEntryMaxBytes` (`applyRing` marked it null): only a snapshot answers a resume across it,
+    // from memory as from its row. The mark survives the reset, and its changes are never kept.
+    const oversized = this.parsedChanges.get(version) === null;
     if (this.parsedSize > 20_000) {
       this.parsedChanges.clear();
       this.parsedSize = 0;
+      if (oversized) this.parsedChanges.set(version, null);
     }
-    if (!this.parsedChanges.has(version)) {
+    if (!oversized && !this.parsedChanges.has(version)) {
       this.parsedChanges.set(version, changes);
       this.parsedSize += changes.length;
     }
-    const gone = this.parsedChanges.get(version - ringSize(this.cfg));
-    if (gone) {
-      this.parsedChanges.delete(version - ringSize(this.cfg));
-      this.parsedSize -= gone.length;
+    const old = version - ringSize(this.cfg);
+    if (this.parsedChanges.has(old)) {
+      this.parsedSize -= this.parsedChanges.get(old)?.length ?? 0;
+      this.parsedChanges.delete(old);
     }
   }
 
@@ -4087,6 +4225,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let missing = false;
     for (let v = version + 1; v <= this.version; v++) {
       const c = this.parsedChanges.get(v);
+      // A version whose changes were over `changeLogEntryMaxBytes`: only a full snapshot answers.
+      if (c === null) return null;
       if (!c) {
         missing = true;
         break;
@@ -4095,6 +4235,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     if (!missing) return out;
     const rows = this.driver.exec("SELECT version, changes FROM _ember_changes WHERE version > ? ORDER BY version", version).rows;
+    // A version gone from the ring (one row short) or an oversized one in range (its out-of-ring row: one more).
     if (rows.length !== this.version - version) return null;
     // Bounded: a resume burst keeps a few thousand changes; dropped whole (and re-read) past that.
     if (this.parsedSize > 20_000) {
@@ -4105,11 +4246,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const r of rows) {
       const v = Number(r.version);
       let c = this.parsedChanges.get(v);
-      if (!c) {
-        c = parse(r.changes as string) as RowChange[];
+      if (c === undefined) {
+        c = parse(r.changes as string) as RowChange[] | null;
         this.parsedChanges.set(v, c);
-        this.parsedSize += c.length;
+        this.parsedSize += c?.length ?? 0;
       }
+      if (c === null) return null;
       for (const x of c) all.push(x);
     }
     for (const v of this.parsedChanges.keys()) if (v <= this.version - ringSize(this.cfg)) this.parsedChanges.delete(v);
