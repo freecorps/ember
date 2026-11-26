@@ -151,7 +151,7 @@ const NEVER_REVEALED = new Set(["BETTER_AUTH_SECRET"]);
 interface LeaseRpc {
   claimActionJob(shard: string, jobId: string): Promise<{ run: boolean }>;
   settleActionJob(shard: string, jobId: string, error: { code: string; message: string } | null): Promise<void>;
-  claimActionJobs(shard: string, jobIds: string[]): Promise<Array<{ run: boolean; leaseMs?: number }>>;
+  claimActionJobs(shard: string, jobIds: string[]): Promise<Array<{ run: boolean; leaseMs?: number; leaseUntil?: number }>>;
   settleActionJobs(shard: string, outcomes: ActionJobOutcome[]): Promise<void>;
 }
 
@@ -165,18 +165,34 @@ const missingRpc = (e: unknown, name: string) => new RegExp(name).test(String((e
 export const SETTLE_MAX_WAIT_MS = 5_000;
 
 /**
+ * When a claimed job's lease ends, as the consumer can tell: the shard's `leaseUntil` (its clock), kept within the
+ * claim's round trip (`sentAt + leaseMs` .. `receivedAt + leaseMs`: the lease was granted in between), so neither the
+ * claim's own latency nor a skewed clock moves it by more than that round trip. Without `leaseUntil` (a shard of the
+ * runtime before it), from when the claim was sent: the earliest the lease can have started.
+ */
+export function leaseDeadline(c: { leaseMs: number; leaseUntil?: number | undefined }, sentAt: number, receivedAt: number): number {
+  const lo = sentAt + c.leaseMs;
+  if (typeof c.leaseUntil !== "number" || !Number.isFinite(c.leaseUntil)) return lo;
+  return Math.min(Math.max(c.leaseUntil, lo), receivedAt + c.leaseMs);
+}
+
+/**
  * The outcomes of one shard's claimed jobs of a Queue batch, reported together: one `settleActionJobs` once all
- * `count` ran, or the ones waiting when the first of them has waited `SETTLE_MAX_WAIT_MS`. Each message is acked once
- * its outcome was sent, reported or not (as with one job: an unreported job runs again when its lease runs out, at
- * least once). The sends go into `settles`, which the batch awaits.
+ * `count` ran, or the ones waiting when the first of them has waited `SETTLE_MAX_WAIT_MS`, or sooner when an outcome
+ * waiting must reach the shard before its lease ends (`reportBy`: a quarter of the lease before it; an outcome
+ * without one goes at once). Each message is acked once its outcome was sent, reported or not (as with one job: an
+ * unreported job runs again when its lease runs out, at least once). The sends go into `settles`, which the batch
+ * awaits (`flush` sends what is left).
  */
 function settleGroup(owner: LeaseRpc, shard: string, count: number, settles: Promise<void>[]) {
   let remaining = count;
   let pending: Array<{ o: ActionJobOutcome; msg: { ack(): void } }> = [];
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let flushAt = Infinity;
   const flush = () => {
     if (timer) clearTimeout(timer);
     timer = null;
+    flushAt = Infinity;
     const items = pending;
     pending = [];
     if (!items.length) return;
@@ -200,11 +216,18 @@ function settleGroup(owner: LeaseRpc, shard: string, count: number, settles: Pro
     );
   };
   return {
-    done(o: ActionJobOutcome, msg: { ack(): void }) {
+    flush,
+    done(o: ActionJobOutcome, msg: { ack(): void }, reportBy?: number) {
+      const now = Date.now();
       pending.push({ o, msg });
       remaining--;
-      if (remaining === 0) flush();
-      else if (!timer) timer = setTimeout(flush, SETTLE_MAX_WAIT_MS);
+      const at = Math.min(flushAt, pending.length === 1 ? now + SETTLE_MAX_WAIT_MS : Infinity, reportBy ?? now);
+      if (remaining === 0 || at <= now) return flush();
+      if (at < flushAt) {
+        if (timer) clearTimeout(timer);
+        flushAt = at;
+        timer = setTimeout(flush, at - now);
+      }
     },
   };
 }
@@ -384,6 +407,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
 
   /** Edge copies being refreshed from this isolate (a stale hit starts one refresh per key, not one per hit). */
   const refreshing = new Set<string>();
+  /** Cache-key version when `EMBER_VERSION` is absent: this isolate's (made on first use: no random at startup). */
+  let isolateVersion: string | undefined;
 
   /**
    * `GET /api/query/<module:fn>?args=<JSON>&shard=<shard>` (contracts.md "Queries HTTP cacheáveis"): only for public
@@ -392,7 +417,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
    *
    * Anonymous calls (no bearer token, no session cookie) get `Cache-Control: public, max-age, stale-while-revalidate`
    * and go through `caches.default`: the key is the function, the shard, the canonical args (keys sorted) and the
-   * Worker version (`EMBER_VERSION.id`, else the schema version), so a deploy starts from an empty cache. A copy
+   * Worker version (`EMBER_VERSION.id`, else a key of the isolate), so a deploy starts from an empty cache. A copy
    * younger than `maxAge` answers without waking the shard; one younger than `maxAge + swr` answers stale while one
    * refresh runs in the background (`waitUntil`). Only `ok: true` answers are stored. Signed-in calls are never cached
    * (`Cache-Control: private, no-store`) and run exactly as `POST /api/query/<fn>` does.
@@ -445,7 +470,9 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     }
 
     const edge = (globalThis as { caches?: { default?: Cache } }).caches?.default;
-    const version = deployVersion(env) ?? manifest.version;
+    // Without the version binding (a deploy not made by `ember deploy`, `wrangler dev`), the code version is unknown: a
+    // key of this isolate, so no copy written by other code is ever served (fewer hits, never stale code).
+    const version = deployVersion(env) ?? (isolateVersion ??= `isolate-${manifest.version}-${crypto.randomUUID()}`);
     const key = new Request(`${url.origin}/__ember/query-cache/${encodeURIComponent(fnName)}?shard=${encodeURIComponent(shard)}&args=${encodeURIComponent(stringify(canonical(args)))}&v=${encodeURIComponent(version)}`);
     const swr = cache.swr ?? 0;
     const store = (body: string) => {
@@ -454,7 +481,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
       ctx.waitUntil(edge.put(key, copy).catch(() => undefined));
     };
     const answer = (body: string, state: "HIT" | "STALE" | "MISS", ageS: number) =>
-      send(body, true, { "cache-control": publicCacheControl(cache), vary: "authorization, cookie", "x-ember-cache": state, age: String(Math.max(0, Math.floor(ageS))) });
+      send(body, true, { "cache-control": publicCacheControl(cache), vary: QUERY_CACHE_VARY, "x-ember-cache": state, age: String(Math.max(0, Math.floor(ageS))) });
     if (edge) {
       const hit = await edge.match(key).catch(() => undefined);
       if (hit) {
@@ -818,7 +845,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
       }
       };
       // Leased action jobs (`lease: true`) are claimed and settled per shard: one `claimActionJobs` RPC for the batch's
-      // jobs of a shard, one `settleActionJobs` once they ran (or sooner, `SETTLE_MAX_WAIT_MS`). The rest go one by one.
+      // jobs of a shard, one `settleActionJobs` once they ran (or sooner: `SETTLE_MAX_WAIT_MS`, or before a lease ends).
+      // The rest go one by one.
       const msgs = [...batch.messages];
       const byShard = new Map<string, Array<{ msg: (typeof msgs)[number]; job: ActionJobMessage }>>();
       const tasks: Array<() => Promise<void>> = [];
@@ -841,13 +869,14 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         l.push({ msg, job });
       }
       const settles: Promise<void>[] = [];
+      const settlers: Array<{ flush(): void }> = [];
       await Promise.all(
         [...byShard].map(async ([shard, all]) => {
           for (let i = 0; i < all.length; i += MAX_LEASE_BATCH) {
             const group = all.slice(i, i + MAX_LEASE_BATCH);
             const owner = stub(env, shard) as unknown as LeaseRpc;
             const sentAt = Date.now();
-            let claims: Array<{ run: boolean; leaseMs?: number }>;
+            let claims: Array<{ run: boolean; leaseMs?: number; leaseUntil?: number }>;
             try {
               const ids = group.map((g) => g.job.jobId);
               try {
@@ -862,6 +891,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
               for (const g of group) g.msg.retry();
               continue;
             }
+            const receivedAt = Date.now();
             const run = group.filter((g, k) => {
               if (claims[k]?.run === true) return true;
               g.msg.ack(); // cancelled, already run by the shard, or claimed by another delivery
@@ -869,15 +899,20 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
             });
             if (!run.length) continue;
             const settler = settleGroup(owner, shard, run.length, settles);
+            settlers.push(settler);
             run.forEach((g) => {
-              const leaseMs = claims[group.indexOf(g)]!.leaseMs;
+              const claim = claims[group.indexOf(g)]!;
+              const leaseMs = typeof claim.leaseMs === "number" && Number.isFinite(claim.leaseMs) ? claim.leaseMs : undefined;
+              // Unknown lease (a shard before `leaseMs`): no start check, and its outcome is reported at once.
+              const deadline = leaseMs !== undefined ? leaseDeadline({ leaseMs, leaseUntil: claim.leaseUntil }, sentAt, receivedAt) : undefined;
+              const reportBy = deadline !== undefined ? deadline - leaseMs! / 4 : undefined;
               tasks.push(async () => {
                 const { msg, job } = g;
                 // Claimed with the batch, not reached before half its lease went by (a long batch): left to the shard
                 // now rather than started this close to the end of the lease.
-                if (leaseMs !== undefined && Date.now() - sentAt > leaseMs / 2) {
+                if (deadline !== undefined && Date.now() > deadline - leaseMs! / 2) {
                   console.warn(`ember: action job ${job.jobId} (${job.fn}) not started within half its lease; released to the shard`);
-                  settler.done({ jobId: job.jobId, released: true }, msg);
+                  settler.done({ jobId: job.jobId, released: true }, msg, reportBy);
                   return;
                 }
                 let error: { code: string; message: string } | null;
@@ -888,7 +923,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
                   error = { code: "internal", message: (e as Error)?.message ?? String(e) };
                 }
                 if (error) console.error(`ember: action job ${job.jobId} (${job.fn}) failed: ${error.code}: ${error.message}`);
-                settler.done({ jobId: job.jobId, error }, msg);
+                settler.done({ jobId: job.jobId, error }, msg, reportBy);
               });
             });
           }
@@ -901,8 +936,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         while (next < tasks.length) await tasks[next++]!();
       };
       await Promise.all(Array.from({ length: Math.min(QUEUE_CONCURRENCY, tasks.length) }, lane));
-      // Every settle sent (the last ones once their shard's jobs all ran) before the batch returns.
-      for (let n = 0; n < settles.length; n++) await settles[n];
+      // Every settle sent and finished before the batch returns: what still waits goes now (each group's last outcome
+      // already sent its own; this is the backstop), and a send pushed while awaiting is awaited too.
+      for (const g of settlers) g.flush();
+      while (settles.length) await Promise.all(settles.splice(0));
     },
 
     async email(message, env) {
@@ -952,9 +989,17 @@ function canonical(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(canonical);
   if (v === null || typeof v !== "object" || Object.getPrototypeOf(v) !== Object.prototype) return v;
   const out: Record<string, unknown> = {};
-  for (const k of Object.keys(v).sort()) out[k] = canonical((v as Record<string, unknown>)[k]);
+  // Own data properties, `__proto__` included (the wire decoder keeps it as one): never the inherited setter, which
+  // would drop it and give `{ __proto__: "x" }` the key of `{}`.
+  for (const k of Object.keys(v).sort()) Object.defineProperty(out, k, { value: canonical((v as Record<string, unknown>)[k]), enumerable: true, writable: true, configurable: true });
   return out;
 }
+
+/**
+ * `Vary` of a cacheable query's anonymous answer: the headers that change it for the same URL (who calls, and the
+ * shard when it comes from `x-ember-shard`), so a cache in front never answers one shard's call with another's copy.
+ */
+const QUERY_CACHE_VARY = "authorization, cookie, x-ember-shard";
 
 /** The `Cache-Control` a cacheable query's anonymous answer carries (`swr` only when set). */
 const publicCacheControl = (c: QueryCache) => `public, max-age=${c.maxAge}${c.swr ? `, stale-while-revalidate=${c.swr}` : ""}`;

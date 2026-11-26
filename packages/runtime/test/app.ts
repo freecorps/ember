@@ -355,6 +355,14 @@ const actions = {
     leaseMs: 1000,
     handler: async (ctx: ActionCtx, { label }: { label: string }) => ctx.runMutation("jobs:record" as any, { label } as any),
   }),
+  /** `actions:record` after 2 s (default lease): a slow job of a batch. */
+  slowRecord: internalAction({
+    args: { label: v.string() },
+    handler: async (ctx: ActionCtx, { label }: { label: string }) => {
+      await new Promise((r) => setTimeout(r, 2000));
+      return ctx.runMutation("jobs:record" as any, { label } as any);
+    },
+  }),
   /** Always runs in the shard's alarm, never through the queue. */
   local: internalAction({
     args: { label: v.string() },
@@ -615,6 +623,8 @@ const cached = {
   members: query({ cache: { maxAge: 60 }, handler: (ctx: Q) => ctx.auth.require().subject }),
   /** Routed by its argument (`room:<room>`). */
   room: query({ args: { room: v.string() }, shard: { room: "room" }, cache: { maxAge: 60 }, handler: (ctx: Q, { room }: { room: string }) => byChannel(ctx, room) }),
+  /** The keys of a record argument, `__proto__` included (a key of the args the cache key must keep). */
+  keys: query({ args: { data: v.record(v.string()) }, cache: { maxAge: 60 }, handler: (_ctx: Q, { data }: { data: Record<string, string> }) => Object.keys(data) }),
 };
 
 export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared, tallies, tenant, cached };
