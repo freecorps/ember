@@ -16,11 +16,15 @@ describe("rate limit dashboard", () => {
     expect(Object.keys(spec!.functions).sort()).toEqual(["@rateLimit/dashboard:buckets", "@rateLimit/dashboard:config", "@rateLimit/lib:reset"]);
     expect(spec!.tabs[0]!.blocks[0]).toMatchObject({ filters: ["name", "key"], pageSize: 25 });
 
-    const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver: createNodeSqliteDriver(), now: () => 1_700_000_000_000 });
+    let now = 1_700_000_000_000;
+    const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver: createNodeSqliteDriver(), now: () => now });
     engine.migrate();
     for (const key of ["ana", "bo", "ana"]) engine.runMutation("@rateLimit/lib:limit", { name: "send", key });
-    const page = (args: object) => engine.runQuery("@rateLimit/dashboard:buckets", { paginationOpts: { numItems: 10, cursor: null }, ...args }).value as { page: Array<{ key: string; value: number; named: boolean }> };
+    const page = (args: object) => engine.runQuery("@rateLimit/dashboard:buckets", { paginationOpts: { numItems: 10, cursor: null }, ...args }).value as { page: Array<{ key: string; value: number; stored: number; named: boolean }> };
     expect(page({}).page.map((b) => [b.key, b.value, b.named])).toEqual([["ana", 0, true], ["bo", 1, true]]);
+    // A minute later, with nothing written (gc off): the tokens now are a full bucket, the stored value is unchanged.
+    now += MINUTE;
+    expect(page({}).page.map((b) => [b.key, b.value, b.stored])).toEqual([["ana", 2, 0], ["bo", 2, 1]]);
     // A key alone would scan every limit's buckets: the limit is asked for.
     expect(() => page({ key: "bo" })).toThrow(/pick the limit \(name\)/);
     expect(page({ name: "send" }).page.map((b) => b.key)).toEqual(["ana", "bo"]);

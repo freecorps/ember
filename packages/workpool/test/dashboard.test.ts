@@ -38,7 +38,7 @@ describe("workpool dashboard", () => {
 
     const detail = (await t.query(fn("item"), { id: ids[0]! })) as { args: unknown; events: Array<{ event: string }> };
     expect(detail.args).toEqual({ i: 0 });
-    expect(detail.events.map((e) => e.event)).toEqual(["enqueued", "attempt 1 started"]);
+    expect(detail.events.map((e) => e.event)).toEqual(["enqueued", "first attempt started"]);
     expect(await t.query(fn("item"), { id: "nope" })).toBeNull();
 
     expect(await t.mutation(fn("cancel"), { id: pending.page[0]!._id })).toBe(true);

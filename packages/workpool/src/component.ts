@@ -754,7 +754,8 @@ export const functions = {
         const w = load(ctx, id);
         if (!w) return null;
         const events: Array<{ at: number; event: string; status?: string }> = [{ at: w.enqueuedAt, event: "enqueued" }];
-        if (w.startedAt !== undefined) events.push({ at: w.startedAt, event: `attempt ${w.attempts} started` });
+        // `startedAt` is the first attempt's start (a retry does not move it; `attempts` already counts the next one).
+        if (w.startedAt !== undefined) events.push({ at: w.startedAt, event: "first attempt started" });
         // A retry waiting for its backoff (finishing clears `attemptAt`).
         if (w.attemptAt !== undefined && w.attempts > 1) events.push({ at: w.attemptAt, event: `attempt ${w.attempts} due`, status: "retrying" });
         if (w.finishedAt !== undefined) events.push({ at: w.finishedAt, event: "finished", status: w.status });

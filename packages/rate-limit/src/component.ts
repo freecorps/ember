@@ -321,7 +321,19 @@ const dashboardFunctions = {
       if (key !== undefined && name === undefined) throw new EmberError("ValidationError", "rateLimit: pick the limit (name) to look up a key");
       const q = name !== undefined ? ctx.db.query("rateLimits").withIndex("by_name_key", (r) => (key !== undefined ? r.eq("name", name).eq("key", key) : r.eq("name", name))) : ctx.db.query("rateLimits").withIndex("by_name_key");
       const page = q.paginate(paginationOpts);
-      return { ...page, page: page.page.map((r) => ({ _id: r._id, name: r.name, key: r.key, value: r.value, updatedAt: r.ts, expiresAt: r.expiresAt ?? null, named: !!ctx.component.config?.limits?.[r.name] })) };
+      // `value`: the tokens available now under the install's config for that limit (as `getValue` computes them);
+      // null for a limit the install does not name (its config comes with each call). `stored`: the row as written.
+      const now = (r: { name: string; value: number; ts: number }): number | null => {
+        const c = ctx.component.config?.limits?.[r.name];
+        if (!c) return null;
+        try {
+          checkConfig(c);
+          return refill(c, { value: r.value, ts: r.ts }, ctx.now).value;
+        } catch {
+          return null;
+        }
+      };
+      return { ...page, page: page.page.map((r) => ({ _id: r._id, name: r.name, key: r.key, value: now(r), stored: r.value, updatedAt: r.ts, expiresAt: r.expiresAt ?? null, named: !!ctx.component.config?.limits?.[r.name] })) };
     },
   }),
   /** The limits named in the install config, and the GC's state. */
@@ -363,7 +375,8 @@ export const rateLimit = defineComponent({
             columns: [
               { label: "Limit", path: "name", format: "code" },
               { label: "Key", path: "key", format: "code" },
-              { label: "Tokens", path: "value", format: "number" },
+              { label: "Tokens now", path: "value", format: "number" },
+              { label: "Stored", path: "stored", format: "number" },
               { label: "Updated", path: "updatedAt", format: "ago" },
               { label: "Full again", path: "expiresAt", format: "date" },
             ],

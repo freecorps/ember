@@ -466,6 +466,22 @@ describe("migrations component", () => {
 };
 
 describe("migrations dashboard", () => {
+  test("Resume (lib:start with the row's name and handle only) keeps the chain a failed migration was queued with", () => {
+    const h = harness();
+    h.mutate("api:seed", { n: 4 });
+    probe.failOn = "org2";
+    h.mutate("api:serial", { names: ["addPlan", "seats"] });
+    h.tick();
+    probe.failOn = "";
+    expect(h.status("addPlan")).toMatchObject({ status: "failed", next: ["defs:seats"] });
+    const row = (h.engine.runQuery("@migrations/lib:runs", { paginationOpts: { numItems: 10, cursor: null } }).value as { page: Array<{ name: string; fn: string }> }).page[0]!;
+    // As the dashboard's Resume calls it: no `next` of its own.
+    h.mutate("@migrations/lib:start", { name: row.name, fn: row.fn });
+    h.tick();
+    expect(h.status("addPlan")).toMatchObject({ status: "done" });
+    expect(h.status("seats")).toMatchObject({ status: "done" });
+  });
+
   test("the spec names the component's own functions; runs/cancel/start do what the screen shows", () => {
     const [spec] = composeApp({ schema, functions: { defs, api }, app }).dashboards;
     expect(spec).toMatchObject({ key: "migrations", component: "migrations", scope: "shard" });

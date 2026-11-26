@@ -176,7 +176,8 @@ const batchesFor = (r: Row, size: number) => Math.max(1, Math.min(r.stepBatches 
 const schedule = (ctx: Ctx, id: Row["_id"], run: number) => ctx.scheduler.runAfter(0, "lib:step", { id, run });
 
 /** Starts (or resumes) a migration; returns its row. Starting a running one changes nothing. */
-function begin(ctx: Ctx, a: { name: string; fn: string; batchSize?: number; reset?: boolean; next: Array<{ name: string; fn: string }> }): Row {
+/** `next` omitted (a resume from the dashboard, a plain `start`): a migration that ran before keeps the chain it had. */
+function begin(ctx: Ctx, a: { name: string; fn: string; batchSize?: number; reset?: boolean; next?: Array<{ name: string; fn: string }> }): Row {
   const row = byName(ctx, a.name);
   if (!row) {
     const doc = {
@@ -190,7 +191,7 @@ function begin(ctx: Ctx, a: { name: string; fn: string; batchSize?: number; rese
       failed: 0,
       batches: 0,
       run: 1,
-      next: a.next,
+      next: a.next ?? [],
       startedAt: ctx.now,
       updatedAt: ctx.now,
     };
@@ -199,17 +200,18 @@ function begin(ctx: Ctx, a: { name: string; fn: string; batchSize?: number; rese
     return ctx.db.get(id)!;
   }
   if (row.status === "running" && !a.reset) {
-    if (a.next.length) ctx.db.patch(row._id, { next: [...row.next, ...a.next], updatedAt: ctx.now });
+    if (a.next?.length) ctx.db.patch(row._id, { next: [...row.next, ...a.next], updatedAt: ctx.now });
     return ctx.db.get(row._id)!;
   }
   if (row.status === "done" && !a.reset) {
     // Already done: a no-op, but a chain moves on to its next migration.
-    if (a.next.length) startNext(ctx, a.next);
+    if (a.next?.length) startNext(ctx, a.next);
     return row;
   }
   if (row.pendingJob) ctx.scheduler.cancel(row.pendingJob);
   const run = row.run + 1;
-  const patch: Patch = { fn: a.fn, status: "running", run, next: a.next, updatedAt: ctx.now, lastError: undefined, finishedAt: undefined };
+  // Resumed (or started over) without a chain of its own: the successors it was queued with still follow it.
+  const patch: Patch = { fn: a.fn, status: "running", run, next: a.next ?? row.next, updatedAt: ctx.now, lastError: undefined, finishedAt: undefined };
   if (a.batchSize !== undefined) patch.batchSize = a.batchSize;
   // A new batch size, or a reset: the per-job budget starts over too.
   if ((a.batchSize !== undefined || a.reset) && row.stepBatches !== undefined) patch.stepBatches = undefined;
@@ -258,7 +260,7 @@ export const functions = {
           }
           throw new EmberError("ValidationError", `migrations: ${a.name} did not roll its dry run back (is fn a function made by Migrations.define?)`);
         }
-        return { status: view(begin(ctx, { name: a.name, fn: a.fn, ...(a.batchSize !== undefined ? { batchSize: a.batchSize } : {}), ...(a.reset ? { reset: true } : {}), next: a.next ?? [] })) };
+        return { status: view(begin(ctx, { name: a.name, fn: a.fn, ...(a.batchSize !== undefined ? { batchSize: a.batchSize } : {}), ...(a.reset ? { reset: true } : {}), ...(a.next !== undefined ? { next: a.next } : {}) })) };
       },
     }),
 

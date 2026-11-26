@@ -3003,7 +3003,9 @@ const dashboardFunctions = {
         .withIndex("by_email", (q) => q.eq("emailId", e._id))
         .order("desc")
         .take(EVENTS_SHOWN)
-        .reverse()
+        // The latest EVENTS_SHOWN received, shown in the order they happened (`at`, the provider's time: a late or
+        // retried batch inserts out of that order).
+        .sort((a, b) => a.at - b.at)
         .map((x) => ({ at: x.at, type: x.type, recipient: x.recipient ?? null, detail: [x.reason, x.bounceType, x.smtpStatus].filter(Boolean).join(" · ") || null }));
       return {
         _id: e._id,
@@ -3093,7 +3095,10 @@ export const email = defineComponent({
             kind: "table",
             id: "suppressions",
             query: emailFunctions.lib.suppressions,
-            columns: [{ label: "Address", path: "email" }, { label: "Reason", path: "reason", format: "badge" }, { label: "Since", path: "at", format: "ago" }],
+            // The query's `project` argument is the table's filter (empty: "default"); a `mailbox:*` project's
+            // suppressions are one filter away, and each row's Remove targets its own project.
+            filters: ["project"],
+            columns: [{ label: "Project", path: "project", format: "code" }, { label: "Address", path: "email" }, { label: "Reason", path: "reason", format: "badge" }, { label: "Since", path: "at", format: "ago" }],
             rowActions: [{ id: "unsuppress", label: "Remove", fn: emailFunctions.lib.unsuppress, fromRow: { project: "project", email: "email" }, description: "Emails to this address are sent again." }],
           },
           { kind: "actions", id: "suppress", actions: [{ id: "suppress", label: "Suppress an address…", fn: emailFunctions.lib.suppress }] },
