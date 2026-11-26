@@ -1,34 +1,22 @@
-// Data of one shard. App tables: filter by an index (equality on a prefix of its fields), order, schema, and — for
-// admins — create, edit and delete documents; every write runs through the engine on the project (validated,
-// indexed, in the change log, seen by subscribers) and is audited. Internal tables (`_jobs`, `_files`, ...) are
-// read-only pages by row id. A runtime without the data endpoints keeps the read-only browser.
+// Data of one shard. App tables: filter by an index (equality on a prefix of its fields, then a range on the next
+// one), open a document by `_id`, full-text search through a searchIndex, order, schema, auto-refresh, and — for
+// admins — create, edit, delete and bulk-delete documents; every write runs through the engine on the project
+// (validated, indexed, in the change log, seen by subscribers) and is audited. `v.id()` fields link to their document,
+// `v.file()` fields to the Files screen. Internal tables (`_jobs`, `_files`, ...) are read-only pages by row id. A
+// runtime without the data endpoints keeps the read-only browser; one before level 16 says so for range, `_id` and
+// search (runtime_outdated) and keeps the rest.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, ApiError, path } from "../api.ts";
 import { fmtNum, text } from "../format.ts";
-import { useApi, useSession } from "../hooks.ts";
+import { href, useApi, useSession } from "../hooks.ts";
 import { Badge, ConfirmDialog, Dialog, Empty, JsonView, Loading, Mono, Problem, Table } from "../ui.tsx";
+import type { SchemaTable, Shape } from "./types.ts";
 
 interface TableInfo {
   name: string;
   rows: number;
   kind: "schema" | "internal";
-}
-
-type Shape =
-  | { kind: "string" | "number" | "int64" | "boolean" | "null" | "bytes" | "file" | "any" }
-  | { kind: "id"; table: string }
-  | { kind: "literal"; value: unknown }
-  | { kind: "array"; item: Shape }
-  | { kind: "record"; value: Shape }
-  | { kind: "object"; fields: Record<string, { shape: Shape; optional: boolean }> }
-  | { kind: "union"; members: Shape[] };
-
-interface SchemaTable {
-  name: string;
-  document: Extract<Shape, { kind: "object" }>;
-  /** `sparse`: only documents with every field present are in the index (filtering by it leaves the others out). */
-  indexes: Array<{ name: string; kind: string; fields: string[]; sparse?: boolean }>;
 }
 
 type Doc = Record<string, unknown>;
@@ -97,8 +85,9 @@ function parseValue(raw: string): unknown {
 const SYSTEM = new Set(["_id", "_creationTime"]);
 const withoutSystem = (d: Doc) => Object.fromEntries(Object.entries(d).filter(([k]) => !SYSTEM.has(k)));
 
-export function DataBrowser({ project, env, shard, initialTable }: { project: string; env: string; shard: string; initialTable?: string }) {
-  // `initialTable`: the route's table (`data/<shard>/<table>`, the command palette's link).
+export function DataBrowser({ project, env, shard, initialTable, initialId }: { project: string; env: string; shard: string; initialTable?: string; initialId?: string }) {
+  // `initialTable`: the route's table (`data/<shard>/<table>`, the command palette's link); `initialId` the document a
+  // `v.id()` link opens (`data/<shard>/<table>/<id>`).
   const [table, setTable] = useState<string | null>(initialTable ?? null);
   // main.tsx keys this component by project/env/shard/table; the reset also holds for any other mount.
   useEffect(() => setTable(initialTable ?? null), [project, env, shard, initialTable]);
@@ -129,7 +118,7 @@ export function DataBrowser({ project, env, shard, initialTable }: { project: st
         {!table ? (
           <Empty>Pick a table. Documents open with Enter or a click.</Empty>
         ) : info?.kind === "schema" && spec ? (
-          <QueryView key={table} {...scope} table={spec} onChanged={tables.reload} />
+          <QueryView key={table} {...scope} table={spec} onChanged={tables.reload} {...(table === initialTable && initialId ? { initialId } : {})} />
         ) : (
           <>
             {info?.kind === "schema" && schema.error && <Problem error={schema.error} />}
@@ -176,14 +165,82 @@ function columnsOf(rows: Doc[]): string[] {
   return [...keys.filter((k) => SYSTEM.has(k)), ...keys.filter((k) => !SYSTEM.has(k))].slice(0, 14);
 }
 
-function Rows({ table, rows, cols, onOpen }: { table: string; rows: Doc[]; cols: string[]; onOpen: (d: Doc) => void }) {
+/** A reference a field's shape makes (`v.id("t")`, `v.file()`), looking through optional / nullable unions. */
+function refOf(shape: Shape | undefined): { kind: "id"; table: string } | { kind: "file" } | null {
+  if (!shape) return null;
+  if (shape.kind === "id") return { kind: "id", table: shape.table };
+  if (shape.kind === "file") return { kind: "file" };
+  if (shape.kind === "union") {
+    const refs = shape.members.filter((m) => m.kind !== "null").map(refOf);
+    const r = refs[0];
+    if (r && refs.every((x) => x && x.kind === r.kind && (x.kind === "file" || (r.kind === "id" && x.kind === "id" && x.table === r.table)))) return r;
+  }
+  return null;
+}
+
+interface RowLinks {
+  project: string;
+  env: string;
+  shard: string;
+  /** Top-level field shapes of the table (links for `v.id()` / `v.file()` values). */
+  fields: Record<string, { shape: Shape; optional: boolean }>;
+}
+
+function Cell({ value, field, links }: { value: unknown; field: string; links?: RowLinks | undefined }) {
+  if (value === null || value === undefined) return <span className="muted">—</span>;
+  const ref = links ? refOf(links.fields[field]?.shape) : null;
+  if (ref && typeof value === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(value)) {
+    const to =
+      ref.kind === "id"
+        ? href({ project: links!.project, env: links!.env, section: "data", shard: links!.shard, rest: [ref.table, value] })
+        : href({ project: links!.project, env: links!.env, section: "files", shard: links!.shard, rest: [value] });
+    return (
+      <a href={to} className="mono" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()} title={ref.kind === "id" ? `Open ${value} in ${ref.table}` : `Open file ${value}`}>
+        {text(value, 80)}
+      </a>
+    );
+  }
+  return <span className={typeof value === "object" ? "mono" : undefined}>{text(value, 80)}</span>;
+}
+
+function Rows({
+  table,
+  rows,
+  cols,
+  onOpen,
+  links,
+  selection,
+}: {
+  table: string;
+  rows: Doc[];
+  cols: string[];
+  onOpen: (d: Doc) => void;
+  links?: RowLinks;
+  /** Checkboxes for bulk actions (admins): the selected `_id`s. */
+  selection?: { ids: ReadonlySet<string>; toggle: (id: string) => void; all: (on: boolean) => void };
+}) {
+  const stop = (e: { stopPropagation(): void }) => e.stopPropagation();
+  const ids = rows.map((r) => String(r._id ?? r.id ?? ""));
+  const allOn = !!selection && rows.length > 0 && ids.every((id) => selection.ids.has(id));
+  const cells = (r: Doc, i: number): ReactNode[] => {
+    const out: ReactNode[] = cols.map((c) => <Cell value={r[c]} field={c} links={links} />);
+    if (selection)
+      out.unshift(
+        <input type="checkbox" checked={selection.ids.has(ids[i]!)} onChange={() => selection.toggle(ids[i]!)} onClick={stop} onKeyDown={stop} aria-label={`Select ${ids[i]}`} />,
+      );
+    return out;
+  };
   return (
     <Table
       label={`${table} rows`}
       empty="No documents match."
       onRow={(i) => onOpen(rows[i]!)}
-      cols={cols.map((h) => ({ h }))}
-      rows={rows.map((r) => cols.map((c) => (r[c] === null || r[c] === undefined ? <span className="muted">—</span> : <span className={typeof r[c] === "object" ? "mono" : undefined}>{text(r[c], 80)}</span>)))}
+      rowKeys={ids.map((id, i) => id || String(i))}
+      cols={[
+        ...(selection ? [{ h: <input type="checkbox" checked={allOn} onChange={(e) => selection.all(e.target.checked)} aria-label="Select all rows on this page" />, cls: "check" }] : []),
+        ...cols.map((h) => ({ h })),
+      ]}
+      rows={rows.map(cells)}
     />
   );
 }
@@ -202,39 +259,77 @@ function Pager({ page, prev, next }: { page: number; prev: (() => void) | null; 
   );
 }
 
+type LowerOp = "gt" | "gte";
+type UpperOp = "lt" | "lte";
+
 interface Filter {
   index: string;
   eq: string[];
   order: "asc" | "desc";
+  /** A range on the index field after the `eq` prefix (level 16). */
+  lower: { op: LowerOp; value: string };
+  upper: { op: UpperOp; value: string };
 }
 
-function QueryView({ project, env, shard, table, onChanged }: { project: string; env: string; shard: string; table: SchemaTable; onChanged: () => void }) {
+/** What the page shows instead of an index range: one document by `_id`, or a full-text search. */
+type Lookup = { kind: "id"; id: string } | { kind: "search"; index: string; text: string } | null;
+
+const EMPTY_RANGE = { lower: { op: "gte" as LowerOp, value: "" }, upper: { op: "lt" as UpperOp, value: "" } };
+
+function QueryView({ project, env, shard, table, onChanged, initialId }: { project: string; env: string; shard: string; table: SchemaTable; onChanged: () => void; initialId?: string }) {
   const s = useSession();
   const indexes = useMemo(() => [{ name: "by_creation_time", kind: "db", fields: [] as string[] }, ...table.indexes.filter((i) => i.kind === "db")], [table]);
-  const [draft, setDraft] = useState<Filter>({ index: "by_creation_time", eq: [], order: "desc" });
+  const searches = useMemo(() => table.indexes.filter((i) => i.kind === "search"), [table]);
+  const [draft, setDraft] = useState<Filter>({ index: "by_creation_time", eq: [], order: "desc", ...EMPTY_RANGE });
   const [filter, setFilter] = useState<Filter>(draft);
+  const [lookup, setLookup] = useState<Lookup>(initialId ? { kind: "id", id: initialId } : null);
+  const [idDraft, setIdDraft] = useState(initialId ?? "");
+  const [searchDraft, setSearchDraft] = useState({ index: searches[0]?.name ?? "", text: "" });
   const [cursors, setCursors] = useState<Array<string | null>>([null]);
   const [showSchema, setShowSchema] = useState(false);
   const [open, setOpen] = useState<Doc | null>(null);
+  /** The `_id` lookup whose document was opened already (a reload does not open it again). */
+  const [opened, setOpened] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  /** The bulk delete dialog: the ids are the ones counted when it opened (an auto-refresh does not change them). */
+  const [bulk, setBulk] = useState<{ ids: string[]; busy: boolean; error: ApiError | null } | null>(null);
+  /** Which bulk delete is current: an answer for another (cancelled, then a new dialog) changes nothing. */
+  const bulkOp = useRef(0);
+  const [auto, setAuto] = useState(false);
   const [n, setN] = useState(0);
   const idx = indexes.find((i) => i.name === draft.index) ?? indexes[0]!;
-  // Only a prefix of the index's fields can be fixed: stop at the first empty one.
+  // Only a prefix of the index's fields can be fixed: stop at the first empty one. The range is on the next field.
   const fields = indexes.find((i) => i.name === filter.index)?.fields ?? [];
   const prefix: unknown[] = [];
   for (let i = 0; i < fields.length && filter.eq[i]; i++) prefix.push(parseValue(filter.eq[i]!));
+  const draftPrefix = (() => {
+    let k = 0;
+    while (k < idx.fields.length && draft.eq[k]) k++;
+    return k;
+  })();
+  const rangeField = [...idx.fields, "_creationTime"][draftPrefix]!;
   const cursor = cursors[cursors.length - 1] ?? null;
+  const bound = (b: { op: string; value: string }) => (b.value.trim() ? { [b.op]: JSON.stringify(parseValue(b.value.trim())) } : {});
   const rows = useApi<{ value: { page: Doc[]; isDone: boolean; continueCursor: string } }>(
     path("/api/rows", {
       project,
       env,
       shard,
       table: table.name,
-      ...(filter.index !== "by_creation_time" ? { index: filter.index } : {}),
-      ...(prefix.length ? { eq: JSON.stringify(prefix) } : {}),
-      order: filter.order,
-      limit: 50,
-      cursor,
+      ...(lookup?.kind === "id"
+        ? { id: lookup.id }
+        : lookup?.kind === "search"
+          ? { index: lookup.index, search: lookup.text, limit: 50 }
+          : {
+              ...(filter.index !== "by_creation_time" ? { index: filter.index } : {}),
+              ...(prefix.length ? { eq: JSON.stringify(prefix) } : {}),
+              ...bound(filter.lower),
+              ...bound(filter.upper),
+              order: filter.order,
+              limit: 50,
+              cursor,
+            }),
       n,
     }),
   );
@@ -244,14 +339,58 @@ function QueryView({ project, env, shard, table, onChanged }: { project: string;
     const seen = page ? columnsOf(page.page) : [];
     return [...new Set(["_id", ...declared, ...seen.filter((c) => c !== "_creationTime"), "_creationTime"])].slice(0, 14);
   }, [page, table]);
+  // An `_id` lookup opens its document once its answer arrives (once per lookup, found or not).
+  useEffect(() => {
+    if (lookup?.kind === "id" && opened !== lookup.id && page) {
+      setOpened(lookup.id);
+      if (page.page[0]) setOpen(page.page[0]);
+    }
+  }, [lookup, page, opened]);
+  // Auto-refresh: every 5 s while on, paused while the tab is hidden or the bulk delete dialog is open (the same page,
+  // data kept while it reloads).
+  const reload = rows.reload;
+  const confirming = !!bulk;
+  // A tick while the previous rows request is still out is skipped (a new one would drop its answer: a request slower
+  // than 5 s would never land). Read through a ref, since the interval is created once per `auto`/`confirming`.
+  const rowsLoading = useRef(rows.loading);
+  rowsLoading.current = rows.loading;
+  useEffect(() => {
+    if (!auto || confirming) return;
+    const t = setInterval(() => {
+      if (document.visibilityState === "visible" && !rowsLoading.current) reload();
+    }, 5000);
+    return () => clearInterval(t);
+  }, [auto, reload, confirming]);
+  const reset = () => {
+    setCursors([null]);
+    setSelected(new Set());
+  };
   const apply = (f: Filter) => {
     setFilter(f);
-    setCursors([null]);
+    setLookup(null);
+    reset();
   };
   const changed = () => {
     setN((x) => x + 1);
+    setSelected(new Set());
     onChanged();
   };
+  const ids = (page?.page ?? []).map((d) => String(d._id));
+  const selection = s.isAdmin
+    ? {
+        ids: selected,
+        toggle: (id: string) =>
+          setSelected((cur) => {
+            const next = new Set(cur);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+          }),
+        all: (on: boolean) => setSelected(on ? new Set(ids) : new Set()),
+      }
+    : undefined;
+  const chosen = ids.filter((id) => selected.has(id));
+  const bulkIds = bulk?.ids ?? [];
   return (
     <div className={showSchema ? "split" : undefined}>
       <div>
@@ -267,7 +406,7 @@ function QueryView({ project, env, shard, table, onChanged }: { project: string;
           </strong>
           <label className="inline">
             Index
-            <select value={draft.index} onChange={(e) => setDraft({ ...draft, index: e.target.value, eq: [] })} aria-label="Index">
+            <select value={draft.index} onChange={(e) => setDraft({ ...draft, index: e.target.value, eq: [], ...EMPTY_RANGE })} aria-label="Index">
               {indexes.map((i) => (
                 <option key={i.name} value={i.name}>
                   {i.name}
@@ -293,6 +432,19 @@ function QueryView({ project, env, shard, table, onChanged }: { project: string;
               />
             </label>
           ))}
+          <span className="inline range" role="group" aria-label={`Range on ${rangeField}`}>
+            <Mono>{rangeField}</Mono>
+            <select value={draft.lower.op} onChange={(e) => setDraft({ ...draft, lower: { ...draft.lower, op: e.target.value as LowerOp } })} aria-label={`${rangeField} lower bound`}>
+              <option value="gte">≥</option>
+              <option value="gt">&gt;</option>
+            </select>
+            <input className="eq" value={draft.lower.value} onChange={(e) => setDraft({ ...draft, lower: { ...draft.lower, value: e.target.value } })} placeholder="from" aria-label={`${rangeField} from`} />
+            <select value={draft.upper.op} onChange={(e) => setDraft({ ...draft, upper: { ...draft.upper, op: e.target.value as UpperOp } })} aria-label={`${rangeField} upper bound`}>
+              <option value="lt">&lt;</option>
+              <option value="lte">≤</option>
+            </select>
+            <input className="eq" value={draft.upper.value} onChange={(e) => setDraft({ ...draft, upper: { ...draft.upper, value: e.target.value } })} placeholder="to" aria-label={`${rangeField} to`} />
+          </span>
           <label className="inline">
             Order
             <select value={draft.order} onChange={(e) => setDraft({ ...draft, order: e.target.value as "asc" | "desc" })} aria-label="Order">
@@ -302,6 +454,9 @@ function QueryView({ project, env, shard, table, onChanged }: { project: string;
           </label>
           <button type="submit">Apply</button>
           <span className="spacer" />
+          <label className="inline" title="Reload this page every 5 s (paused while the tab is hidden)">
+            <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} aria-label="Auto-refresh every 5 seconds" /> Auto-refresh
+          </label>
           <button type="button" onClick={() => setShowSchema((x) => !x)} aria-pressed={showSchema}>
             Schema
           </button>
@@ -311,18 +466,79 @@ function QueryView({ project, env, shard, table, onChanged }: { project: string;
             </button>
           )}
         </form>
-        {idx.fields.length > 0 && <p className="muted small hint">Values are JSON when they parse (5, true, "5"), text otherwise.</p>}
+        <div className="toolbar">
+          <form
+            className="inline"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const id = idDraft.trim();
+              if (!id) return;
+              setOpened(null);
+              setLookup({ kind: "id", id });
+              reset();
+            }}
+          >
+            <input type="search" value={idDraft} onChange={(e) => setIdDraft(e.target.value)} placeholder="Go to _id" aria-label="Document _id" className="mono" spellCheck={false} />
+            <button type="submit">Open</button>
+          </form>
+          {searches.length > 0 && (
+            <form
+              className="inline"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (!searchDraft.text.trim() || !searchDraft.index) return;
+                setLookup({ kind: "search", index: searchDraft.index, text: searchDraft.text.trim() });
+                reset();
+              }}
+            >
+              {searches.length > 1 && (
+                <select value={searchDraft.index} onChange={(e) => setSearchDraft({ ...searchDraft, index: e.target.value })} aria-label="Search index">
+                  {searches.map((i) => (
+                    <option key={i.name} value={i.name}>
+                      {i.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <input
+                type="search"
+                value={searchDraft.text}
+                onChange={(e) => setSearchDraft({ ...searchDraft, text: e.target.value })}
+                placeholder={`Search ${searches.find((i) => i.name === searchDraft.index)?.searchField ?? searches.find((i) => i.name === searchDraft.index)?.fields[0] ?? "text"}`}
+                aria-label="Full-text search"
+              />
+              <button type="submit">Search</button>
+            </form>
+          )}
+          {lookup && (
+            <span className="inline">
+              <Badge tone="info">{lookup.kind === "id" ? `_id = ${lookup.id}` : `search “${lookup.text}” in ${lookup.index}`}</Badge>
+              <button type="button" className="link" onClick={() => (setLookup(null), reset())}>
+                Clear
+              </button>
+            </span>
+          )}
+          <span className="spacer" />
+          {s.isAdmin && chosen.length > 0 && (
+            <button type="button" className="danger-text" onClick={() => setBulk({ ids: chosen, busy: false, error: null })}>
+              Delete {chosen.length} selected…
+            </button>
+          )}
+        </div>
+        {(idx.fields.length > 0 || draft.lower.value || draft.upper.value) && <p className="muted small hint">Values are JSON when they parse (5, true, "5"), text otherwise. The range is on the field after the fixed ones.</p>}
         {rows.error ? (
           <Problem error={rows.error} onRetry={rows.reload} />
         ) : !page ? (
           <Loading lines={8} />
         ) : (
           <>
-            <Rows table={table.name} rows={page.page} cols={cols} onOpen={setOpen} />
-            <div className="toolbar">
-              <span className="spacer" />
-              <Pager page={cursors.length} prev={cursors.length > 1 ? () => setCursors((c) => c.slice(0, -1)) : null} next={page.isDone ? null : () => setCursors((c) => [...c, page.continueCursor])} />
-            </div>
+            <Rows table={table.name} rows={page.page} cols={cols} onOpen={setOpen} links={{ project, env, shard, fields: table.document.fields }} {...(selection ? { selection } : {})} />
+            {!lookup && (
+              <div className="toolbar">
+                <span className="spacer" />
+                <Pager page={cursors.length} prev={cursors.length > 1 ? () => (setCursors((c) => c.slice(0, -1)), setSelected(new Set())) : null} next={page.isDone ? null : () => (setCursors((c) => [...c, page.continueCursor]), setSelected(new Set()))} />
+              </div>
+            )}
           </>
         )}
       </div>
@@ -341,6 +557,37 @@ function QueryView({ project, env, shard, table, onChanged }: { project: string;
           }}
         />
       )}
+      <ConfirmDialog
+        open={!!bulk}
+        title={`Delete ${bulkIds.length} document${bulkIds.length === 1 ? "" : "s"} of ${table.name}?`}
+        confirmLabel={`Delete ${bulkIds.length} document${bulkIds.length === 1 ? "" : "s"}`}
+        danger
+        expected={s.isProtected(env) ? table.name : null}
+        busy={bulk?.busy ?? false}
+        error={bulk?.error ?? null}
+        onCancel={() => {
+          // While the delete is out the dialog stays: its answer belongs to it.
+          if (bulk?.busy) return;
+          bulkOp.current++;
+          setBulk(null);
+        }}
+        onConfirm={async (typed) => {
+          const op = ++bulkOp.current;
+          setBulk({ ids: bulkIds, busy: true, error: null });
+          try {
+            const r = await api.post<{ value: { deleted: number } }>("/api/doc/delete", { project, env, shard, table: table.name, ids: bulkIds, ...(typed ? { confirm: typed } : {}) });
+            s.toast({ text: `Deleted ${r.value.deleted} document${r.value.deleted === 1 ? "" : "s"} from ${table.name}` });
+            changed();
+            if (bulkOp.current === op) setBulk(null);
+          } catch (e) {
+            if (bulkOp.current === op) setBulk({ ids: bulkIds, busy: false, error: e as ApiError });
+          }
+        }}
+      >
+        <p>
+          {bulkIds.length} document{bulkIds.length === 1 ? "" : "s"} leave <Mono>{table.name}</Mono> on <Mono>{shard}</Mono> in one mutation (all or nothing): indexes are updated and subscribed clients see them go. Recorded in the audit log.
+        </p>
+      </ConfirmDialog>
     </div>
   );
 }
