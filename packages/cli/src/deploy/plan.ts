@@ -128,6 +128,30 @@ type ComponentsLike = Record<
 >;
 
 /**
+ * Binding names the deploy itself adds (`buildMetadata`, the AI resources): a component may not ask for one, or the
+ * Worker would get two bindings of that name (the runtime would read the component's as the platform's, or the
+ * upload would fail late). `EMBER_AI` is shared on purpose (`{ type: "ai" }`).
+ */
+const PLATFORM_BINDINGS = new Set([
+  ...doClasses(true).map((d) => d.binding),
+  "EMBER_ENV",
+  "EMBER_PROJECT",
+  "EMBER_LOCATION_HINT",
+  "EMBER_VERSION",
+  "EMBER_FILES",
+  "EMBER_R2_BUCKET",
+  "EMBER_R2_ACCOUNT_ID",
+  "EMBER_IMAGES",
+  "EMBER_BROWSER",
+  "EMBER_REGISTRY",
+  "EMBER_METRICS",
+  "EMBER_METRICS_SAMPLE",
+  "EMBER_ACTIONS",
+  "EMBER_INDEXING",
+]);
+const PLATFORM_PREFIXES = ["EMBER_VEC__", "EMBER_AIS__"];
+
+/**
  * Bindings that installed components declared in the composed manifest (`manifest.components[*].bindings`).
  * Rate Limiting: `namespace_id` is derived from `ember-<project>-<env>/<binding>` (stable across deploys,
  * distinct per environment; two bindings with the same id would share counters per location).
@@ -145,6 +169,10 @@ export function componentBindings(components: ComponentsLike | undefined, projec
       }
       // EMBER_AI is the Workers AI binding every install shares: no other binding may take the name.
       if (b.name === "EMBER_AI") throw new Error(`Component ${key}: EMBER_AI is reserved for the Workers AI binding ({ type: "ai" })`);
+      if (b.name === "EMBER_METRICS") throw new Error(`Component ${key}: EMBER_METRICS is reserved for Ember's metrics dataset`);
+      if (PLATFORM_BINDINGS.has(b.name) || PLATFORM_PREFIXES.some((p) => b.name.startsWith(p))) {
+        throw new Error(`Component ${key}: the binding name ${b.name} is reserved (ember deploy adds a platform binding with that name)`);
+      }
       if (seen.has(b.name)) throw new Error(`Components ask for the binding ${b.name} twice (component ${key})`);
       seen.add(b.name);
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name)) throw new Error(`Component ${key}: invalid binding name ${b.name}`);
@@ -159,8 +187,6 @@ export function componentBindings(components: ComponentsLike | undefined, projec
         continue;
       }
       if (b.type === "analytics_engine") {
-        // EMBER_METRICS is the runtime's own dataset (execution metrics, RUM): a component gets a binding of its own.
-        if (b.name === "EMBER_METRICS") throw new Error(`Component ${key}: EMBER_METRICS is reserved for Ember's metrics dataset`);
         if (!b.dataset || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(b.dataset)) throw new Error(`Component ${key}: analytics_engine ${b.name} needs a dataset name ([A-Za-z_][A-Za-z0-9_]*)`);
         out.push({ type: "analytics_engine", name: b.name, dataset: b.dataset });
         continue;
