@@ -239,4 +239,22 @@ describe("ember dashboard deploy", () => {
     await expect(deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, log: () => {} })).rejects.toThrow(/settings/);
     expect(cf.calls.filter((c) => c.method === "PUT").length).toBe(puts);
   }, 60_000);
+
+  it("a preview environment's Worker is bound only once linked explicitly; then it stays", async () => {
+    const build = await buildDashboard();
+    const cf = fakeAccount();
+    const project = repo("dashprev", { environments: { prod: {}, preview: {} } });
+    await deploy(project, { env: "prod", token: "t", fetch: cf.fetchImpl, prebuilt, registryName: "r", log: () => {} });
+    await deploy(project, { env: "preview-feat-x", token: "t", fetch: cf.fetchImpl, prebuilt, registryName: "r", log: () => {} });
+    const reg = await D1Registry.open(cf.client, "r");
+    const workers = (await reg.exec("SELECT worker FROM environments ORDER BY env")).map((r) => String(r.worker));
+    const preview = workers.find((w) => w.endsWith("-preview-feat-x"))!;
+    const prod = workers.find((w) => w.endsWith("-prod"))!;
+    expect(preview).toBeTruthy();
+    // Registered and deployed, never linked: a dashboard deploy does not bind it.
+    expect((await deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, log: () => {} })).services).toEqual([prod]);
+    // Linked by its own deploy (`--dashboard`): bound, and kept by the next dashboard deploys.
+    expect((await deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, include: [preview], noToken: true, log: () => {} })).services).toEqual([preview, prod]);
+    expect((await deployDashboard(cf.client, { registry: reg, name: "ember-spike-dashboard", build, noToken: true, log: () => {} })).services).toEqual([preview, prod]);
+  }, 60_000);
 });

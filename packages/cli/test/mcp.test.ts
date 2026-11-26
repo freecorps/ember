@@ -34,7 +34,7 @@ const DEV = "http://127.0.0.1:8787";
  * (`cloudflare-workers-version-overrides`) to the new version goes to the old one every other time. `noVersion`: a
  * runtime with the guards but no EMBER_VERSION. `hang`: `run` never answers.
  */
-function fakeRuntime(o: { deployed?: Record<string, string>; old?: boolean; split?: boolean; noVersion?: boolean; hang?: boolean } = {}) {
+function fakeRuntime(o: { deployed?: Record<string, string>; old?: boolean; split?: boolean; noVersion?: boolean; hang?: boolean; fallback?: boolean } = {}) {
   const calls: Array<{ url: string; method: string; body?: any; env?: string; pin?: string; redirect?: string }> = [];
   let unpinned = 0;
   const types: Record<string, string> = { "messages:list": "query", "messages:send": "mutation", ...o.deployed };
@@ -50,11 +50,15 @@ function fakeRuntime(o: { deployed?: Record<string, string>; old?: boolean; spli
     const have = url.hostname === "127.0.0.1" ? "local" : url.hostname.split(".")[0]!.replace(/^ember-chat-/, "");
     const version = `v14-${have}`;
     // The version that serves this request: the pinned one, or (split) either of the two.
-    const old = o.old || (o.split && have === "prod" && (pin ? pin !== `ember-chat-prod="${version}"` : unpinned++ % 2 === 1));
+    // `fallback`: the pinned version left the deployment between the check and the run, so the run reaches the old one.
+    const old = o.old || (o.fallback && url.pathname.startsWith("/api/_ember/run")) || (o.split && have === "prod" && (pin ? pin !== `ember-chat-prod="${version}"` : unpinned++ % 2 === 1));
     if (!old && want !== undefined && want !== have) return json({ ok: false, error: { code: "wrong_environment", message: `this Worker serves the environment "${have}", not "${want}"` } }, 409);
     if (url.pathname === "/api/_ember/capabilities") return old ? json({ ok: false, error: { code: "not_found", message: "not found" } }, 404) : json({ ok: true, level: 14, features: ["run", "data", "status", "inspect", "run/read-only", "env-check"], version: o.noVersion ? null : version });
-    if (url.pathname === "/api/_ember/run") {
+    // An old runtime has no read-only path (and ignores a readOnly in the body of run).
+    if (url.pathname === "/api/_ember/run/read-only" && old) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
+    if (url.pathname === "/api/_ember/run" || url.pathname === "/api/_ember/run/read-only") {
       if (o.hang) return new Promise<Response>(() => {});
+      if (url.pathname.endsWith("/read-only")) body.readOnly = true;
       const type = types[body.fn] ?? "query";
       if (!old && body.readOnly === true && type !== "query") return json({ ok: false, error: { code: "confirm_required", message: `${body.fn} is a ${type} in this deployment` } }, 403);
       // An application error that happens to use the same code: the function ran (a 400, not the guard's 403).
@@ -244,7 +248,7 @@ describe("MCP tools", () => {
     const on = server({ allowRun: ["prod"] });
     // A query needs only the flag.
     expect((await call(on.s, "run", { fn: "messages:list", env: "prod" })).structuredContent.env).toBe("prod");
-    expect(on.rt.calls.at(-1)!.url).toBe("https://ember-chat-prod.acme.workers.dev/api/_ember/run");
+    expect(on.rt.calls.at(-1)!.url).toBe("https://ember-chat-prod.acme.workers.dev/api/_ember/run/read-only");
     // A mutation (by the local manifest) unconfirmed is refused before anything is sent.
     const before = on.rt.calls.length;
     const unconfirmed = await call(on.s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" } });
@@ -339,9 +343,18 @@ describe("MCP tools", () => {
       const r = await call(s, "run", { fn: "messages:list", env: "prod", args: { channel: "c" } });
       expect([i, r.isError, r.content[0]!.text]).toEqual([i, true, expect.stringMatching(/not a query in what "prod" runs|older than this `ember mcp`/)]);
     }
-    const runs = rt.calls.filter((c) => c.url.endsWith("/run"));
+    const runs = rt.calls.filter((c) => /\/run(\/read-only)?$/.test(c.url));
     expect(runs.length).toBeGreaterThan(0);
     expect(runs.every((c) => c.pin === 'ember-chat-prod="v14-prod"')).toBe(true);
+  });
+
+  it("a pinned version that left the deployment: the unconfirmed run reaches an old runtime, which has no read-only path, and nothing runs", async () => {
+    const { s, rt } = server({ allowRun: ["prod"] }, { fallback: true, deployed: { "messages:list": "mutation" } });
+    const r = await call(s, "run", { fn: "messages:list", env: "prod", args: { channel: "c" } });
+    expect([r.isError, r.content[0]!.text]).toEqual([true, expect.stringMatching(/has no read-only runs \(an older version\): nothing ran/)]);
+    // Never the plain run path, which an old runtime would run without looking at readOnly.
+    expect(rt.calls.filter((c) => c.url.endsWith("/api/_ember/run"))).toEqual([]);
+    expect(rt.calls.filter((c) => c.url.endsWith("/api/_ember/run/read-only"))).toHaveLength(1);
   });
 
   it("run: a deadline for the request and its body; past it, the outcome is unknown and nothing is retried", async () => {

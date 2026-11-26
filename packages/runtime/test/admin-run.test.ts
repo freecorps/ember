@@ -29,6 +29,11 @@ describe("functions and the runner", () => {
     // Nothing was written by the refused mutation.
     expect((await admin("run", { fn: "messages:list", args: { channel: "ro" }, shard })).body.value).toEqual([]);
     expect((await admin("run", { fn: "messages:list", args: { channel: "ro" }, shard, readOnly: "yes" })).status).toBe(400);
+    // POST run/read-only: readOnly forced (no body flag needed, none can turn it off); older runtimes have no such path.
+    expect((await admin("run/read-only", { fn: "messages:list", args: { channel: "ro" }, shard })).body).toMatchObject({ ok: true, type: "query" });
+    const w = await admin("run/read-only", { fn: "messages:send", args: { channel: "ro", body: "x" }, shard, readOnly: false });
+    expect([w.status, w.body.error.code]).toEqual([403, "confirm_required"]);
+    expect((await admin("run", { fn: "messages:list", args: { channel: "ro" }, shard })).body.value).toEqual([]);
   });
 
   it("x-ember-env: a caller naming another environment is refused before any admin endpoint runs", async () => {

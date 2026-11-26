@@ -179,7 +179,7 @@ export function revealOnce(label: string, value: string, o: { io: DashboardIo; d
 export async function finishDashboardLink(client: CfClient, link: DashboardLink, registry: D1Registry, o: { io: DashboardIo; project: Project | null; dir: string }): Promise<DashboardDeployResult> {
   const extraSecrets = link.token ? { [adminTokenKey(link.worker)]: link.token } : {};
   if (link.exists) {
-    const r = await deployDashboard(client, { registry, name: link.name, extraSecrets, skipUnchanged: true, noToken: true, log: o.io.log });
+    const r = await deployDashboard(client, { registry, name: link.name, extraSecrets, include: [link.worker], skipUnchanged: true, noToken: true, log: o.io.log });
     o.io.log(r.skipped ? `  dashboard: ${link.name} already up to date` : `  dashboard: ${link.worker} linked`);
     return r;
   }
@@ -188,6 +188,7 @@ export async function finishDashboardLink(client: CfClient, link: DashboardLink,
     registry,
     name: link.name,
     extraSecrets,
+    include: [link.worker],
     ...(login.access ? { accessTeam: login.access.team, accessAud: login.access.aud, noToken: true } : {}),
     ...(login.admins ? { admins: login.admins } : {}),
     log: o.io.log,

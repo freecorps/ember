@@ -48,8 +48,10 @@ describe("migrate convex: libraries", () => {
       `const C = class extends (require("base-expr") as any).B<import("erased-arg").T> {};`,
       `interface I extends Ifc<typeof import("erased-iface")> {}`,
       `class K implements Ifc<import("erased-impl").T> {}`,
+      // An instantiation expression keeps its runtime operand.
+      `export const factory = (require("instantiated") as <T>(input: T) => T)<Uint8Array>;`,
     ].join("\n");
-    expect(importSpecifiers(heritage, "x.ts").sort()).toEqual(["base-expr", "node:worker_threads"]);
+    expect(importSpecifiers(heritage, "x.ts").sort()).toEqual(["base-expr", "instantiated", "node:worker_threads"]);
     expect([packageOf("@s/b/sub"), packageOf("fs"), packageOf("fs/promises"), packageOf("node:zlib"), packageOf("./x"), packageOf("lodash/fp")]).toEqual(["@s/b", "node:fs", "node:fs/promises", "node:zlib", null, "lodash"]);
     expect(lookup("sharp")).toMatchObject({ matched: "sharp", verdict: "no" });
     expect(lookup("crypto")).toMatchObject({ matched: "node:crypto", verdict: "works" });
@@ -85,6 +87,15 @@ describe("migrate convex: libraries", () => {
     expect(lines).toMatch(/unknown\s+left-pad-pro/);
     expect(lines).not.toMatch(/openai/);
     expect(checkLibraries(join(FIXTURE, "missing")).findings).toEqual([]);
+  });
+
+  it("the configuration files the conversion skips (auth.config, convex.config) are not checked", () => {
+    const src = join(out, "configs", "convex");
+    mkdirSync(src, { recursive: true });
+    writeFileSync(join(src, "convex.config.ts"), `import { execSync } from "node:child_process";\nexport default execSync;\n`);
+    writeFileSync(join(src, "auth.config.js"), `const sharp = require("sharp");\nmodule.exports = { sharp };\n`);
+    writeFileSync(join(src, "run.ts"), `import { Worker } from "node:worker_threads";\nexport const w = Worker;\n`);
+    expect(checkLibraries(src).findings.map((f) => [f.module, f.files])).toEqual([["node:worker_threads", ["run.ts"]]]);
   });
 
   it("declaration files (.d.ts, .d.mts, .d.cts) are not run: their imports never block", () => {

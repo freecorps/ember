@@ -81,8 +81,8 @@ export const ADMIN_FEATURES = [
   "dashboards",
   "dashboards/query",
   "dashboards/run",
-  // level 14: guards for callers that act on an environment by name (`ember mcp`): `run` with `readOnly: true` runs
-  // queries only, an `x-ember-env` header that is not this Worker's EMBER_ENV refuses any admin call, and `capabilities`
+  // level 14: guards for callers that act on an environment by name (`ember mcp`): `run` with `readOnly: true` (or
+  // `POST run/read-only`, which older runtimes do not have) runs queries only, an `x-ember-env` header that is not this Worker's EMBER_ENV refuses any admin call, and `capabilities`
   // says which Worker version answered (`version`: the caller pins its next requests to it)
   "run/read-only",
   "env-check",
@@ -330,7 +330,9 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     const r = await deps.stub(shard).profileQuery(shard, key);
     return r ? deps.json({ ok: true, profile: r }) : deps.error(404, "not_found_entry", "that query is no longer cached on the shard (no subscriber left)");
   }
-  if (url.pathname === "/api/_ember/run") {
+  // `run/read-only`: `run` with readOnly forced. A caller that has not confirmed a write uses this path, so a runtime
+  // older than the guard (which would ignore a readOnly in the body) has no such endpoint and runs nothing (404).
+  if (url.pathname === "/api/_ember/run" || url.pathname === "/api/_ember/run/read-only") {
     if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
     let body: Record<string, unknown>;
     try {
@@ -348,6 +350,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     const args = body.args ?? {};
     if (typeof args !== "object" || args === null || Array.isArray(args)) return deps.error(400, "bad_request", "args must be an object");
     if (body.readOnly !== undefined && typeof body.readOnly !== "boolean") return deps.error(400, "bad_request", "readOnly must be a boolean");
+    if (url.pathname === "/api/_ember/run/read-only") body.readOnly = true;
     // `readOnly`: the caller has not confirmed a write. The type that counts is this deployment's (the caller's local
     // code may call it a query while the deployed one is a mutation), checked here, where it runs.
     if (body.readOnly === true && info.type !== "query") return deps.error(403, "confirm_required", `${name} is a ${info.type} in this deployment: it changes data, and the caller has not confirmed a write (readOnly)`);

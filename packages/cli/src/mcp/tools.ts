@@ -336,7 +336,9 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
         let res: Response;
         let text: string;
         try {
-          ({ res, text } = await adminFetch({ ...admin(t), timeoutMs: o.runTimeoutMs ?? RUN_TIMEOUT_MS }, "POST", "/api/_ember/run", body));
+          // Unconfirmed: the read-only path, which a runtime older than the guard does not have (a gradual deployment
+          // whose pinned version left between the check and the run falls back to it: a 404 there, nothing runs).
+          ({ res, text } = await adminFetch({ ...admin(t), timeoutMs: o.runTimeoutMs ?? RUN_TIMEOUT_MS }, "POST", confirmed ? "/api/_ember/run" : "/api/_ember/run/read-only", body));
         } catch (e) {
           if (e instanceof AdminApiError && e.code === "timeout") {
             throw new ToolError(`${fn.name} on ${t.env}: ${e.message}. It may or may not have run: check its effects (data, logs) before calling it again.`);
@@ -349,6 +351,8 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
         } catch {
           throw new ToolError(`POST /api/_ember/run on ${t.env}: HTTP ${res.status} ${text.slice(0, 300)}`);
         }
+        // An unconfirmed call reached a runtime without the read-only path (older than the guard): nothing ran.
+        if (!confirmed && res.status === 404 && r.error?.code !== "FunctionNotFound") throw new ToolError(`the "${t.env}" runtime that answered has no read-only runs (an older version): nothing ran. Redeploy it (ember deploy --env ${t.env}), or ask the user and call again with confirm: "${t.env}".`);
         // The runtime's own refusals (before anything ran) by their status as well: an application error a function
         // throws with the same code is a 400 and is reported as the function's failure.
         if (res.status === 403 && r.error?.code === "confirm_required") throw new ToolError(`${fn.name} is not a query in what "${t.env}" runs (${r.error.message}): it changes real data there. Ask the user, then call again with confirm: "${t.env}".`);

@@ -74,9 +74,11 @@ export function importSpecifiers(text: string, fileName = "x.tsx"): string[] {
     }
     // A class's `extends <expression>` runs (`extends require("m").Base`): TypeScript wraps it in an
     // ExpressionWithTypeArguments, a type node; its type arguments and `implements`/interface heritage are erased.
+    // An instantiation expression (`(require("m") as F)<T>`) is one too: its operand runs. Interface heritage and
+    // `implements` are erased.
     if (ts.isExpressionWithTypeArguments(n)) {
       const clause = n.parent;
-      if (ts.isHeritageClause(clause) && clause.token === ts.SyntaxKind.ExtendsKeyword && (ts.isClassDeclaration(clause.parent) || ts.isClassExpression(clause.parent))) visit(n.expression);
+      if (!ts.isHeritageClause(clause) || (clause.token === ts.SyntaxKind.ExtendsKeyword && (ts.isClassDeclaration(clause.parent) || ts.isClassExpression(clause.parent)))) visit(n.expression);
       return;
     }
     // Types (`import("m").T`, `typeof import("m")`) are never loaded.
@@ -131,6 +133,9 @@ function findPackageJson(src: string): string | null {
 
 const ORDER: Record<LibraryFinding["verdict"], number> = { no: 0, partial: 1, unknown: 2, works: 3 };
 
+/** Root files migrateConvex does not convert (Convex auth providers, Convex components). */
+export const CONVEX_CONFIG = /^(auth|convex)\.config\.(ts|js)$/;
+
 /** Checks the functions folder `src` (`convex/`) and its package.json against libraries.ts. */
 export function checkLibraries(src: string): LibraryCheck {
   const root = resolve(src);
@@ -138,6 +143,8 @@ export function checkLibraries(src: string): LibraryCheck {
   if (!existsSync(root) || !statSync(root).isDirectory()) return { packageJson: null, findings: [], blocking: [] };
   const byModule = new Map<string, LibraryFinding>();
   for (const f of walk(root)) {
+    // The configuration files migrateConvex skips (never part of the converted output).
+    if (CONVEX_CONFIG.test(f)) continue;
     for (const spec of importSpecifiers(readFileSync(join(root, f), "utf8"), f)) {
       if (REWRITTEN.test(spec)) continue;
       const pkg = packageOf(spec);
