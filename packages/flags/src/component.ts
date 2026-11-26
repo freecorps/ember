@@ -194,7 +194,8 @@ export const functions = {
 
     /**
      * Creates or replaces a flag's definition (fields left out keep their value on an existing flag; a new flag is
-     * enabled, not client-visible, with no rules). Every value is checked against `type`. Returns the new version.
+     * enabled, not client-visible, with no rules). A change of `type` drops the stored `value` and rules unless given
+     * again. Every value is checked against `type`. Returns the new version.
      */
     setFlag: mutation({
       args: {
@@ -212,9 +213,13 @@ export const functions = {
       handler: (ctx, a) => {
         checkKey(a.key);
         const cur = find(ctx, a.key);
-        const rules = (a.rules ?? cur?.rules ?? []) as FlagRule[];
-        const value = a.value !== undefined ? a.value : cur?.type === a.type ? cur.value : undefined;
+        // A new type drops what was written for the old one (the on value, the rules' values); the rollout and the
+        // other fields are type-independent and carry over.
+        const sameType = cur?.type === a.type;
+        const rules = (a.rules ?? (sameType ? cur!.rules : [])) as FlagRule[];
+        const value = a.value !== undefined ? a.value : sameType ? cur!.value : undefined;
         const rollout = a.rollout ?? cur?.rollout;
+        const description = a.description ?? cur?.description;
         checkValue(a.type, "defaultValue", a.defaultValue);
         if (value !== undefined) checkValue(a.type, "value", value);
         checkRules(a.type, rules);
@@ -225,7 +230,7 @@ export const functions = {
           defaultValue: a.defaultValue,
           ...(value !== undefined ? { value } : {}),
           enabled: a.enabled ?? cur?.enabled ?? true,
-          ...((a.description ?? cur?.description) !== undefined ? { description: a.description ?? cur!.description! } : {}),
+          ...(description !== undefined ? { description } : {}),
           clientVisible: a.clientVisible ?? cur?.clientVisible ?? false,
           rules,
           ...(rollout ? { rollout } : {}),
@@ -272,6 +277,7 @@ export const functions = {
         const cur = existing(ctx, a.key);
         const version = cur.version + 1;
         if (a.percent === null) {
+          // `undefined` in a patch removes an optional field (PatchValue).
           ctx.db.patch(cur._id, { rollout: undefined, updatedAt: ctx.now, version });
           return version;
         }
@@ -298,7 +304,15 @@ export const functions = {
 
 // ------------------------------------------------------------------------------------------------ dashboard
 
-const show = (x: unknown) => (x === undefined ? null : JSON.stringify(x));
+/** A value as JSON text for the dashboard; never throws (writes refuse what JSON cannot hold, this is a safety net). */
+const show = (x: unknown): string | null => {
+  if (x === undefined) return null;
+  try {
+    return JSON.stringify(x) ?? String(x);
+  } catch {
+    return String(x);
+  }
+};
 
 /** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
 const dashboardFunctions = {

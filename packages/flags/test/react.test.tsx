@@ -43,22 +43,51 @@ function Checkout() {
 describe("useFlag", () => {
   it("fallbacks while loading and for missing flags; live values; a value of another type keeps the fallback", async () => {
     const { client, set } = setup();
-    await set({ key: "theme", type: "string", defaultValue: "classic", value: "fresh" });
-    await set({ key: "limit", type: "string", defaultValue: "lots" });
-    render(
-      <EmberProvider client={client}>
-        <FlagsProvider query={api.flags.forClient} args={{ context: { unitId: "u1" } }}>
-          <Checkout />
-        </FlagsProvider>
-      </EmberProvider>,
-    );
-    expect(screen.getByTestId("out").textContent).toBe("loading:false:classic:10");
-    await waitFor(() => expect(screen.getByTestId("out").textContent).toBe("ready:false:fresh:10"));
-    await act(() => set({ key: "newCheckout", type: "boolean", defaultValue: false }));
-    await waitFor(() => expect(screen.getByTestId("out").textContent).toBe("ready:true:fresh:10"));
-    await act(() => set({ key: "newCheckout", enabled: false }));
-    await waitFor(() => expect(screen.getByTestId("out").textContent).toBe("ready:false:fresh:10"));
-    client.close();
+    try {
+      await set({ key: "theme", type: "string", defaultValue: "classic", value: "fresh" });
+      await set({ key: "limit", type: "string", defaultValue: "lots" });
+      render(
+        <EmberProvider client={client}>
+          <FlagsProvider query={api.flags.forClient} args={{ context: { unitId: "u1" } }}>
+            <Checkout />
+          </FlagsProvider>
+        </EmberProvider>,
+      );
+      expect(screen.getByTestId("out").textContent).toBe("loading:false:classic:10");
+      await waitFor(() => expect(screen.getByTestId("out").textContent).toBe("ready:false:fresh:10"));
+      await act(() => set({ key: "newCheckout", type: "boolean", defaultValue: false }));
+      await waitFor(() => expect(screen.getByTestId("out").textContent).toBe("ready:true:fresh:10"));
+      await act(() => set({ key: "newCheckout", enabled: false }));
+      await waitFor(() => expect(screen.getByTestId("out").textContent).toBe("ready:false:fresh:10"));
+    } finally {
+      client.close();
+    }
+  });
+
+  it("a null fallback accepts any value (typed unknown); a query that declares errors fits FlagsProvider", async () => {
+    const { client, set } = setup();
+    function Any() {
+      const theme = useFlag("theme", null);
+      // @ts-expect-error unknown: narrow it before use
+      const upper: string = theme;
+      void upper;
+      return <p data-testid="any">{typeof theme === "string" ? theme : "none"}</p>;
+    }
+    // A generated reference keeps its declared errors and shard kind.
+    const withErrors = api.flags.forClient as unknown as import("@freecorps/ember-values").FunctionReference<"query", "public", { context: { unitId: string } }, Record<string, unknown>, import("@freecorps/ember-values").ErrorSpec<"Forbidden", null>, { kind: "org" }>;
+    try {
+      await set({ key: "theme", type: "string", defaultValue: "classic", value: "fresh" });
+      render(
+        <EmberProvider client={client}>
+          <FlagsProvider query={withErrors} args={{ context: { unitId: "u1" } }}>
+            <Any />
+          </FlagsProvider>
+        </EmberProvider>,
+      );
+      await waitFor(() => expect(screen.getByTestId("any").textContent).toBe("fresh"));
+    } finally {
+      client.close();
+    }
   });
 
   it("outside a FlagsProvider: a clear error", () => {

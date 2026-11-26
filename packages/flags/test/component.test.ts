@@ -58,6 +58,8 @@ const modules = {
   },
   flags: {
     forClient: queryGeneric({ args: { context: vFlagContext }, handler: (ctx: any, a: any) => ff.forClient(ctx, a.context) }),
+    /** The flag as stored in the shard the query runs on. */
+    get: queryGeneric({ args: { key: v.string() }, handler: (ctx: any, a: any) => ctx.runQuery(components.flags.lib.get, { key: a.key }) }),
   },
 };
 const api = anyApi as unknown as ApiFromModules<typeof modules>;
@@ -116,6 +118,8 @@ describe("flags component", () => {
       expect(there.value).toBe(here.value);
     }
     expect(await t.mutation(api.admin.rollout, { key: "newCheckout", percent: null })).toBe(5);
+    // `percent: null` removes the field (a patch with `undefined`), not just its value.
+    expect(await t.query(api.flags.get, { key: "newCheckout" })).not.toHaveProperty("rollout");
     expect(await t.mutation(api.admin.rules, { key: "newCheckout", rules: [{ conditions: [{ attr: "staff", op: "eq", value: true }], value: false }] })).toBe(6);
     await t.syncReplicas();
     expect(await t.query(api.checkout.detail, { key: "newCheckout", context: { unitId: "u1", staff: true } }, ORG)).toMatchObject({ value: false, reason: "rule", version: 6 });
@@ -123,6 +127,8 @@ describe("flags component", () => {
 
     expect(await t.mutation(api.admin.remove, { key: "newCheckout" })).toBe(true);
     await t.syncReplicas();
+    // The delete is replicated (the org shard's copy is gone, not kept stale): the flag is missing there, with no version.
+    expect(await t.query(api.flags.get, { key: "newCheckout" }, ORG)).toBeNull();
     expect(await t.query(api.checkout.detail, { key: "newCheckout", context: {} }, ORG)).toEqual({ value: false, reason: "missing" });
   });
 
@@ -133,7 +139,44 @@ describe("flags component", () => {
     await t.mutation(api.admin.set, { flag: { key: "maxItems", type: "string", defaultValue: "lots", clientVisible: true } });
     await t.syncReplicas();
     expect(await t.query(api.flags.forClient, { context: {} }, ORG)).toEqual({ checkoutTheme: "classic", maxItems: 10 });
+    // `secretBeta` is enabled with no `value`: a boolean flag's on value is `true` (`defaultValue` is what a disabled
+    // flag, or a unit outside its rollout, gets).
     expect(await t.query(api.checkout.all, { context: {} }, ORG)).toEqual({ newCheckout: false, checkoutTheme: "classic", maxItems: 10, secretBeta: true });
+  });
+
+  test("setFlag with a new type drops the stored value and rules (written for the old type) unless given again", async () => {
+    const t = await setup();
+    await t.mutation(api.admin.set, { flag: { key: "limit", type: "string", defaultValue: "low", value: "high", rollout: { percent: 100, salt: "s" }, rules: [{ conditions: [{ attr: "plan", op: "eq", value: "pro" }], value: "max" }] } });
+    expect(await t.mutation(api.admin.set, { flag: { key: "limit", type: "number", defaultValue: 10 } })).toBe(2);
+    const stored = await t.query(api.flags.get, { key: "limit" });
+    expect(stored).toMatchObject({ type: "number", defaultValue: 10, rules: [], rollout: { percent: 100, salt: "s" } });
+    expect(stored).not.toHaveProperty("value");
+    expect(await t.query(api.checkout.detail, { key: "limit", context: { unitId: "u1", plan: "pro" } })).toMatchObject({ value: 10, reason: "rollout" });
+    // Same type: what is left out is kept.
+    await t.mutation(api.admin.set, { flag: { key: "limit", type: "number", defaultValue: 10, value: 20, rules: [{ conditions: [{ attr: "plan", op: "eq", value: "pro" }], value: 50 }] } });
+    await t.mutation(api.admin.set, { flag: { key: "limit", type: "number", defaultValue: 5, description: "max items" } });
+    expect(await t.query(api.flags.get, { key: "limit" })).toMatchObject({ defaultValue: 5, value: 20, rules: [{ value: 50 }], description: "max items", version: 4 });
+    // A json value JSON cannot hold is refused (the dashboard prints values as JSON).
+    await expect(t.mutation(api.admin.set, { flag: { key: "cfg", type: "json", defaultValue: { n: 1n } } })).rejects.toThrow(/defaultValue: expected a JSON value, got bigint 1n at n/);
+  });
+
+  test("forClient returns a new object (the query's result is not changed in place)", () => {
+    const raw = { checkoutTheme: 1, other: "x" };
+    const ctx = { db: {}, runQuery: () => raw };
+    expect(ff.forClient(ctx, {})).toEqual({ checkoutTheme: "classic", other: "x" });
+    expect(raw).toEqual({ checkoutTheme: 1, other: "x" });
+  });
+
+  test("declared specs: the default must be of the declared type", () => {
+    new FeatureFlags(components.flags, {
+      ok: { type: "boolean", default: false },
+      also: { type: "json", default: { any: ["thing"] } },
+      // @ts-expect-error a boolean flag with a string default
+      bad: { type: "boolean", default: "enabled" },
+    });
+    const typed = new FeatureFlags(components.flags, { n: { type: "number", default: 1 } });
+    const value: (ctx: { db: unknown; runQuery(fn: unknown, args?: unknown): unknown }) => number = (ctx) => typed.evaluate(ctx, "n");
+    expect(typeof value).toBe("function");
   });
 
   test("refusals: writes off global:main, bad values, unknown flags (typed error)", async () => {

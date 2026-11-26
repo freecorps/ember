@@ -14,11 +14,14 @@
 // its default and `useFlags().error` carries it.
 
 import { useQuerySnapshot } from "@freecorps/ember-react";
-import type { FunctionReference, Visibility } from "@freecorps/ember-values";
+import type { ErrorSpec, FunctionReference, ShardSpec, Visibility } from "@freecorps/ember-values";
 import { createContext, createElement, useContext, useMemo, type ReactNode } from "react";
 
-/** The app's query that returns the client-visible values (`ff.forClient(ctx, context)`). */
-export type FlagsQuery<Args extends Record<string, unknown>> = FunctionReference<"query", Visibility, Args, Record<string, unknown>, never, null>;
+/**
+ * The app's query that returns the client-visible values (`ff.forClient(ctx, context)`). Any declared errors and shard
+ * kind fit: an error of the query is not thrown (every flag serves its default).
+ */
+export type FlagsQuery<Args extends Record<string, unknown>> = FunctionReference<"query", Visibility, Args, Record<string, unknown>, ErrorSpec, ShardSpec | null>;
 
 export interface FlagsState {
   /** The values by key (undefined while loading). */
@@ -44,16 +47,17 @@ export interface FlagsProviderProps<Args extends Record<string, unknown>> {
 /** Runs the flags query once for the tree below; `useFlag` reads from it. */
 export function FlagsProvider<Args extends Record<string, unknown>>(props: FlagsProviderProps<Args>): ReactNode {
   const snap = (useQuerySnapshot as unknown as LooseSnapshot)(props.query, props.args, props.shard === undefined ? undefined : { shard: props.shard });
+  const skip = props.args === "skip";
   const state = useMemo(
     (): FlagsState =>
-      props.args === "skip"
+      skip
         ? { values: undefined, loading: false, error: undefined }
         : snap.status === "success"
           ? { values: (snap.value ?? {}) as Record<string, unknown>, loading: false, error: undefined }
           : snap.status === "error"
             ? { values: undefined, loading: false, error: snap.error instanceof Error ? snap.error : new Error(String(snap.error)) }
             : EMPTY,
-    [props.args === "skip", snap.status, snap.value, snap.error],
+    [skip, snap.status, snap.value, snap.error],
   );
   return createElement(FlagsContext.Provider, { value: state }, props.children);
 }
@@ -67,8 +71,11 @@ export function useFlags(): FlagsState {
 
 /**
  * A flag's value, or `fallback` while loading, when the flag is missing or not client-visible, or when its value is
- * not of the fallback's type (`typeof`; a `null` fallback accepts anything).
+ * not of the fallback's type (`typeof`). A `null` or `undefined` fallback accepts any value, so the result is then
+ * `unknown` (narrow it yourself).
  */
+export function useFlag(key: string, fallback: null | undefined): unknown;
+export function useFlag<V>(key: string, fallback: V): V;
 export function useFlag<V>(key: string, fallback: V): V {
   const { values } = useFlags();
   const value = values?.[key];

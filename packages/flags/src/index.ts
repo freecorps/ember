@@ -59,10 +59,11 @@ export interface FlagsComponentApi {
 }
 
 /** A flag the app declares: its type and the value served when the flag is missing or holds a value of another type. */
-export type FlagSpec<T extends FlagType = FlagType> = { type: T; default: FlagValueOf<T> };
+// Distributive: `FlagSpec` is a union of one shape per type, so `{ type: "boolean", default: "on" }` does not fit.
+export type FlagSpec<T extends FlagType = FlagType> = T extends FlagType ? { type: T; default: FlagValueOf<T> } : never;
 export type FlagSpecs = Record<string, FlagSpec>;
 /** The value of a declared flag. */
-export type SpecValue<S> = S extends FlagSpec<infer T> ? FlagValueOf<T> : unknown;
+export type SpecValue<S> = S extends { type: infer T extends FlagType } ? FlagValueOf<T> : unknown;
 /** Every declared flag's value, plus the undeclared ones (`unknown`). */
 export type FlagValues<Specs extends FlagSpecs> = { [K in keyof Specs]: SpecValue<Specs[K]> } & Record<string, unknown>;
 
@@ -133,8 +134,12 @@ export class FeatureFlags<Specs extends FlagSpecs = {}> {
   forClient(ctx: SyncCtx | AsyncCtx, context: FlagContext = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
     const r = ctx.runQuery(this.component.lib.forClient, { context }) as Record<string, unknown> | Promise<Record<string, unknown>>;
     return then(r, (values) => {
-      for (const k of Object.keys(values)) if (this.specs[k] && flagValueError(this.specs[k]!.type, values[k]) !== null) values[k] = this.specs[k]!.default;
-      return values;
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(values)) {
+        const s = this.specs[k];
+        out[k] = s && flagValueError(s.type, v) !== null ? s.default : v;
+      }
+      return out;
     });
   }
 
