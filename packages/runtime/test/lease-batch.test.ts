@@ -28,7 +28,7 @@ const LEASE_RPCS = ["claimActionJob", "settleActionJob", "claimActionJobs", "set
  * (a slow hop: the lease starts when it arrives). `failClaimOf`: job ids whose one-job claim fails (the RPC itself).
  * `settled`: every outcome reported, with when.
  */
-function countingEnv(missing: string[] = [], claimDelayMs = 0, failClaimOf: string[] = []) {
+function countingEnv(missing: string[] = [], claimDelayMs = 0, failClaimOf: string[] = [], failSettleOf: string[] = []) {
   const calls: string[] = [];
   const settled: Array<{ at: number; jobId: string; released?: true; error?: unknown }> = [];
   const ns = env.SHARD;
@@ -44,6 +44,7 @@ function countingEnv(missing: string[] = [], claimDelayMs = 0, failClaimOf: stri
             calls.push(prop);
             if (missing.includes(prop)) return Promise.reject(new Error(`The RPC receiver does not implement the method "${prop}".`));
             if (prop === "claimActionJob" && failClaimOf.includes(args[1] as string)) return Promise.reject(new Error("network connection lost"));
+            if (prop === "settleActionJob" && failSettleOf.includes(args[1] as string)) return Promise.reject(new Error("network connection lost"));
             if (prop === "settleActionJobs") for (const o of args[1] as Array<{ jobId: string }>) settled.push({ at: Date.now(), ...o });
             if (prop === "claimActionJobs" && claimDelayMs) return sleep(claimDelayMs).then(() => (v as (...a: unknown[]) => unknown)(...args));
             return (v as (...a: unknown[]) => unknown)(...args);
@@ -179,6 +180,19 @@ describe("leased action jobs, per shard and batch", () => {
     expect(again[0]!.acked).toBe(true);
     expect(await labels(shard)).toEqual(["p1", "p2", "p3"]);
     expect((await shardStub(shard).inspect()).jobs).toEqual([]);
+  });
+
+  it("a shard without settleActionJobs: one refused one-job settle does not leave the others unreported", async () => {
+    const shard = "leaseb:old-settle";
+    const msgs = await dispatched(shard, "actions:record", ["s1", "s2", "s3"]);
+    const lost = msgs[0]!.jobId;
+    const { env: e, calls } = countingEnv(["settleActionJobs"], 0, [], [lost]);
+    const out = await deliverBatch(msgs, e);
+    expect(out.every((d) => d.acked && !d.retried)).toBe(true);
+    expect(calls.filter((c) => c === "settleActionJob")).toHaveLength(3);
+    expect(await labels(shard)).toEqual(["s1", "s2", "s3"]);
+    // Only the one whose report was refused is still claimed (its lease brings it back); the others are settled.
+    expect((await shardStub(shard).inspect()).jobs.map((j) => [j.job_id, j.state])).toEqual([[lost, "claimed"]]);
   });
 
   it("a claimed job handed back unstarted (`released`) runs in the shard now, not when its lease runs out", async () => {
