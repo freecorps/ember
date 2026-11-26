@@ -58,6 +58,11 @@ const stringValue = (n: unknown): string | null => {
   if (is(n, "TemplateLiteral") && n.expressions.length === 0) return n.quasis[0]?.value.cooked ?? null;
   return null;
 };
+/** A property's static key: `{ a: ... }` / `{ "a": ... }` (not computed `[a]`). */
+const keyName = (p: unknown): string | null => {
+  if (!is(p, "Property") || p.computed) return null;
+  return is(p.key, "Identifier") ? p.key.name : stringValue(p.key);
+};
 /** `"chat/messages:send"` → `api.chat.messages.send` (null for component names, which have no api path). */
 const apiPath = (name: string): string | null => {
   if (name.includes("@") || name.includes("$")) return null;
@@ -111,7 +116,7 @@ function handlerOf(arg: unknown, field = "handler"): Fn | undefined {
   if (isFn(arg)) return field === "handler" ? arg : undefined;
   if (!is(arg, "ObjectExpression")) return undefined;
   for (const p of arg.properties) {
-    if (is(p, "Property") && is(p.key, "Identifier") && p.key.name === field && isFn(p.value)) return p.value;
+    if (is(p, "Property") && keyName(p) === field && isFn(p.value)) return p.value;
   }
   return undefined;
 }
@@ -144,14 +149,17 @@ function builderOf(n: unknown, aliases: Aliases): Builder | null {
   return null;
 }
 
-/** Top-level `const x = <builder>` (also exported), chains included. */
+/**
+ * Top-level `const x = <builder>` (also exported), chains included. Only `const`: a `let` may be reassigned
+ * (`let b = query; b = action`), so what it holds at a call is not known from its declaration.
+ */
 function collectAliases(program: unknown): Aliases {
   const aliases: Aliases = new Map();
   if (!is(program, "Program")) return aliases;
   const decls: Array<[string, unknown]> = [];
   for (const st of program.body) {
     const d = is(st, "VariableDeclaration") ? st : is(st, "ExportNamedDeclaration") && is(st.declaration, "VariableDeclaration") ? st.declaration : null;
-    if (d) for (const v of d.declarations) if (is(v.id, "Identifier") && v.init && (isUse((v.init as { callee?: unknown }).callee) || is(v.init, "Identifier") || is(v.init, "MemberExpression"))) decls.push([v.id.name, v.init]);
+    if (d?.kind === "const") for (const v of d.declarations) if (is(v.id, "Identifier") && v.init && (isUse((v.init as { callee?: unknown }).callee) || is(v.init, "Identifier") || is(v.init, "MemberExpression"))) decls.push([v.id.name, v.init]);
   }
   for (let changed = true; changed; ) {
     changed = false;
@@ -177,13 +185,14 @@ function roleOf(fn: Fn, aliases: Aliases): Role | null {
   let arg: unknown = fn;
   let field: "handler" | "authorize" = "handler";
   const parent = parentOf(fn);
-  if (is(parent, "Property") && parent.value === fn && is(parent.key, "Identifier")) {
+  const key = keyName(parent);
+  if (is(parent, "Property") && parent.value === fn && key !== null) {
     const obj = parentOf(parent);
-    // defineTriggers({ table: fn }) / defineTriggers({ table: [fn, fn] })
+    // defineTriggers({ table: fn }) / defineTriggers({ "table": [fn, fn] })
     const call = parentOf(obj);
     if (is(call, "CallExpression") && call.arguments[0] === obj && is(call.callee, "Identifier") && call.callee.name === "defineTriggers") return { builder: TRIGGERS_BUILDER, role: "trigger" };
-    if (parent.key.name !== "handler" && parent.key.name !== "authorize") return null;
-    field = parent.key.name;
+    if (key !== "handler" && key !== "authorize") return null;
+    field = key;
     arg = obj;
   } else if (is(parent, "ArrayExpression")) {
     const prop = parentOf(parent);
@@ -339,18 +348,20 @@ const LOOPS = new Set(["ForStatement", "ForInStatement", "ForOfStatement", "Whil
 
 /**
  * Whether `node` runs once per iteration of a loop of its own function: a loop body (or its per-iteration test),
- * or a callback of `xs.map/forEach/...` / `Array.from(xs, fn)`. Other nested functions end the search (defined, not
- * necessarily run), and so does `Promise.all(xs.map(...))`, the way to run calls together.
+ * or a callback of `xs.map/forEach/...` / `Array.from(xs, fn)`. Other nested functions (declarations too) end the
+ * search: defined, not necessarily run. `"parallel"`: the callback of `Promise.all(xs.map(...))`, which starts the
+ * calls together; still once per element, so only the round trips of actions are not repeated one after another.
  */
-function inLoop(context: Context, node: Node): boolean {
+function inLoop(context: Context, node: Node): false | "sequential" | "parallel" {
   const chain = context.sourceCode.getAncestors(node);
   let child: unknown = node;
   for (let i = chain.length - 1; i >= 0; i--) {
     const a = chain[i] as Node;
     if (LOOPS.has(a.type)) {
       const l = a as unknown as { body: unknown; test?: unknown; update?: unknown };
-      if (child === l.body || (a.type !== "ForInStatement" && a.type !== "ForOfStatement" && (child === l.test || child === l.update))) return true;
+      if (child === l.body || (a.type !== "ForInStatement" && a.type !== "ForOfStatement" && (child === l.test || child === l.update))) return "sequential";
     }
+    if (is(a, "FunctionDeclaration")) return false;
     if (isFn(a)) {
       const call = parentOf(a);
       if (!is(call, "CallExpression") || !call.arguments.includes(a as never)) return false;
@@ -358,8 +369,8 @@ function inLoop(context: Context, node: Node): boolean {
       const iterates = (m !== null && ITERATORS.has(m) && call.arguments[0] === a) || (dotted(call.callee) === "Array.from" && call.arguments[1] === a);
       if (!iterates) return false;
       const outer = parentOf(call);
-      if (is(outer, "CallExpression") && outer.arguments[0] === call && PARALLEL.has(dotted(outer.callee) ?? "")) return false;
-      return true;
+      if (is(outer, "CallExpression") && outer.arguments[0] === call && PARALLEL.has(dotted(outer.callee) ?? "")) return "parallel";
+      return "sequential";
     }
     child = a;
   }
@@ -387,7 +398,10 @@ const noDbInLoop: Rule = {
         if (isDb(object) && (DB_READS.has(m) || DB_WRITES.has(m))) messageId = DB_READS.has(m) ? "read" : "write";
         else if (RUN.has(m) && is(parentOf(node), "AwaitExpression")) messageId = "roundTrip";
         else return;
-        if (!inLoop(context, node)) return;
+        const loop = inLoop(context, node);
+        // `Promise.all(ids.map((id) => ctx.db.get(id)))`: the database API is synchronous, so the reads still run
+        // one per element (N+1); only an action's `await ctx.run*` calls really run together there.
+        if (!loop || (loop === "parallel" && messageId === "roundTrip")) return;
         const call = `${context.sourceCode.getText(object as Node)}.${m}()`;
         context.report({ node, messageId, data: { call } });
       },
@@ -418,7 +432,7 @@ const noThrowRawError: Rule = {
         let child: unknown = node;
         for (let i = chain.length - 1; i >= 0; i--) {
           const a = chain[i];
-          if (isFn(a)) break;
+          if (isFn(a) || is(a, "FunctionDeclaration")) break;
           if (is(a, "TryStatement") && a.handler && child === a.block) return;
           child = a;
         }
@@ -445,7 +459,7 @@ const requireArgsValidators: Rule = {
         const arg = node.arguments[0];
         const h = handlerOf(arg);
         if (!arg || !h || h.params.length < 2) return;
-        const hasArgs = is(arg, "ObjectExpression") && arg.properties.some((p) => is(p, "Property") && is(p.key, "Identifier") && p.key.name === "args");
+        const hasArgs = is(arg, "ObjectExpression") && arg.properties.some((p) => keyName(p) === "args");
         if (!hasArgs) context.report({ node: arg, messageId: "args", data: { kind: node.callee.name } });
       },
     };

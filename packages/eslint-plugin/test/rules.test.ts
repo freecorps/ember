@@ -59,6 +59,9 @@ tester.run("no-async-query-handler", rules["no-async-query-handler"] as never, {
     "client.query(api.x.y, { handler: async () => 1 })",
     "app.use(async (req, res) => {})",
     "query({ handler: (ctx) => { const later = async () => 1; return 1; } })",
+    // A `let` may be reassigned: what it holds at the call is not known from its declaration.
+    "let build = query; build = action; export const a = build({ handler: async () => 1 });",
+    "let authed = query.use(mw); authed = action.use(mw); export const a = authed({ handler: async () => 1 });",
   ],
   invalid: [
     { code: "query({ args: {}, handler: async (ctx) => 1 })", errors: [{ messageId: "async", data: { kind: "query" } }] },
@@ -69,6 +72,9 @@ tester.run("no-async-query-handler", rules["no-async-query-handler"] as never, {
     // Triggers run inside the mutation's transaction.
     { code: "export default defineTriggers({ messages: async (ctx, change) => {} })", errors: [{ messageId: "async", data: { kind: "defineTriggers" } }] },
     { code: "export default defineTriggers({ messages: [(ctx) => {}, async function (ctx) {}] })", errors: [{ messageId: "async" }] },
+    // Quoted keys are the same keys.
+    { code: 'export default defineTriggers({ "messages": async () => {} })', errors: [{ messageId: "async", data: { kind: "defineTriggers" } }] },
+    { code: 'query({ "handler": async (ctx) => 1 })', errors: [{ messageId: "async", data: { kind: "query" } }] },
     // Handlers of builders made with `.use()`: inline, chained, or stored in a variable (also exported, also chained).
     { code: "export const x = query.use(mw)({ handler: async (ctx) => 1 })", errors: [{ messageId: "async" }] },
     { code: "export const x = mutation.use(a).use(b)(async (ctx) => 1)", errors: [{ messageId: "async" }] },
@@ -77,6 +83,8 @@ tester.run("no-async-query-handler", rules["no-async-query-handler"] as never, {
     { code: "const authed = query.use(mw); const admin = authed.use(async (ctx) => ({}));", errors: [{ messageId: "async", data: { kind: "authed.use" } }] },
     // componentBuilders: `cb.query(...)` / destructured.
     { code: "const cb = componentBuilders(); export const get = cb.query({ handler: async (ctx) => 1 });", errors: [{ messageId: "async" }] },
+    // A `const` alias is still tracked.
+    { code: "const build = query; export const a = build({ handler: async () => 1 });", errors: [{ messageId: "async", data: { kind: "build" } }] },
   ],
 });
 
@@ -130,12 +138,20 @@ tester.run("no-db-in-loop", rules["no-db-in-loop"] as never, {
     "for (const id of ids) promises.push(ctx.runQuery(api.x.get, { id }));",
     // A function defined in a loop is not run by it.
     "for (const id of ids) handlers.set(id, () => ctx.db.get(id));",
+    "for (const id of ids) { function load() { return ctx.db.get(id); } handlers.push(load); }",
+    // An action's calls started together.
+    "await Promise.all(ids.map(async (id) => await ctx.runQuery(api.x.get, { id })))",
     "rows.map((r) => r.n)",
     "xs.sort((a, b) => a - b)",
   ],
   invalid: [
     { code: "for (const id of ids) out.push(ctx.db.get(id));", errors: [{ messageId: "read", data: { call: "ctx.db.get()" } }] },
     { code: "ids.map((id) => ctx.db.get(id))", errors: [{ messageId: "read" }] },
+    // Promise.all does not batch database calls: they are synchronous, one per element all the same (N+1).
+    { code: "await Promise.all(ids.map((id) => ctx.db.get(id)))", errors: [{ messageId: "read", data: { call: "ctx.db.get()" } }] },
+    { code: "await Promise.all(rows.map(async (r) => ctx.db.patch(r._id, { seen: true })))", errors: [{ messageId: "write" }] },
+    // A function declared in the loop and called there.
+    { code: "for (const id of ids) { const load = () => 1; out.push(ctx.db.get(id)); }", errors: [{ messageId: "read" }] },
     { code: "rows.forEach((r) => { ctx.db.patch(r._id, { seen: true }); })", errors: [{ messageId: "write", data: { call: "ctx.db.patch()" } }] },
     { code: "for (const t of done) ctx.db.delete(t._id);", errors: [{ messageId: "write" }] },
     { code: "let i = 0; while (i < n) { db.insert('t', { i }); i++; }", errors: [{ messageId: "write", data: { call: "db.insert()" } }] },
@@ -169,12 +185,15 @@ tester.run("no-throw-raw-error", rules["no-throw-raw-error"] as never, {
     { code: "const authed = mutation.use(mw); export const x = authed({ handler: (ctx) => { throw new Error('x'); } });", errors: [{ messageId: "raw" }] },
     // A try without catch does not handle it.
     { code: "mutation({ handler: (ctx) => { try { throw new Error('x'); } finally { cleanup(); } } })", errors: [{ messageId: "raw" }] },
+    // A helper declared inside a try throws when called, not inside that try.
+    { code: "mutation({ handler: (ctx) => { try { function f() { throw new Error('x'); } } catch {} return f(); } })", errors: [{ messageId: "raw" }] },
   ],
 });
 
 tester.run("require-args-validators", rules["require-args-validators"] as never, {
-  valid: ["query({ args: { id: v.string() }, handler: (ctx, { id }) => id })", "query({ handler: (ctx) => 1 })", "internalQuery({ handler: (ctx, a) => a })"],
+  valid: ["query({ args: { id: v.string() }, handler: (ctx, { id }) => id })", "query({ handler: (ctx) => 1 })", "internalQuery({ handler: (ctx, a) => a })", "query({ \"args\": { id: v.string() }, \"handler\": (ctx, { id }) => id })"],
   invalid: [
+    { code: 'mutation({ "handler": (ctx, { id }) => id })', errors: [{ messageId: "args" }] },
     { code: "mutation({ handler: (ctx, { id }) => id })", errors: [{ messageId: "args" }] },
     { code: "mutationGeneric({ handler: (ctx, { id }) => id })", errors: [{ messageId: "args" }] },
   ],
