@@ -55,6 +55,9 @@ tester.run("no-async-query-handler", rules["no-async-query-handler"] as never, {
     // Action middlewares and actions built from a `.use()` chain may be async.
     "const authedAction = action.use(async (ctx) => ({ ctx: {} })); export const a = authedAction({ handler: async (ctx) => 1 });",
     "export default defineTriggers({ messages: (ctx, change) => {}, log: [(ctx) => {}, function (ctx) {}] })",
+    // A parameter (or local) of the alias's name is not the file's builder.
+    "const build = query; function make(build) { return build({ handler: async () => 1 }); } make(action);",
+    "function make(query) { return query({ handler: async () => 1 }); }",
     // Not builders: the client, express-like `.use`, a promise callback.
     "client.query(api.x.y, { handler: async () => 1 })",
     "app.use(async (req, res) => {})",
@@ -66,6 +69,8 @@ tester.run("no-async-query-handler", rules["no-async-query-handler"] as never, {
   invalid: [
     { code: "query({ args: {}, handler: async (ctx) => 1 })", errors: [{ messageId: "async", data: { kind: "query" } }] },
     { code: "internalMutation(async (ctx) => null)", errors: [{ messageId: "async" }] },
+    // The unshadowed alias is still the builder (even inside a function).
+    { code: "const build = query; function make() { return build({ handler: async () => 1 }); }", errors: [{ messageId: "async", data: { kind: "build" } }] },
     { code: "queryGeneric({ handler: async (ctx) => 1 })", errors: [{ messageId: "async" }] },
     { code: "query({ authorize: async (ctx) => {}, handler: (ctx) => 1 })", errors: [{ messageId: "async" }] },
     { code: "const authed = mutation.use(async (ctx) => ({ ctx: {} }))", errors: [{ messageId: "async", data: { kind: "mutation.use" } }] },
@@ -121,11 +126,15 @@ tester.run("no-collect-length", rules["no-collect-length"] as never, {
     "ctx.db.query('messages').first() !== null",
     "const all = ctx.db.query('messages').collect(); return all.length + all.map(f).length;",
     "stream.collect().length",
+    // Not a database: a local object with a `query` method.
+    "const local = { query: () => ({ collect: () => [1, 2] }) }; local.query().collect().length;",
+    "repo.query('x').withIndex('y').collect().length",
   ],
   invalid: [
     { code: "ctx.db.query('messages').collect().length", errors: [{ messageId: "length" }] },
     { code: "ctx.db.query('m').withIndex('by_room', (q) => q.eq('room', r)).collect().length", errors: [{ messageId: "length" }] },
     { code: "db.query('m').filter((q) => q.eq(q.field('a'), 1)).order('desc').collect().length", errors: [{ messageId: "length" }] },
+    { code: "this.ctx.db.query('m').withSearchIndex('s', (q) => q.search('t', x)).collect().length", errors: [{ messageId: "length" }] },
   ],
 });
 

@@ -143,7 +143,11 @@ const isUse = (n: unknown): n is Extract<Node, { type: "MemberExpression" }> => 
  * holding one, or any of them with `.use(mw)` applied (a builder too).
  */
 function builderOf(n: unknown, aliases: Aliases): Builder | null {
-  if (is(n, "Identifier")) return aliases.get(n.name) ?? (BUILDERS[n.name] ? { ...BUILDERS[n.name]!, name: n.name } : null);
+  if (is(n, "Identifier")) {
+    // A parameter or local of the same name (`function make(build) { build({...}) }`) is not the file's builder.
+    if (shadowedIn.get(aliases)?.(n)) return null;
+    return aliases.get(n.name) ?? (BUILDERS[n.name] ? { ...BUILDERS[n.name]!, name: n.name } : null);
+  }
   if (is(n, "MemberExpression") && !n.computed && is(n.property, "Identifier") && BUILDERS[n.property.name]) return { ...BUILDERS[n.property.name]!, name: n.property.name };
   if (is(n, "CallExpression") && isUse(n.callee)) return builderOf(n.callee.object, aliases);
   return null;
@@ -223,10 +227,26 @@ function enclosingRole(context: Context, node: Node, aliases: Aliases): Role | n
   return null;
 }
 
+/**
+ * Per-alias-map check: does this identifier resolve to a binding inside a function or block (a parameter, a local)
+ * rather than to the file's own (module or global) one? Lexical, through ESLint's scope manager.
+ */
+const shadowedIn = new WeakMap<Aliases, (id: Extract<Node, { type: "Identifier" }>) => boolean>();
+
 /** Per-file builder aliases, computed once. */
 function aliasesOf(context: Context): () => Aliases {
   let cached: Aliases | undefined;
-  return () => (cached ??= collectAliases(context.sourceCode.ast));
+  return () => {
+    if (cached) return cached;
+    const aliases = collectAliases(context.sourceCode.ast);
+    shadowedIn.set(aliases, (id) => {
+      for (let scope: ReturnType<typeof context.sourceCode.getScope> | null = context.sourceCode.getScope(id); scope; scope = scope.upper) {
+        if (scope.set.has(id.name)) return scope.type !== "module" && scope.type !== "global";
+      }
+      return false;
+    });
+    return (cached = aliases);
+  };
 }
 
 const noAsyncQueryHandler: Rule = {
@@ -302,12 +322,14 @@ const noNondeterministicInSync: Rule = {
 // ------------------------------------------------------------------ no-collect-length
 
 const memberName = (n: unknown): string | null => (is(n, "MemberExpression") && !n.computed && is(n.property, "Identifier") ? n.property.name : null);
-/** `x.query(...)...` / `x.withIndex(...)`: a database query chain (not any `.collect()`). */
+/** `db` or `<anything>.db` (`ctx.db`, `this.ctx.db`): a database the chain is read from. */
+const isDbRoot = (n: unknown): boolean => (is(n, "Identifier") && n.name === "db") || memberName(n) === "db";
+
+/** `ctx.db.query(...)...` (`.withIndex(...)`, `.withSearchIndex(...)` on it): a database query chain, not any `.collect()`. */
 function isDbChain(n: unknown): boolean {
   for (let cur = n; ; ) {
     if (is(cur, "CallExpression")) {
-      const m = memberName(cur.callee);
-      if (m === "query" || m === "withIndex" || m === "withSearchIndex") return true;
+      if (memberName(cur.callee) === "query" && is(cur.callee, "MemberExpression")) return isDbRoot(cur.callee.object);
       cur = cur.callee;
     } else if (is(cur, "MemberExpression")) cur = cur.object;
     else return false;
