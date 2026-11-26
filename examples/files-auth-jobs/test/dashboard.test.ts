@@ -423,10 +423,10 @@ describe("dashboard → runtime (workerd)", () => {
     expect(rep.body.sources["global:main"]).toMatchObject({ enabled: true, maxAttempts: 10, outbox: { seq: expect.any(Number), depth: expect.any(Number), parked: 0 } });
     const resync = await write("/api/replicas/resync", { project: "files-auth-jobs", env: "test", shard: "org:dash-resync", source: "global:main" });
     expect(resync).toMatchObject({ status: 200, body: { ok: true } });
-    // Stuck uploads of a shard (read role).
-    const stuck = await read<{ value: { rows: unknown[]; totals: { count: number } } }>(`/api/files/stuck?${q}&shard=global:main&graceMs=0`);
+    // Stuck uploads of a shard (read role): a shard no test wrote has none.
+    const stuck = await read<{ value: { rows: unknown[]; totals: { count: number; bytes: number; referenced: number }; done: boolean; graceMs: number } }>(`/api/files/stuck?${q}&shard=org:dash-stuck&graceMs=0`);
     expect(stuck.status).toBe(200);
-    expect(stuck.body.value.totals.count).toBeGreaterThanOrEqual(0);
+    expect(stuck.body.value).toMatchObject({ rows: [], done: true, totals: { count: 0, bytes: 0, referenced: 0 }, graceMs: 0 });
     // An orphan in the real bucket: listed by a dry run, deleted on the typed confirmation; a key a file row has is kept.
     const orphan = `f/Z2xvYmFsOm1haW4/${"0d".repeat(32)}`;
     await env.EMBER_FILES.put(orphan, "orphan");
@@ -448,5 +448,10 @@ describe("dashboard → runtime (workerd)", () => {
     // The refusal that asked for the confirmation ran nothing (428, before the audit row); the two writes are logged.
     const log = await read<{ entries: Array<{ action: string; outcome: string }> }>(`/api/audit?${q}&limit=2`);
     expect(log.body.entries.map((e) => [e.action, e.outcome])).toEqual([["file.orphans_delete", "ok"], ["replica.resync", "ok"]]);
+    // Collecting a stuck row the shard does not have: confirmed with the shard, refused row by row, nothing queued.
+    const id = "_storage_01JDZ8Q6Y2K3M4N5P6Q7R8S9TV";
+    const gone = await write("/api/files/stuck/delete", { project: "files-auth-jobs", env: "test", shard: "org:dash-stuck", ids: [id], graceMs: 0, confirm: "org:dash-stuck" });
+    expect(gone.status).toBe(200);
+    expect((gone.body as unknown as { value: unknown }).value).toEqual({ queued: [], refused: [{ id, reason: "not_found" }], graceMs: 0 });
   });
 });

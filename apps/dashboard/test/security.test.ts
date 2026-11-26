@@ -730,8 +730,11 @@ describe("local dev mode (`ember dev --dashboard`, DASHBOARD_DEV)", () => {
 
 describe("replication and storage cleanup (admin API level 18)", () => {
   const h = { headers: { authorization: "Bearer read-secret" } };
-  /** ADMIN_FEATURES of @freecorps/ember-runtime at level 16 (before the Replication screen and storage cleanup). */
-  const level16 = ["capabilities", "status", "data", "replicas", "replicas/resync", "files/orphans", "files/delete", "sql"];
+  /**
+   * Features of a runtime at level 17 (before the Replication screen and storage cleanup): `replicas` and
+   * `replicas/resync` are level 10, the orphan listing `files/orphans` level 12, `dashboards/embed` level 17.
+   */
+  const level17 = ["capabilities", "status", "data", "replicas", "replicas/resync", "files/orphans", "files/delete", "sql", "dashboards", "dashboards/embed"];
 
   it("the read role sees replication and the orphan listing; the listing never asks the project to delete", async () => {
     const t = setup();
@@ -776,6 +779,14 @@ describe("replication and storage cleanup (admin API level 18)", () => {
     expect(t.project.calls.slice(before).filter((c) => c.method === "POST")).toEqual([]);
   });
 
+  it("stuck ids are `_files` ids as the runtime makes them: `_storage_<ULID>`, or a Convex id kept by `ember import`", async () => {
+    const t = setup();
+    const ids = ["_storage_01JDZ8Q6Y2K3M4N5P6Q7R8S9TV", "jd7c6x5mbkxd2w6k3f0b0n9q9h6y2r1a"];
+    const res = await t.post("/api/files/stuck/delete", { project: "chat", env: "dev", shard: "org:acme", ids, confirm: "org:acme" });
+    expect(res.status).toBe(200);
+    expect(t.project.calls.at(-1)!.body).toEqual({ shard: "org:acme", ids });
+  });
+
   it("a resync is audited as replica.resync with its source, and asks for no typed confirmation", async () => {
     const t = setup();
     const res = await t.post("/api/replicas/resync", { project: "chat", env: "prod", shard: "org:acme", source: "global:main" });
@@ -786,7 +797,7 @@ describe("replication and storage cleanup (admin API level 18)", () => {
   });
 
   it("a runtime before level 18: runtime_outdated for the orphan delete and stuck rows, the rest still answers", async () => {
-    const t = setup({ features: level16 });
+    const t = setup({ features: level17 });
     expect((await t.call("GET", "/api/replicas?project=chat&env=prod", h)).status).toBe(200);
     expect((await t.call("GET", "/api/files/orphans?project=chat&env=prod", h)).status).toBe(200);
     const stuck = await t.call("GET", "/api/files/stuck?project=chat&env=prod&shard=org:acme", h);
