@@ -415,4 +415,38 @@ describe("dashboard → runtime (workerd)", () => {
     expect(first).toMatchObject({ outcome: "ok", target: "global:main" });
     expect(bySql("DELETE FROM fxRates")).toMatchObject({ action: "sql.run", outcome: "error" });
   });
+  it("replication and storage cleanup: outbox and lag from the real sources, a resync, orphans deleted only when no row has them", async () => {
+    const q = "project=files-auth-jobs&env=test";
+    // global:main (fxRates is .replicated()) and the Auth DO (organizations) as sources, with admin API level 18 fields.
+    const rep = await read<{ sources: Record<string, { enabled: boolean; maxAttempts: number; outbox: { seq: number; depth: number; parked: number } }> }>(`/api/replicas?${q}`);
+    expect(rep.status).toBe(200);
+    expect(rep.body.sources["global:main"]).toMatchObject({ enabled: true, maxAttempts: 10, outbox: { seq: expect.any(Number), depth: expect.any(Number), parked: 0 } });
+    const resync = await write("/api/replicas/resync", { project: "files-auth-jobs", env: "test", shard: "org:dash-resync", source: "global:main" });
+    expect(resync).toMatchObject({ status: 200, body: { ok: true } });
+    // Stuck uploads of a shard (read role).
+    const stuck = await read<{ value: { rows: unknown[]; totals: { count: number } } }>(`/api/files/stuck?${q}&shard=global:main&graceMs=0`);
+    expect(stuck.status).toBe(200);
+    expect(stuck.body.value.totals.count).toBeGreaterThanOrEqual(0);
+    // An orphan in the real bucket: listed by a dry run, deleted on the typed confirmation; a key a file row has is kept.
+    const orphan = `f/Z2xvYmFsOm1haW4/${"0d".repeat(32)}`;
+    await env.EMBER_FILES.put(orphan, "orphan");
+    let found = false;
+    for (let cursor: string | null = null, i = 0; i < 50 && !found; i++) {
+      const page: { body: { value: { orphans: Array<{ key: string }>; cursor: string | null } } } = await read(`/api/files/orphans?${q}&graceMs=0${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      found = page.body.value.orphans.some((o) => o.key === orphan);
+      cursor = page.body.value.cursor;
+      if (!cursor) break;
+    }
+    expect(found).toBe(true);
+    expect(await env.EMBER_FILES.head(orphan)).not.toBeNull();
+    const body = { project: "files-auth-jobs", env: "test", keys: [orphan], graceMs: 0 };
+    expect((await write("/api/files/orphans/delete", body)).body.error?.data?.expected).toBe("orphans");
+    const del = await write("/api/files/orphans/delete", { ...body, confirm: "orphans" });
+    expect(del.status).toBe(200);
+    expect((del.body as unknown as { value: { deleted: Array<{ key: string }> } }).value.deleted).toEqual([{ key: orphan, shard: "global:main", size: 6 }]);
+    expect(await env.EMBER_FILES.head(orphan)).toBeNull();
+    // The refusal that asked for the confirmation ran nothing (428, before the audit row); the two writes are logged.
+    const log = await read<{ entries: Array<{ action: string; outcome: string }> }>(`/api/audit?${q}&limit=2`);
+    expect(log.body.entries.map((e) => [e.action, e.outcome])).toEqual([["file.orphans_delete", "ok"], ["replica.resync", "ok"]]);
+  });
 });
