@@ -79,6 +79,39 @@ export function href(r: { project: string; env: string; section?: string | undef
   return `#/p/${seg}`;
 }
 
+/** Fired when a navigation targets the route already shown (the hash would not change): the page reloads its data. */
+const RENAVIGATE = "ember:renavigate";
+
+/** Same page: the hashes parse to the same route (`#/` and `` are both the projects list; encoding aside). */
+export function sameRoute(a: string, b: string): boolean {
+  const x = parseHash(a);
+  const y = parseHash(b);
+  const rx = x.rest ?? [];
+  const ry = y.rest ?? [];
+  // Field by field (not the objects' JSON, which depends on the order parseHash builds them in).
+  return x.page === y.page && x.project === y.project && x.env === y.env && x.section === y.section && x.shard === y.shard && x.fn === y.fn && x.user === y.user && rx.length === ry.length && rx.every((s, i) => s === ry[i]);
+}
+
+/**
+ * Goes to `hash`. Choosing the route already shown re-runs the navigation instead of doing nothing: the shell remounts
+ * the page (`useRenavigations`), so its data loads again.
+ */
+export function navigate(hash: string): void {
+  if (sameRoute(location.hash, hash)) dispatchEvent(new Event(RENAVIGATE));
+  else location.hash = hash;
+}
+
+/** Counts same-route navigations (a key for the page: it remounts on each). */
+export function useRenavigations(): number {
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const f = () => setN((x) => x + 1);
+    addEventListener(RENAVIGATE, f);
+    return () => removeEventListener(RENAVIGATE, f);
+  }, []);
+  return n;
+}
+
 export function useRoute(): Route {
   const [h, setH] = useState(location.hash);
   useEffect(() => {

@@ -279,7 +279,8 @@ export function ConfirmDialog({
   }, [open]);
   const ok = !expected || typed === expected;
   return (
-    <Dialog open={open} onClose={onCancel} title={title}>
+    // While the write is in flight the dialog stays (Esc and × too, like Cancel): its answer belongs to this dialog.
+    <Dialog open={open} onClose={busy ? () => {} : onCancel} title={title}>
       <form
         onSubmit={(e) => {
           e.preventDefault();

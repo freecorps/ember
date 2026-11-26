@@ -97,6 +97,10 @@ const SQL_AUDIT_CHARS = 2048;
 const SQL_TEXT_MAX = 100_000;
 const SQL_ROWS_MAX = 5000;
 const SQL_PARAMS_MAX = 100;
+/** Keys (orphans) or ids (stuck rows) per storage cleanup write: the runtime's ORPHAN_DELETE_MAX. */
+const ORPHAN_KEYS_MAX = 100;
+/** An R2 object key as the listing shows it (Ember keys are `f/<b64url shard>/<sha256>` and `t/<b64url shard>/<id>`). */
+const OBJECT_KEY = /^[\x21-\x7e]{1,512}$/;
 /** `data/list` arguments of admin API level 16 (`id`, range bounds, `search`): older runtimes would ignore them. */
 const ROWS_V2 = ["id", "gt", "gte", "lt", "lte", "search"];
 
@@ -689,6 +693,101 @@ export const ROUTES: Route[] = [
         args: { id },
         confirm: id,
         run: async (c, t) => pass(await projectAdmin(c.env, t, `/api/_ember/files/delete?${new URLSearchParams({ shard: s.shard, id })}`, c.fetch, { method: "POST", body: {} }), t, "files/delete"),
+      };
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/files/orphans",
+    role: "read",
+    feature: "files/orphans",
+    summary: "a page of the files bucket's objects that no `_files` row references (?cursor&limit&graceMs; a dry run: never deletes)",
+    async run(c) {
+      const t = await targetOf(c, "files/orphans");
+      if (t instanceof Response) return t;
+      const cursor = c.q.get("cursor");
+      const limit = c.q.get("limit");
+      const grace = c.q.get("graceMs");
+      if (cursor !== null && (!cursor || cursor.length > 1024)) return err(400, "bad_request", "cursor: the previous page's cursor");
+      if (limit !== null && !/^\d{1,4}$/.test(limit)) return err(400, "bad_request", "limit: an integer");
+      if (grace !== null && !/^\d{1,13}$/.test(grace)) return err(400, "bad_request", "graceMs: a non-negative integer");
+      // The runtime's sweep is a POST (it can delete): this read always sends `delete: false`.
+      const body = { ...(cursor ? { cursor } : {}), ...(limit ? { limit: Number(limit) } : {}), ...(grace ? { graceMs: Number(grace) } : {}), delete: false };
+      return pass(await projectAdmin(c.env, t.target, "/api/_ember/files/orphans", c.fetch, { method: "POST", body }), t.target, "files/orphans");
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/files/orphans/delete",
+    role: "admin",
+    action: "file.orphans_delete",
+    destructive: true,
+    feature: "files/orphans/delete",
+    summary: "delete orphans picked from the listing (1 to 100 object keys); the project checks each again and never deletes a key a `_files` row has",
+    plan(b) {
+      const s = bodyScope(b, false);
+      if (s instanceof Response) return s;
+      const keys = Array.isArray(b.keys) ? b.keys : [];
+      if (!keys.length || keys.length > ORPHAN_KEYS_MAX || !keys.every((k): k is string => typeof k === "string" && OBJECT_KEY.test(k))) return err(400, "bad_request", `keys: 1 to ${ORPHAN_KEYS_MAX} object keys`);
+      const grace = b.graceMs;
+      if (grace !== undefined && (!Number.isSafeInteger(grace) || (grace as number) < 0)) return err(400, "bad_request", "graceMs: a non-negative integer");
+      const unique = [...new Set(keys)];
+      return {
+        ...s,
+        target: unique.length === 1 ? unique[0]! : `${unique.length} objects`,
+        // Object keys name a shard and a hash, no user data; the first ones are kept (the log's row stays small).
+        args: { count: unique.length, keys: unique.slice(0, 10), ...(grace !== undefined ? { graceMs: grace } : {}) },
+        confirm: "orphans",
+        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/files/orphans/delete", c.fetch, { method: "POST", body: { keys: unique, ...(grace !== undefined ? { graceMs: grace } : {}) } }), t, "files/orphans/delete"),
+      };
+    },
+  },
+  adminGet("/api/files/stuck", "files/stuck", ["shard", "cursor", "limit", "graceMs"], "a shard's `_files` rows stuck short of ready (failed, abandoned pending) older than the grace period, with totals"),
+  {
+    method: "POST",
+    path: "/api/files/stuck/delete",
+    role: "admin",
+    action: "file.stuck_delete",
+    destructive: true,
+    feature: "files/stuck/delete",
+    summary: "queue stuck `_files` rows for the shard's GC (1 to 100 ids); the shard refuses referenced, ready or young ones",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const ids = Array.isArray(b.ids) ? b.ids : [];
+      if (!ids.length || ids.length > ORPHAN_KEYS_MAX || !ids.every((i): i is string => typeof i === "string" && DOC_ID.test(i))) return err(400, "bad_request", `ids: 1 to ${ORPHAN_KEYS_MAX} file ids`);
+      const grace = b.graceMs;
+      if (grace !== undefined && (!Number.isSafeInteger(grace) || (grace as number) < 0)) return err(400, "bad_request", "graceMs: a non-negative integer");
+      const unique = [...new Set(ids)];
+      return {
+        ...s,
+        target: unique.length === 1 ? unique[0]! : `${unique.length} files`,
+        args: { count: unique.length, ids: unique.slice(0, 20), ...(grace !== undefined ? { graceMs: grace } : {}) },
+        confirm: s.shard,
+        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/files/stuck/delete", c.fetch, { method: "POST", body: { shard: s.shard, ids: unique, ...(grace !== undefined ? { graceMs: grace } : {}) } }), t, "files/stuck/delete"),
+      };
+    },
+  },
+  adminGet("/api/replicas", "replicas", ["source", "shard"], "cross-shard replication: per source (Auth DO, global:main) the outbox and each target's acked seq, backlog, parked state and last error"),
+  {
+    method: "POST",
+    path: "/api/replicas/resync",
+    role: "admin",
+    action: "replica.resync",
+    destructive: false,
+    feature: "replicas/resync",
+    summary: "resync one target shard from a replication source (it re-reads the rows the shard should hold and replaces them there)",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const source = b.source === undefined ? null : str(b.source);
+      if (source !== null && !LABEL.test(source)) return err(400, "bad_request", "source: a replication source (auth, global:main)");
+      return {
+        ...s,
+        target: s.shard,
+        args: { source },
+        confirm: s.shard,
+        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/replicas/resync", c.fetch, { method: "POST", body: { shard: s.shard, ...(source ? { source } : {}) } }), t, "replicas/resync"),
       };
     },
   },

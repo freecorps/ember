@@ -22,6 +22,7 @@ export {
   enqueueReplica,
   ensureReplicationTables,
   nextReplicationAt,
+  replicationOutbox,
   replicationTargets,
   requestSnapshot,
   REPLICA_APPLY_FN,
@@ -29,6 +30,7 @@ export {
   type ReplicaChange,
   type ReplicationDrain,
   type ReplicationOptions,
+  type ReplicationOutbox,
   type ReplicationTargetRow,
 } from "./replication.ts";
 export {
