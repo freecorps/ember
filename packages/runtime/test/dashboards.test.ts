@@ -83,6 +83,14 @@ describe("dashboards (admin API)", () => {
       expect([r.status, r.body.error.code, r.body.error.message]).toEqual([400, "bad_request", "args must be a JSON object"]);
     }
     expect((await post("dashboards/run", { dashboard: "tally", fn: "@tally/lib:bump", args: [1], shard: "dash:args" })).status).toBe(400);
+    // An explicit null is not "no args"; a shard that is not a string is not global:main.
+    const nullArgs = await post("dashboards/run", { dashboard: "", fn: "components:bump", args: null });
+    expect([nullArgs.status, nullArgs.body.error.code]).toEqual([400, "bad_request"]);
+    for (const shard of [42, "", null]) {
+      const r = await post("dashboards/run", { dashboard: "tally", fn: "@tally/lib:bump", args: { key: "x", by: 1 }, shard });
+      expect([r.status, r.body.error.code], String(shard)).toEqual([400, "bad_shard"]);
+    }
+    expect((await query("tally", "@tally/lib:get", { key: "x" }, "global:main")).body.value).toBe(0);
     // The app's screen is global.
     const app = await query("", "components:count", { key: "g" });
     expect(app.body).toMatchObject({ ok: true, value: 0, shard: "global:main" });

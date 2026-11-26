@@ -392,7 +392,8 @@ async function handleDashboards(request: Request, url: URL, deps: AdminDeps): Pr
   } else {
     const b = await jsonBody(request);
     if (!b) return deps.error(400, "bad_request", "body must be a JSON object { dashboard, fn, args, shard }");
-    input = { dashboard: b.dashboard, fn: b.fn, shard: b.shard, args: b.args ?? {}, destructive: b.destructive };
+    // Omitted args are `{}`; an explicit null is refused below like any other non-object.
+    input = { dashboard: b.dashboard, fn: b.fn, shard: b.shard, args: b.args === undefined ? {} : b.args, destructive: b.destructive };
   }
   const args = input.args;
   if (typeof args !== "object" || args === null || Array.isArray(args)) return deps.error(400, "bad_request", "args must be a JSON object");
@@ -404,7 +405,9 @@ async function handleDashboards(request: Request, url: URL, deps: AdminDeps): Pr
   if (isQuery !== (declared.type === "query")) {
     return deps.error(403, "not_in_dashboard", isQuery ? `${name} is a ${declared.type}: it runs through dashboards/run` : `${name} is a query: it runs through dashboards/query`);
   }
-  let shard = typeof input.shard === "string" && input.shard ? input.shard : "global:main";
+  // Omitted: global:main. Anything else must be a shard (a number or "" is refused, never read as global:main).
+  if (input.shard !== undefined && (typeof input.shard !== "string" || !input.shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(input.shard)}`);
+  let shard = typeof input.shard === "string" ? input.shard : "global:main";
   if (spec.scope === "global") {
     if (shard !== "global:main") return deps.error(400, "bad_shard", `the ${spec.key || "app"} dashboard runs on global:main only (scope "global")`);
     shard = "global:main";
