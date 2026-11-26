@@ -623,7 +623,19 @@ function authzClaimsKey(token: string): string {
   const p = jwtPayload(token);
   if (!p) return "";
   const keys = Object.keys(p).filter((k) => k !== "exp" && k !== "iat" && k !== "nbf" && k !== "jti").sort();
-  return JSON.stringify(keys.map((k) => [k, (p as Record<string, unknown>)[k]]));
+  return JSON.stringify(keys.map((k) => [k, canonicalClaim((p as Record<string, unknown>)[k])]));
+}
+
+/** A claim value with every nested object's keys in order: the same claims in another key order are the same key. */
+function canonicalClaim(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonicalClaim);
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return Object.keys(o)
+      .sort()
+      .map((k) => [k, canonicalClaim(o[k])]);
+  }
+  return v;
 }
 
 /** `{subject: sub, issuer: iss}` of a JWT payload (not verified: only used to run queries on local data). */
