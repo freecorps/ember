@@ -33,6 +33,7 @@ import { canonicalJson, manifestHash, SchemaDefinition, type SchemaManifest, typ
 import { assertNotReserved, type HttpRouter, type HttpRoute } from "./http.ts";
 import { cronFunctionName, cronList, type CronDef, type CronsExport } from "./crons.ts";
 import type { ActionCtx } from "./functions.ts";
+import { checkDashboardShape, prefixDashboard, resolveDashboard, type DashboardManifest, type DashboardSpec, type DashboardSpecInput } from "./dashboard.ts";
 
 /** Separator of physical table names: `<component>$<table>`. Never valid in an app table name. */
 export const TABLE_SEP = "$";
@@ -148,6 +149,8 @@ export interface ComponentDefinition<
   readonly email: ComponentEmailDef<Config> | undefined;
   /** Indexes of `schema` an install leaves out for its config (`DefineComponentOptions.omitIndexes`). */
   readonly omitIndexes: ((config: Config, installName: string) => string[]) | undefined;
+  /** Its dashboard screens (`DefineComponentOptions.dashboard`), checked, with function names local to it. */
+  readonly dashboard: DashboardSpec | undefined;
   readonly children: readonly Installed[];
   /** Installs a child component (nested: its tables are `<this>$<child>$<table>`). */
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
@@ -185,6 +188,12 @@ export interface DefineComponentOptions<Name extends string, Modules extends Rec
    * change like any other (a staged backfill).
    */
   omitIndexes?: (config: CV extends GenericValidator ? Infer<CV> : undefined, installName: string) => string[];
+  /**
+   * Screens the Ember Dashboard shows for each install (contracts.md "Telas declarativas"): plain data naming this
+   * component's own functions by reference (`functions.lib.stats`). Checked here: refs that exist, the right kind of
+   * function, args that fit its validators.
+   */
+  dashboard?: DashboardSpecInput;
 }
 
 function checkName(what: string, name: string) {
@@ -226,6 +235,7 @@ export function defineComponent<const Name extends string, Modules extends Recor
     if (d.binding !== undefined && !BINDING_NAME.test(d.binding)) throw new Error(`Component ${def.name}: queue ${q}: invalid binding name ${d.binding}`);
   }
   if (def.email && typeof def.email.handler !== "function") throw new Error(`Component ${def.name}: email needs a handler`);
+  const dashboard = def.dashboard === undefined ? undefined : resolveDashboard(def.dashboard, flattenFunctions(def.functions ?? {}), `Component ${def.name}`);
   return makeComponent({
     name: def.name,
     schema: def.schema,
@@ -237,6 +247,7 @@ export function defineComponent<const Name extends string, Modules extends Recor
     queues: def.queues as AnyComponentDefinition["queues"],
     email: def.email as AnyComponentDefinition["email"],
     omitIndexes: def.omitIndexes as AnyComponentDefinition["omitIndexes"],
+    dashboard,
     children: [],
   }) as any;
 }
@@ -269,6 +280,8 @@ export interface AppDefinition<Components extends Record<string, AnyComponentDef
   readonly limits: Readonly<Partial<Limits>>;
   /** Storage choices (`defineApp({ storage })`): `compactFormat` of the tables created from now on (contracts.md "Armazenamento compacto"). */
   readonly storage: Readonly<AppStorage>;
+  /** The app's own dashboard screens (`defineApp({ dashboard })`); its refs are resolved by `composeApp`. */
+  readonly dashboard: DashboardSpecInput | undefined;
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
     component: C,
     opts?: InstallOptions<ConfigOf<C>> & { name?: N },
@@ -309,8 +322,22 @@ function checkStorage(storage: unknown): Readonly<AppStorage> {
  * limits (`DEFAULT_LIMITS` otherwise; each function may set its own), at most `MAX_LIMITS`. `storage.compactFormat`: 2 makes
  * migrations create format 2 compact tables from now on (the rollback lever for format 3; default 3).
  */
-export function defineApp<const Env extends PropertyValidators = {}>(opts: { env?: Env; limits?: Partial<Limits>; storage?: AppStorage } = {}): AppDefinition<{}, Env> {
+export function defineApp<const Env extends PropertyValidators = {}>(
+  opts: {
+    env?: Env;
+    limits?: Partial<Limits>;
+    storage?: AppStorage;
+    /**
+     * The app's screens in the Ember Dashboard (contracts.md "Telas declarativas"), naming its functions by reference
+     * (`internal.jobs.list` from `./_generated/api`). The refs are checked against the app's functions when it is
+     * composed (codegen, the Worker).
+     */
+    dashboard?: DashboardSpecInput;
+  } = {},
+): AppDefinition<{}, Env> {
   const env = (opts.env ?? {}) as Env;
+  if (opts.dashboard !== undefined) checkDashboardShape(opts.dashboard, "defineApp");
+  const dashboard = opts.dashboard;
   const limits = checkLimits(opts.limits, "defineApp");
   const storage = checkStorage(opts.storage);
   for (const [k, val] of Object.entries(env)) {
@@ -326,6 +353,7 @@ export function defineApp<const Env extends PropertyValidators = {}>(opts: { env
       env,
       limits,
       storage,
+      dashboard,
       use(c: AnyComponentDefinition, opts: InstallOptions<unknown> = {}) {
         return make([...components, install(c, opts, components)]);
       },
@@ -575,6 +603,8 @@ export interface ComposedApp {
   queues: ComposedQueue[];
   /** Component `email()` hooks, in install order. */
   email: ComposedEmailHook[];
+  /** Dashboard screens: the app's first (key ""), then each install's, with absolute function names. */
+  dashboards: DashboardManifest[];
 }
 
 export interface ComposedQueue extends ComponentQueueManifest {
@@ -613,8 +643,10 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
   const crons: CronDef[] = [];
   const queues: ComposedQueue[] = [];
   const email: ComposedEmailHook[] = [];
+  const dashboards: DashboardManifest[] = [];
+  if (input.app?.dashboard !== undefined) dashboards.push({ key: "", component: null, ...resolveDashboard(input.app.dashboard, appFns, "defineApp", "app") });
   const installed = input.app?.components ?? [];
-  if (!installed.length) return { schema: input.schema, functions, routes, configs, crons, queues, email };
+  if (!installed.length) return { schema: input.schema, functions, routes, configs, crons, queues, email, dashboards };
 
   const base = input.schema.manifest;
   const tables: Record<string, TableManifest> = { ...base.tables };
@@ -671,6 +703,7 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
         ...(c.email ? { email: true as const } : {}),
       };
       configs.set(key, inst.config);
+      if (c.dashboard) dashboards.push({ key, component: c.name, ...prefixDashboard(c.dashboard, scopePrefix(p)) });
       const ownFns = flattenFunctions(c.functions);
       for (const [name, f] of ownFns) {
         if (name.startsWith("@") || name.startsWith("&")) throw new Error(`Component ${key}: function name ${name} is reserved`);
@@ -710,7 +743,7 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
     // The app's own private SQL tables stay with the composed schema (components declare none).
     ...(input.schema.privateSql ? { privateSql: input.schema.privateSql } : {}),
   });
-  return { schema, functions, routes, configs, crons, queues, email };
+  return { schema, functions, routes, configs, crons, queues, email, dashboards };
 }
 
 function mountRoute(r: HttpRoute, prefix: string): Pick<HttpRoute, "path" | "pathPrefix"> {
