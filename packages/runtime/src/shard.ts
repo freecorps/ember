@@ -280,6 +280,20 @@ const dedupDdl = (name: string) =>
 /** Change-log ring size (`changeLogVersions`, at least 1: the newest entry also carries the shard's version). */
 const ringSize = (cfg: EmberConfig): number => Math.max(1, Math.floor(cfg.changeLogVersions ?? 256));
 
+/** Default `changeLogEntryMaxBytes`: the largest `changes` a change-log row holds (UTF-8 bytes of its JSON). */
+export const CHANGE_LOG_ENTRY_MAX_BYTES = 128 * 1024;
+/**
+ * The `changes` of a version whose changes did not fit (`changeLogEntryMaxBytes`): JSON `null`. A resume that needs
+ * that version answers with a full snapshot (`changesSince` → null), as for a version the ring no longer holds.
+ */
+const OVERSIZED_CHANGES = "null";
+const entryCap = (cfg: EmberConfig): number => {
+  const c = cfg.changeLogEntryMaxBytes;
+  return c !== undefined && Number.isFinite(c) && c >= 0 ? Math.floor(c) : CHANGE_LOG_ENTRY_MAX_BYTES;
+};
+/** Whether `text` (JSON) is more than `cap` UTF-8 bytes: from its length alone unless it may be either (1–3 bytes a unit). */
+const overCap = (text: string, cap: number): boolean => text.length > cap || (text.length * 3 > cap && UTF8.encode(text).byteLength > cap);
+
 const RUNTIME_DDL = `
 CREATE TABLE IF NOT EXISTS _ember_rt_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS _ember_subs (
@@ -524,6 +538,8 @@ export interface ShardInspection {
     gateRuns: number;
     /** Subscriptions whose first run came from the HTTP query just before them (`warm`), not from SQLite again. */
     prefetchHits: number;
+    /** Commits whose changes were over `changeLogEntryMaxBytes`: their change-log row only marks the version. */
+    changeLogOversized: number;
     /** `armAlarm` calls, and the subsystem reads they made (the rest came from the in-memory cache). */
     alarmArms: number;
     alarmJobReads: number;
@@ -852,7 +868,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0, prefetchHits: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0, prefetchHits: 0, changeLogOversized: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   /** Tables with an external index (Vectorize, AI Search): only a commit touching one may have written the outbox. */
@@ -1296,7 +1312,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly volatileSizes = new Map<string, number>();
   private volatileUnits = 0;
   /** The ring update of the commit in progress, applied to `ring` once its transaction commits. */
-  private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[]; maint?: true } | null = null;
+  private ringPending: { slot: number; keys: string[]; entries: OutcomeEntry[]; acks: string[]; maint?: true; oversized?: number } | null = null;
   /** `next_maint` is known to be set (null: not known). Set once a commit that wrote or saw it is durable in memory. */
   private maintArmed: boolean | null = null;
   /** This commit set `next_maint` (the alarm must pick it up). */
@@ -1372,6 +1388,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const p = this.ringPending;
     this.ringPending = null;
     if (p?.maint) this.maintArmed = true;
+    // The commit's changes are not in its row: no resume is answered from memory for that version either.
+    if (p?.oversized !== undefined) this.parsedChanges.set(p.oversized, null);
     if (!p || !this.ring) return;
     const ring = this.ring;
     const old = ring.bySlot.get(p.slot);
@@ -2506,9 +2524,17 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       // One upsert per commit: the ring slot of version v replaces version v - ring (and carries the version, the
       // socket mutations' outcomes and the pending acks).
       const ring = this.ringColumns(v, outcomes, now);
+      // Changes over `changeLogEntryMaxBytes` (a huge document) are not written: the row only marks the version, and
+      // a client resuming across it gets a full snapshot (the subscription's value, read once, instead of the commit).
+      let text = stringify(changes);
+      if (overCap(text, entryCap(this.cfg))) {
+        text = OVERSIZED_CHANGES;
+        this.ringPending!.oversized = v;
+        this.stats.changeLogOversized++;
+      }
       this.driver.exec(
         "INSERT INTO _ember_changes(slot, version, at, changes, dedup, acks) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(slot) DO UPDATE SET version = excluded.version, at = excluded.at, changes = excluded.changes, dedup = excluded.dedup, acks = excluded.acks",
-        v % ringSize(this.cfg), v, now, stringify(changes), ring.dedup, ring.acks,
+        v % ringSize(this.cfg), v, now, text, ring.dedup, ring.acks,
       );
       // Once known set (most commits), no meta read per commit; the in-memory flag follows the commit (applyRing).
       if (this.maintArmed !== true) {
@@ -4046,7 +4072,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * Parsed change-log rows by version (a version's changes never change; a ring slot is reused only for a newer one):
    * resumes read and parse each row once, not once per subscription.
    */
-  private readonly parsedChanges = new Map<number, RowChange[]>();
+  private readonly parsedChanges = new Map<number, RowChange[] | null>();
   private parsedSize = 0;
 
   /** Every change after `version`, or null when the change log no longer covers them all (too old: full snapshot). */
@@ -4059,10 +4085,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.parsedChanges.set(version, changes);
       this.parsedSize += changes.length;
     }
-    const gone = this.parsedChanges.get(version - ringSize(this.cfg));
-    if (gone) {
-      this.parsedChanges.delete(version - ringSize(this.cfg));
-      this.parsedSize -= gone.length;
+    const old = version - ringSize(this.cfg);
+    if (this.parsedChanges.has(old)) {
+      this.parsedSize -= this.parsedChanges.get(old)?.length ?? 0;
+      this.parsedChanges.delete(old);
     }
   }
 
@@ -4073,6 +4099,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     let missing = false;
     for (let v = version + 1; v <= this.version; v++) {
       const c = this.parsedChanges.get(v);
+      // A version whose changes were over `changeLogEntryMaxBytes`: only a full snapshot answers.
+      if (c === null) return null;
       if (!c) {
         missing = true;
         break;
@@ -4091,11 +4119,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const r of rows) {
       const v = Number(r.version);
       let c = this.parsedChanges.get(v);
-      if (!c) {
-        c = parse(r.changes as string) as RowChange[];
+      if (c === undefined) {
+        c = parse(r.changes as string) as RowChange[] | null;
         this.parsedChanges.set(v, c);
-        this.parsedSize += c.length;
+        this.parsedSize += c?.length ?? 0;
       }
+      if (c === null) return null;
       for (const x of c) all.push(x);
     }
     for (const v of this.parsedChanges.keys()) if (v <= this.version - ringSize(this.cfg)) this.parsedChanges.delete(v);
