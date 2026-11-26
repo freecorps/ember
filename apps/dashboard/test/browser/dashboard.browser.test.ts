@@ -44,7 +44,7 @@ function fakeAnalytics(): typeof fetch {
     const sql = String(init?.body ?? "");
     let data: Array<Record<string, unknown>> = [];
     if (sql.includes("toStartOfInterval")) data = Array.from({ length: 12 }, (_, i) => ({ t: at(i), calls: 10 + i * 3, errors: i % 4 === 0 ? 2 : 0, p50: 3 + (i % 3), p95: 12 + i, rows_read: 40 + i * 5, rows_written: i }));
-    else if (sql.includes("blob6 = 'error'")) data = [{ t: at(11), code: "MessageTooLong", shard: "org:acme", kind: "mutation", ms: 4.2 }];
+    else if (sql.includes("blob7 AS code")) data = [{ t: at(11), code: "MessageTooLong", shard: "org:acme", kind: "mutation", ms: 4.2 }];
     else if (sql.includes("blob8 AS shard")) data = [{ shard: "org:acme", calls: 300, errors: 3, rows_read: 900, rows_written: 40 }];
     else data = [{ project: "chat", env: "prod", fn: "messages:send", kind: "mutation", timing: "rpc", calls: 120, errors: 6, p50: 4, p95: 18, rows_read: 240, rows_written: 120, bytes_out: 9000 }];
     return new Response(JSON.stringify({ data, rows: data.length }));
@@ -455,6 +455,37 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
       await rx.locator("tr", { hasText: "messages:mine" }).getByRole("button", { name: "Profile" }).click();
       await page.getByRole("dialog").getByText(/narrow the scan with withIndex/).waitFor();
       await shot(page, "reactivity-profile");
+      expect(problems).toEqual([]);
+      await close();
+    } finally {
+      delete env.CF_API_TOKEN;
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("estimated cost: a month projected from the metrics, by function and by shard, labelled as an estimate", async () => {
+    env.CF_API_TOKEN = "cf";
+    globalThis.fetch = fakeAnalytics();
+    try {
+      const { page, problems, close } = await open("#/p/chat/prod/health");
+      await page.getByText("Needs attention").waitFor();
+      await page.keyboard.press("e");
+      await expect.poll(() => page.url()).toMatch(/\/cost$/);
+      await page.getByRole("note").getByText("Estimate, not a bill").waitFor();
+      await page.getByRole("note").getByRole("link", { name: "Durable Objects" }).waitFor();
+      const byFn = page.getByRole("table", { name: "Estimated cost by function" });
+      await byFn.getByText("messages:send").waitFor();
+      // 120 calls in 7 days → ×730/168 a month; prices as small as these show as <$0.01.
+      await byFn.getByText("<$0.01").waitFor();
+      const byShard = page.getByRole("table", { name: "Estimated cost by shard" });
+      // From the metrics (org:acme) and from the catalog's storage (idle shards too).
+      await byShard.getByText("org:acme").waitFor();
+      await byShard.getByText("org:beta").waitFor();
+      await page.getByRole("table", { name: "Cost breakdown" }).getByText("SQLite rows written").waitFor();
+      await page.locator(".stat", { hasText: "With included usage" }).getByText("$5.00").waitFor();
+      await shot(page, "cost");
+      await byFn.locator("tr", { hasText: "messages:send" }).click();
+      await expect.poll(() => page.url()).toContain("/functions/messages%3Asend");
       expect(problems).toEqual([]);
       await close();
     } finally {
