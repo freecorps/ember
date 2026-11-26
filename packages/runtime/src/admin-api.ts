@@ -94,10 +94,11 @@ export const EXPECT_ENV_HEADER = "x-ember-env";
  * The refusal of an admin call that names (`x-ember-env`) an environment other than this Worker's EMBER_ENV, or null.
  * A caller that resolved "staging" never acts on prod because a URL on disk points there.
  */
-export function wrongEnvironment(request: Request, env: { EMBER_ENV?: unknown }, error: (status: number, code: string, message: string) => Response): Response | null {
+export function wrongEnvironment(request: Request, env: object, error: (status: number, code: string, message: string) => Response): Response | null {
   const want = request.headers.get(EXPECT_ENV_HEADER);
   if (want === null) return null;
-  const have = typeof env.EMBER_ENV === "string" ? env.EMBER_ENV : null;
+  const name = (env as { EMBER_ENV?: unknown }).EMBER_ENV;
+  const have = typeof name === "string" ? name : null;
   if (have === want) return null;
   return error(409, "wrong_environment", `this Worker serves the environment ${have === null ? "(unknown: no EMBER_ENV)" : JSON.stringify(have)}, not ${JSON.stringify(want)}: the URL recorded for ${JSON.stringify(want)} points at another deployment`);
 }
