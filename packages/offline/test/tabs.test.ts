@@ -457,6 +457,43 @@ describe("tabs: one leader writes, followers go through it", () => {
     });
   });
 
+  it("resumed while a frozen takeover closes what it opened: the tab queues again once that lock goes, and leads", async () => {
+    await withPage(async ({ doc }) => {
+      const w = world();
+      let opening!: (s: ServableStorage) => void;
+      let finishClose!: () => void;
+      const closing = new Promise<void>((r) => (finishClose = r));
+      let closeStarted!: () => void;
+      const started = new Promise<void>((r) => (closeStarted = r));
+      let opens = 0;
+      const open = (): Promise<ServableStorage> | ServableStorage => {
+        if (opens++ > 0) return w.store();
+        return new Promise<ServableStorage>((r) => (opening = r));
+      };
+      const a = w.tab("A", open, { lifecycle: true });
+      await until(() => opening !== undefined);
+      // Frozen while the storage opens: the takeover closes what it opened (slowly) and gives the lock up.
+      doc.dispatchEvent(new Event("freeze"));
+      const s = w.store();
+      const close = s.close.bind(s);
+      s.close = async () => {
+        closeStarted();
+        await closing;
+        return close();
+      };
+      opening(s);
+      await started;
+      // Back while that close runs: the lock is still this tab's own (held by the retiring takeover).
+      doc.dispatchEvent(new Event("resume"));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(w.locks.holder(`ember-offline:${w.name}`)).toBe("A");
+      finishClose();
+      await until(() => a.t.role === "leader");
+      expect(opens).toBe(2);
+      expect(w.locks.holder(`ember-offline:${w.name}`)).toBe("A");
+    });
+  });
+
   it("a tab that failed to open keeps failing its calls at once across a freeze and resume", async () => {
     await withPage(async ({ doc }) => {
       const w = world();

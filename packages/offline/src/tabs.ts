@@ -93,6 +93,8 @@ export class TabCoordinator implements StorageAdapter {
   private steppingDown: Promise<void> | null = null;
   /** `lead()` runs: this tab holds the leader lock (opening the storage, or serving it) until it returns. */
   private leading = false;
+  /** A `tryLead()` found the lock held by this tab's own `lead()`: once that returns without leading, queue again. */
+  private retryAfterLead = false;
   private readonly saved = new Set<(n: SavedNotice) => void>();
   private stopStoreSaved: (() => void) | null = null;
   /** The leader's `saved` broadcasts (followers: the storage is the leader's). */
@@ -131,7 +133,10 @@ export class TabCoordinator implements StorageAdapter {
         if (lock) return this.lead();
         // Taken: maybe by this tab, whose `lead()` (from before a freeze and resume) is still opening the storage or
         // already serves it. Then it leads (or fails) as it is; following would report it as a follower.
-        if (!this.leading) this.follow();
+        // If that `lead()` gives up instead (a freeze during the takeover closed what it opened), it queues again
+        // once it returns, when its lock is on its way out (`retryAfterLead`).
+        if (this.leading) this.retryAfterLead = true;
+        else this.follow();
         return undefined;
       })
       .catch(() => this.follow());
@@ -247,6 +252,12 @@ export class TabCoordinator implements StorageAdapter {
       await this.leadHeld();
     } finally {
       this.leading = false;
+      if (this.retryAfterLead) {
+        this.retryAfterLead = false;
+        // Not leading and not failed (failed tabs follow the next leader's announcement): queue for the lock. The
+        // request waits behind the lock this `lead()` still holds until its callback settles, so it cannot run early.
+        if (!this.store && this.roleValue !== "failed") this.follow();
+      }
     }
   }
 
