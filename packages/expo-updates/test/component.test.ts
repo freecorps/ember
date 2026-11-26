@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { composeApp, defineApp, defineSchema, unsafeRef } from "@freecorps/ember-server";
 import { emberTest, type EmberTest } from "@freecorps/ember-testing";
 import { describe, expect, test } from "vitest";
-import { expoUpdates, parseMultipart, parseSfvDictionary } from "../src/index.ts";
+import { expoUpdates, MAX_CHANNELS_PER_BRANCH, parseMultipart, parseSfvDictionary } from "../src/index.ts";
 import { testKeys, verify } from "./keys.ts";
 
 const keys = await testKeys();
@@ -62,12 +62,12 @@ async function ask(t: EmberTest, h: Record<string, string> = {}): Promise<Answer
   const directive = parts.find((p) => p.name === "directive");
   const sig = (manifest ?? directive)?.headers["expo-signature"];
   const signature = sig ? (parseSfvDictionary(sig)!.get("sig") as string) : undefined;
-  const body = (manifest ?? directive)!.body;
   if (manifest) {
     const json = JSON.parse(manifest.body);
-    return { status: 200, kind: "update", id: json.id, manifest: json, body, headers: res.headers, ...(signature ? { signature } : {}) };
+    return { status: 200, kind: "update", id: json.id, manifest: json, body: manifest.body, headers: res.headers, ...(signature ? { signature } : {}) };
   }
-  return { status: 200, kind: JSON.parse(directive!.body).type, body, headers: res.headers, ...(signature ? { signature } : {}) };
+  if (!directive) throw new Error(`200 multipart response without a manifest or directive part (parts: ${parts.map((p) => p.name).join(", ")})`);
+  return { status: 200, kind: JSON.parse(directive.body).type, body: directive.body, headers: res.headers, ...(signature ? { signature } : {}) };
 }
 
 describe("expo updates component", () => {
@@ -105,8 +105,13 @@ describe("expo updates component", () => {
     expect((await ask(t, { "expo-platform": "android" })).kind).toBe("noUpdateAvailable");
     expect((await ask(t, { "expo-runtime-version": "2.0.0" })).kind).toBe("noUpdateAvailable");
     expect((await ask(t, { "expo-channel-name": "staging" })).kind).toBe("noUpdateAvailable");
-    // Protocol 0: no directives; nothing new is a 204.
+    // Protocol 0: no directives; nothing new is a 204, and the current update's manifest is sent (the client compares).
     expect((await ask(t, { "expo-protocol-version": "0", "expo-runtime-version": "9" })).status).toBe(204);
+    expect(await ask(t, { "expo-protocol-version": "0", "expo-current-update-id": b.id! })).toMatchObject({ status: 200, kind: "update", id: b.id });
+    // The JSON forms: the media type accept selected.
+    const json = await t.fetch("/expoUpdates/manifest", { headers: { "expo-protocol-version": "1", "expo-platform": "ios", "expo-runtime-version": "1.0.0", accept: "application/expo+json" } });
+    expect(json.headers.get("content-type")).toBe("application/expo+json; charset=utf-8");
+    expect(((await json.json()) as { id: string }).id).toBe(b.id);
     // A signature expected without the key configured: 500 with what to set.
     const unsigned = emberTest({ schema, modules: {}, app });
     await publish(unsigned, { bundle: "x" });
@@ -118,11 +123,25 @@ describe("expo updates component", () => {
     expect((await ask(t, { "expo-protocol-version": "7" })).status).toBe(406);
   });
 
-  test("publish refuses an asset that was never uploaded", async () => {
+  test("publish refuses an asset that was never uploaded, and a runtime version no client can send", async () => {
     const t = harness();
     await expect(
       t.mutation(m("publish"), { branch: "production", updates: [{ platform: "ios", runtimeVersion: "1", launchAsset: asset("never", "k", "application/javascript"), assets: [] }] }),
     ).rejects.toMatchObject({ code: "AssetNotUploaded" });
+    await expect(publish(t, { bundle: "ws", runtimeVersion: "1.0.0 " })).rejects.toThrow(/surrounding whitespace/);
+    await expect(publish(t, { bundle: "ws", runtimeVersion: " 1.0.0" })).rejects.toThrow(/surrounding whitespace/);
+    expect((await publish(t, { bundle: "ws", runtimeVersion: "1.0.0" })).ids).toHaveLength(1);
+  });
+
+  test("assetsUrl with its own query string: key joins it", async () => {
+    const cdn = defineApp().use(expoUpdates, { config: { assetsUrl: "https://cdn.test/expoUpdates/assets?region=eu" } });
+    const t = emberTest({ schema, modules: {}, app: cdn });
+    await publish(t, { bundle: "q", image: "q-img" });
+    const a = await ask(t);
+    const u = new URL(a.manifest.launchAsset.url);
+    expect([u.origin + u.pathname, u.searchParams.get("region"), u.searchParams.get("key")]).toEqual(["https://cdn.test/expoUpdates/assets", "eu", hex("q")]);
+    // Served by the route as is (the origin is ignored by the harness).
+    expect(await (await t.fetch(a.manifest.assets[0].url)).text()).toBe("q-img");
   });
 
   test("rollout: a share of installs gets the new update, the rest the previous one; publishing waits for it to end", async () => {
@@ -176,6 +195,11 @@ describe("expo updates component", () => {
     await publish(t2, { bundle: "only" });
     expect(((await t2.mutation(m("rollback"), { branch: "production" })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
     expect((await ask(t2)).kind).toBe("rollBackToEmbedded");
+    // A publish after that, rolled back: the head goes back to the directive, and the result says so.
+    await publish(t2, { bundle: "after" });
+    expect((await ask(t2)).kind).toBe("update");
+    expect(((await t2.mutation(m("rollback"), { branch: "production" })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
+    expect((await ask(t2)).kind).toBe("rollBackToEmbedded");
   });
 
   test("kill switch per channel and per branch; channels with a branch rollout", async () => {
@@ -197,9 +221,28 @@ describe("expo updates component", () => {
     const paused = await Promise.all(Array.from({ length: 300 }, (_, i) => ask(t, { "eas-client-id": `i${i}` })));
     for (let i = 0; i < got.length; i++) expect(paused[i]!.kind).toBe(got[i]!.id === beta.ids[0] ? "noUpdateAvailable" : "update");
     await t.mutation(m("setChannel"), { name: "production", branch: "production", rolloutBranch: null });
-    expect((await ask(t, { "eas-client-id": "i1" })).kind).toBe("update");
+    // Cleared (patch with undefined removes the field): every install is back on production.
+    const cleared = await Promise.all(Array.from({ length: 300 }, (_, i) => ask(t, { "eas-client-id": `i${i}` })));
+    expect(cleared.every((g) => g.kind === "update" && g.id !== beta.ids[0])).toBe(true);
     await expect(t.mutation(m("setChannelPaused"), { name: "nope", paused: true })).rejects.toMatchObject({ code: "UnknownChannel" });
   });
+
+  test("a branch serves at most MAX_CHANNELS_PER_BRANCH channels, and a publish re-versions every one of them", async () => {
+    const t = harness();
+    for (let i = 0; i < MAX_CHANNELS_PER_BRANCH; i++) await t.mutation(m("setChannel"), { name: `c${i}`, branch: "wide" });
+    await expect(t.mutation(m("setChannel"), { name: "one-more", branch: "wide" })).rejects.toThrow(/already serves 1000 channels/);
+    await t.mutation(m("setChannel"), { name: "other", branch: "elsewhere" });
+    await expect(t.mutation(m("setChannel"), { name: "other", branch: "elsewhere", rolloutBranch: "wide", rolloutPercent: 5 })).rejects.toThrow(/already serves/);
+    // Re-pointing a channel that already serves it is not one more.
+    await t.mutation(m("setChannel"), { name: "c0", branch: "wide" });
+    const r = (await publish(t, { branch: "wide", bundle: "wide" })) as { ids: string[] };
+    expect(r.ids).toHaveLength(1);
+    const plan = (name: string) => t.query(unsafeRef<"query">("@expoUpdates/http:plan"), { channel: name, platform: "ios", runtimeVersion: "1.0.0" }) as Promise<{ version: number }>;
+    // Every channel got the bump, the last one by name too (c999: the old take(1000) per index could miss channels).
+    expect((await plan("c999")).version).toBe(1);
+    expect((await plan("c0")).version).toBe(2);
+    expect((await plan("wide")).version).toBe(0); // never created: no room for the convenience channel
+  }, 60_000);
 
   test("the plan's version changes with every write that can change the answer", async () => {
     const t = harness();
@@ -245,6 +288,11 @@ describe("dashboard", () => {
     expect(await q("overview")).toMatchObject({ channels: 1, branches: 1, updates: 1, assets: 2, paused: 0 });
     expect((await q("channels", { paginationOpts: { numItems: 25, cursor: null } })).page).toEqual([expect.objectContaining({ name: "production", branch: "production", paused: false })]);
     expect((await q("updates", { branch: "production", paginationOpts: { numItems: 25, cursor: null } })).page[0]).toMatchObject({ id: ids[0], platform: "ios", assets: 2, rolloutPercent: 100 });
+    // Paused channels are counted by an index, not among the first 200 names.
+    for (let i = 0; i < 201; i++) await t.mutation(m("setChannel"), { name: `a${String(i).padStart(3, "0")}`, branch: "production" });
+    await t.mutation(m("setChannel"), { name: "zz", branch: "production" });
+    await t.mutation(m("setChannelPaused"), { name: "zz", paused: true });
+    expect(await q("overview")).toMatchObject({ channels: 203, paused: 1 });
     const detail = await q("update", { id: ids[0] });
     expect(detail.manifest).toMatchObject({ id: ids[0], launchAsset: { url: `/expoUpdates/assets?key=${hex("dash")}` } });
     expect(detail.assetList).toHaveLength(2);

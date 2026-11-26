@@ -1,4 +1,4 @@
-export { expoUpdates, expoUpdatesErrors, expoUpdatesProbes, functions, DEFAULT_CHANNEL, DEFAULT_PLAN_TTL_S, DEFAULT_RESPONSE_TTL_S, DEFAULT_SIGNING_SECRET, MAX_ASSET_BYTES, type ExpoUpdatesConfig } from "./component.ts";
+export { expoUpdates, expoUpdatesErrors, expoUpdatesProbes, functions, DEFAULT_CHANNEL, DEFAULT_PLAN_TTL_S, DEFAULT_RESPONSE_TTL_S, DEFAULT_SIGNING_SECRET, MAX_ASSET_BYTES, MAX_CHANNELS_PER_BRANCH, type ExpoUpdatesConfig } from "./component.ts";
 export {
   assetHash,
   base64,
@@ -23,6 +23,7 @@ export {
   SigningKeyMissing,
   type ExpoAsset,
   type ExpoManifest,
+  type MediaType,
   type MultipartPart,
   type Outcome,
   type Platform,

@@ -12,8 +12,9 @@
  * - `channels(name, branch, rolloutBranch?, rolloutPercent?, paused, version)`: what an app build asks for (its
  *   `expo-channel-name`), mapped to a branch, optionally with a percentage of installs on a second branch. `version`
  *   changes with every write that can change what the channel serves (the edge cache key).
- * - `branches(name, paused)`: a line of updates. `paused` (and `channels.paused`) is the kill switch: every client
- *   gets `noUpdateAvailable` and keeps what it runs.
+ * - `branches(name, paused)`: a line of updates. `paused` is the kill switch of the branch: installs it serves (on
+ *   every channel, as its branch or its rollout branch) get `noUpdateAvailable` and keep what they run;
+ *   `channels.paused` is the kill switch of a whole channel, whatever branch an install falls on.
  * - `updates`: per branch, platform and runtime version, newest first; `kind` is an update (its manifest: launch asset,
  *   assets, metadata, extra) or a `rollBackToEmbedded` directive; `rolloutPercent` for a partial rollout of the head;
  *   `rolledBack` takes a row out of what is served.
@@ -40,7 +41,8 @@ const schema = defineSchema({
     })
       .index("by_name", ["name"])
       .index("by_branch", ["branch"])
-      .index("by_rollout_branch", ["rolloutBranch"], { sparse: true }),
+      .index("by_rollout_branch", ["rolloutBranch"], { sparse: true })
+      .index("by_paused", ["paused"]),
     branches: defineTable({ name: v.string(), paused: v.boolean(), createdAt: v.number(), updatedAt: v.number() }).index("by_name", ["name"]),
     updates: defineTable({
       uuid: v.string(),
@@ -120,6 +122,11 @@ export const DEFAULT_PLAN_TTL_S = 30;
 export const DEFAULT_RESPONSE_TTL_S = 86_400;
 /** Largest asset `prepareAssets` accepts (one PUT; Hermes bundles are a few MiB). */
 export const MAX_ASSET_BYTES = 1024 ** 3;
+/**
+ * Most channels that may serve one branch (as their branch or rollout branch): a write to the branch bumps the version
+ * of each of them in one mutation, so the fan-out is bounded where channels are pointed, not cut short there.
+ */
+export const MAX_CHANNELS_PER_BRANCH = 1000;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._\-/]{0,99}$/;
 
 function checkName(what: string, name: string): void {
@@ -148,20 +155,28 @@ const liveRows = (ctx: ReadCtx, branch: string, platform: Platform, runtimeVersi
     .order("desc")
     .take(n);
 
-/** Every channel that serves `branch` (as its branch or its rollout branch) gets a new version. */
+/** The channels that serve `branch` (as their branch or their rollout branch): at most `limit` per index. */
+function channelsServing(ctx: ReadCtx, branch: string, limit: number) {
+  const out = new Map<string, ReturnType<typeof channelByName> & {}>();
+  for (const c of ctx.db.query("channels").withIndex("by_branch", (q) => q.eq("branch", branch)).take(limit)) out.set(c._id, c);
+  for (const c of ctx.db.query("channels").withIndex("by_rollout_branch", (q) => q.eq("rolloutBranch", branch)).take(limit)) out.set(c._id, c);
+  return [...out.values()];
+}
+
+/** Whether one more channel (`channelId`: the one being changed, if it exists) may serve `branch`. */
+const fanOutRoom = (ctx: ReadCtx, branch: string, channelId: string | null): boolean =>
+  channelsServing(ctx, branch, MAX_CHANNELS_PER_BRANCH + 1).filter((c) => c._id !== channelId).length < MAX_CHANNELS_PER_BRANCH;
+
+/** Refuses pointing one more channel at `branch` past the limit. */
+function checkFanOut(ctx: ReadCtx, branch: string, channelId: string | null): void {
+  if (!fanOutRoom(ctx, branch, channelId)) throw new EmberError("ValidationError", `branch ${branch} already serves ${MAX_CHANNELS_PER_BRANCH} channels (the most a publish re-versions at once)`);
+}
+
+/** Every channel that serves `branch` gets a new version (all of them: `checkFanOut` bounds how many there are). */
 function bumpChannelsOf(ctx: Ctx["mutation"], branch: string): number {
-  let n = 0;
-  const seen = new Set<string>();
-  for (const idx of ["by_branch", "by_rollout_branch"] as const) {
-    const rows = idx === "by_branch" ? ctx.db.query("channels").withIndex("by_branch", (q) => q.eq("branch", branch)).take(1000) : ctx.db.query("channels").withIndex("by_rollout_branch", (q) => q.eq("rolloutBranch", branch)).take(1000);
-    for (const c of rows) {
-      if (seen.has(c._id)) continue;
-      seen.add(c._id);
-      ctx.db.patch(c._id, { version: c.version + 1, updatedAt: ctx.now });
-      n++;
-    }
-  }
-  return n;
+  const rows = channelsServing(ctx, branch, MAX_CHANNELS_PER_BRANCH);
+  for (const c of rows) ctx.db.patch(c._id, { version: c.version + 1, updatedAt: ctx.now });
+  return rows.length;
 }
 
 function ensureBranch(ctx: Ctx["mutation"], name: string) {
@@ -270,7 +285,8 @@ export const functions = {
         checkPercent(percent);
         if (a.message !== undefined && a.message.length > 1000) throw new EmberError("ValidationError", "message is at most 1000 characters");
         ensureBranch(ctx, a.branch);
-        if (a.createChannel !== false && !channelByName(ctx, a.branch)) {
+        // The convenience channel is skipped (the publish goes on) when the branch already serves the most channels.
+        if (a.createChannel !== false && !channelByName(ctx, a.branch) && fanOutRoom(ctx, a.branch, null)) {
           ctx.db.insert("channels", { name: a.branch, branch: a.branch, paused: false, version: 0, updatedAt: ctx.now });
         }
         const group = a.group ?? uuidOf(ctx.random);
@@ -283,6 +299,8 @@ export const functions = {
           if (pairs.has(pair)) throw new EmberError("ValidationError", `two updates for ${u.platform} ${u.runtimeVersion}`);
           pairs.add(pair);
           if (!u.runtimeVersion || u.runtimeVersion.length > 256) throw new EmberError("ValidationError", "runtimeVersion must be 1..256 characters");
+          // Clients send it as a header, whose value has no surrounding whitespace: such an update could never be asked for.
+          if (u.runtimeVersion.trim() !== u.runtimeVersion) throw new EmberError("ValidationError", `runtimeVersion ${JSON.stringify(u.runtimeVersion)} has surrounding whitespace`);
           for (const x of [u.launchAsset, ...u.assets]) checkAsset(ctx, x, ready);
           if (u.assets.length > 2000) throw new EmberError("ValidationError", "at most 2000 assets per update");
           const [head] = liveRows(ctx, a.branch, u.platform, u.runtimeVersion, 1);
@@ -335,6 +353,8 @@ export const functions = {
           ctx.db.patch(head._id, { rolledBack: true });
           const uuid = uuidOf(ctx.random);
           const toEmbedded = !!a.toEmbedded || !prev;
+          // What the new head is: the previous row may itself be a directive (a publish after a rollback to embedded).
+          const kind = toEmbedded ? "rollBackToEmbedded" : prev!.kind;
           const base = { uuid, group: uuid, branch: a.branch, platform: p.platform, runtimeVersion: p.runtimeVersion, rolloutPercent: 100, rolledBack: false, rollbackOf: head.uuid };
           if (toEmbedded) {
             insertHead(ctx, { ...base, kind: "rollBackToEmbedded", assets: [], metadata: {}, message: a.message ?? `Roll back ${head.uuid} to the embedded update` }, head.createdAt);
@@ -342,7 +362,7 @@ export const functions = {
             const { _id: _x, _creationTime: _y, uuid: prevUuid, group: _g, createdAt: _c, rollbackOf: _r, republishOf: _p, message: _m, ...copy } = prev!;
             insertHead(ctx, { ...copy, ...base, republishOf: prevUuid, message: a.message ?? `Roll back ${head.uuid} to ${prevUuid}` }, head.createdAt);
           }
-          out.push({ platform: p.platform, runtimeVersion: p.runtimeVersion, rolledBack: head.uuid, now: uuid, kind: toEmbedded ? "rollBackToEmbedded" : "update" });
+          out.push({ platform: p.platform, runtimeVersion: p.runtimeVersion, rolledBack: head.uuid, now: uuid, kind });
         }
         if (out.length) bumpChannelsOf(ctx, a.branch);
         return out;
@@ -380,6 +400,9 @@ export const functions = {
         if (a.rolloutBranch && a.rolloutPercent === undefined) throw new EmberError("ValidationError", "rolloutBranch needs rolloutPercent");
         if (a.rolloutBranch === a.branch) throw new EmberError("ValidationError", "rolloutBranch must differ from branch");
         const c = channelByName(ctx, a.name);
+        if (c?.branch !== a.branch && c?.rolloutBranch !== a.branch) checkFanOut(ctx, a.branch, c?._id ?? null);
+        if (a.rolloutBranch && c?.branch !== a.rolloutBranch && c?.rolloutBranch !== a.rolloutBranch) checkFanOut(ctx, a.rolloutBranch, c?._id ?? null);
+        // undefined removes an optional field (ctx.db.patch), so this clears the rollout.
         const rollout = clear ? { rolloutBranch: undefined, rolloutPercent: undefined } : a.rolloutBranch ? { rolloutBranch: a.rolloutBranch, rolloutPercent: a.rolloutPercent! } : {};
         if (c) {
           if (!clear && !a.rolloutBranch && a.rolloutPercent !== undefined && !c.rolloutBranch) throw new EmberError("ValidationError", "rolloutPercent needs rolloutBranch");
@@ -404,7 +427,10 @@ export const functions = {
       },
     }),
 
-    /** Kill switch of a branch, for every channel that serves it; or resume it. */
+    /**
+     * Kill switch of a branch, or resume it: installs the branch serves (on every channel, as its branch or as its
+     * rollout branch) get `noUpdateAvailable`; installs of those channels on another branch keep updating.
+     */
     setBranchPaused: mutation({
       args: { name: v.string(), paused: v.boolean() },
       errors: [expoUpdatesErrors.UnknownBranch],
@@ -507,6 +533,18 @@ const text = (status: number, body: string, headers: Record<string, string> = {}
 /** Probes for tests: what each request did (plan from the cache or the shard, response from the cache or rendered). */
 export const expoUpdatesProbes = { planFetches: 0, renders: 0, assetFetches: 0 };
 
+/** A short digest of a PEM (cached in the isolate): the signing key's identity in the response cache key. */
+const digests = new Map<string, Promise<string>>();
+function keyDigest(pem: string): Promise<string> {
+  let d = digests.get(pem);
+  if (!d) {
+    d = crypto.subtle.digest("SHA-256", new TextEncoder().encode(pem)).then((b) => [...new Uint8Array(b).subarray(0, 8)].map((x) => x.toString(16).padStart(2, "0")).join(""));
+    if (digests.size >= 8) digests.delete(digests.keys().next().value!);
+    digests.set(pem, d);
+  }
+  return d;
+}
+
 const PLAN = unsafeRef<"query">("http:plan");
 const ASSET = unsafeRef<"query">("http:asset");
 
@@ -522,7 +560,13 @@ const manifestAction = httpAction(async (ctx, request) => {
   if (!req.channel) return text(400, "expo-channel-name is required");
   const url = new URL(request.url);
   const assetsBase = config.assetsUrl ?? `${url.origin}${url.pathname.replace(/\/manifest\/?$/, "")}/assets`;
-  const assetUrl = (sha: string) => `${assetsBase}?key=${sha}`;
+  // `key` joins the base's own query (`?region=eu`) instead of starting a second one.
+  const assetsTemplate = new URL(assetsBase, url);
+  const assetUrl = (sha: string) => {
+    const u = new URL(assetsTemplate);
+    u.searchParams.set("key", sha);
+    return u.href;
+  };
   const cacheConf = config.cache === false ? null : (config.cache ?? {});
   const edge = cacheConf ? edgeCache() : null;
   const planTtl = Math.max(0, cacheConf?.planTtlSeconds ?? DEFAULT_PLAN_TTL_S);
@@ -543,9 +587,12 @@ const manifestAction = httpAction(async (ctx, request) => {
   }
   if (!plan) {
     expoUpdatesProbes.planFetches++;
+    // Stamped with the time the read started: the copy is never older than its stamp says (a write that commits while
+    // the read runs is visible within planTtl of it, not planTtl plus the read).
+    const readAt = Date.now();
     plan = (await ctx.runQuery(PLAN, { channel: req.channel, platform: req.platform, runtimeVersion: req.runtimeVersion })) as Plan;
     if (edge && planTtl > 0) {
-      await edge.put(planKey, new Response(JSON.stringify(plan), { headers: { "content-type": "application/json", "cache-control": `public, max-age=${planTtl}`, [CACHED_AT]: String(Date.now()) } })).catch(() => undefined);
+      await edge.put(planKey, new Response(JSON.stringify(plan), { headers: { "content-type": "application/json", "cache-control": `public, max-age=${planTtl}`, [CACHED_AT]: String(readAt) } })).catch(() => undefined);
     }
   }
 
@@ -553,8 +600,15 @@ const manifestAction = httpAction(async (ctx, request) => {
   const { outcome, sides } = resolvePlan(plan, req.clientId);
   const final = finalOutcome(outcome, req);
   const what = final.type === "update" ? `u:${final.update.uuid}` : final.type === "rollBackToEmbedded" ? `r:${final.commitTime}` : "n";
+  // A signed response is keyed by the key that signed it too: replacing the PEM (same key id) never serves the old
+  // signature. `-` when no key is set (only bodies that need no signature are rendered then).
+  const secretName = config.signing?.privateKeySecret ?? DEFAULT_SIGNING_SECRET;
+  const pemValue = req.expectSignature ? ctx.env[secretName] : undefined;
+  const pem = typeof pemValue === "string" && pemValue ? pemValue : null;
+  const keyId = config.signing?.keyId ?? "main";
+  const signedBy = !req.expectSignature ? "0" : pem ? `${keyId}:${await keyDigest(pem)}` : "-";
   const responseKey = new Request(
-    `${base}/response?${q({ ch: req.channel, p: req.platform, rv: req.runtimeVersion, v: String(plan.version), b: sides, o: what, proto: String(req.protocolVersion), fmt: req.format, sig: req.expectSignature ? "1" : "0", a: assetsBase })}`,
+    `${base}/response?${q({ ch: req.channel, p: req.platform, rv: req.runtimeVersion, v: String(plan.version), b: sides, o: what, proto: String(req.protocolVersion), fmt: req.mediaType, sig: signedBy, a: assetsBase })}`,
   );
   const send = (r: RenderedResponse, state: string) => new Response(r.body, { status: r.status, headers: { ...r.headers, "x-ember-cache": state, "x-ember-plan-cache": planState } });
   if (edge) {
@@ -563,12 +617,10 @@ const manifestAction = httpAction(async (ctx, request) => {
   }
 
   // 3. Render (and sign) it once per key.
-  const secretName = config.signing?.privateKeySecret ?? DEFAULT_SIGNING_SECRET;
-  const pem = req.expectSignature ? ctx.env[secretName] : undefined;
   let rendered: RenderedResponse;
   try {
     expoUpdatesProbes.renders++;
-    rendered = await renderResponse(final, req, { assetUrl, signer: typeof pem === "string" && pem ? rsaSigner(pem, config.signing?.keyId ?? "main") : null });
+    rendered = await renderResponse(final, req, { assetUrl, signer: pem ? rsaSigner(pem, keyId) : null });
   } catch (e) {
     if (e instanceof SigningKeyMissing) return text(500, `${e.message}: set the ${secretName} secret (\`ember env set ${secretName}\`)`);
     throw e;
@@ -597,11 +649,26 @@ const assetsAction = httpAction(async (ctx, request) => {
   const a = (await ctx.runQuery(ASSET, { sha256: key })) as { file: string; contentType: string; size: number } | null;
   const file = a ? await ctx.storage.get(a.file) : null;
   if (!a || !file) return text(404, "unknown asset");
-  const bytes = await file.arrayBuffer();
   // Content-addressed (the URL is the SHA-256): never changes, cached for a year at the edge and on the device.
-  const headers = { "content-type": a.contentType, "cache-control": "public, max-age=31536000, immutable", etag: `"${key}"` };
-  if (edge) await edge.put(cacheKey, new Response(bytes, { headers })).catch(() => undefined);
-  return new Response(bytes, { headers: { ...headers, "x-ember-cache": "MISS" } });
+  const headers = { "content-type": a.contentType, "content-length": String(file.size), "cache-control": "public, max-age=31536000, immutable", etag: `"${key}"` };
+  // Streamed, never buffered (an asset may be larger than the isolate's memory): the R2 stream fills the edge cache,
+  // and the response is that cache entry; without a cache, or when the put fails (too large for it), a fresh stream.
+  if (edge) {
+    const put = await edge.put(cacheKey, new Response(file.body, { headers })).then(
+      () => true,
+      () => false,
+    );
+    const cached = put ? await edge.match(cacheKey).catch(() => undefined) : undefined;
+    if (cached) {
+      const res = new Response(cached.body, cached);
+      res.headers.set("x-ember-cache", "MISS");
+      return res;
+    }
+    const again = await ctx.storage.get(a.file);
+    if (!again) return text(404, "unknown asset");
+    return new Response(again.body, { headers: { ...headers, "x-ember-cache": "MISS" } });
+  }
+  return new Response(file.body, { headers: { ...headers, "x-ember-cache": "MISS" } });
 });
 
 const http = httpRouter()
@@ -621,7 +688,7 @@ const dashboardFunctions = {
         branches: count(ctx.db.query("branches").take(1001).length),
         updates: count(ctx.db.query("updates").take(1001).length),
         assets: count(ctx.db.query("assets").take(1001).length),
-        paused: ctx.db.query("channels").withIndex("by_name").take(200).filter((c) => c.paused).length,
+        paused: count(ctx.db.query("channels").withIndex("by_paused", (q) => q.eq("paused", true)).take(1001).length),
       };
     },
   }),
@@ -733,7 +800,7 @@ export const expoUpdates = defineComponent({
             rowActions: [
               { id: "rollout", label: "Rollout %…", fn: functions.lib.setRollout, fromRow: { branch: "name" }, description: "Percentage of installs that get the head update in a partial rollout (100 ends it)." },
               { id: "rollback", label: "Roll back…", fn: functions.lib.rollback, fromRow: { branch: "name" }, destructive: true, description: "Takes the head out: clients get the previous update again (or the embedded one with toEmbedded)." },
-              { id: "kill", label: "Kill switch", fn: functions.lib.setBranchPaused, fromRow: { name: "name" }, args: { paused: true }, destructive: true, description: "Every channel serving this branch answers noUpdateAvailable." },
+              { id: "kill", label: "Kill switch", fn: functions.lib.setBranchPaused, fromRow: { name: "name" }, args: { paused: true }, destructive: true, description: "Installs this branch serves get noUpdateAvailable, on every channel that points at it (also as a rollout branch); installs on a channel's other branch keep updating. To stop a whole channel, use its kill switch." },
               { id: "resume", label: "Resume", fn: functions.lib.setBranchPaused, fromRow: { name: "name" }, args: { paused: false } },
             ],
           },

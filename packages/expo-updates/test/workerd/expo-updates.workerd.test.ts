@@ -57,10 +57,12 @@ async function publish(host: string, install: string, o: { bundle: string; image
   const files = [{ body: o.bundle, contentType: "application/javascript" }, ...(o.image ? [{ body: o.image, contentType: "image/png" }] : [])];
   const assets = await Promise.all(files.map(async (f) => ({ sha256: await hex(f.body), size: enc.encode(f.body).length, contentType: f.contentType })));
   const prepared = (await admin(`@${install}/lib:prepareAssets`, { assets }, host)) as Array<{ sha256: string; upload?: { url: string; headers: Record<string, string>; storageId: string; shard: string; token: string } }>;
+  const bodies = new Map(assets.map((a, i) => [a.sha256, files[i]!.body]));
   let puts = 0;
   for (const p of prepared) {
     if (!p.upload) continue;
-    const body = files.find((_, i) => assets[i]!.sha256 === p.sha256)!.body;
+    const body = bodies.get(p.sha256);
+    if (body === undefined) throw new Error(`prepareAssets returned an asset that was not asked for: ${p.sha256}`);
     const put = await call(p.upload.url.startsWith("http") ? p.upload.url : `${host}${p.upload.url}`, { method: "PUT", headers: p.upload.headers, body });
     expect(put.status).toBe(200);
     puts++;
@@ -161,6 +163,8 @@ describe("expo-updates in workerd", () => {
     expect(await ask(host, "expoUpdates")).toMatchObject({ cache: "MISS", id: v1.id });
     expect(await ask(host, "expoUpdates")).toMatchObject({ cache: "HIT", id: v1.id });
     const t0 = Date.now();
+    // Only Date is faked: the plan's age is checked against its `x-ember-cached-at` stamp with Date.now() in the
+    // Worker (same isolate), while the cache entry itself (max-age by the real clock) is still there.
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       vi.setSystemTime(t0);
@@ -172,6 +176,7 @@ describe("expo-updates in workerd", () => {
       // Past it: one plan read, a new version, a new response.
       vi.setSystemTime(t0 + 31_000);
       expect(await ask(host, "expoUpdates", {}, counted.env)).toMatchObject({ cache: "MISS", plan: "MISS", id: v2.id });
+      // The plan is one internal query: one RPC to the shard (`http:plan` reads channel, branches and heads inside it).
       expect(counted.rpcs()).toBe(1);
       expect(await ask(host, "expoUpdates", {}, counted.env)).toMatchObject({ cache: "HIT", plan: "HIT", id: v2.id });
       expect(counted.rpcs()).toBe(1);
@@ -222,6 +227,55 @@ describe("expo-updates in workerd", () => {
     expect(share).toBeLessThan(0.4);
     expect(got.every((g) => g.id === v1.id || g.id === v2.id)).toBe(true);
     expect(got.filter((g) => g.cache === "MISS")).toHaveLength(2);
+  });
+
+  it("a rotated signing key (same key id) never gets a response signed by the old one", async () => {
+    const host = "http://rotate.test";
+    await publish(host, "expoUpdates", { bundle: "rot-1" });
+    const signed = { "expo-expect-signature": 'sig, keyid="main"' };
+    const before = await ask(host, "expoUpdates", signed);
+    expect(before).toMatchObject({ cache: "MISS", kind: "update" });
+    expect(await ask(host, "expoUpdates", signed)).toMatchObject({ cache: "HIT" });
+    const pair = (await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
+    const der = new Uint8Array((await crypto.subtle.exportKey("pkcs8", pair.privateKey)) as ArrayBuffer);
+    const pem = `-----BEGIN PRIVATE KEY-----\n${btoa(String.fromCharCode(...der))}\n-----END PRIVATE KEY-----\n`;
+    const rotated = { ...env, EXPO_UPDATES_PRIVATE_KEY: pem } as Env;
+    const after = await ask(host, "expoUpdates", signed, rotated);
+    expect(after).toMatchObject({ cache: "MISS", plan: "HIT", kind: "update", id: before.id });
+    const sig = parseSfvDictionary(after.part!.headers["expo-signature"]!)!.get("sig") as string;
+    expect(await crypto.subtle.verify("RSASSA-PKCS1-v1_5", pair.publicKey, Uint8Array.from(atob(sig), (c) => c.charCodeAt(0)), enc.encode(after.part!.body))).toBe(true);
+    expect(await ask(host, "expoUpdates", signed, rotated)).toMatchObject({ cache: "HIT" });
+    // Unsigned requests share one response whatever the key.
+    expect(await ask(host, "expoUpdates", {}, rotated)).toMatchObject({ cache: "MISS" });
+    expect(await ask(host, "expoUpdates", {})).toMatchObject({ cache: "HIT" });
+  });
+
+  it("cache: false reads the shard and renders on every request", async () => {
+    const host = "http://nocache.test";
+    const v1 = await publish(host, "nocache", { bundle: "nc-1" });
+    const renders = probes.renders;
+    for (let i = 0; i < 2; i++) expect(await ask(host, "nocache")).toMatchObject({ status: 200, cache: "MISS", plan: "MISS", id: v1.id });
+    expect(probes.renders - renders).toBe(2);
+  });
+
+  it("the JSON form through the Worker: the manifest alone, the signature as a header, 204 and 406", async () => {
+    const host = "http://json.test";
+    const v1 = await publish(host, "expoUpdates", { bundle: "json-1", branch: "json" });
+    const get = (h: Record<string, string>) =>
+      call(`${host}/expoUpdates/manifest`, { headers: { "expo-protocol-version": "1", "expo-platform": "ios", "expo-runtime-version": "1.0.0", "expo-channel-name": "json", accept: "application/json", ...h } });
+    const res = await get({ "expo-expect-signature": "sig" });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    const body = await res.text();
+    expect(JSON.parse(body).id).toBe(v1.id);
+    expect(await verify(res.headers.get("expo-signature")!, body)).toBe(true);
+    // A separate response from multipart (the key holds the media type), and an exact JSON media type is honoured.
+    expect((await get({ accept: "application/expo+json" })).headers.get("content-type")).toBe("application/expo+json; charset=utf-8");
+    expect((await get({ "expo-current-update-id": v1.id })).status).toBe(204);
+    // A rollback cannot be said in JSON: 406 (another branch, so no cached plan is in the way).
+    await publish(host, "expoUpdates", { bundle: "json-2", branch: "json2" });
+    await admin("@expoUpdates/lib:rollback", { branch: "json2", toEmbedded: true }, host);
+    expect((await get({ "expo-channel-name": "json2" })).status).toBe(406);
   });
 
   it("protocol errors and an unsigned install", async () => {
