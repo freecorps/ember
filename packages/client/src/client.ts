@@ -1,6 +1,6 @@
 import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } from "./connectivity.ts";
 import { EmberError, errorFromWire, type WireErrorLike } from "./errors.ts";
-import { Channels, type Channel, type ChannelOptions } from "./channels.ts";
+import { CHANNEL_KEEPALIVE_MS, Channels, type Channel, type ChannelOptions } from "./channels.ts";
 import type { ClientFiles, UploadData, UploadedFile, UploadFileOptions } from "./files.ts";
 import {
   getFunctionName,
@@ -445,6 +445,8 @@ interface Conn {
   pingTimer: ReturnType<typeof setTimeout> | null;
   /** `Date.now()` of the last frame from the current socket: the heartbeat pings only after that long a silence. */
   heardAt?: number;
+  /** `Date.now()` of the last frame this client sent (a joined channel's member must send one every so often). */
+  sentAt?: number;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   /** Count of `auth` frames sent on this shard's sockets. */
   authSeq: number;
@@ -3002,6 +3004,7 @@ export class EmberClient {
     if (conn.failedWs === ws) return false;
     try {
       ws.send(frame);
+      conn.sentAt = Date.now();
       return true;
     } catch {
       // Nothing else goes out on it, even later in this loop (`openWs`).
@@ -3127,11 +3130,15 @@ export class EmberClient {
     const armedAt = Date.now();
     conn.pingTimer = setTimeout(() => {
       conn.pingTimer = null;
+      const now = Date.now();
       const heardAt = conn.heardAt ?? 0;
-      const since = Date.now() - heardAt;
-      // Joined channels: the shard drops a member whose socket sent nothing for a while (EPHEMERAL_TTL_MS), so a socket
-      // that only listens to a busy channel still pings every interval.
-      if (heardAt > armedAt && since < quiet && !this.chans.joined(conn.shard)) return this.pingAfter(conn, quiet, quiet - since);
+      const since = now - heardAt;
+      // Joined channels: the shard closes a member whose socket *sent* nothing for a while (EPHEMERAL_TTL_MS, 90 s).
+      // Frames coming in do not count for that, frames going out (a publish, a state update, any other) do: a socket
+      // that only listens to a busy channel pings every interval, one that also talks never needs to.
+      const keep = this.chans.joined(conn.shard) ? Math.min(quiet, CHANNEL_KEEPALIVE_MS) : Infinity;
+      const sinceSent = now - (conn.sentAt ?? 0);
+      if (heardAt > armedAt && since < quiet && sinceSent < keep) return this.pingAfter(conn, quiet, Math.min(quiet - since, keep - sinceSent));
       this.ping(conn);
     }, ms);
   }
@@ -3248,7 +3255,9 @@ export class EmberClient {
 
   private onMessage(conn: Conn, m: ServerMessage): void {
     // Feature "ephemeral": channel frames (and an `err` about a channel).
-    if ((m.t === "joined" || m.t === "members" || m.t === "msg" || m.t === "left" || (m.t === "err" && m.ch !== undefined)) && this.chans.onMessage(conn.shard, m)) return;
+    // `onMessage` takes every one of these (also for a channel this client no longer has); only an `err` without `ch`
+    // goes on to the switch.
+    if ((m.t === "joined" || m.t === "members" || m.t === "msg" || m.t === "left" || m.t === "published" || (m.t === "err" && m.ch !== undefined)) && this.chans.onMessage(conn.shard, m)) return;
     switch (m.t) {
       case "ready":
         return this.onReady(conn, m);

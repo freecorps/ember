@@ -80,7 +80,8 @@ describe("client.channel()", () => {
     s.history.at(-1)!.drop();
     await until(() => room.status() === "connecting");
     await until(() => room.status() === "joined" && s.history.length === 2);
-    expect(sent(s, "join").at(-2)).toEqual({ t: "join", ch: "room:3", state: { n: 1 } });
+    // On the new socket (not by its order among the channels' joins).
+    expect(s.history[1]!.sent.filter((m) => typeof m === "object" && m.t === "join" && m.ch === "room:3")).toEqual([{ t: "join", ch: "room:3", state: { n: 1 } }]);
     a.signIn("user:ana");
     await until(() => vip.status() === "joined");
     expect(vip.members().map((m) => m.user)).toEqual(["ana"]);
@@ -88,7 +89,7 @@ describe("client.channel()", () => {
     await until(() => vip.status() === "refused");
   });
 
-  it("an older runtime: unsupported, nothing sent", async () => {
+  it("an older runtime: unsupported, nothing sent; a stray joined does not make it joined", async () => {
     const s = messagesServer();
     const a = client(s, "user:ana");
     const ch = a.channel("room:1");
@@ -96,6 +97,54 @@ describe("client.channel()", () => {
     expect(ch.error()?.code).toBe("unsupported");
     expect(ch.publish("x")).toBe(false);
     expect(sent(s, "join")).toHaveLength(0);
+    s.history.at(-1)!.deliver(JSON.stringify({ t: "joined", ch: "room:1", self: "m9", members: [{ id: "m9", user: "ana" }] }));
+    await tick(5);
+    expect(ch.status()).toBe("unsupported");
+    expect(ch.members()).toEqual([]);
+    expect(ch.self()).toBeNull();
+  });
+
+  it("a join refused under the identity before an auth that went out meanwhile is tried again under the new one", async () => {
+    const s = server();
+    const a = client(s, null);
+    const lobby = a.channel("room:0");
+    await until(() => lobby.status() === "joined");
+    const ws = s.history.at(-1)!;
+    // The shard's answers wait: the join goes out anonymous, the sign-in's auth right behind it.
+    ws.hold();
+    const vip = a.channel("vip");
+    await until(() => ws.sent.some((m) => typeof m === "object" && m.t === "join" && m.ch === "vip"));
+    a.signIn("user:ana");
+    await until(() => ws.sent.some((m) => typeof m === "object" && m.t === "auth"));
+    ws.release();
+    await until(() => vip.status() === "joined");
+    expect(vip.members().map((m) => m.user)).toEqual(["ana"]);
+    expect(ws.sent.filter((m) => typeof m === "object" && m.t === "join" && m.ch === "vip")).toHaveLength(2);
+  });
+
+  it("rate_limited: joins again a second later", async () => {
+    const s = server();
+    const a = client(s, "user:ana");
+    const ch = a.channel("room:rl");
+    await until(() => ch.status() === "joined");
+    const ws = s.history.at(-1)!;
+    ws.deliver(JSON.stringify({ t: "left", ch: "room:rl", code: "rate_limited", message: "slow down" }));
+    await until(() => ch.status() === "refused");
+    expect(ch.error()?.code).toBe("rate_limited");
+    await until(() => ch.status() === "joined", 3_000);
+    expect(ws.sent.filter((m) => typeof m === "object" && m.t === "join")).toHaveLength(2);
+  });
+
+  it("an err about a channel this client does not have is not reported as an error", async () => {
+    const s = server();
+    const errors: unknown[] = [];
+    const a = client(s, "user:ana", { onError: (e) => errors.push(e) });
+    const ch = a.channel("room:e");
+    await until(() => ch.status() === "joined");
+    s.history.at(-1)!.deliver(JSON.stringify({ t: "err", code: "not_joined", message: "x", ch: "room:gone" }));
+    s.history.at(-1)!.deliver(JSON.stringify({ t: "msg", ch: "room:gone", from: "m9", user: null, data: 1 }));
+    await tick(5);
+    expect(errors).toEqual([]);
   });
 
   it("a socket that only listens to a busy channel still pings every interval", async () => {
@@ -112,6 +161,49 @@ describe("client.channel()", () => {
     } finally {
       clearInterval(timer);
     }
+  });
+
+  it("a socket in a channel that also publishes does not ping: what it sends keeps it alive", async () => {
+    const s = server();
+    const hb = { heartbeat: { intervalMs: 30, timeoutMs: 1_000 } };
+    const a = client(s, "user:ana", hb);
+    const b = client(s, "user:bia", hb);
+    const ca = a.channel("room:chat");
+    const cb = b.channel("room:chat");
+    await until(() => ca.status() === "joined" && cb.status() === "joined");
+    const timer = setInterval(() => {
+      ca.publish("a");
+      cb.publish("b");
+    }, 5);
+    try {
+      await tick(300);
+    } finally {
+      clearInterval(timer);
+    }
+    expect(s.history.flatMap((ws) => ws.sent).filter((m) => m === "ping")).toEqual([]);
+  });
+
+  it("multiTab: the leader's shared socket that also publishes does not ping", async () => {
+    const s = server();
+    const browser = new FakeBrowser();
+    const t = browser.tab();
+    const hb = { heartbeat: { intervalMs: 30, timeoutMs: 1_000 } };
+    const a = client(s, "user:ana", { ...hb, multiTab: { locks: t.locks, BroadcastChannel: t.BroadcastChannel, lifecycle: false, clientIdTimeoutMs: 100 } });
+    await until(() => a.tabRole === "leader");
+    const b = client(s, "user:bia", hb);
+    const ca = a.channel("room:chat");
+    const cb = b.channel("room:chat");
+    await until(() => ca.status() === "joined" && cb.status() === "joined");
+    const timer = setInterval(() => {
+      ca.publish("a");
+      cb.publish("b");
+    }, 5);
+    try {
+      await tick(300);
+    } finally {
+      clearInterval(timer);
+    }
+    expect(s.history.flatMap((ws) => ws.sent).filter((m) => m === "ping")).toEqual([]);
   });
 
   it("multiTab: the leader's shared socket pings every interval while its tabs are in a channel", async () => {

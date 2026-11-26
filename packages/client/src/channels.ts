@@ -92,13 +92,24 @@ interface Entry {
   listeners: Set<(m: ChannelMessage) => void>;
   watchers: Set<() => void>;
   retry: ReturnType<typeof setTimeout> | null;
+  /** `Channels.gen` when its last `join` went out, until a `joined` answers (null: none waits). */
+  sentGen: number | null;
 }
 
 const EMPTY: readonly ChannelMember[] = Object.freeze([]);
 
+/**
+ * A socket in a joined channel sends a frame (a `ping` when nothing else went) at least this often, whatever its
+ * heartbeat interval: the shard closes a member silent for 90 s (`EPHEMERAL_TTL_MS`), and a third of that leaves room
+ * for a lost frame or two.
+ */
+export const CHANNEL_KEEPALIVE_MS = 30_000;
+
 export class Channels {
   private readonly entries = new Map<string, Entry>();
   private readonly byShard = new Map<string, Set<Entry>>();
+  /** Bumped by every `auth` that goes out: a refusal of a join sent before it was about the identity before. */
+  private gen = 0;
 
   constructor(private readonly host: ChannelHost) {}
 
@@ -118,7 +129,7 @@ export class Channels {
     const key = `${shard}\u0000${name}`;
     let e = this.entries.get(key);
     if (!e) {
-      e = { shard, name, handles: 0, state: undefined, status: "connecting", error: null, self: null, byId: new Map(), members: EMPTY, listeners: new Set(), watchers: new Set(), retry: null };
+      e = { shard, name, handles: 0, state: undefined, status: "connecting", error: null, self: null, byId: new Map(), members: EMPTY, listeners: new Set(), watchers: new Set(), retry: null, sentGen: null };
       this.entries.set(key, e);
       let set = this.byShard.get(shard);
       if (!set) this.byShard.set(shard, (set = new Set()));
@@ -203,6 +214,19 @@ export class Channels {
     if (!r) return;
     if (!r.ephemeral) return this.unsupported(e);
     this.host.send(e.shard, e.state ? { t: "join", ch: e.name, state: e.state.v } : { t: "join", ch: e.name });
+    e.sentGen = this.gen;
+  }
+
+  /** Too many joins at once: again a second later (and then every second until the shard's socket is ready again). */
+  private retryLater(e: Entry): void {
+    if (e.retry) return;
+    e.retry = setTimeout(() => {
+      e.retry = null;
+      if (this.entries.get(`${e.shard}\u0000${e.name}`) !== e || e.status !== "refused") return;
+      // No socket now: `onReady` joins on the next one, unless this entry is refused again by then.
+      if (!this.host.ready(e.shard)) return this.retryLater(e);
+      this.sendJoin(e);
+    }, 1_000);
   }
 
   private unsupported(e: Entry): void {
@@ -246,8 +270,12 @@ export class Channels {
     }
   }
 
-  /** An `auth` went out (another identity, a fresh token): refused channels try again under it. */
+  /**
+   * An `auth` went out (another identity, a fresh token): refused channels try again under it, and a refusal of a join
+   * still waiting for its answer (sent under the identity before) is tried again when it comes.
+   */
   onAuth(shard: string): void {
+    this.gen++;
     for (const e of this.byShard.get(shard) ?? []) if (e.status === "refused") this.sendJoin(e);
   }
 
@@ -261,7 +289,9 @@ export class Channels {
     switch (m.t) {
       case "joined": {
         const e = this.entries.get(`${shard}\u0000${m.ch}`);
-        if (!e) return true;
+        // `unsupported`: the shard's `ready` did not speak "ephemeral" (a stray frame does not make it joined).
+        if (!e || e.status === "unsupported") return true;
+        e.sentGen = null;
         e.status = "joined";
         e.error = null;
         e.self = m.self;
@@ -295,22 +325,25 @@ export class Channels {
       }
       case "left": {
         const e = this.entries.get(`${shard}\u0000${m.ch}`);
-        if (!e) return true;
+        if (!e || e.status === "unsupported") return true;
+        if (e.sentGen !== null && e.sentGen < this.gen) {
+          // The join went out before the last `auth`: refused as the identity before it. Again, as the one now.
+          this.sendJoin(e);
+          return true;
+        }
+        e.sentGen = null;
         e.status = "refused";
         e.error = new EmberError(m.code, m.message);
         e.self = null;
         e.byId.clear();
         e.members = EMPTY;
         this.notify(e);
-        // Too many joins at once: a second later.
-        if (m.code === "rate_limited" && !e.retry) {
-          e.retry = setTimeout(() => {
-            e.retry = null;
-            if (this.entries.get(`${shard}\u0000${e.name}`) === e && e.status === "refused") this.sendJoin(e);
-          }, 1_000);
-        }
+        if (m.code === "rate_limited") this.retryLater(e);
         return true;
       }
+      case "published":
+        // The `multiTab` leader's (it asks with `ref`); never this client's.
+        return true;
       case "err": {
         if (m.ch === undefined) return false;
         const e = this.entries.get(`${shard}\u0000${m.ch}`);

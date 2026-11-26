@@ -28,10 +28,11 @@ export type ClientMessage =
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated (new `snap`s). */
   | { t: "auth"; token: string | null }
   /** Feature "ephemeral" (v1.6): join a channel (again: update the member state; without `state`, keep it). */
-  | { t: "join"; ch: string; state?: unknown }
+  /** `ref` (the `multiTab` leader's): the answer to this frame carries it. */
+  | { t: "join"; ch: string; state?: unknown; ref?: number }
   | { t: "leave"; ch: string }
-  /** Feature "ephemeral": broadcast to the channel's other members. */
-  | { t: "pub"; ch: string; data: unknown };
+  /** Feature "ephemeral": broadcast to the channel's other members (`ref`: answered `published` or `err` with it). */
+  | { t: "pub"; ch: string; data: unknown; ref?: number };
 
 /** A channel member on the wire (feature "ephemeral"): one per socket. */
 export type WireChannelMember = { id: string; user: string | null; state?: unknown };
@@ -49,14 +50,16 @@ export type ServerMessage =
   | { t: "mres"; mid: Id; ok: true; value: unknown; version: number }
   | { t: "mres"; mid: Id; ok: false; error: WireError }
   /** `ch` (feature "ephemeral"): a refused `pub`, or a refused update of a channel the socket stays in. */
-  | { t: "err"; code: string; message: string; data?: unknown; kind?: "app"; qid?: Id; ch?: string }
+  | { t: "err"; code: string; message: string; data?: unknown; kind?: "app"; qid?: Id; ch?: string; ref?: number }
   | { t: "authExpired" }
   /** Feature "ephemeral": the answer to `join`, every member (`self` included). */
-  | { t: "joined"; ch: string; self: string; members: WireChannelMember[] }
+  | { t: "joined"; ch: string; self: string; members: WireChannelMember[]; ref?: number }
   | { t: "members"; ch: string; join?: WireChannelMember[]; leave?: string[] }
   | { t: "msg"; ch: string; from: string; user: string | null; data: unknown }
   /** Feature "ephemeral": not (or no longer) in the channel. */
-  | { t: "left"; ch: string; code: string; message: string };
+  | { t: "left"; ch: string; code: string; message: string; ref?: number }
+  /** Feature "ephemeral": a `pub` with `ref` went out to the other members. */
+  | { t: "published"; ch: string; ref: number };
 
 /**
  * A query's new value, or (feature "rowdiff") the per-row diff from the value this socket last received, or (feature
