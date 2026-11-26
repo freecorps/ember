@@ -1,6 +1,6 @@
 import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } from "./connectivity.ts";
 import { EmberError, errorFromWire, type WireErrorLike } from "./errors.ts";
-import { ClientFiles } from "./files.ts";
+import type { ClientFiles, UploadData, UploadedFile, UploadFileOptions } from "./files.ts";
 import {
   getFunctionName,
   getFunctionShard,
@@ -10,7 +10,8 @@ import {
   type ArgsAndOptions,
   type FunctionReference,
 } from "./functions.ts";
-import { applyRowDiff, applyValueDiff, claimKey, reuseUnchanged, unverifiedJwtPayload, validate, type ObjectShape, type ShardSpec } from "@freecorps/ember-values";
+import { applyRowDiff, applyValueDiff, claimKey, reuseUnchanged, validate, type ObjectShape, type RowDiff, type ShardSpec, type ValueDiff } from "@freecorps/ember-values";
+import { jwtPayload } from "./jwt.ts";
 import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import {
   isStorageAdapter,
@@ -21,11 +22,14 @@ import {
   type PendingStorage,
   type StorageAdapter,
 } from "./storage.ts";
-import { fromBase64, parse, stableStringify, stringify } from "./wire.ts";
+import { parse, stableStringify, stringify } from "./wire.ts";
 import type { PageHost } from "./paginate.ts";
 import { RoutedStore, type ClaimRoute } from "./route.ts";
+import { FrameQueue, withoutDeliveries, zframeSupported } from "./zframe.ts";
 import type { CachedSnapshot, SnapshotCache } from "./snapshot-cache.ts";
-import { createMultiTab, type MultiTab, type MultiTabOptions, type TabRole } from "./multitab.ts";
+// Type-only: the multi-tab hub and the upload helpers are subpaths (`@freecorps/ember-client/multitab`, `/files`), or a
+// lazy `import()` for the old options, never in the static graph of an app that does not use them.
+import type { MultiTab, MultiTabHost, MultiTabOptions, MultiTabPlugin, TabRole } from "./multitab.ts";
 
 // ------------------------------------------------------------------------------------------------ public types
 
@@ -81,6 +85,14 @@ export interface EmberClientOptions {
    * holding arrays of docs (`paginate()`'s `{page, ...}`) with a value diff. Default true.
    */
   rowDiff?: boolean;
+  /**
+   * Feature "zframe" (protocol v1.5): ask the shard to send frames above 2 KiB compressed (raw DEFLATE, binary
+   * messages), decoded here with `DecompressionStream`. A large `snap` or `patch` is typically 5–10× smaller on the
+   * wire (a 120-row list: 21.6 KB → 2.5 KB), at the cost of the shard's CPU to compress it (billed) and the client's to
+   * decompress. Worth it on slow or metered links (mobile web); off by default. Announced only where the platform
+   * decodes it (not React Native/Hermes); a runtime without the feature keeps sending text.
+   */
+  zframe?: boolean;
   /** How long a shard socket stays open without subscriptions or pending mutations. Default 10 s. */
   idleTimeoutMs?: number;
   /**
@@ -134,10 +146,19 @@ export interface EmberClientOptions {
    * other tabs' clients go through it over a BroadcastChannel; each tab's subscriptions, mutations and identity stay
    * its own (a tab signed in as someone else gets a socket of its own), and a leader that goes away hands over to the
    * next tab (mutations without an answer are resent with the same mid and the shared clientId: the shard dedups
-   * them). Without Web Locks or BroadcastChannel (React Native, older Node, old browsers) nothing changes. `true` or
-   * `{ name, openTimeoutMs, ... }` (contracts.md "Várias abas").
+   * them). Tabs subscribed to the same query share one subscription on the shard (contracts.md "Várias abas").
+   * Without Web Locks or BroadcastChannel (React Native, older Node, old browsers) nothing changes.
+   *
+   * `multiTab({ name, openTimeoutMs, ... })` from `@freecorps/ember-client/multitab`: the hub is in the app's bundle
+   * only when it uses it. `true` or a plain `{ name, ... }` still work: the hub is then loaded with `import()` when the
+   * client is built (a chunk of its own in a bundler that splits code), and the first socket waits for it.
    */
-  multiTab?: boolean | MultiTabOptions;
+  multiTab?: boolean | MultiTabOptions | MultiTabPlugin;
+  /**
+   * `files()` from `@freecorps/ember-client/files`: `client.files` is the upload helper itself. Without it, the
+   * first `client.files.upload()` loads it with `import()` (a chunk of its own in a bundler that splits code).
+   */
+  files?: (client: EmberClient) => FilesApi;
   /** Injected for tests. */
   random?: () => number;
 }
@@ -451,8 +472,33 @@ interface HttpFirstItem {
   reject: (e: unknown) => void;
 }
 
+/** An HTTP call's answer: status, parsed body, whose token it went with (`ownerKey`), the `authGen` it started under. */
+/** `identityGen`: the identity it was sent as (after its token was read; null when no token was known yet). */
+type HttpAnswer = { status: number; body: unknown; owner: string; authGen: number; identityGen: number | null };
+
+/** One query of `query()` / `fetchForHydration` waiting for the end of its turn (`flushQueries`). */
+interface QueuedQuery {
+  fn: string;
+  /** The arguments encoded when the query was asked (`stringify`): a caller changing its object later changes nothing. */
+  args: string;
+  /**
+   * `authGen` / `identityGen` when it was asked: the request reads the token at flush, so a query asked as one identity
+   * is never sent (or answered) with another's (`flushQueries` refuses it with `identity_changed`). `identityGen` is
+   * null when the token was not known yet: the query goes as whoever the source's first answer says (as one alone would).
+   */
+  authGen: number;
+  identityGen: number | null;
+  resolve: (r: HttpAnswer) => void;
+  reject: (e: unknown) => void;
+}
+
 /** Most queries one `POST /api/query/batch` carries (the runtime's `MAX_QUERY_BATCH`). */
 const MAX_QUERY_BATCH = 32;
+
+/** `{fn, args, shard?}` as JSON text, `args` already encoded (the canonical JSON composes: a value's text is its parts'). */
+function queryEntry(fn: string, args: string, shard?: string): string {
+  return `{"fn":${JSON.stringify(fn)},"args":${args}${shard === undefined ? "" : `,"shard":${JSON.stringify(shard)}`}}`;
+}
 
 /** An HTTP query answer as `httpFirst` uses it: a value with version, epoch and `ik` (an older runtime: null). */
 function httpFirstValue(r: unknown): HttpFirstValue | null {
@@ -552,15 +598,10 @@ function jwtInfo(token: string): JwtInfo {
   const hit = jwtCache.get(token);
   if (hit) return hit;
   let info = NOT_JWT;
-  const parts = token.split(".");
-  if (parts.length === 3) {
-    try {
-      const p = JSON.parse(new TextDecoder().decode(fromBase64(parts[1]!.replace(/-/g, "+").replace(/_/g, "/")))) as { sub?: unknown; iss?: unknown; exp?: unknown };
-      const identity = typeof p.sub !== "string" ? null : Object.freeze(typeof p.iss === "string" ? { subject: p.sub, issuer: p.iss } : { subject: p.sub });
-      info = Object.freeze({ exp: typeof p.exp === "number" ? p.exp : null, identity });
-    } catch {
-      info = NOT_JWT;
-    }
+  const p = jwtPayload(token);
+  if (p) {
+    const identity = typeof p.sub !== "string" ? null : Object.freeze(typeof p.iss === "string" ? { subject: p.sub, issuer: p.iss } : { subject: p.sub });
+    info = Object.freeze({ exp: typeof p.exp === "number" ? p.exp : null, identity });
   }
   // A few tokens live at once (the current one, the one being refreshed): keep the last ones.
   if (jwtCache.size >= 8) jwtCache.delete(jwtCache.keys().next().value!);
@@ -585,15 +626,55 @@ function toArgs(args: unknown): Record<string, unknown> {
   return args as Record<string, unknown>;
 }
 
+/** `client.files`: uploads (PLAN §7). `ClientFiles` (`@freecorps/ember-client/files`) is one. */
+export interface FilesApi {
+  /** Absolute URL for a path returned by the server (proxy-mode URLs are paths on the deployment). */
+  url(pathOrUrl: string): string;
+  upload(data: UploadData, opts?: UploadFileOptions): Promise<UploadedFile>;
+}
+
+/** `client.files` without option `files`: the helper is loaded on the first upload (`url` needs none of it). */
+function lazyFiles(client: EmberClient): FilesApi {
+  let real: Promise<ClientFiles> | undefined;
+  const load = () =>
+    (real ??= import("./files.ts").then(
+      (m) => new m.ClientFiles(client),
+      (e: unknown) => {
+        real = undefined; // a chunk that failed to load (offline) is tried again on the next upload
+        throw e;
+      },
+    ));
+  return {
+    url: (pathOrUrl) => (/^https?:\/\//.test(pathOrUrl) ? pathOrUrl : `${client.url.replace(/^ws(s?):/, "http$1:")}${pathOrUrl.startsWith("/") ? "" : "/"}${pathOrUrl}`),
+    upload: async (data, opts) => (await load()).upload(data, opts),
+  };
+}
+
+/**
+ * Web Locks and BroadcastChannel are there (as `multiTabSupported`, without loading its module): the older `multiTab`
+ * option loads the hub only where it can run, and `tabRole` is null at once where it cannot.
+ */
+function canShareTabs(o: MultiTabOptions): boolean {
+  const g = globalThis as { navigator?: { locks?: { request?: unknown } }; BroadcastChannel?: unknown };
+  const locks = o.locks !== undefined ? o.locks : typeof g.navigator?.locks?.request === "function" ? g.navigator.locks : null;
+  const bc = o.BroadcastChannel !== undefined ? o.BroadcastChannel : typeof g.BroadcastChannel === "function" ? g.BroadcastChannel : null;
+  return !!locks && !!bc;
+}
+
+/** Option `multiTab` given as a plugin (`multiTab()`), not as the older `true` / options object. */
+const isMultiTabPlugin = (x: unknown): x is MultiTabPlugin => typeof x === "object" && x !== null && (x as { kind?: unknown }).kind === "ember.multiTab" && typeof (x as { create?: unknown }).create === "function";
+
 // ------------------------------------------------------------------------------------------------ client
 
 export class EmberClient {
   readonly url: string;
   private readonly wsBase: string;
   private readonly httpBase: string;
-  private readonly WS: WebSocketConstructor | undefined;
+  private WS: WebSocketConstructor | undefined;
   /** Option `multiTab` in an environment that can coordinate tabs: `WS` makes virtual sockets through the leader. */
-  private readonly tabs: MultiTab | null = null;
+  private tabs: MultiTab | null = null;
+  /** The older `multiTab: true | {...}`: the hub's module is being loaded (`import()`); sockets and the clientId wait. */
+  private tabsLoading: Promise<void> | null = null;
   private readonly fetchImpl: typeof fetch | undefined;
   private readonly storage: PendingStorage;
   private offline: StorageAdapter | null;
@@ -662,6 +743,9 @@ export class EmberClient {
 
   private readonly conns = new Map<string, Conn>();
   private readonly subs = new Map<string, Sub>();
+  /** `subs` by shard and by function: a socket's own (`needed`, `hello`, `ready`) and `getAllQueries` walk only theirs. */
+  private readonly subsByShard = new Map<string, Set<Sub>>();
+  private readonly subsByFn = new Map<string, Set<Sub>>();
   /** Subscriptions with no listener waiting out `unsubscribeGraceMs`, oldest first. */
   private readonly lingering = new Set<Sub>();
   private readonly pending: Pending[] = [];
@@ -677,11 +761,11 @@ export class EmberClient {
   /** Inside `setAuth` (which tells `onIdentityChange` listeners once, at the end). */
   private settingAuth = false;
 
-  private filesApi: ClientFiles | undefined;
+  private filesApi: FilesApi | undefined;
 
   /** File uploads (PLAN §7): `client.files.upload(data, opts)`. */
-  get files(): ClientFiles {
-    return (this.filesApi ??= new ClientFiles(this));
+  get files(): FilesApi {
+    return (this.filesApi ??= this.options.files ? this.options.files(this) : lazyFiles(this));
   }
 
   constructor(private readonly options: EmberClientOptions) {
@@ -690,12 +774,32 @@ export class EmberClient {
     this.wsBase = base.replace(/^http(s?):/, "ws$1:");
     this.httpBase = base.replace(/^ws(s?):/, "http$1:");
     const WS = options.WebSocket === null ? undefined : (options.WebSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket);
-    if (options.multiTab && WS) {
-      const mt = options.multiTab === true ? {} : options.multiTab;
+    this.WS = WS;
+    const mt = options.multiTab;
+    if (mt && WS) {
       const hb = options.heartbeat === false ? false : { intervalMs: options.heartbeat?.intervalMs ?? 25_000, timeoutMs: options.heartbeat?.timeoutMs ?? 10_000 };
-      this.tabs = createMultiTab({ ...mt, name: mt.name ?? base, WebSocket: WS, heartbeat: hb });
+      // The leader keeps the values of queries tabs share with the same diff functions as this client.
+      const applyDiff = (prev: unknown, c: { diff?: unknown; vdiff?: unknown }) => (c.diff !== undefined ? applyRowDiff(prev, c.diff as RowDiff) : applyValueDiff(prev, c.vdiff as ValueDiff));
+      const hub: MultiTabHost = { name: base, WebSocket: WS, heartbeat: hb, applyDiff };
+      const use = (plugin: MultiTabPlugin) => {
+        this.tabs = plugin.create(hub);
+        if (this.tabs) this.WS = this.tabs.socketConstructor();
+      };
+      if (isMultiTabPlugin(mt)) use(mt);
+      else if (canShareTabs(mt === true ? {} : mt)) {
+        this.tabsLoading = import("./multitab.ts").then(
+          (m) => {
+            this.tabsLoading = null;
+            if (!this.closed) use(m.multiTab(mt === true ? {} : mt));
+          },
+          (e: unknown) => {
+            // The chunk did not load (offline): one socket per client, as without the option.
+            this.tabsLoading = null;
+            this.report(new EmberError("multitab_unavailable", `multiTab could not be loaded: ${(e as Error)?.message ?? String(e)}`), {});
+          },
+        );
+      }
     }
-    this.WS = this.tabs ? this.tabs.socketConstructor() : WS;
     this.fetchImpl = options.fetch ?? (typeof fetch === "function" ? fetch.bind(globalThis) : undefined);
     this.offline = isStorageAdapter(options.storage) ? options.storage : null;
     this.storage = this.offline ? this.offline.persistPending : ((options.storage as PendingStorage | undefined) ?? new MemoryPendingStorage());
@@ -724,6 +828,7 @@ export class EmberClient {
         this.report(new EmberError("storage_error", `offline storage unavailable: ${(e as Error).message}`), {});
       }
     }
+    if (this.tabsLoading) await this.tabsLoading;
     if (!this.clientIdValue) {
       let id: string | null = null;
       try {
@@ -796,7 +901,7 @@ export class EmberClient {
 
   /** This tab's part in sharing sockets across tabs (option `multiTab`); null when it does not share them. */
   get tabRole(): TabRole | null {
-    return this.tabs?.role ?? null;
+    return this.tabs?.role ?? (this.tabsLoading ? "starting" : null);
   }
 
   /** Close every socket and stop reconnecting. Pending in-memory callers are rejected; storage is kept. */
@@ -1000,7 +1105,7 @@ export class EmberClient {
       void this.fetchToken().catch(() => undefined);
       return undefined;
     }
-    const payload = unverifiedJwtPayload(this.token!);
+    const payload = jwtPayload(this.token!);
     if (!payload) return new EmberError("no_shard", `${where}, and the auth token is not a JWT (its claims cannot be read here): ${pass}`, { ...data, reason: "opaque_token" });
     const key = claimKey(payload, spec.fromClaim);
     if (key === undefined) return new EmberError("no_shard", `${where}, and the token has no ${spec.fromClaim} claim: ${pass}`, { ...data, reason: "no_claim" });
@@ -1014,7 +1119,7 @@ export class EmberClient {
   private currentClaimShard(ref: AnyFunctionReference, opts: ShardOptions | undefined): string | undefined {
     const spec = this.claimSpec(ref, opts);
     if (!spec || !this.tokenKnown || !this.token) return undefined;
-    const key = claimKey(unverifiedJwtPayload(this.token), spec.fromClaim);
+    const key = claimKey(jwtPayload(this.token), spec.fromClaim);
     return key === undefined ? undefined : `${spec.kind}:${key}`;
   }
 
@@ -1187,6 +1292,11 @@ export class EmberClient {
         for (const p of [...this.pending]) if (p.held && p.record.shard === conn.shard) this.sendMut(conn, p);
       }
     }
+  }
+
+  /** Who the socket runs as now (what `sendAuth` / `hello` last set): the tag of the frames that arrive. */
+  private connIdentityKey(conn: Conn): string {
+    return conn.opaque ? `opaque:${conn.lastToken ?? ""}` : identityCacheKey(conn.identity ?? null);
   }
 
   private sendAuth(conn: Conn, token: string | null): void {
@@ -1442,6 +1552,8 @@ export class EmberClient {
         sub.owner = seed.owner;
       }
       this.subs.set(key, sub);
+      index(this.subsByShard, shard, sub);
+      index(this.subsByFn, fn, sub);
       this.recompute([sub]);
       const conn = this.ensure(shard);
       // A cached value may let the `sub` resume (nothing downloaded): it waits for the cache, briefly.
@@ -1524,6 +1636,11 @@ export class EmberClient {
   private dropSub(s: Sub): void {
     if (s.listeners.size || this.subs.get(s.key) !== s) return;
     this.subs.delete(s.key);
+    unindex(this.subsByShard, s.shard, s);
+    unindex(this.subsByFn, s.fn, s);
+    // An optimistic update that read this query (`getQuery`, `updateQuery`) or listed its function's (`getAllQueries`)
+    // runs again next time: what it read is gone now.
+    if (this.overlayCache && (this.overlayCache.fns.has(s.fn) || this.overlayCache.keys.has(s.key))) this.overlayCache = null;
     this.optimisticSubs.delete(s);
     this.deferredSubs.delete(s);
     if (s.localTimer) clearTimeout(s.localTimer);
@@ -1820,7 +1937,7 @@ export class EmberClient {
     this.checkArgs(fn, a);
     const routed = this.shardOrWait(opts, ref, a);
     const shard = typeof routed === "string" ? routed : await routed;
-    const { status, body, owner, authGen } = await this.post("query", stringify({ fn, args: a, shard }));
+    const { status, body, owner, authGen } = await this.postQuery(fn, a, shard);
     const b = body as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown; error?: WireErrorLike };
     if (!b || b.ok !== true) throw errorFromWire(b?.error ? { message: `HTTP ${status}`, ...b.error } : { message: `HTTP ${status}` }, `http_${status}`);
     // A runtime without them (older): the client then subscribes without `resume`.
@@ -2058,7 +2175,7 @@ export class EmberClient {
   }
 
   private async http(kind: "query" | "mutation" | "action", fn: string, args: Record<string, unknown>, shard: string): Promise<unknown> {
-    const { status, body } = await this.post(kind, stringify({ fn, args, shard }));
+    const { status, body } = kind === "query" ? await this.postQuery(fn, args, shard) : await this.post(kind, stringify({ fn, args, shard }));
     const b = body as { ok?: boolean; value?: unknown; error?: WireErrorLike };
     if (b && b.ok === true) return b.value;
     throw errorFromWire(b?.error ? { message: `HTTP ${status}`, ...b.error } : { message: `HTTP ${status}` }, `http_${status}`, kind === "mutation" ? "rejected" : undefined);
@@ -2071,7 +2188,7 @@ export class EmberClient {
    * the shard; as someone else it is not sent again). Returns the status, the parsed body, whose token it went with
    * (`ownerKey`) and the `authGen` it started under.
    */
-  private async post(kind: "query" | "mutation" | "action", payload: string): Promise<{ status: number; body: unknown; owner: string; authGen: number }> {
+  private async post(kind: "query" | "mutation" | "action", payload: string, path: string = kind): Promise<HttpAnswer> {
     if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
     const gen = this.authGen;
     let token = await this.httpToken();
@@ -2082,7 +2199,7 @@ export class EmberClient {
       if (token) headers.authorization = `Bearer ${token}`;
       let res: Response;
       try {
-        res = await this.fetchImpl(`${this.httpBase}/api/${kind}`, { method: "POST", headers, body: payload });
+        res = await this.fetchImpl(`${this.httpBase}/api/${path}`, { method: "POST", headers, body: payload });
       } catch (e) {
         // A query sent twice is harmless: only writes have an outcome. An action is not one transaction: never "rejected".
         throw new EmberError("network_error", (e as Error).message ?? "network error", undefined, kind === "query" ? {} : { outcome: "unknown" });
@@ -2102,7 +2219,77 @@ export class EmberClient {
           continue;
         }
       }
-      return { status: res.status, body, owner: ownerKey(token), authGen: gen };
+      return { status: res.status, body, owner: ownerKey(token), authGen: gen, identityGen: this.tokenKnown ? idGen : null };
+    }
+  }
+
+  /** HTTP queries of `query()` and `fetchForHydration` waiting for the end of their turn, by shard (`flushQueries`). */
+  private readonly queryQueue = new Map<string, QueuedQuery[]>();
+
+  /**
+   * `POST /api/query` for one query, as one entry of this turn's `POST /api/query/batch` of its shard when others go
+   * with it (one request and one shard call, feature "qbatch"): the same answer either way. A lone query, or a runtime
+   * without the batch, goes on its own.
+   */
+  private postQuery(fn: string, args: Record<string, unknown>, shard: string): Promise<HttpAnswer> {
+    return new Promise((resolve, reject) => {
+      // Encoded now, as the call was made (an argument that cannot be encoded, a cycle, rejects this query alone).
+      const encoded = stringify(args);
+      if (this.queryBatch === false) return void this.post("query", queryEntry(fn, encoded, shard)).then(resolve, reject);
+      let q = this.queryQueue.get(shard);
+      if (!q) {
+        this.queryQueue.set(shard, (q = []));
+        queueMicrotask(() => this.flushQueries(shard));
+      }
+      q.push({ fn, args: encoded, authGen: this.authGen, identityGen: this.tokenKnown ? this.identityGen : null, resolve, reject });
+    });
+  }
+
+  /**
+   * The turn's HTTP queries of one shard: one `POST /api/query/batch` per `MAX_QUERY_BATCH`, each query answered with
+   * its own entry. A refusal of the whole request (an invalid token after the one renewal `post` tries, 429, a server
+   * error) is every query's answer, as `{ok: false, error}` with the request's status, as it would have been one by
+   * one; a batch too large (413) goes one by one; a runtime that does not serve the batch gets them one by one (and
+   * no batch again). A query asked under an identity replaced since (a `setAuth`, a token for someone else) is never
+   * sent: it fails with `identity_changed`, here and again before each one-by-one fallback.
+   */
+  private flushQueries(shard: string): void {
+    const current = (i: QueuedQuery) => {
+      if (i.authGen === this.authGen && (i.identityGen === null || i.identityGen === this.identityGen)) return true;
+      i.reject(new EmberError("identity_changed", "the signed-in identity changed before the query was sent"));
+      return false;
+    };
+    const items = (this.queryQueue.get(shard) ?? []).filter(current);
+    this.queryQueue.delete(shard);
+    const alone = (list: QueuedQuery[]) => {
+      for (const i of list) if (current(i)) this.post("query", queryEntry(i.fn, i.args, shard)).then(i.resolve, i.reject);
+    };
+    if (items.length < 2 || this.queryBatch === false) return alone(items);
+    for (let k = 0; k < items.length; k += MAX_QUERY_BATCH) {
+      const chunk = items.slice(k, k + MAX_QUERY_BATCH);
+      const payload = `{"shard":${JSON.stringify(shard)},"queries":[${chunk.map((i) => queryEntry(i.fn, i.args)).join(",")}]}`;
+      this.post("query", payload, `query/batch?shard=${encodeURIComponent(shard)}`).then(
+        (r) => {
+          const b = r.body as { ok?: unknown; results?: unknown; error?: unknown } | null;
+          if (b?.ok === true && Array.isArray(b.results) && b.results.length === chunk.length) {
+            const results = b.results as unknown[];
+            chunk.forEach((i, n) => i.resolve({ ...r, body: results[n] }));
+            return;
+          }
+          if (r.status === 401 || r.status === 429 || r.status >= 500) {
+            // Each query's own answer, shaped as `POST /api/query` refuses one (never the batch's other fields).
+            const body = b && typeof b.error === "object" && b.error !== null ? { ok: false, error: b.error } : { ok: false };
+            return chunk.forEach((i) => i.resolve({ ...r, body }));
+          }
+          // One by one as the identity the batch went as: a query asked before any token was known is bound to it now,
+          // so an identity that changed while the batch was in flight is refused, not sent as the new one.
+          for (const i of chunk) if (i.identityGen === null) i.identityGen = r.identityGen;
+          if (r.status === 413) return alone(chunk);
+          this.queryBatch = false;
+          alone(chunk);
+        },
+        (e: unknown) => chunk.forEach((i) => i.reject(e)),
+      );
     }
   }
 
@@ -2182,72 +2369,67 @@ export class EmberClient {
   // ---------------------------------------------------------------------------------------------- optimistic view
 
   /**
-   * Inside a batch frame (`onFrame`): the messages' recomputes wait for its end, where one recompute of every
-   * subscription runs. Listeners see the frame's final state once, as after a frame of one message.
+   * Inside a batch frame (`onFrame`): the messages' recomputes wait for its end, where one recompute of what they
+   * changed runs. Listeners see the frame's final state once, as after a frame of one message.
    */
   private frameDepth = 0;
   private recomputeDeferred = false;
-  /** Deferred in the frame: every subscription (true), or only these. */
-  private deferredAll = false;
   private readonly deferredSubs = new Set<Sub>();
   /** Subscriptions whose snapshot shows an optimistic value now. */
   private readonly optimisticSubs = new Set<Sub>();
+  /**
+   * The last run of the pending optimistic updates: the overlay they built, the pending mutations (and updates) it ran,
+   * the token it ran under (`fromAuth` keys follow its claim) and what the updates read (query keys, and functions
+   * listed with `getAllQueries`). While those are the same and nothing they read changed, it is reused as it is.
+   */
+  private overlayCache: { overlay: Map<string, unknown>; ran: Pending[]; updates: Array<OptimisticUpdate | undefined>; token: string | null; keys: Set<string>; fns: Set<string> } | null = null;
+
+  /** Runs of the optimistic updates (each pending mutation's update, once per run): for tests. @internal */
+  optimisticRuns = 0;
 
   /**
-   * Rebuild the visible value of `only` (or every) subscription: confirmed state + pending updates in order. `only`
-   * is a hint: while an optimistic update is pending or shown, any change may move another subscription's value
-   * (updates read other queries), so every subscription is rebuilt; with none, only `only` can have changed.
+   * Rebuild the visible value of `only` (the subscriptions whose confirmed value, local value or error changed), and of
+   * every subscription an optimistic layer covers now or covered before: confirmed state + pending updates in order.
+   * The updates run again only when the pending mutations changed or a query they read did (an update may read any
+   * query): a patch of a query no pending update reads costs only the walk of what it changed. Without `only`, the
+   * pending mutations changed.
    */
   private recompute(only?: Sub[]): void {
     if (this.frameDepth > 0) {
       this.recomputeDeferred = true;
-      if (!only) this.deferredAll = true;
-      else for (const s of only) this.deferredSubs.add(s);
+      if (only) for (const s of only) this.deferredSubs.add(s);
       return;
     }
     const withUpdates = this.pending.filter((p) => p.update);
-    if (only && (withUpdates.length || this.optimisticSubs.size)) only = undefined;
-    const overlay = new Map<string, unknown>();
-    for (const p of withUpdates) {
-      const defaultShard = p.record.shard;
-      // A `fromAuth` query lives on the shard of the current token's claim, whatever shard the mutation was sent to.
-      const keyOf = (ref: AnyFunctionReference, args: unknown, o?: ShardOptions) =>
-        this.subKey(this.currentClaimShard(ref, o) ?? routeShard(ref, toArgs(args), o?.shard, defaultShard) ?? defaultShard, getFunctionName(ref), stableStringify(toArgs(args)));
-      const current = (k: string): unknown => (overlay.has(k) ? overlay.get(k) : baseOf(this.subs.get(k))?.value);
-      const store: OptimisticLocalStore = {
-        getQuery: (ref: AnyFunctionReference, ...rest: unknown[]) => current(keyOf(ref, rest[0], rest[1] as ShardOptions | undefined)),
-        setQuery: (ref, args, value, o) => {
-          overlay.set(keyOf(ref, args, o), value);
-        },
-        updateQuery: (ref, args, fn, o) => {
-          const k = keyOf(ref, args, o);
-          const v = current(k);
-          if (v !== undefined) overlay.set(k, fn(v));
-        },
-        getAllQueries: (ref, o) => {
-          const fn = getFunctionName(ref);
-          const spec = getFunctionShard(ref);
-          const claimed = spec?.fromClaim !== undefined && !o?.shard;
-          const shard = o?.shard ?? (spec?.fromArg !== undefined ? undefined : claimed ? this.currentClaimShard(ref, o) : defaultShard);
-          const out: Array<{ args: Record<string, unknown>; value: unknown }> = [];
-          // A claim that cannot be read now (signed out, opaque token): no subscription of it is live.
-          if (claimed && shard === undefined) return out;
-          for (const s of this.subs.values()) {
-            if (s.fn !== fn || (shard !== undefined && s.shard !== shard)) continue;
-            out.push({ args: s.args, value: overlay.has(s.key) ? overlay.get(s.key) : baseOf(s)?.value });
-          }
-          return out;
-        },
-      };
-      try {
-        p.update!(store, p.record.args, p.record);
-      } catch (e) {
-        this.report(new EmberError("optimistic_update_failed", (e as Error).message), { shard: defaultShard });
-      }
+    let overlay: Map<string, unknown>;
+    const cache = this.overlayCache;
+    if (!withUpdates.length) {
+      overlay = new Map();
+      this.overlayCache = null;
+    } else if (
+      cache &&
+      cache.token === this.token &&
+      cache.ran.length === withUpdates.length &&
+      cache.ran.every((p, i) => p === withUpdates[i] && p.update === cache.updates[i]) &&
+      !(only ?? []).some((s) => cache.keys.has(s.key) || cache.fns.has(s.fn))
+    ) {
+      overlay = cache.overlay;
+    } else {
+      overlay = this.runUpdates(withUpdates);
+    }
+    // What can show something else now: what changed, what an update covers, what one covered until now.
+    const walk = new Set(only ?? []);
+    for (const s of this.optimisticSubs) walk.add(s);
+    for (const k of overlay.keys()) {
+      const s = this.subs.get(k);
+      if (s) walk.add(s);
     }
     const changed: Sub[] = [];
-    for (const s of only ?? this.subs.values()) {
-      if (only && this.subs.get(s.key) !== s) continue;
+    for (const s of walk) {
+      if (this.subs.get(s.key) !== s) {
+        this.optimisticSubs.delete(s);
+        continue;
+      }
       const optimistic = overlay.has(s.key);
       const base = baseOf(s);
       const value = optimistic ? overlay.get(s.key) : base?.value;
@@ -2268,6 +2450,58 @@ export class EmberClient {
       changed.push(s);
     }
     for (const s of changed) for (const l of [...s.listeners]) l();
+  }
+
+  /** Runs the pending optimistic updates in order: the overlay of values they set, and what they read (cached). */
+  private runUpdates(withUpdates: Pending[]): Map<string, unknown> {
+    const overlay = new Map<string, unknown>();
+    const keys = new Set<string>();
+    const fns = new Set<string>();
+    for (const p of withUpdates) {
+      this.optimisticRuns++;
+      const defaultShard = p.record.shard;
+      // A `fromAuth` query lives on the shard of the current token's claim, whatever shard the mutation was sent to.
+      const keyOf = (ref: AnyFunctionReference, args: unknown, o?: ShardOptions) =>
+        this.subKey(this.currentClaimShard(ref, o) ?? routeShard(ref, toArgs(args), o?.shard, defaultShard) ?? defaultShard, getFunctionName(ref), stableStringify(toArgs(args)));
+      const current = (k: string): unknown => {
+        keys.add(k);
+        return overlay.has(k) ? overlay.get(k) : baseOf(this.subs.get(k))?.value;
+      };
+      const store: OptimisticLocalStore = {
+        getQuery: (ref: AnyFunctionReference, ...rest: unknown[]) => current(keyOf(ref, rest[0], rest[1] as ShardOptions | undefined)),
+        setQuery: (ref, args, value, o) => {
+          overlay.set(keyOf(ref, args, o), value);
+        },
+        updateQuery: (ref, args, fn, o) => {
+          const k = keyOf(ref, args, o);
+          const v = current(k);
+          if (v !== undefined) overlay.set(k, fn(v));
+        },
+        getAllQueries: (ref, o) => {
+          const fn = getFunctionName(ref);
+          const spec = getFunctionShard(ref);
+          const claimed = spec?.fromClaim !== undefined && !o?.shard;
+          const shard = o?.shard ?? (spec?.fromArg !== undefined ? undefined : claimed ? this.currentClaimShard(ref, o) : defaultShard);
+          const out: Array<{ args: Record<string, unknown>; value: unknown }> = [];
+          // A claim that cannot be read now (signed out, opaque token): no subscription of it is live.
+          if (claimed && shard === undefined) return out;
+          fns.add(fn);
+          for (const s of this.subsByFn.get(fn) ?? []) {
+            if (shard !== undefined && s.shard !== shard) continue;
+            keys.add(s.key);
+            out.push({ args: s.args, value: overlay.has(s.key) ? overlay.get(s.key) : baseOf(s)?.value });
+          }
+          return out;
+        },
+      };
+      try {
+        p.update!(store, p.record.args, p.record);
+      } catch (e) {
+        this.report(new EmberError("optimistic_update_failed", (e as Error).message), { shard: defaultShard });
+      }
+    }
+    this.overlayCache = { overlay, ran: withUpdates, updates: withUpdates.map((p) => p.update), token: this.token, keys, fns };
+    return overlay;
   }
 
   // ---------------------------------------------------------------------------------------------- connection state
@@ -2341,9 +2575,14 @@ export class EmberClient {
     return c;
   }
 
+  /** The subscriptions of a shard, in the order they were made (a copy: sending may drop one). */
+  private shardSubs(shard: string): Sub[] {
+    return [...(this.subsByShard.get(shard) ?? [])];
+  }
+
   private needed(conn: Conn): boolean {
     if (conn.queries.size) return true;
-    for (const s of this.subs.values()) if (s.shard === conn.shard) return true;
+    if (this.subsByShard.get(conn.shard)?.size) return true;
     for (const p of this.pending) if (p.record.shard === conn.shard) return true;
     // Acks waiting for their timer do not keep the socket: they go out before it closes (`release`).
     return !!conn.acking;
@@ -2407,6 +2646,11 @@ export class EmberClient {
     const gen = ++conn.gen;
     conn.state = "connecting";
     this.emitState();
+    if (this.tabsLoading) {
+      // The older `multiTab` option: the socket goes through the hub once its module is here.
+      await this.tabsLoading;
+      if (gen !== conn.gen || conn.ws) return;
+    }
     const pipeline = this.options.pipelineConnect !== false;
     let tokenPromise: Promise<string | null>;
     if (pipeline) {
@@ -2444,6 +2688,23 @@ export class EmberClient {
       return;
     }
     conn.ws = ws;
+    // Feature "zframe": binary frames as bytes, not a Blob to read first (a socket that has the property). Its frames
+    // are handled in order: a binary one is decoded before what follows it.
+    if ("binaryType" in ws) (ws as { binaryType: string }).binaryType = "arraybuffer";
+    // Each frame tagged with the identity the socket had when it arrived: a compressed one decoded after an `auth` for
+    // someone else (sent meanwhile) carries the previous identity's values. Its `snap`/`patch` are dropped (the shard
+    // sends every subscription a fresh `snap` under the new identity, after that `auth`); the rest is handled.
+    const inbox = new FrameQueue<string>(
+      (text, arrivedAs) => {
+        if (conn.ws !== ws) return;
+        if (arrivedAs === this.connIdentityKey(conn)) return this.onFrame(conn, text);
+        const kept = withoutDeliveries(text);
+        if (kept !== null) this.onFrame(conn, kept);
+      },
+      (e) => {
+        if (conn.ws === ws) this.report(new EmberError("bad_frame", `could not decode a compressed frame: ${(e as Error)?.message ?? String(e)}`), { shard: conn.shard });
+      },
+    );
     const authGen = this.authGen;
     let opened = false;
     let token: { value: string | null } | null = null;
@@ -2458,6 +2719,7 @@ export class EmberClient {
       conn.identity = t ? jwtIdentity(t) : null;
       conn.opaque = !!t && !conn.identity;
       m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch"] : ["ident", "query", "ack", "batch", "qbatch"];
+      if (this.options.zframe && zframeSupported()) m.features.push("zframe");
       this.send(conn, m);
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot); one whose
@@ -2465,7 +2727,7 @@ export class EmberClient {
       // Those whose answer already came wait in `httpFirstDone` for the rest of the shard's, to go out in one frame.
       if (pipeline) {
         const queued = new Set(conn.httpFirstDone ?? []);
-        for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.httpFirst && !sub.localPending && !queued.has(sub)) this.sendSub(conn, sub);
+        for (const sub of this.shardSubs(conn.shard)) if (!conn.qids.has(sub.qid) && !sub.httpFirst && !sub.localPending && !queued.has(sub)) this.sendSub(conn, sub);
         this.flushHttpFirst(conn);
       }
     };
@@ -2488,7 +2750,7 @@ export class EmberClient {
     };
     ws.onmessage = (ev) => {
       if (conn.ws !== ws) return;
-      this.onFrame(conn, ev.data);
+      inbox.push(ev.data, this.connIdentityKey(conn));
     };
     ws.onclose = () => {
       if (conn.ws !== ws) return;
@@ -2983,11 +3245,9 @@ export class EmberClient {
       this.frameDepth--;
       if (this.frameDepth === 0 && this.recomputeDeferred) {
         this.recomputeDeferred = false;
-        const all = this.deferredAll;
         const subs = [...this.deferredSubs];
-        this.deferredAll = false;
         this.deferredSubs.clear();
-        this.recompute(all ? undefined : subs);
+        this.recompute(subs);
       }
     }
   }
@@ -3174,7 +3434,7 @@ export class EmberClient {
               /* best effort */
             }
           }
-          for (const sub of this.subs.values()) if (sub.shard === conn.shard && !sub.confirmed && sub.local?.source === "cache") this.forgetCached(sub);
+          for (const sub of this.shardSubs(conn.shard)) if (!sub.confirmed && sub.local?.source === "cache") this.forgetCached(sub);
         }
         if (m.code === "bad_frame" && conn.ikRefusals) {
           conn.ikRefusals--; // a pipelined `resume.ik` refused by a server without "ident"; already resent
@@ -3243,7 +3503,7 @@ export class EmberClient {
     conn.httpFirstWaiting = undefined;
     conn.httpFirstDone = undefined;
     // Pipelined subscriptions already went out with hello.
-    for (const sub of this.subs.values()) if (sub.shard === conn.shard && !conn.qids.has(sub.qid) && !sub.localPending && !sub.httpFirst) this.sendSub(conn, sub);
+    for (const sub of this.shardSubs(conn.shard)) if (!conn.qids.has(sub.qid) && !sub.localPending && !sub.httpFirst) this.sendSub(conn, sub);
     // Over a copy: sending can drop a mutation (another identity's), which would skip the next one in a live walk.
     for (const p of [...this.pending]) if (p.record.shard === conn.shard) this.sendMut(conn, p);
     this.armPing(conn);
@@ -3371,6 +3631,18 @@ export class EmberClient {
 
 /** Mutation ids are strings; the server echoes them back as given. */
 export type MutationId = Id;
+
+function index<K>(map: Map<K, Set<Sub>>, k: K, s: Sub): void {
+  const set = map.get(k);
+  if (set) set.add(s);
+  else map.set(k, new Set([s]));
+}
+
+function unindex<K>(map: Map<K, Set<Sub>>, k: K, s: Sub): void {
+  const set = map.get(k);
+  if (!set?.delete(s)) return;
+  if (!set.size) map.delete(k);
+}
 
 function sameIdentity(a: LocalIdentity, b: LocalIdentity): boolean {
   return a.subject === b.subject && (a.issuer ?? null) === (b.issuer ?? null);

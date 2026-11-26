@@ -28,11 +28,15 @@ export const MAX_BATCH_MESSAGES = 512;
  *   MAX_BATCH_MESSAGES, never `hello`), handled in order as if sent one by one: one frame (and one Durable Object event)
  *   carries every message a side produced in the same turn.
  * - "qbatch" (v1.4): the deployment serves `POST /api/query/batch` (several queries of one shard in one request and one
- *   shard RPC); nothing changes on the socket. The client batches its `httpFirst` fetches once a `ready` confirmed it
- *   (before any, it tries the batch once and falls back to `POST /api/query` per query when the runtime refuses it).
+ *   shard RPC); nothing changes on the socket. The client batches its `httpFirst` fetches, and the HTTP queries of one
+ *   turn (`query()`, `fetchForHydration`), once a `ready` confirmed it (before any, it tries the batch once and falls
+ *   back to `POST /api/query` per query when the runtime refuses it).
+ * - "zframe" (v1.5): after `ready`, a server frame larger than 2 KiB (ZFRAME_MIN_CHARS) may go as a binary message: the
+ *   frame's UTF-8 text compressed with raw DEFLATE (`DecompressionStream("deflate-raw")` decodes it). Server → client
+ *   only; frames keep their order. A client announces it only where it can decode it.
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch"] as const;
+export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "zframe"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;

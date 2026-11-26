@@ -179,6 +179,101 @@ describe("recompute after a server value", () => {
     client.close();
   });
 
+  it("a patch of a query no pending update reads re-runs no update and rebuilds only what it changed", async () => {
+    const server = messagesServer();
+    const client = makeClient(server);
+    const runs = () => (client as unknown as { optimisticRuns: number }).optimisticRuns;
+    const watch = (args: Record<string, unknown>, opts?: { shard: string }) => {
+      const seen: QuerySnapshot<string[]>[] = [];
+      client.subscribe(list, args, opts, (s) => seen.push(s as QuerySnapshot<string[]>));
+      return seen;
+    };
+    const mine = watch({ channel: "o" });
+    const others = Array.from({ length: 20 }, (_, i) => watch({ channel: `c${i}` }));
+    const elsewhere = watch({ channel: "o" }, { shard: "org:other" });
+    await until(() => [mine, elsewhere, ...others].every((x) => x.at(-1)?.status === "success"));
+    server.open(SHARD)[0]!.holdIncoming();
+    let ran = 0;
+    const p = client.mutation(send, { channel: "o", body: "mine" }, {
+      optimisticUpdate: (store) => {
+        ran++;
+        store.updateQuery(list, { channel: "o" }, (cur) => [...(cur as string[]), "mine"]);
+      },
+    });
+    expect(mine.at(-1)).toMatchObject({ value: ["mine"], optimistic: true });
+    const before = runs();
+    expect(ran).toBe(1);
+    // Other queries change (this shard and another): the update reads none of them.
+    for (let i = 0; i < 10; i++) server.mutateDirect(SHARD, "messages:send", { channel: `c${i}`, body: `x${i}` });
+    server.mutateDirect("org:other", "messages:send", { channel: "o", body: "there" });
+    await until(() => others[9]!.at(-1)!.value!.length === 1 && elsewhere.at(-1)!.value!.length === 1);
+    expect(runs()).toBe(before);
+    expect(ran).toBe(1);
+    // Unchanged subscriptions were not rebuilt (their listeners did not run); the optimistic one still shows.
+    expect(others[15]!.length).toBe(1);
+    expect(mine.at(-1)).toMatchObject({ value: ["mine"], optimistic: true });
+    // A change of the query it reads: it runs again, over the new value.
+    server.mutateDirect(SHARD, "messages:send", { channel: "o", body: "theirs" });
+    await until(() => mine.at(-1)!.value!.join() === "theirs,mine");
+    expect(ran).toBe(2);
+    server.open(SHARD)[0]!.releaseIncoming();
+    await p;
+    await until(() => mine.at(-1)!.optimistic === false);
+    client.close();
+  });
+
+  it("an update that read a query runs again once that query is unsubscribed (its cached run is dropped)", async () => {
+    const server = messagesServer();
+    server.mutateDirect(SHARD, "messages:send", { channel: "b", body: "b1" });
+    server.mutateDirect(SHARD, "messages:send", { channel: "b", body: "b2" });
+    const client = makeClient(server, { unsubscribeGraceMs: 0 });
+    const watch = (channel: string) => {
+      const seen: QuerySnapshot<string[]>[] = [];
+      return { seen, off: client.subscribe(list, { channel }, {}, (s) => seen.push(s as QuerySnapshot<string[]>)) };
+    };
+    const a = watch("a");
+    const b = watch("b");
+    const c = watch("c");
+    await until(() => [a, b, c].every((x) => x.seen.at(-1)?.status === "success"));
+    server.open(SHARD)[0]!.holdIncoming();
+    const p = client.mutation(send, { channel: "a", body: "x" }, {
+      optimisticUpdate: (store) => {
+        const read = store.getQuery(list, { channel: "b" }) as string[] | undefined;
+        store.setQuery(list, { channel: "a" }, [`b:${read?.length ?? "none"}`]);
+      },
+    });
+    expect(a.seen.at(-1)).toMatchObject({ value: ["b:2"], optimistic: true });
+    b.off();
+    await tick(5);
+    // A patch of a query the update does not read: the update runs again (what it read is gone), not the cached run.
+    server.mutateDirect(SHARD, "messages:send", { channel: "c", body: "c1" });
+    await until(() => c.seen.at(-1)!.value!.length === 1);
+    expect(a.seen.at(-1)).toMatchObject({ value: ["b:none"], optimistic: true });
+    p.catch(() => undefined);
+    client.close();
+  });
+
+  it("an update listing a function's queries (getAllQueries) runs again when a query of it is subscribed", async () => {
+    const server = messagesServer();
+    const client = makeClient(server);
+    const a: QuerySnapshot<string[]>[] = [];
+    client.subscribe(list, { channel: "a" }, {}, (s) => a.push(s as QuerySnapshot<string[]>));
+    await until(() => a.at(-1)?.status === "success");
+    server.open(SHARD)[0]!.holdIncoming();
+    const p = client.mutation(send, { channel: "a", body: "all" }, {
+      optimisticUpdate: (store) => {
+        for (const q of store.getAllQueries(list)) store.setQuery(list, q.args, [...((q.value as string[] | undefined) ?? []), "all"]);
+      },
+    });
+    expect(a.at(-1)!.value).toEqual(["all"]);
+    const b: QuerySnapshot<string[]>[] = [];
+    client.subscribe(list, { channel: "b" }, {}, (s) => b.push(s as QuerySnapshot<string[]>));
+    // Loading with an optimistic value already: the update covered the new query as soon as it was there.
+    expect(b.at(-1)).toMatchObject({ value: ["all"], optimistic: true });
+    p.catch(() => undefined);
+    client.close();
+  });
+
   it("an optimistic `undefined` (shown as loading) is forgotten when its update goes", async () => {
     const server = messagesServer();
     const client = makeClient(server);

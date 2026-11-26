@@ -109,6 +109,7 @@ import {
 import { REPLICA_APPLY_FN } from "./replication.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, sampleExecution, share, usageMetrics, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
+import { deflateFrame, ZFRAME_MIN_CHARS, zframeSupported } from "./zframe.ts";
 import { queryAdvice, ReactivityLog, reactivityReport, returnedOf, type ProfileResult, type ReactivityReport } from "./reactivity.ts";
 import { AHEAD_MARKER_KEY, aheadFinishDecision, isAheadMarker, type AheadMarker, type BookmarkRow, type RestoreFinishInfo, type RestoreOutcome, type RestorePrepared, type RestoreRpc } from "./restore.ts";
 
@@ -428,6 +429,8 @@ export interface Attachment {
   acks?: string[];
   /** The client negotiated `features: ["batch"]`: frames to it may be JSON arrays of messages. */
   batch?: true;
+  /** The client negotiated `features: ["zframe"]`: frames to it above ZFRAME_MIN_CHARS go compressed (binary). */
+  zframe?: true;
   /**
    * The client negotiated `features: ["ack"]`: it acknowledges settled outcomes, so the effect-free ones need not stay
    * in the dedup generations (`Pending.acks`). Missing (a client without it, or a socket from an older runtime): they
@@ -567,6 +570,10 @@ export interface ShardInspection {
     authRenewals: number;
     /** Socket mutation outcomes with no effect (no write, or an error) kept in memory instead of a dedup row. */
     volatileOutcomes: number;
+    /** Feature "zframe": frames sent compressed, and their size before (UTF-16 units) and after (bytes), since boot. */
+    zframes: number;
+    zframeBytesIn: number;
+    zframeBytesOut: number;
   };
   /** External-index outbox (Vectorize / AI Search). */
   outbox: OutboxStats;
@@ -820,6 +827,24 @@ const errInfo = (e: unknown, fallback: string): WireError => errorInfo(e, fallba
 /** A shard registers with global:main's catalog again after this long (replicated.ts). */
 const CATALOG_REREGISTER_MS = 24 * HOUR;
 
+/**
+ * A server frame's text without its subscription deliveries (`snap`, `patch`): null when nothing is left. For a frame
+ * produced before the socket's access expired (`revokeSockets` without `close`, feature "zframe").
+ */
+function withoutDeliveries(text: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const isDelivery = (m: unknown) => typeof m === "object" && m !== null && ((m as { t?: unknown }).t === "snap" || (m as { t?: unknown }).t === "patch");
+  if (!Array.isArray(parsed)) return isDelivery(parsed) ? null : text;
+  const kept = parsed.filter((m) => !isDelivery(m));
+  if (!kept.length) return null;
+  return kept.length === parsed.length ? text : JSON.stringify(kept);
+}
+
 export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalIndexRpc, RestoreRpc {
   private readonly cfg: EmberConfig;
   private readonly driver: DoSqlDriver;
@@ -875,7 +900,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0, prefetchHits: 0, changeLogOversized: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0, prefetchHits: 0, changeLogOversized: 0, zframes: 0, zframeBytesIn: 0, zframeBytesOut: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   /** Tables with an external index (Vectorize, AI Search): only a commit touching one may have written the outbox. */
@@ -1156,6 +1181,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.attachments.set(sid, att);
       if (att.acks?.length) this.ackedSockets.add(sid);
       if (att.batch) this.batching.add(ws);
+      if (att.zframe) this.zframes.add(ws);
       // Acks received before a hibernation, not yet in a ring row.
       for (const mid of att.acks ?? []) this.pendingAcks.add(outcomeKey(identityKey(att.identity), att.clientId ?? "", mid));
     }
@@ -2494,12 +2520,94 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private sendFrame(ws: WebSocket, frame: string): void {
+    // Feature "zframe": a large frame goes compressed; one behind a compression still running waits for it (in order).
+    if (this.zframes.has(ws) && (frame.length > ZFRAME_MIN_CHARS || this.zsending.has(ws))) return this.sendCompressed(ws, frame);
     try {
       ws.send(frame);
     } catch {
       // socket already closed
     }
   }
+
+  /** Sockets that negotiated feature "zframe" (from `hello`, or their attachment after a wake). */
+  private readonly zframes = new WeakSet<WebSocket>();
+  /** Per "zframe" socket, the last frame still being compressed (or waiting behind one): what comes after waits. */
+  private readonly zsending = new Map<WebSocket, Promise<void>>();
+
+  /**
+   * Feature "zframe": `frame` as a binary message of its raw-DEFLATE bytes when it is large (as text when that is not
+   * smaller), sent after every frame queued before it. The compression runs at once; the event is kept alive until the
+   * frame went out (`waitUntil`), so a hibernation never drops it.
+   */
+  private sendCompressed(ws: WebSocket, frame: string): void {
+    const bytes = frame.length > ZFRAME_MIN_CHARS ? deflateFrame(frame).catch(() => null) : null;
+    const before = this.zsending.get(ws);
+    const cut = this.zcut.get(ws) ?? 0;
+    const sent = (before ?? Promise.resolve()).then(async () => {
+      const z = bytes && (await bytes);
+      // Closed meanwhile (revoked, restored): what was being compressed for it is dropped, never sent after the close.
+      if (this.zclosed.has(ws)) return;
+      // Its access expired meanwhile (`revokeSockets` without `close`): the subscription values in it (`snap`, `patch`)
+      // were produced for the identity that just lost access and are dropped; the rest (a committed mutation's `mres`,
+      // a `qres`, an `err`) still goes, as text, in its place in the order. What was queued after (`authExpired`) follows.
+      if ((this.zcut.get(ws) ?? 0) !== cut) {
+        const rest = withoutDeliveries(frame);
+        try {
+          if (rest !== null) ws.send(rest);
+        } catch {
+          // socket already closed
+        }
+        return;
+      }
+      try {
+        if (z && z.byteLength < frame.length) {
+          ws.send(z);
+          this.stats.zframes++;
+          this.stats.zframeBytesIn += frame.length;
+          this.stats.zframeBytesOut += z.byteLength;
+        } else ws.send(frame);
+      } catch {
+        // socket already closed
+      }
+    });
+    this.zsending.set(ws, sent);
+    void sent.finally(() => {
+      if (this.zsending.get(ws) === sent) this.zsending.delete(ws);
+    });
+    this.ctx.waitUntil(sent);
+  }
+
+  /**
+   * Closes `ws` now (access revoked, restore, import): nothing produced before the close may reach it after. What
+   * waits for the end of the turn goes first, as text (never through an asynchronous compression), unless a frame
+   * is still being compressed (feature "zframe"): then that one, and everything behind it, are dropped, so the order
+   * is never broken either. The client resynchronizes on its next socket (subscriptions anew, mutations resent).
+   */
+  private closeNow(ws: WebSocket, code: number, reason: string): void {
+    const q = this.outbox.get(ws);
+    this.outbox.delete(ws);
+    const compressing = this.zsending.has(ws);
+    this.zsending.delete(ws);
+    this.zclosed.add(ws);
+    try {
+      if (q && !compressing) ws.send(q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`);
+    } catch {
+      // socket already closed
+    }
+    try {
+      ws.close(code, reason);
+    } catch {
+      // already closing
+    }
+  }
+
+  /** Sockets closed by the shard or by the client: a compression still running for one is never sent (`closeNow`). */
+  private readonly zclosed = new WeakSet<WebSocket>();
+  /**
+   * Per socket, bumped when its access expires without a close (`revokeSockets`): a frame whose compression started
+   * under an earlier count was produced for the identity that just lost access, and is dropped (`sendCompressed`).
+   */
+  private readonly zcut = new WeakMap<WebSocket, number>();
 
   /** Frames waiting for the end of the turn, per batching socket. */
   private readonly outbox = new Map<WebSocket, { frames: string[]; bytes: number }>();
@@ -3808,12 +3916,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const ident = msg.features?.includes("ident") === true;
         const acks = msg.features?.includes("ack") === true;
         const batch = msg.features?.includes("batch") === true;
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}) };
+        const zframe = msg.features?.includes("zframe") === true && zframeSupported();
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}), ...(zframe ? { zframe: true as const } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : []), ...(msg.features?.includes("qbatch") ? ["qbatch" as const] : [])];
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : []), ...(msg.features?.includes("qbatch") ? ["qbatch" as const] : []), ...(zframe ? ["zframe" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
-        // `ready` goes out alone (the client reads it before it knows the server batches); everything after may batch.
+        // `ready` goes out alone (the client reads it before it knows the server batches), and as text (before it knows
+        // the server compresses); everything after may batch, and go compressed.
         if (batch) this.batching.add(ws);
+        if (zframe) this.zframes.add(ws);
         return;
       }
       case "q": {
@@ -3898,6 +4009,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           this.stats.authRenewals++;
           return;
         }
+        // Not a renewal: a frame still being compressed for this socket (feature "zframe") holds values of the identity
+        // before; its `snap`/`patch` are dropped unsent (as on a revocation), and the fresh snaps below replace them.
+        if (this.zsending.has(ws)) this.zcut.set(ws, (this.zcut.get(ws) ?? 0) + 1);
         // Identity changed: every subscription of this socket is re-evaluated under the new identity (the dormant ones
         // run first, so each has its entry to re-bind from).
         this.warmDormant(Infinity, att.sid);
@@ -4191,6 +4305,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (att?.sid) this.dropSocket(att.sid);
     this.outbox.delete(ws);
     this.unflushed.delete(ws);
+    this.zsending.delete(ws);
+    this.zclosed.add(ws);
     try {
       ws.close(code, reason);
     } catch {
@@ -4204,6 +4320,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // Frames queued for a broken socket are never sent: as on close, nothing of it is kept.
     this.outbox.delete(ws);
     this.unflushed.delete(ws);
+    this.zsending.delete(ws);
+    this.zclosed.add(ws);
   }
 
   // ------------------------------------------------------------------ RPC (Worker / System)
@@ -4337,16 +4455,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!att?.sid || !att.identity || !revokeMatches(match, att.identity)) continue;
       reached++;
       if (opts.close) {
-        this.flushSocket(ws);
-        try {
-          ws.close(4401, "ember: access revoked");
-        } catch {
-          // already closing
-        }
+        this.closeNow(ws, 4401, "ember: access revoked");
         this.dropSocket(att.sid);
         continue;
       }
-      // Expired from now on: its patches stop and its frames are refused until a fresh token arrives (`auth`).
+      // Expired from now on: its patches stop and its frames are refused until a fresh token arrives (`auth`). A frame
+      // still being compressed for it (feature "zframe") was produced before: dropped, never sent after this.
+      if (this.zsending.has(ws)) this.zcut.set(ws, (this.zcut.get(ws) ?? 0) + 1);
       const { token: _drop, ...rest } = att;
       const expired: Attachment = { ...rest, identity: { ...att.identity, exp: 0 } };
       this.saveAttachment(ws, expired);
@@ -4766,12 +4881,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.sid) this.dropSocket(att.sid);
-      this.flushSocket(ws);
-      try {
-        ws.close(1012, "ember restore");
-      } catch {
-        // already closed
-      }
+      this.closeNow(ws, 1012, "ember restore");
     }
     // `.replicated()` tables: a restored global:main resends everything (its log went back in time); a restored target
     // asks for a fresh copy (its marks went back).
@@ -4831,12 +4941,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.sid) this.dropSocket(att.sid);
-      this.flushSocket(ws);
-      try {
-        ws.close(1012, "ember import");
-      } catch {
-        // already closed
-      }
+      this.closeNow(ws, 1012, "ember import");
     }
   }
 

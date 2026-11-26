@@ -32,6 +32,16 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./multitab": {
+      "@freecorps/ember-source": "./src/multitab.ts",
+      "types": "./dist/multitab.d.ts",
+      "default": "./dist/multitab.js"
+    },
+    "./files": {
+      "@freecorps/ember-source": "./src/files.ts",
+      "types": "./dist/files.d.ts",
+      "default": "./dist/files.js"
+    },
     "./testing": {
       "@freecorps/ember-source": "./src/testing.ts",
       "types": "./dist/testing.d.ts",
