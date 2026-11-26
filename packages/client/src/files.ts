@@ -262,6 +262,8 @@ export class ClientFiles implements FilesApi {
               // The failed answer's body is not needed: released before the wait.
               await res?.body?.cancel().catch(() => undefined);
               await wait(delay, opts.signal);
+              // Another part failed for good during the wait: the upload is being aborted, this one is not sent again.
+              if (failed) throw new EmberError("aborted", `part ${partNumber}: upload aborted (another part failed)`);
             }
           };
           const worker = async () => {
@@ -270,6 +272,8 @@ export class ClientFiles implements FilesApi {
               const start = (p.partNumber - 1) * partSize;
               const chunk = slice(data, start, Math.min(size, start + partSize));
               const res = await putPart(this.url(p.url), chunk, p.partNumber);
+              // A part that was in flight when another failed: the upload is rejected already (no progress after that).
+              if (failed) return;
               const etag = res.headers.get("etag") ?? ((await res.json().catch(() => ({}))) as { etag?: string }).etag;
               if (!etag) throw new EmberError("no_etag", `part ${p.partNumber}: no ETag in the response (bucket CORS must expose ETag)`);
               etags.push({ partNumber: p.partNumber, etag });

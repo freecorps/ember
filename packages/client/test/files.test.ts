@@ -129,12 +129,18 @@ describe("client.files.upload", () => {
   it("a part answered 5xx, 429 or lost on the network is sent again (exponential backoff, Retry-After) before the upload gives up", async () => {
     const { client } = setup(() => ({ multipart: { partSize: 10 } }));
     const s = storageFetch({ parts: { 1: [503, "network"], 2: [{ status: 429, retryAfter: "2" }], 3: [500] } });
-    // The waits the upload asks for (not the client's own timers), run at once.
+    // The waits the upload asks for, run at once: timers set by `wait` in files.ts itself (the innermost frame of the
+    // package's source), never the client's own (backoff, idle, heartbeat), whatever called into them.
     const waits: number[] = [];
     const real = globalThis.setTimeout;
     const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
-      if (/src\/files\.ts/.test(new Error().stack ?? "")) waits.push(ms!);
-      return real(fn, 0);
+      const frames = (new Error().stack ?? "").split("\n").slice(1);
+      const caller = frames.find((l) => /\/packages\/client\/src\//.test(l));
+      if (caller && /\/src\/files\.ts:/.test(caller) && frames.some((l) => /\bwait \(.*\/src\/files\.ts:/.test(l))) {
+        waits.push(ms!);
+        return real(fn, 0);
+      }
+      return real(fn, ms);
     }) as typeof setTimeout);
     try {
       const out = await client.files.upload(new Uint8Array(25), { fetch: s.fetchImpl, multipartThreshold: 8, concurrency: 1 });
@@ -171,6 +177,22 @@ describe("client.files.upload", () => {
     await expect(up).rejects.toMatchObject({ name: "AbortError" });
     expect(Date.now() - at).toBeLessThan(1000);
     expect(t.calls.filter((c) => c.url === "https://r2.test/part?n=1")).toHaveLength(1);
+    client.close();
+  });
+
+  it("a part waiting to be sent again is not sent once another part failed for good (no progress after the rejection)", async () => {
+    const { client } = setup(() => ({ multipart: { partSize: 10 } }));
+    const s = storageFetch({ parts: { 1: [503], 2: [403] } });
+    const progress: number[] = [];
+    const up = client.files.upload(new Uint8Array(25), { fetch: s.fetchImpl, multipartThreshold: 8, concurrency: 2, retryDelayMs: 40, onProgress: (p) => progress.push(p.loaded) });
+    await expect(up).rejects.toMatchObject({ code: "SlowDown" });
+    expect(s.calls.some((c) => (c.body as any)?.op === "abort")).toBe(true);
+    const seen = progress.length;
+    // Part 1's wait (20–40 ms) ends after the rejection: nothing more goes out.
+    await new Promise((r) => setTimeout(r, 80));
+    expect(s.calls.filter((c) => c.url === "https://r2.test/part?n=1")).toHaveLength(1);
+    expect(s.calls.filter((c) => c.url === "https://r2.test/part?n=3")).toHaveLength(0);
+    expect(progress.length).toBe(seen);
     client.close();
   });
 
