@@ -152,7 +152,10 @@ const group = (items: unknown[]) => {
   const e = engine as any;
   return e.commitMutationBatch ? e.commitMutationBatch(items, (r: unknown) => r) : driver.transaction(() => engine.runMutationBatch(items as any));
 };
-bench("group commit 1 patch (as the shard)", () => group(batchItems.slice(0, 1)));
+// A value that changes on every call: an unchanged patch writes nothing (no UPDATE, index or change-log work).
+let flip = 0;
+const flipItem = { name: mutationGeneric({ handler: ((ctx: any) => ctx.db.patch(id, { likes: 100 + (++flip % 2) })) as any }) as any, args: {} };
+bench("group commit 1 patch (as the shard)", () => group([flipItem]));
 bench("group commit 10 patches (as the shard)", () => group(batchItems));
 bench("engine empty mutation", () => mutate(() => null));
 bench("engine empty query", () => query(() => null));

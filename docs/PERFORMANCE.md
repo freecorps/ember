@@ -95,7 +95,10 @@ para o índice esparso, as linhas cobradas pelo DO no workerd (`spikes/rows-writ
 
 **Como foi medido (2026-11-25):** o mesmo laptop (Apple M3, load ~2 com outro processo pesado), `scripts/bench-hot-path.ts`
 nas duas árvores, `main` em `268a7f63` contra a PR, três rodadas alternando as árvores e o menor tempo de cada linha.
-O bench ganhou linhas de filtro, de lote e de strings (rodadas também no `main`, a mesma API pública).
+O bench ganhou linhas de filtro, de lote e de strings (rodadas também no `main`, a mesma API pública). As linhas de
+`.filter()` e de group commit foram medidas de novo depois do review (três rodadas alternadas, load ~3): o filtro
+passou a olhar o `_json` em toda linha (abaixo) e o group commit de 1 `patch` media um `patch` sem mudança (que não
+escreve nada; era 10.382 → 8.398 ns).
 
 | Caminho | `main` (ns/op) | PR 3b (ns/op) | |
 |---|---|---|---|
@@ -104,12 +107,12 @@ O bench ganhou linhas de filtro, de lote e de strings (rodadas também no `main`
 | `validate` string regex | 123 | **42** | −66% |
 | query `db.get` | 5.884 | **5.156** | −12% |
 | query `withIndex().take(10)` | 27.116 | **22.900** | −16% |
-| query `.filter()` `take(10)` (1 em 10 passa; ~540 linhas lidas) | 711.114 | **479.109** | −33% |
-| query `.filter()` `collect()` (1.000 linhas, 12 passam) | 1.231.688 | **764.450** | −38% |
-| query `withIndex` + `.filter()` `collect()` | 358.617 | **265.636** | −26% |
-| mutation `.filter()` `first()` (lê 1.000) | 1.234.880 | **899.574** | −27% |
-| group commit de 1 mutation, como o shard faz | 10.382 | **8.398** | −19% |
-| group commit de 10 mutations | 123.238 | 121.290 | −2% |
+| query `.filter()` `take(10)` (1 em 10 passa; ~540 linhas lidas) | 711.500 | **496.654** | −30% |
+| query `.filter()` `collect()` (1.000 linhas, 12 passam) | 1.222.114 | **808.282** | −34% |
+| query `withIndex` + `.filter()` `collect()` | 365.596 | **281.683** | −23% |
+| mutation `.filter()` `first()` (lê 1.000) | 1.225.699 | **943.670** | −23% |
+| group commit de 1 `patch` que muda o valor, como o shard faz | 15.478 | **13.758** | −11% |
+| group commit de 10 `patch` | 119.111 | 115.705 | −3% |
 | mutation vazia / query vazia | 1.858 / 568 | 1.806 / 550 | −3% / −3% |
 | `patch` / `increment` / `db.sql` / chaves / JSON | — | — | igual (±1%) |
 
@@ -126,8 +129,12 @@ por mutation **3 → 1**; statements, linhas lidas e escritas iguais (2,17 / 3,8
   `_json` e sem colunas de texto. O scan é o mesmo (faixa, `LIMIT`, lotes), então `rowsRead`, `documentsRead`, read
   set e paginação não mudam: o teste no workerd compara o pushdown ligado e desligado no DO SQLite, com as linhas
   lidas que o DO conta. Na primeira versão a expressão era repetida por coluna escondida (o SQLite achata a
-  subquery) e o filtro ficou 18% mais lento que o JS; a co-rotina (`LIMIT -1` por fora) e procurar no `_json` só
-  quando a coluna é NULL viraram isso no ganho acima.
+  subquery) e o filtro ficou 18% mais lento que o JS; a co-rotina (`LIMIT -1` por fora) virou isso no ganho acima.
+  A linha cujo `_json` cita o campo fica com o JS mesmo com a coluna preenchida (o decoder lê o `_json` primeiro, e
+  uma coluna adicionada depois das linhas, ou um `patch` antigo, pode deixar o valor nos dois): ler o `_json` em toda
+  linha custa ~8% contra lê-lo só com a coluna NULL (a primeira versão), e o veredito do SQLite é sempre o do
+  documento. O filtro tem teto de 256 nós e 32 KiB de SQL (um `or` plano é uma árvore funda no SQLite, que recusa
+  profundidade acima de 1.000; o DO recusa statement acima de 100 KB); acima disso fica com o JS.
 - **Linhas como arrays** (`SqlDriver.execRaw`, `DoSqlDriver` sobre `cursor.raw()`): os scans e o `db.get` de query
   decodificam do array (`decodeValues`), sem montar um objeto por linha. Medido com o filtro desligado: −24% num
   `take(10)` filtrado, −29% num `collect()` de 1.000 linhas.
