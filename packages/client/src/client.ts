@@ -10,7 +10,7 @@ import {
   type ArgsAndOptions,
   type FunctionReference,
 } from "./functions.ts";
-import { applyRowDiff, applyValueDiff, claimKey, reuseUnchanged, validate, type ObjectShape, type ShardSpec } from "@freecorps/ember-values";
+import { applyRowDiff, applyValueDiff, claimKey, reuseUnchanged, validate, type ObjectShape, type RowDiff, type ShardSpec, type ValueDiff } from "@freecorps/ember-values";
 import { jwtPayload } from "./jwt.ts";
 import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
 import {
@@ -729,7 +729,9 @@ export class EmberClient {
     const mt = options.multiTab;
     if (mt && WS) {
       const hb = options.heartbeat === false ? false : { intervalMs: options.heartbeat?.intervalMs ?? 25_000, timeoutMs: options.heartbeat?.timeoutMs ?? 10_000 };
-      const hub: MultiTabHost = { name: base, WebSocket: WS, heartbeat: hb };
+      // The leader keeps the values of queries tabs share with the same diff functions as this client.
+      const applyDiff = (prev: unknown, c: { diff?: unknown; vdiff?: unknown }) => (c.diff !== undefined ? applyRowDiff(prev, c.diff as RowDiff) : applyValueDiff(prev, c.vdiff as ValueDiff));
+      const hub: MultiTabHost = { name: base, WebSocket: WS, heartbeat: hb, applyDiff };
       const use = (plugin: MultiTabPlugin) => {
         this.tabs = plugin.create(hub);
         if (this.tabs) this.WS = this.tabs.socketConstructor();

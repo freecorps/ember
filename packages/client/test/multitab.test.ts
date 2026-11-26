@@ -125,7 +125,8 @@ describe("multiTab: one socket per shard for every tab", () => {
     expect(shardSockets(server)).toHaveLength(1);
     expect(b.sockets).toHaveLength(0);
     expect(c.sockets).toHaveLength(0);
-    expect(server.subscriptionCount(SHARD)).toBe(3);
+    // The same query in three tabs: one subscription on the shard.
+    expect(server.subscriptionCount(SHARD)).toBe(1);
     // Tabs without a stored clientId took the leader's: a mutation's dedup key does not depend on the socket.
     await Promise.all([a.client.ready(), b.client.ready(), c.client.ready()]);
     expect(b.client.clientId).toBe(a.client.clientId);
@@ -286,7 +287,7 @@ describe("multiTab: one socket per shard for every tab", () => {
     await until(() => wb.ok() && wc.ok());
     a.client.close();
     await until(() => b.client.tabRole === "leader" || c.client.tabRole === "leader");
-    await until(() => shardSockets(server).length === 1 && server.subscriptionCount(SHARD) === 2);
+    await until(() => shardSockets(server).length === 1 && server.subscriptionCount(SHARD) === 1);
     server.mutateDirect(SHARD, "messages:send", { channel: "g", body: "after handover" });
     await until(() => (wb.value() as string[]).includes("after handover") && (wc.value() as string[]).includes("after handover"));
     expect(shardSockets(server)).toHaveLength(1);
@@ -415,8 +416,142 @@ describe("multiTab: one socket per shard for every tab", () => {
     const ws = [a, b, c].flatMap((t) => [watch(t.client, list, { channel: "g" }), watch(t.client, list, { channel: "h" })]);
     await until(() => ws.every((w) => w.ok()));
     expect(shardSockets(server)).toHaveLength(1);
-    expect(server.subscriptionCount(SHARD)).toBe(6);
+    // Two queries in three tabs: two subscriptions on the shard.
+    expect(server.subscriptionCount(SHARD)).toBe(2);
     expect(errors).toEqual([]);
+  });
+});
+
+const docs = unsafeRef<"query">("messages:docs");
+const boom = unsafeRef<"query">("boom:query");
+/** Documents (rowdiff patches: the leader applies the same diffs as the clients to the value it keeps). */
+const docQueries = { "messages:docs": (db: { where(t: string, f: string, v: unknown): unknown[] }, { channel }: Record<string, unknown>) => db.where("messages", "channel", channel) };
+const bodies = (v: unknown) => ((v as Array<{ body: string }> | undefined) ?? []).map((d) => d.body);
+
+describe("multiTab: tabs share one subscription per query", () => {
+  it("N tabs on one query: one sub on the shard; leaving decrements, the last one unsubscribes; a new tab gets the value at once", async () => {
+    const browser = new FakeBrowser();
+    const server = messagesServer({ batch: true, ident: true, queries: docQueries });
+    const a = tabClient(browser, server);
+    await until(() => a.client.tabRole === "leader");
+    const b = tabClient(browser, server);
+    const c = tabClient(browser, server);
+    await until(() => b.client.tabRole === "follower" && c.client.tabRole === "follower");
+    const wa = watch(a.client, docs, { channel: "g" });
+    const wb = watch(b.client, docs, { channel: "g" });
+    await until(() => wa.ok() && wb.ok());
+    const [ws] = shardSockets(server);
+    expect(sentOf(ws!, "sub")).toHaveLength(1);
+    expect(server.subscriptionCount(SHARD)).toBe(1);
+
+    // Patches (row diffs) reach every tab; the leader's copy follows them.
+    await b.client.mutation(send, { channel: "g", body: "1" });
+    await a.client.mutation(send, { channel: "g", body: "2" });
+    await until(() => bodies(wa.value()).length === 2 && bodies(wb.value()).length === 2);
+    expect(ws!.received.some((m) => m !== "pong" && m.t === "patch" && m.changes.some((ch) => ch.diff))).toBe(true);
+
+    // A third tab: answered by the leader from that copy, while nothing comes from the shard.
+    ws!.hold();
+    const wc = watch(c.client, docs, { channel: "g" });
+    await until(() => wc.ok());
+    expect(bodies(wc.value())).toEqual(["1", "2"]);
+    expect(sentOf(ws!, "sub")).toHaveLength(1);
+    ws!.release();
+    server.mutateDirect(SHARD, "messages:send", { channel: "g", body: "3" });
+    await until(() => [wa, wb, wc].every((w) => bodies(w.value()).join() === "1,2,3"));
+
+    // Ref-counted: the shard keeps it until the last tab leaves.
+    wb.off();
+    wa.off();
+    await tick(10);
+    expect(sentOf(ws!, "unsub")).toHaveLength(0);
+    expect(server.subscriptionCount(SHARD)).toBe(1);
+    wc.off();
+    await until(() => server.subscriptionCount(SHARD) === 0);
+    expect(sentOf(ws!, "unsub")).toHaveLength(1);
+    // Other args: a subscription of their own.
+    const wg = watch(a.client, docs, { channel: "g" });
+    const wh = watch(b.client, docs, { channel: "h" });
+    await until(() => wg.ok() && wh.ok());
+    expect(server.subscriptionCount(SHARD)).toBe(2);
+  });
+
+  it("a tab that subscribes while the first answer is on its way waits for it (one sub); a failing query is shared too", async () => {
+    const browser = new FakeBrowser();
+    const server = messagesServer({ batch: true, ident: true });
+    const a = tabClient(browser, server);
+    await until(() => a.client.tabRole === "leader");
+    const b = tabClient(browser, server);
+    await until(() => b.client.tabRole === "follower");
+    // Same turn of the leader: both `sub`s reach it before the shard answers.
+    const wa = watch(a.client, list, { channel: "g" });
+    const wb = watch(b.client, list, { channel: "g" });
+    await until(() => wa.ok() && wb.ok());
+    const [ws] = shardSockets(server);
+    expect(sentOf(ws!, "sub")).toHaveLength(1);
+
+    const ea = watch(a.client, boom);
+    await until(() => ea.seen.at(-1)?.status === "error");
+    const eb = watch(b.client, boom);
+    await until(() => eb.seen.at(-1)?.status === "error");
+    expect(eb.seen.at(-1)!.error?.code).toBe("nope");
+    expect(sentOf(ws!, "sub")).toHaveLength(2);
+  });
+
+  it("after a leader handover each tab resumes: one sub with resume; the other tab's resume is answered unchanged by the leader", async () => {
+    const browser = new FakeBrowser();
+    const server = messagesServer({ batch: true, ident: true, queries: docQueries });
+    const a = tabClient(browser, server);
+    await until(() => a.client.tabRole === "leader");
+    const b = tabClient(browser, server);
+    const c = tabClient(browser, server);
+    const wb = watch(b.client, docs, { channel: "g" });
+    const wc = watch(c.client, docs, { channel: "g" });
+    await until(() => wb.ok() && wc.ok());
+    server.mutateDirect(SHARD, "messages:send", { channel: "g", body: "before" });
+    await until(() => bodies(wb.value()).length === 1 && bodies(wc.value()).length === 1);
+    a.client.close();
+    await until(() => b.client.tabRole === "leader" || c.client.tabRole === "leader");
+    await until(() => shardSockets(server).length === 1 && server.subscriptionCount(SHARD) === 1);
+    const [ws] = shardSockets(server);
+    // Both tabs are back on the new leader's socket.
+    await until(() => b.client.connectionState().shards[SHARD] === "open" && c.client.connectionState().shards[SHARD] === "open");
+    await tick(20);
+    expect(sentOf(ws!, "sub")).toHaveLength(1);
+    const sub = sentOf(ws!, "sub")[0] as { resume?: unknown };
+    expect(sub.resume).toBeDefined();
+    // Both kept their value (the shard sent no snapshot: unchanged), and follow the next change.
+    expect(ws!.received.filter((m) => m !== "pong" && m.t === "snap" && m.value !== undefined)).toHaveLength(0);
+    server.mutateDirect(SHARD, "messages:send", { channel: "g", body: "after" });
+    await until(() => bodies(wb.value()).join() === "before,after" && bodies(wc.value()).join() === "before,after");
+
+    // The leader holds no value (the shard only said `unchanged`): a new tab without one subscribes on its own.
+    const d = tabClient(browser, server);
+    const wd = watch(d.client, docs, { channel: "g" });
+    await until(() => wd.ok());
+    expect(bodies(wd.value())).toEqual(["before", "after"]);
+    expect(sentOf(ws!, "sub")).toHaveLength(2);
+    server.mutateDirect(SHARD, "messages:send", { channel: "g", body: "last" });
+    await until(() => [wb, wc, wd].every((w) => bodies(w.value()).at(-1) === "last"));
+  });
+
+  it("the leader's own tab talks to it in-process: no BroadcastChannel message for its frames", async () => {
+    const browser = new FakeBrowser();
+    const server = messagesServer({ batch: true, ident: true });
+    const a = tabClient(browser, server);
+    await until(() => a.client.tabRole === "leader");
+    await tick(10);
+    const posted = browser.posted;
+    const wa = watch(a.client, list, { channel: "g" });
+    await until(() => wa.ok());
+    await a.client.mutation(send, { channel: "g", body: "x" });
+    await until(() => (wa.value() as string[]).includes("x"));
+    expect(browser.posted).toBe(posted);
+    // A follower still goes over the channel.
+    const b = tabClient(browser, server);
+    const wb = watch(b.client, list, { channel: "g" });
+    await until(() => wb.ok());
+    expect(browser.posted).toBeGreaterThan(posted);
   });
 });
 

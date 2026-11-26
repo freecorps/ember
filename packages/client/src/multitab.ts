@@ -36,6 +36,17 @@
 // client resend what had no `mres`, and the shard answers those from its dedup. Pending mutations never leave the tab
 // that issued them.
 //
+// Shared subscriptions. Tabs of one group that subscribe to the same query (`fn` and args, the group fixing shard and
+// identity) share one subscription on the shard, under a qid of the leader's (`*<n>`): ref-counted (the last tab to
+// leave sends the `unsub`), its patches routed to every tab subscribed, each under its own qid. The leader keeps the
+// last value the shard confirmed (diffs applied as the clients apply them) with its version and identity tag: a tab
+// that subscribes to a query already live gets its `snap` at once, from that value, or `unchanged` when its `resume`
+// starts at or after the version the value has held since. When the leader does not hold the value (the shard
+// answered `unchanged` to the first tab's `resume`, a diff it could not apply) and the tab's resume does not fit, the
+// tab's subscription goes to the shard on its own, as without sharing.
+//
+// The leader's own tab talks to it in-process (a microtask), not over the BroadcastChannel loopback.
+//
 // Qids are rewritten per virtual socket (`<vid>~<qid>`) on the shared socket and routed back, so nothing sent for a
 // socket that is gone reaches the next one of the same tab. Attempts of one mid go to the shard one at a time (the shard
 // does not answer them in the order they came: a `sensitive` one awaits its session check, a refusal is immediate, a
@@ -100,6 +111,9 @@ export interface MultiTabOptions {
   onRoleChange?(role: TabRole): void;
 }
 
+/** A `patch` change carrying a diff (feature "rowdiff"/"vdiff"), as the wire has it. */
+export type DiffChange = { diff?: unknown; vdiff?: unknown };
+
 /** What the hub needs from its client. */
 interface HubConfig extends MultiTabOptions {
   name: string;
@@ -107,6 +121,8 @@ interface HubConfig extends MultiTabOptions {
   BroadcastChannel: BroadcastChannelConstructor;
   WebSocket: WebSocketConstructor;
   heartbeat: { intervalMs: number; timeoutMs: number } | false;
+  /** Applies a change's diff to the shared value the leader keeps (throws when it does not fit); none: diffs forget it. */
+  applyDiff?: ((prev: unknown, change: DiffChange) => unknown) | undefined;
 }
 
 /** What a client gives the hub it builds (`MultiTabPlugin.create`). */
@@ -115,6 +131,11 @@ export interface MultiTabHost {
   name: string;
   WebSocket: WebSocketConstructor;
   heartbeat: { intervalMs: number; timeoutMs: number } | false;
+  /**
+   * The client's diff functions (`applyRowDiff` / `applyValueDiff`): the leader keeps shared values current with them.
+   * Passed in so this module, loaded with `import()` for the older option, does not import the values package.
+   */
+  applyDiff?: (prev: unknown, change: DiffChange) => unknown;
 }
 
 /** Option `multiTab` of `EmberClient`, as `multiTab()` returns it. */
@@ -131,7 +152,7 @@ export interface MultiTabPlugin {
 export function multiTab(options: MultiTabOptions = {}): MultiTabPlugin {
   return {
     kind: "ember.multiTab",
-    create: (host) => createMultiTab({ ...options, name: options.name ?? host.name, WebSocket: host.WebSocket, heartbeat: host.heartbeat }),
+    create: (host) => createMultiTab({ ...options, name: options.name ?? host.name, WebSocket: host.WebSocket, heartbeat: host.heartbeat, applyDiff: host.applyDiff }),
   };
 }
 
@@ -223,7 +244,7 @@ function resolveChannel(options: MultiTabOptions): BroadcastChannelConstructor |
  * The hub of one client: its virtual sockets, and (while it leads) the shared real sockets of every tab. Null when the
  * environment cannot coordinate tabs: the client then uses its WebSocket directly.
  */
-export function createMultiTab(options: MultiTabOptions & { name: string; WebSocket: WebSocketConstructor; heartbeat: HubConfig["heartbeat"] }): MultiTab | null {
+export function createMultiTab(options: MultiTabOptions & { name: string; WebSocket: WebSocketConstructor; heartbeat: HubConfig["heartbeat"]; applyDiff?: HubConfig["applyDiff"] }): MultiTab | null {
   const locks = resolveLocks(options);
   const BC = resolveChannel(options);
   if (!locks || !BC) return null;
@@ -464,9 +485,19 @@ export class MultiTab {
     }
   }
 
-  /** @internal */
+  /** @internal To the leader: in-process when it is this tab's (no BroadcastChannel loopback), else over the channel. */
   postToLeader(m: ToLeader): void {
-    this.post(this.toLeader, m);
+    const leader = this.leader;
+    if (!leader) return this.post(this.toLeader, m);
+    if (this.roleValue === "closed" && m.k !== "close") return;
+    // A later microtask, as a message would come (never inside the call that sent it), in post order.
+    queueMicrotask(() => leader.receive(m));
+  }
+
+  /** @internal From this tab's own leader, in-process. */
+  local(m: ToTab): void {
+    if (this.roleValue === "closed") return;
+    queueMicrotask(() => this.onInbox({ data: m }));
   }
 
   // ---------------------------------------------------------------------------------------------- sockets
@@ -715,8 +746,48 @@ interface Member {
   group: Group | null;
   /** Frames that came before the group's `ready` (handled once it comes). */
   waiting: string[] | null;
-  /** Its subscriptions on the shared socket (prefixed qids): unsubscribed when it goes. */
+  /** Its subscriptions on the shared socket of its own (prefixed qids): unsubscribed when it goes. */
   subs: Set<string>;
+  /** Its subscriptions to a shared query, by prefixed qid: it leaves them when it goes. */
+  keyed: Map<string, Shared>;
+}
+
+/** A `resume` as a tab's `sub` carries it. */
+type Resume = { version?: unknown; epoch?: unknown; ik?: unknown };
+
+/** A tab's subscription to a shared query: the qid it sent, its `resume`. */
+interface Holder {
+  m: Member;
+  qid: string | number;
+  resume: Resume | undefined;
+}
+
+/**
+ * One query (fn and args) the members of a group share: one `sub` on the shard, under the leader's qid. Its value is
+ * the last one the shard confirmed for it (null: not known here), with the version it is current as of, the version it
+ * has held since (a `resume` from there on is `unchanged`; null: not known) and its identity tag.
+ */
+interface Shared {
+  key: string;
+  qid: string;
+  fn: unknown;
+  args: unknown;
+  /** Answered by the shard: their patches reach them. */
+  holders: Map<string, Holder>;
+  /** Waiting for the shard's first answer; `first` is the one whose `sub` (and `resume`) went out. */
+  waiting: Map<string, Holder>;
+  first: string;
+  /** The `resume` of the first `sub` (what an `unchanged` answer to it is about), kept if that member leaves. */
+  firstResume: Resume | undefined;
+  answered: boolean;
+  value: { v: unknown } | null;
+  version: number;
+  since: number | null;
+  ik: unknown;
+  /** The shard's last `err` for it (it stays subscribed; a patch follows once it succeeds again). */
+  error: Record<string, unknown> | null;
+  /** The shard sent only errors so far: its holders have no value either (a new one is told just the error). */
+  bare: boolean;
 }
 
 /**
@@ -750,6 +821,12 @@ interface Group {
   byVid: Map<string, Member>;
   /** Mids with an attempt out on the shared socket (one at a time per mid: see {@link MidSlot}). */
   mids: Map<string, MidSlot>;
+  /** Shared queries by `fn` + canonical args, and by their qid on the shard. */
+  shared: Map<string, Shared>;
+  sharedByQid: Map<string, Shared>;
+  sharedSeq: number;
+  /** Version of the last `patch` (or `ready`): every answered subscription of the socket is current as of it. */
+  patchVersion: number;
   /** The shard said `authExpired` and no renewal went since. */
   expired: boolean;
   /**
@@ -811,7 +888,13 @@ class Leader {
     this.tabs.clear();
   }
 
+  /** @internal A message of this tab's own virtual sockets (in-process). */
+  receive(m: ToLeader): void {
+    this.onInbox({ data: m });
+  }
+
   private toTab(tab: string, m: ToTab): void {
+    if (tab === this.hub.id) return this.hub.local(m);
     let ch = this.tabs.get(tab);
     if (!ch) {
       ch = new this.hub.config.BroadcastChannel(`${this.base}:tab:${tab}`);
@@ -852,7 +935,7 @@ class Leader {
     const member = this.members.get(id);
     if (m.k === "open" && typeof m.url === "string") {
       if (!member) {
-        this.members.set(id, { tab: m.from, vid: m.vid, url: m.url, token: null, exp: null, expiredTold: false, group: null, waiting: null, subs: new Set() });
+        this.members.set(id, { tab: m.from, vid: m.vid, url: m.url, token: null, exp: null, expiredTold: false, group: null, waiting: null, subs: new Set(), keyed: new Map() });
         this.watchTab(m.from);
       }
       this.toTab(m.from, { e: E, k: "opened", vid: m.vid, lid: this.lid });
@@ -903,10 +986,113 @@ class Leader {
       if (slot.sender === m) slot.sender = null;
       if (slot.queue.some((q) => q.m === m)) slot.queue = slot.queue.filter((q) => q.m !== m);
     }
+    // Out of every shared query (the last one out unsubscribes it).
+    const left: string[] = [];
+    for (const mq of [...m.keyed.keys()]) this.leave(g, m, mq, left);
     if (g.closed) return;
     if (!g.members.size) return this.end(g, 1000, "no tabs left");
-    if (unsub) this.unsubShared(g, [...m.subs]);
+    if (unsub) this.unsubShared(g, [...m.subs, ...left]);
     m.subs.clear();
+  }
+
+  /**
+   * `m` leaves the shared query its `mq` (prefixed qid) is subscribed to: false when it is not one. The last subscriber
+   * out ends it: its qid is pushed to `unsubs` (the caller sends the `unsub`).
+   */
+  private leave(g: Group, m: Member, mq: string, unsubs: string[]): boolean {
+    const s = m.keyed.get(mq);
+    if (!s) return false;
+    m.keyed.delete(mq);
+    s.holders.delete(mq);
+    s.waiting.delete(mq);
+    if (!s.holders.size && !s.waiting.size) {
+      this.forget(g, s);
+      unsubs.push(s.qid);
+    }
+    return true;
+  }
+
+  /** A shared query is gone (unsubscribed, or dropped by the shard): nobody holds it any more. */
+  private forget(g: Group, s: Shared): void {
+    if (g.shared.get(s.key) === s) g.shared.delete(s.key);
+    if (g.sharedByQid.get(s.qid) === s) g.sharedByQid.delete(s.qid);
+    for (const [mq, h] of [...s.holders, ...s.waiting]) if (h.m.keyed.get(mq) === s) h.m.keyed.delete(mq);
+    s.holders.clear();
+    s.waiting.clear();
+  }
+
+  /**
+   * A member's `sub` of a query: shared with the other members of the group subscribed to it. The first one goes to the
+   * shard (under the leader's qid, with its `resume`); one that comes while that answer is on its way waits for it; one
+   * that comes after is answered here (`answerFrom`). False: it goes to the shard on its own (the leader cannot answer
+   * it: see `answerFrom`).
+   */
+  private share(g: Group, m: Member, msg: Record<string, unknown>, out: unknown[], back: unknown[]): boolean {
+    const qid = msg.qid as string | number;
+    const mq = prefix(m.vid, qid);
+    const resume = isObj(msg.resume) ? (msg.resume as Resume) : undefined;
+    const key = `${String(msg.fn)}\u0000${canonical(msg.args ?? {})}`;
+    const s = g.shared.get(key);
+    const holder: Holder = { m, qid, resume };
+    if (!s) {
+      // `*<lid>.<n>`: never a member's (`<vid>~…`), never another leader's (the shard keys a few rows by clientId and qid).
+      const created: Shared = { key, qid: `*${this.lid}.${(++g.sharedSeq).toString(36)}`, fn: msg.fn, args: msg.args, holders: new Map(), waiting: new Map([[mq, holder]]), first: mq, firstResume: resume, answered: false, value: null, version: 0, since: null, ik: undefined, error: null, bare: false };
+      g.shared.set(key, created);
+      g.sharedByQid.set(created.qid, created);
+      m.keyed.set(mq, created);
+      out.push({ ...msg, qid: created.qid });
+      return true;
+    }
+    if (!s.answered) {
+      s.waiting.set(mq, holder);
+      m.keyed.set(mq, s);
+      return true;
+    }
+    const answer = this.answerFrom(g, s, qid, resume);
+    if (!answer) return false;
+    s.holders.set(mq, holder);
+    m.keyed.set(mq, s);
+    back.push(...answer);
+    return true;
+  }
+
+  /**
+   * The answer to a `sub` of a shared query the shard already answered, as the shard would give it: `unchanged` when
+   * its `resume` is of this epoch and identity tag and starts at or after the version the value has held since, else
+   * the value (and its error, if it fails now). Null when the leader cannot tell: it does not hold the value and the
+   * resume does not fit (the `sub` then goes to the shard on its own).
+   */
+  private answerFrom(g: Group, s: Shared, qid: string | number, resume: Resume | undefined): unknown[] | null {
+    const version = Math.max(s.version, g.patchVersion);
+    const fits =
+      !!resume && g.ident && s.since !== null && resume.epoch === g.ready?.epoch && resume.ik !== undefined && resume.ik === s.ik && typeof resume.version === "number" && resume.version >= s.since && resume.version <= version;
+    const err = s.error ? [{ ...s.error, qid }] : [];
+    if (s.bare && err.length) return err;
+    if (fits) return [{ t: "snap", qid, version, unchanged: true }, ...err];
+    if (s.value) return [{ t: "snap", qid, version, ...(s.value.v === undefined ? {} : { value: s.value.v }), ...(s.ik !== undefined ? { ik: s.ik } : {}) }, ...err];
+    return null;
+  }
+
+  /** A change of a shared query's value (`patch`): the leader's copy follows it, as each client's does. */
+  private follow(s: Shared, c: Record<string, unknown>, version: number): void {
+    s.version = version;
+    s.since = version;
+    s.error = null;
+    s.bare = false;
+    if (c.diff !== undefined || c.vdiff !== undefined) {
+      const apply = this.hub.config.applyDiff;
+      if (!s.value || !apply) {
+        s.value = null;
+        return;
+      }
+      try {
+        s.value = { v: apply(s.value.v, c as DiffChange) };
+      } catch {
+        s.value = null; // not the shard's base: the tabs resynchronize themselves; a new tab's `sub` goes on its own
+      }
+      return;
+    }
+    s.value = { v: c.value };
   }
 
   private onMemberFrame(m: Member, data: string): void {
@@ -985,6 +1171,10 @@ class Leader {
       members: new Set(),
       byVid: new Map(),
       mids: new Map(),
+      shared: new Map(),
+      sharedByQid: new Map(),
+      sharedSeq: 0,
+      patchVersion: 0,
       expired: false,
       refused: false,
       closed: false,
@@ -1108,12 +1298,21 @@ class Leader {
             continue;
           }
           const qid = prefix(m.vid, msg.qid);
+          // Again on a qid it holds (an errored subscription re-run): out of what it held first.
+          const left: string[] = [];
+          if (this.leave(g, m, qid, left)) for (const q of left) out.push({ t: "unsub", qid: q });
+          if (this.share(g, m, msg, out, back)) continue;
           m.subs.add(qid);
           out.push({ ...msg, qid });
           continue;
         }
         case "unsub": {
           const qid = prefix(m.vid, msg.qid);
+          const left: string[] = [];
+          if (this.leave(g, m, qid, left)) {
+            for (const q of left) out.push({ t: "unsub", qid: q });
+            continue;
+          }
           m.subs.delete(qid);
           out.push({ ...msg, qid });
           continue;
@@ -1188,6 +1387,8 @@ class Leader {
     if (parsed === undefined) return;
     const array = Array.isArray(parsed);
     const per = new Map<Member, unknown[]>();
+    /** Subscriptions of shared queries the leader could not answer: they go to the shard on their own. */
+    const solos: unknown[] = [];
     const to = (m: Member | undefined, msg: unknown) => {
       if (!m || m.group !== g) return;
       const list = per.get(m);
@@ -1206,10 +1407,20 @@ class Leader {
           const features = Array.isArray(msg.features) ? msg.features : [];
           g.batch = features.includes("batch");
           g.ident = features.includes("ident");
+          if (typeof msg.version === "number") g.patchVersion = msg.version;
           // Routed below, then the members waiting for it get theirs.
           continue;
         }
-        case "snap":
+        case "snap": {
+          const s = typeof msg.qid === "string" ? g.sharedByQid.get(msg.qid) : undefined;
+          if (s) {
+            this.snapShared(g, s, msg, to, solos);
+            continue;
+          }
+          const r = this.route(g, msg.qid);
+          if (r) to(r.m, { ...msg, qid: r.qid });
+          continue;
+        }
         case "qres": {
           const r = this.route(g, msg.qid);
           if (r) to(r.m, { ...msg, qid: r.qid });
@@ -1217,6 +1428,11 @@ class Leader {
         }
         case "err": {
           if (msg.qid !== undefined) {
+            const s = typeof msg.qid === "string" ? g.sharedByQid.get(msg.qid) : undefined;
+            if (s) {
+              this.errShared(g, s, msg, to);
+              continue;
+            }
             const r = this.route(g, msg.qid);
             if (r) to(r.m, { ...msg, qid: r.qid });
             continue;
@@ -1235,8 +1451,21 @@ class Leader {
         }
         case "patch": {
           const changes = new Map<Member, unknown[]>();
+          const version = typeof msg.version === "number" ? msg.version : g.patchVersion;
+          if (version > g.patchVersion) g.patchVersion = version;
           for (const c of Array.isArray(msg.changes) ? msg.changes : []) {
             if (!isObj(c)) continue;
+            const s = typeof c.qid === "string" ? g.sharedByQid.get(c.qid) : undefined;
+            if (s) {
+              this.follow(s, c, version);
+              for (const h of s.holders.values()) {
+                const list = changes.get(h.m);
+                const routed = { ...c, qid: h.qid };
+                if (list) list.push(routed);
+                else changes.set(h.m, [routed]);
+              }
+              continue;
+            }
             const r = this.route(g, c.qid);
             if (!r) continue;
             const list = changes.get(r.m);
@@ -1273,6 +1502,7 @@ class Leader {
       if (array) this.sendTo(m, JSON.stringify(list));
       else for (const x of list) this.sendTo(m, JSON.stringify(x));
     }
+    if (solos.length) this.flush(g, solos, g.batch);
     if (g.ready) for (const m of [...g.members]) if (m.waiting && m.group === g) this.greet(m, g);
   }
 
@@ -1330,7 +1560,7 @@ class Leader {
     const refuseSub = (qid: unknown) => {
       if (typeof qid !== "string" && typeof qid !== "number") return;
       const shared = prefix(m.vid, qid);
-      if (m.subs.delete(shared)) unsubs.push(shared);
+      if (!this.leave(g, m, shared, unsubs) && m.subs.delete(shared)) unsubs.push(shared);
       refused.push({ t: "err", ...error, qid });
     };
     for (const msg of list) {
@@ -1360,6 +1590,75 @@ class Leader {
     if (refused.length) this.tellExpired(m, out);
     this.unsubShared(g, unsubs);
     return [...out, ...refused];
+  }
+
+  /**
+   * The shard's `snap` of a shared query. Its first answer goes as it is to the member whose `sub` went out, and answers
+   * the members that waited for it (`answerFrom`; one it cannot answer goes to the shard on its own, into `solos`).
+   * A later one (the socket's subscriptions re-evaluated after its expired token was renewed) goes to every holder.
+   */
+  private snapShared(g: Group, s: Shared, msg: Record<string, unknown>, to: (m: Member, msg: unknown) => void, solos: unknown[]): void {
+    const version = typeof msg.version === "number" ? msg.version : g.patchVersion;
+    const firstResume = s.firstResume;
+    s.version = version;
+    s.error = null;
+    s.bare = false;
+    if (msg.unchanged === true) {
+      // The value the first member offered is current: the leader does not have it, only how long it has held.
+      if (!s.answered) {
+        s.value = null;
+        s.since = typeof firstResume?.version === "number" ? firstResume.version : null;
+        s.ik = firstResume?.ik;
+      }
+    } else {
+      s.value = { v: msg.value };
+      s.since = version;
+      s.ik = msg.ik;
+    }
+    if (s.answered) {
+      for (const h of s.holders.values()) to(h.m, { ...msg, qid: h.qid });
+      return;
+    }
+    s.answered = true;
+    const waiting = [...s.waiting];
+    s.waiting.clear();
+    for (const [mq, h] of waiting) {
+      if (h.m.group !== g) continue;
+      const answer = mq === s.first ? [{ ...msg, qid: h.qid }] : this.answerFrom(g, s, h.qid, h.resume);
+      if (answer) {
+        s.holders.set(mq, h);
+        for (const x of answer) to(h.m, x);
+        continue;
+      }
+      // Its own subscription on the shard, as without sharing (with its own `resume`).
+      h.m.keyed.delete(mq);
+      h.m.subs.add(mq);
+      solos.push({ t: "sub", qid: mq, fn: s.fn, args: s.args, ...(h.resume ? { resume: h.resume } : {}) });
+    }
+    if (!s.holders.size) {
+      this.forget(g, s);
+      solos.push({ t: "unsub", qid: s.qid });
+    }
+  }
+
+  /**
+   * The shard's `err` for a shared query, to everyone subscribed to it. `auth_expired` means the shard dropped it (each
+   * client subscribes again after its `auth`); any other error leaves it subscribed and is what a new member is told.
+   */
+  private errShared(g: Group, s: Shared, msg: Record<string, unknown>, to: (m: Member, msg: unknown) => void): void {
+    const all = [...s.holders.values(), ...s.waiting.values()];
+    for (const h of all) to(h.m, { ...msg, qid: h.qid });
+    if (msg.code === "auth_expired") return this.forget(g, s);
+    const { qid: _qid, ...error } = msg;
+    s.error = error;
+    if (!s.answered) {
+      // The first answer is a failure: nobody holds a value (unless the first `sub` resumed from one: then not known).
+      s.answered = true;
+      s.bare = !s.firstResume;
+      s.version = g.patchVersion;
+      for (const [mq, h] of s.waiting) s.holders.set(mq, h);
+      s.waiting.clear();
+    }
   }
 
   /** The member a prefixed qid belongs to, and the qid it sent. */
