@@ -17,7 +17,7 @@ import { parse } from "./wire.ts";
 import { validate, withDefaults } from "@freecorps/ember-values";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 15;
+export const ADMIN_API_LEVEL = 16;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -87,7 +87,10 @@ export const ADMIN_FEATURES = [
   // says which Worker version answered (`version`: the caller pins its next requests to it)
   "run/read-only",
   "env-check",
-  // level 15: the SQL Explorer (one read-only query per call, admin-sql.ts); `data/list` also takes `id` (a direct
+  // level 15: real-user latency (rum.ts). Public (no admin token: what clients post), listed so the dashboard knows the
+  // runtime takes RUM batches and its shards report their colo.
+  "rum",
+  // level 16: the SQL Explorer (one read-only query per call, admin-sql.ts); `data/list` also takes `id` (a direct
   // get), range bounds on the next index field (`gt`/`gte`/`lt`/`lte`) and a full-text `search` through a searchIndex
   "sql",
 ] as const;
@@ -311,7 +314,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
       return deps.error(400, "bad_request", "eq must be a JSON array");
     }
     if (eq !== undefined && !Array.isArray(eq)) return deps.error(400, "bad_request", "eq must be a JSON array");
-    // Level 15: range bounds on the index field after the `eq` prefix (JSON values), a direct get, a full-text search.
+    // Level 16: range bounds on the index field after the `eq` prefix (JSON values), a direct get, a full-text search.
     const bounds: Record<string, unknown> = {};
     for (const op of ["gt", "gte", "lt", "lte"] as const) {
       if (!q.has(op)) continue;

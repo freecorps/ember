@@ -48,6 +48,8 @@ export class FakeFunctionError extends Error {
 }
 
 export interface FakeServerOptions {
+  /** Feature "rum": the colo `ready` reports to a client that asked for it. */
+  colo?: string;
   queries?: Record<string, FakeQuery>;
   mutations?: Record<string, FakeMutation>;
   /** token -> identity (null = invalid). Default: token "user:<subject>" or "user:<subject>:<exp>". */
@@ -565,8 +567,9 @@ export class FakeEmberServer {
         ws.ident = this.opts.ident === true && msg.features?.includes("ident") === true;
         const batch = this.opts.batch === true && msg.features?.includes("batch") === true;
         ws.ephemeral = !!this.opts.ephemeral && msg.features?.includes("ephemeral") === true;
-        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.vdiff ? ["vdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(this.opts.ack && msg.features?.includes("ack") ? ["ack"] : []), ...(batch ? ["batch"] : []), ...(this.opts.queryBatch && msg.features?.includes("qbatch") ? ["qbatch"] : []), ...(ws.ephemeral ? ["ephemeral"] : [])];
-        this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}) });
+        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.vdiff ? ["vdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(this.opts.ack && msg.features?.includes("ack") ? ["ack"] : []), ...(batch ? ["batch"] : []), ...(this.opts.queryBatch && msg.features?.includes("qbatch") ? ["qbatch"] : []), ...(ws.ephemeral ? ["ephemeral"] : []), ...(this.opts.colo && msg.features?.includes("rum") ? ["rum"] : [])];
+        const colo = this.opts.colo && msg.features?.includes("rum") ? this.opts.colo : undefined;
+        this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}), ...(colo ? { colo } : {}) });
         ws.batch = batch;
         return;
       }

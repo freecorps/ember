@@ -369,3 +369,7 @@ ul.plan li { padding: 3px 0; }
 .inline.range { gap: 4px; }
 form.inline { display: inline-flex; gap: 6px; align-items: center; }
 td.check, th.check { width: 30px; padding-right: 0; }
+
+/* real latency (RUM) */
+table.heat td, table.heat th[scope="row"] { white-space: nowrap; font-family: var(--mono); font-size: 12px; }
+table.heat td.warn { background: color-mix(in srgb, var(--warn) 10%, transparent); }

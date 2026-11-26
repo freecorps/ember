@@ -43,7 +43,16 @@ function fakeAnalytics(): typeof fetch {
     if (!u.startsWith("https://api.cloudflare.com/client/v4/accounts/acc/analytics_engine/sql")) return realFetch(input, init);
     const sql = String(init?.body ?? "");
     let data: Array<Record<string, unknown>> = [];
-    if (sql.includes("toStartOfInterval")) data = Array.from({ length: 12 }, (_, i) => ({ t: at(i), calls: 10 + i * 3, errors: i % 4 === 0 ? 2 : 0, p50: 3 + (i % 3), p95: 12 + i, rows_read: 40 + i * 5, rows_written: i }));
+    if (sql.includes("blob5 = 'rum'"))
+      data = [
+        { metric: "rtt", country: "BR", colo: "GRU", bucket: 11, n: 80 },
+        { metric: "rtt", country: "BR", colo: "GRU", bucket: 13, n: 20 },
+        { metric: "rtt", country: "BR", colo: "MIA", bucket: 15, n: 50 },
+        { metric: "rtt", country: "US", colo: "MIA", bucket: 9, n: 40 },
+        { metric: "ack", country: "BR", colo: "GRU", bucket: 14, n: 10 },
+        { metric: "rtt", country: XSS, colo: "", bucket: 16, n: 1 },
+      ];
+    else if (sql.includes("toStartOfInterval")) data = Array.from({ length: 12 }, (_, i) => ({ t: at(i), calls: 10 + i * 3, errors: i % 4 === 0 ? 2 : 0, p50: 3 + (i % 3), p95: 12 + i, rows_read: 40 + i * 5, rows_written: i }));
     else if (sql.includes("blob7 AS code")) data = [{ t: at(11), code: "MessageTooLong", shard: "org:acme", kind: "mutation", ms: 4.2 }];
     else if (sql.includes("blob8 AS shard")) data = [{ shard: "org:acme", calls: 300, errors: 3, rows_read: 900, rows_written: 40 }];
     else data = [{ project: "chat", env: "prod", fn: "messages:send", kind: "mutation", timing: "rpc", calls: 120, errors: 6, p50: 4, p95: 18, rows_read: 240, rows_written: 120, bytes_out: 9000 }];
@@ -638,6 +647,35 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
       await shot(page, "cost");
       await byFn.locator("tr", { hasText: "messages:send" }).click();
       await expect.poll(() => page.url()).toContain("/functions/messages%3Asend");
+      expect(problems).toEqual([]);
+      await close();
+    } finally {
+      delete env.CF_API_TOKEN;
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("real latency (RUM): p50/p95 per metric and a country × shard colo grid, from Analytics Engine", async () => {
+    env.CF_API_TOKEN = "cf";
+    globalThis.fetch = fakeAnalytics();
+    try {
+      const { page, problems, close } = await open("#/p/chat/prod/health");
+      await page.getByText("Needs attention").waitFor();
+      await page.keyboard.press("n");
+      await expect.poll(() => page.url()).toMatch(/\/latency$/);
+      // RTT over every country and colo: 191 weighted samples; p50 in bucket 11 (~53 ms), p95 in bucket 15 (~214 ms).
+      await page.locator(".stat", { hasText: "RTT p50 / p95" }).getByText("53 ms / 214 ms").waitFor();
+      const grid = page.getByRole("table", { name: "Latency by country and shard colo" });
+      await grid.getByRole("columnheader", { name: "GRU" }).waitFor();
+      await grid.getByRole("columnheader", { name: "?" }).waitFor();
+      await grid.getByRole("row", { name: /^BR/ }).getByText("53 ms / 107 ms").waitFor();
+      await grid.getByRole("row", { name: /^US/ }).getByText("26 ms / 26 ms").waitFor();
+      // A country value is data: rendered as text.
+      await grid.getByText(XSS).waitFor();
+      await page.getByLabel("Metric").selectOption("ack");
+      await grid.getByRole("row", { name: /^BR/ }).getByText("151 ms / 151 ms").waitFor();
+      expect(await page.evaluate(() => (window as { __xss?: number }).__xss)).toBeUndefined();
+      await shot(page, "latency");
       expect(problems).toEqual([]);
       await close();
     } finally {

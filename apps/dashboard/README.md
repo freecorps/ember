@@ -16,7 +16,8 @@ table in code.
 
 ## Screens
 
-Health, Functions (charts, errors, the runner), **Estimated cost**, App screens and Components (declarative screens of
+Health, Functions (charts, errors, the runner), **Estimated cost**, **Real latency** (RUM: p50/p95 of what sampled
+clients measured, by country × the colo the shard runs in; clients opt in with `rum: { sampleRate }`), App screens and Components (declarative screens of
 `defineApp`/`defineComponent({ dashboard })`), Shards, Data, Reactivity, Logs, Files, Users, Schedules, Deployments,
 the audit log and Settings. Single keys switch sections (`?` lists them); `/` searches shards; **`⌘K` / `Ctrl+K`**
 opens the command palette (environments, sections, screens, shards, tables, functions, users).
@@ -32,7 +33,7 @@ opens the command palette (environments, sections, screens, shards, tables, func
 ## Tests
 
 `bun run test`: the Worker (`test/worker.test.ts`, `security.test.ts`, `perf.test.ts`, `logs.test.ts`,
-`pricing.test.ts`) and the SPA in real Chromium (`test/browser`, playwright-core; skipped without an installed
+`pricing.test.ts`, `rum.test.ts`) and the SPA in real Chromium (`test/browser`, playwright-core; skipped without an installed
 Playwright browser unless `EMBER_REQUIRE_BROWSER=1`). The browser test counts every call the fake project receives
 (`fakeProject().calls`). End to end against a real runtime: `examples/files-auth-jobs/test/dashboard.test.ts`;
 `ember dev --dashboard`: `packages/cli/test/dev-dashboard.test.ts`.

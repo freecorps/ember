@@ -1,7 +1,7 @@
 // Ember Dashboard SPA (React, no router or UI dependencies). Hash routes:
 //   #/                                       projects of the account
 //   #/audit                                  audit log, all projects
-//   #/p/<project>/<env>/<section>[/<shard>]  health | functions | cost | shards | data | sql | schema | crons | ...
+//   #/p/<project>/<env>/<section>[/<shard>]  health | functions | cost | latency | shards | data | sql | schema | crons | ...
 //   #/p/<project>/<env>/data/<shard>/<table>[/<id>], files/<shard>/<file id>: a table, a document, a file
 //   #/p/<project>/<env>/components[/<shard>/<install>[/<tab>]], #/p/<project>/<env>/app[/<shard>/<tab>]: declarative screens
 // The shard in the route is the one the top bar's picker selected (data, shards and crons use it).
@@ -14,6 +14,7 @@ import { Audit } from "./pages/audit.tsx";
 import { DataBrowser } from "./pages/data.tsx";
 import { Health } from "./pages/health.tsx";
 import { Cost } from "./pages/cost.tsx";
+import { Latency } from "./pages/latency.tsx";
 import { Functions } from "./pages/functions.tsx";
 import { Crons, Deployments, Projects } from "./pages/misc.tsx";
 import { Files } from "./pages/files.tsx";
@@ -33,6 +34,7 @@ const SECTIONS = [
   { id: "health", label: "Health", key: "h" },
   { id: "functions", label: "Functions", key: "f" },
   { id: "cost", label: "Estimated cost", key: "e" },
+  { id: "latency", label: "Real latency", key: "n" },
   { id: "app", label: "App screens", key: "x" },
   { id: "components", label: "Components", key: "k" },
   { id: "shards", label: "Shards", key: "s" },
@@ -241,6 +243,8 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         <Functions {...p} fn={route.fn} />
       ) : section.id === "components" || section.id === "app" ? (
         <Screens key={`${p.project}/${p.env}/${section.id}`} {...p} shard={shard} kind={section.id} rest={route.rest ?? []} />
+      ) : section.id === "latency" ? (
+        <Latency key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "cost" ? (
         <Cost key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "users" ? (

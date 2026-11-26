@@ -25,6 +25,9 @@ import {
   bucketMinutes,
   jobHistorySql,
   parseJobHistory,
+  rumAggregate,
+  RUM_MAX_ROWS,
+  rumSql,
   parseUsageTotals,
   usageTotalsSql,
 } from "./metrics-sql.ts";
@@ -85,7 +88,7 @@ const DASH_ARGS_MAX = 8192;
 const SQL_AUDIT_CHARS = 2048;
 const SQL_ROWS_MAX = 5000;
 const SQL_PARAMS_MAX = 100;
-/** `data/list` arguments of admin API level 15 (`id`, range bounds, `search`): older runtimes would ignore them. */
+/** `data/list` arguments of admin API level 16 (`id`, range bounds, `search`): older runtimes would ignore them. */
 const ROWS_V2 = ["id", "gt", "gte", "lt", "lte", "search"];
 
 interface Ctx {
@@ -839,7 +842,7 @@ export const ROUTES: Route[] = [
     feature: "data/list",
     summary: "a page of an app table through an index (eq on a prefix of its fields, then gt/gte/lt/lte on the next), asc or desc; `id` gets one document, `search` runs a searchIndex",
     async run(c) {
-      // Bounds, a direct get and full-text search are level 15 (feature `sql` marks it): an older runtime would ignore
+      // Bounds, a direct get and full-text search are level 16 (feature `sql` marks it): an older runtime would ignore
       // them and answer the unfiltered page, so it is refused as outdated instead.
       const v2 = ROWS_V2.some((k) => c.q.has(k));
       const t = await targetOf(c, v2 ? "sql" : "data/list");
@@ -933,6 +936,21 @@ export const ROUTES: Route[] = [
       if (s instanceof Response) return s;
       const r = await analytics(c, () => shardStatsSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", project: s.project, env: s.env, sinceHours: hoursOf(c.q) }));
       return r instanceof Response ? r : json({ ok: true, shards: parseShardStats(r) });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/rum",
+    role: "read",
+    summary: "real-user latency (RUM batches of the clients, Analytics Engine): p50/p95 per metric and per country × shard colo",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const r = await analytics(c, () => rumSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...s, sinceHours: hoursOf(c.q) }));
+      if (r instanceof Response) return r;
+      // More groups than the cap: some buckets are missing, so no percentile is honest. Narrower window, then.
+      if ((r.data?.length ?? 0) > RUM_MAX_ROWS) return err(422, "too_many_groups", `more than ${RUM_MAX_ROWS} latency groups in this window: pick a shorter one`);
+      return json({ ok: true, ...rumAggregate(r) });
     },
   },
   {

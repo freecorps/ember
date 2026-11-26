@@ -440,9 +440,60 @@ describe("SQL Explorer", () => {
     expect(t.project.calls.filter((c) => c.method === "POST")).toHaveLength(1);
   });
 
-  it("a runtime before level 15 (no `sql` feature): runtime_outdated for the SQL page and for rows with bounds, id or search", async () => {
-    const level14 = ["capabilities", "status", "data", "schema", "data/list", "data/delete", "dashboards", "dashboards/query", "dashboards/run", "run/read-only", "env-check"];
-    const t = setup({ features: level14 });
+  it("a runtime before level 16 (no `sql` feature): runtime_outdated for the SQL page and for rows with bounds, id or search", async () => {
+    // ADMIN_FEATURES of @freecorps/ember-runtime at level 15 (RUM is the last one; `sql` came at 16).
+    const level15 = [
+      "capabilities",
+      "status",
+      "data",
+      "crons",
+      "inspect",
+      "bookmarks",
+      "bookmark",
+      "restore",
+      "keys/rotate",
+      "env/reveal",
+      "schema",
+      "data/list",
+      "data/insert",
+      "data/patch",
+      "data/replace",
+      "data/delete",
+      "functions",
+      "run",
+      "reactivity",
+      "reactivity/profile",
+      "jobs/run",
+      "jobs/cancel",
+      "crons/run",
+      "files/content",
+      "files/upload",
+      "files/delete",
+      "env",
+      "auth/users",
+      "auth/sessions",
+      "auth/revoke",
+      "auth/revoke-sockets",
+      "import/begin",
+      "import/batch",
+      "import/blob",
+      "import/files",
+      "import/finish",
+      "import/hash",
+      "import/meta",
+      "import/export",
+      "replicas",
+      "replicas/resync",
+      "preflight",
+      "files/orphans",
+      "dashboards",
+      "dashboards/query",
+      "dashboards/run",
+      "run/read-only",
+      "env-check",
+      "rum",
+    ];
+    const t = setup({ features: level15 });
     const res = await t.post("/api/sql", { ...base, sql: "SELECT 1" });
     expect(res.status).toBe(501);
     expect((await res.json()) as unknown).toMatchObject({ error: { code: "runtime_outdated", data: { feature: "sql" } } });
@@ -451,7 +502,7 @@ describe("SQL Explorer", () => {
     const rows = (qs: string) => t.call("GET", `/api/rows?project=chat&env=prod&shard=org:acme&table=messages${qs}`, h);
     expect((await rows("")).status).toBe(200);
     for (const qs of ["&id=messages_1", "&index=by_b&gt=1", "&lte=5", "&index=search_body&search=hi"]) expect((await rows(qs)).status, qs).toBe(501);
-    // A level 15 runtime gets them forwarded as given (capabilities are cached per Worker for a minute: forget them).
+    // A level 16 runtime gets them forwarded as given (capabilities are cached per Worker for a minute: forget them).
     clearCapabilities();
     const t2 = setup();
     const ok = await t2.call("GET", `/api/rows?project=chat&env=prod&shard=org:acme&table=messages&index=by_b&eq=${encodeURIComponent("[1]")}&gte=2&lt=9&search=x&id=messages_1`, h);

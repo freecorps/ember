@@ -136,6 +136,11 @@ export function setMetricsSink(sink: AnalyticsEngineDatasetLike | null): void {
   sinkOverride = sink;
 }
 
+/** The Analytics Engine dataset (EMBER_METRICS, or the override): RUM batches go there too (rum.ts). */
+export function metricsDataset(env: TelemetryEnv): AnalyticsEngineDatasetLike | null {
+  return dataset(env);
+}
+
 function dataset(env: TelemetryEnv): AnalyticsEngineDatasetLike | null {
   if (sinkOverride) return sinkOverride;
   const d = env.EMBER_METRICS as AnalyticsEngineDatasetLike | undefined;
