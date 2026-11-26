@@ -321,6 +321,20 @@ describe("ephemeral channels", () => {
     a.close();
   });
 
+  it("a refused join for a name that has no room keeps nothing for it (no sweep entry per distinct name)", async () => {
+    const shard = "eph:sweep-fresh";
+    const a = await member(shard, "good:ana");
+    for (let i = 0; i < 8; i++) await join(a, `room:in:${i}`);
+    // Past the channel cap: every join is refused after its sweep, each for a fresh name.
+    for (let i = 0; i < 5; i++) {
+      a.send({ t: "join", ch: `room:overflow:${i}` });
+      expect(await a.waitFor<Left>(is("left", (m) => m.ch === `room:overflow:${i}`))).toMatchObject({ code: "too_many_channels" });
+    }
+    const swept = await runInDurableObject(shardStub(shard), (instance: Shard) => [...(instance as unknown as { eph: { swept: Map<string, number> } }).eph.swept.keys()]);
+    expect(swept.filter((n) => n.startsWith("room:overflow:"))).toEqual([]);
+    a.close();
+  });
+
   it("a member silent past the TTL is closed and leaves; an auto-response ping keeps it", async () => {
     const shard = "eph:ttl";
     const a = await member(shard, "good:ana");

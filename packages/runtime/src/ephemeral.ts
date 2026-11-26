@@ -179,11 +179,12 @@ export class EphemeralChannels {
 
   /** Members of `name` silent past the TTL are closed (they leave everything; `drop` tells the others). */
   private sweep(name: string, now = Date.now()): void {
+    // No room, nothing to sweep and nothing kept: a refused join for a fresh name must not leave an entry behind.
+    const room = this.rooms.get(name);
+    if (!room) return;
     const at = this.swept.get(name) ?? 0;
     if (now - at < EPHEMERAL_SWEEP_MS) return;
     this.swept.set(name, now);
-    const room = this.rooms.get(name);
-    if (!room) return;
     for (const sid of [...room.keys()]) {
       const ws = this.host.socket(sid);
       const last = Math.max(this.seen.get(sid) ?? now, ws ? this.host.autoResponseAt(ws) : 0);
