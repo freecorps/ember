@@ -25,9 +25,10 @@ const LEASE_RPCS = ["claimActionJob", "settleActionJob", "claimActionJobs", "set
 /**
  * The test env with every Shard stub wrapped: counts the lease RPCs by name, and `missing` makes a method throw as a
  * shard instance of the runtime before it would (mid-deploy). `claimDelayMs`: the claim reaches the shard that late
- * (a slow hop: the lease starts when it arrives). `settled`: every outcome reported, with when.
+ * (a slow hop: the lease starts when it arrives). `failClaimOf`: job ids whose one-job claim fails (the RPC itself).
+ * `settled`: every outcome reported, with when.
  */
-function countingEnv(missing: string[] = [], claimDelayMs = 0) {
+function countingEnv(missing: string[] = [], claimDelayMs = 0, failClaimOf: string[] = []) {
   const calls: string[] = [];
   const settled: Array<{ at: number; jobId: string; released?: true; error?: unknown }> = [];
   const ns = env.SHARD;
@@ -42,6 +43,7 @@ function countingEnv(missing: string[] = [], claimDelayMs = 0) {
           return (...args: unknown[]) => {
             calls.push(prop);
             if (missing.includes(prop)) return Promise.reject(new Error(`The RPC receiver does not implement the method "${prop}".`));
+            if (prop === "claimActionJob" && failClaimOf.includes(args[1] as string)) return Promise.reject(new Error("network connection lost"));
             if (prop === "settleActionJobs") for (const o of args[1] as Array<{ jobId: string }>) settled.push({ at: Date.now(), ...o });
             if (prop === "claimActionJobs" && claimDelayMs) return sleep(claimDelayMs).then(() => (v as (...a: unknown[]) => unknown)(...args));
             return (v as (...a: unknown[]) => unknown)(...args);
@@ -157,6 +159,25 @@ describe("leased action jobs, per shard and batch", () => {
     expect(calls.filter((c) => c === "claimActionJob")).toHaveLength(3);
     expect(calls.filter((c) => c === "settleActionJob")).toHaveLength(3);
     expect(await labels(shard)).toEqual(["o1", "o2", "o3"]);
+    expect((await shardStub(shard).inspect()).jobs).toEqual([]);
+  });
+
+  it("a shard of the runtime before the batch RPCs: one failed claim retries only its delivery, the granted ones run", async () => {
+    const shard = "leaseb:old-partial";
+    const msgs = await dispatched(shard, "actions:record", ["p1", "p2", "p3"]);
+    const lost = msgs[1]!.jobId;
+    const { env: e } = countingEnv(["claimActionJobs", "settleActionJobs"], 0, [lost]);
+    const out = await deliverBatch(msgs, e);
+    expect(out.map((d) => ({ acked: d.acked, retried: d.retried }))).toEqual([
+      { acked: true, retried: false },
+      { acked: false, retried: true },
+      { acked: true, retried: false },
+    ]);
+    // The granted claims ran now (not after their leases): only the failed one waits for its redelivery.
+    expect(await labels(shard)).toEqual(["p1", "p3"]);
+    const again = await deliverBatch([msgs[1]!], countingEnv(["claimActionJobs", "settleActionJobs"]).env);
+    expect(again[0]!.acked).toBe(true);
+    expect(await labels(shard)).toEqual(["p1", "p2", "p3"]);
     expect((await shardStub(shard).inspect()).jobs).toEqual([]);
   });
 

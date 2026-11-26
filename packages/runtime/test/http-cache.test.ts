@@ -4,8 +4,8 @@
  * args, the shard and the Worker version. Signed-in calls are never cached; functions without `cache` refuse GET.
  */
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
-import { api, sleep } from "./helpers.ts";
+import { describe, expect, it, vi } from "vitest";
+import { api } from "./helpers.ts";
 import { getEmberConfig } from "../src/config.ts";
 import worker from "./worker.ts";
 
@@ -73,13 +73,25 @@ describe("GET /api/query/<fn> (cache)", () => {
   it("stale-while-revalidate: past maxAge the stale copy answers and one refresh stores the new value", async () => {
     const shard = "hc:swr";
     await send(shard, "s", "old");
-    expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "MISS", cacheControl: "public, max-age=1, stale-while-revalidate=60", body: { value: ["old"] } });
-    await send(shard, "s", "new");
-    expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "HIT", body: { value: ["old"] } });
-    await sleep(1100);
-    // Stale: answered from the copy, refreshed in the background (awaited by `get`).
-    expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "STALE", body: { value: ["old"] } });
-    expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "HIT", body: { value: ["old", "new"] } });
+    // The copy's age from a controlled clock (`Date` only): fresh, stale and refreshed without racing a real second.
+    const t0 = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(t0);
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "MISS", cacheControl: "public, max-age=1, stale-while-revalidate=60", body: { value: ["old"] } });
+      await send(shard, "s", "new");
+      vi.setSystemTime(t0 + 900);
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "HIT", body: { value: ["old"] } });
+      vi.setSystemTime(t0 + 1500);
+      // Stale: answered from the copy, refreshed in the background (awaited by `get`).
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "STALE", body: { value: ["old"] } });
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "HIT", body: { value: ["old", "new"] } });
+      // Past maxAge + swr: a miss.
+      vi.setSystemTime(t0 + 1500 + 62_000);
+      expect(await get("cached:swr", { channel: "s" }, { shard })).toMatchObject({ cache: "MISS", body: { value: ["old", "new"] } });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("signed-in calls are never cached (private, no-store) and see their own identity", async () => {
@@ -89,6 +101,8 @@ describe("GET /api/query/<fn> (cache)", () => {
     expect(await get("cached:who", {}, { token: "good:bob" })).toMatchObject({ body: { value: "bob" }, cacheControl: "private, no-store" });
     // A session cookie counts as signed in for the cache (never stored, never served from it).
     expect(await get("cached:who", {}, { cookie: "theme=dark; app.session_token=abc" })).toMatchObject({ cache: null, cacheControl: "private, no-store" });
+    // Any Authorization header (another scheme too) is not anonymous: off the cache, with no identity from it.
+    expect(await get("cached:who", {}, { headers: { authorization: "Basic YTpi" } })).toMatchObject({ status: 200, body: { value: "anonymous" }, cache: null, cacheControl: "private, no-store" });
     // An invalid token: 401, not the anonymous copy.
     expect(await get("cached:who", {}, { token: "bad" })).toMatchObject({ status: 401, cacheControl: "private, no-store" });
     // The anonymous copy is still the anonymous one.
@@ -123,6 +137,14 @@ describe("GET /api/query/<fn> (cache)", () => {
     await send("global:main", "g", "in main");
     expect(await get("cached:list", { channel: "g" })).toMatchObject({ body: { value: ["in main"] } });
     expect((await get("cached:list", { channel: "g" }, { shard: "bad" })).status).toBe(400);
+    // A routing argument that is not a string or number: 400, never coerced (an object without toString threw before).
+    expect(await get("cached:room", undefined, { raw: '{"room":{"toString":1}}' })).toMatchObject({ status: 400, body: { error: { code: "bad_shard" } } });
+    expect(await get("cached:room", { room: ["r1"] })).toMatchObject({ status: 400, body: { error: { code: "bad_shard" } } });
+    // A named shard wins and the argument is not read for routing: the shard validates it.
+    expect(await get("cached:room", undefined, { raw: '{"room":{"toString":1}}', shard: "room:r1" })).toMatchObject({ status: 400, body: { error: { code: "ValidationError" } } });
+    const post = await worker.fetch(new Request("http://ember.test/api/query/cached:room", { method: "POST", headers: { "content-type": "application/json" }, body: '{"room":{"toString":1}}' }), env as never, createExecutionContext());
+    expect(post.status).toBe(400);
+    expect(((await post.json()) as { error: { code: string } }).error.code).toBe("bad_shard");
   });
 
   it("a new Worker version starts from an empty cache", async () => {
