@@ -3411,6 +3411,8 @@ export class EmberClient {
             sub.confirmed = { value: next };
           } else sub.confirmed = { value: sub.confirmed ? reuseUnchanged(sub.confirmed.value, c.value) : c.value };
           this.dropLocal(sub);
+          // A subscription that failed first and now has its first value (the shard patched it): its first_value.
+          if (sub.error) this.rumFirst(conn, sub);
           sub.error = null;
           sub.awaitingReply = false;
           changed.push(sub);
@@ -3570,7 +3572,9 @@ export class EmberClient {
     // What was queued before `ready` goes out as pipelined (so the fallback below accounts for it).
     if (conn.out) this.flushOut(conn);
     // RUM: the shard's colo (feature "rum"), and how long this socket took to be ready.
-    if (m.colo) conn.colo = m.colo;
+    // A new socket never inherits the previous one's colo: unknown until its own `ready`/`colo` says (the shard caches
+    // its probe, so a reconnect to the same shard normally brings it in `ready`).
+    conn.colo = m.colo || undefined;
     if (conn.rumOpenAt !== undefined) this.rumRecord("connect", conn.shard, conn.colo, conn.rumOpenAt);
     conn.rumOpenAt = undefined;
     conn.ready = true;

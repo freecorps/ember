@@ -95,6 +95,17 @@ describe("RUM", () => {
     expect(sent.length).toBe(1); // stop() had nothing left
   });
 
+  it("the collector: leaving (pagehide, stop) sends every queued batch, not only the first", () => {
+    const sent: string[] = [];
+    const c = new RumCollector("https://x/api/_ember/rum", { sampleRate: 1, flushIntervalMs: 1e9 }, (async (_u: unknown, init?: RequestInit) => (sent.push(String(init?.body)), new Response(null, { status: 204 }))) as typeof fetch);
+    // The most histograms the collector keeps (32), more than one batch's worth (each batch stays under 2 KB).
+    for (let i = 0; i < 32; i++) for (let b = 0; b < 6; b++) c.record("first_value", `kind${i}:x`, "MIA", 2 ** b * 3);
+    c.stop();
+    expect(sent.length).toBeGreaterThan(1);
+    const kinds = new Set(sent.flatMap((body) => (JSON.parse(body) as { h: Array<{ k: string }> }).h.map((x) => x.k)));
+    expect(kinds.size).toBe(32);
+  });
+
   type Batch = { h: Array<{ m: string; k: string; c: string; b: Array<[number, number]> }> };
   const counts = (body: string) => Object.fromEntries((JSON.parse(body) as Batch).h.map((x) => [x.m, x.b.reduce((a, [, n]) => a + n, 0)]));
 

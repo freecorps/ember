@@ -130,8 +130,19 @@ export class RumCollector {
   /** Posts what was measured (a beacon when the page is going away). Never throws. A batch that fails (network
    *  error, 429 or 5xx) goes back for the next flush; one the server refuses (4xx) is dropped. */
   flush(leaving: boolean): void {
-    const batch = this.takeBatch();
-    if (!batch) return;
+    if (!leaving) {
+      const batch = this.takeBatch();
+      if (batch) this.send(batch, false);
+      return;
+    }
+    // Leaving: every batch, taken out first (a send that fails at once restores its histograms: a loop of take and
+    // send could then go on forever).
+    const all: Array<{ body: string; taken: Hist[] }> = [];
+    for (let b = this.takeBatch(); b; b = this.takeBatch()) all.push(b);
+    for (const b of all) this.send(b, true);
+  }
+
+  private send(batch: { body: string; taken: Hist[] }, leaving: boolean): void {
     const { body, taken } = batch;
     this.sent++;
     try {

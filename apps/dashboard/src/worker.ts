@@ -26,6 +26,7 @@ import {
   jobHistorySql,
   parseJobHistory,
   rumAggregate,
+  RUM_MAX_ROWS,
   rumSql,
   parseUsageTotals,
   usageTotalsSql,
@@ -881,7 +882,10 @@ export const ROUTES: Route[] = [
       const s = scope(c.q);
       if (s instanceof Response) return s;
       const r = await analytics(c, () => rumSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...s, sinceHours: hoursOf(c.q) }));
-      return r instanceof Response ? r : json({ ok: true, ...rumAggregate(r) });
+      if (r instanceof Response) return r;
+      // More groups than the cap: some buckets are missing, so no percentile is honest. Narrower window, then.
+      if ((r.data?.length ?? 0) > RUM_MAX_ROWS) return err(422, "too_many_groups", `more than ${RUM_MAX_ROWS} latency groups in this window: pick a shorter one`);
+      return json({ ok: true, ...rumAggregate(r) });
     },
   },
   {

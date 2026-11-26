@@ -337,6 +337,9 @@ export async function queryFunctionStats(o: { accountId: string; token: string; 
  * RUM points (runtime rum.ts: `blob5 = 'rum'`, one point per metric, shard kind, DO colo and log bucket): weighted
  * samples per metric × country × DO colo × bucket. Percentiles come from the summed histograms (`rumAggregate`).
  */
+/** Groups (metric × country × colo × bucket) `/api/rum` sums; one more is asked to tell a truncated answer. */
+export const RUM_MAX_ROWS = 20_000;
+
 export function rumSql(o: { dataset: string; project: string; env: string; sinceHours: number }): string {
   if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
   const where = [...scopeWhere(o), "blob5 = 'rum'"];
@@ -346,7 +349,8 @@ export function rumSql(o: { dataset: string; project: string; env: string; since
     `FROM ${o.dataset}`,
     `WHERE ${where.join(" AND ")}`,
     "GROUP BY metric, country, colo, bucket",
-    "LIMIT 20000",
+    // One row past the cap: a truncated histogram would give a false p95 (the endpoint refuses it then).
+    `LIMIT ${RUM_MAX_ROWS + 1}`,
   ].join("\n");
 }
 

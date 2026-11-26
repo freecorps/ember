@@ -1,7 +1,7 @@
 // Real-user latency in the dashboard: the Analytics Engine SQL (RUM points apart from execution metrics), percentiles
 // from summed log histograms, and the bucket formula shared with the runtime.
 import { describe, expect, it } from "vitest";
-import { functionStatsSql, rumAggregate, rumBucketMs, rumSql, shardStatsSql } from "../src/metrics-sql.ts";
+import { functionStatsSql, RUM_MAX_ROWS, rumAggregate, rumBucketMs, rumSql, shardStatsSql } from "../src/metrics-sql.ts";
 
 describe("RUM in the dashboard", () => {
   it("RUM points are read apart: never counted as function or shard executions", () => {
@@ -12,6 +12,8 @@ describe("RUM in the dashboard", () => {
     expect(sql).toContain("SUM(_sample_interval * double11 * double12) AS n");
     expect(sql).toContain("index1 = 'chat/prod'");
     expect(() => rumSql({ dataset: "x; DROP", project: "chat", env: "prod", sinceHours: 1 })).toThrow();
+    // One row past the cap, so a truncated answer is told apart (the endpoint refuses it instead of a false p95).
+    expect(sql).toContain(`LIMIT ${RUM_MAX_ROWS + 1}`);
   });
 
   it("same buckets as the runtime's rumBucketMs (packages/runtime/src/rum.ts)", () => {
