@@ -98,7 +98,9 @@ describe("zframe: compressed server frames", () => {
     w.send({ t: "mut", mid: "after", fn: "messages:send", args: { channel: "w", body: "after wake" } });
     const patch = await c.waitFor<Patch>(is("patch"));
     expect((patch.changes[0]!.value as unknown[]).length).toBe(61);
-    expect(c.wire.slice(before).find((f) => f.chars > 2048)?.binary).toBe(true);
+    const big = c.wire.slice(before).find((f) => f.chars > 2048);
+    expect(big).toBeDefined();
+    expect(big!.binary).toBe(true);
     c.close();
     w.close();
   });

@@ -45,7 +45,8 @@ export class FrameQueue {
   push(data: unknown): void {
     if (typeof data === "string" && !this.behind) return this.handle(data);
     const text = typeof data === "string" ? Promise.resolve(data) : inflateFrame(data);
-    // Decoded meanwhile (in parallel), handled in order.
+    // Decoded meanwhile (in parallel), handled in order. The chain below reads `text` only once the frames ahead are
+    // handled: a decode that fails before then would be an unhandled rejection meanwhile (the chain reports it).
     text.catch(() => undefined);
     const next: Promise<void> = (this.behind ?? Promise.resolve())
       .then(() => text)

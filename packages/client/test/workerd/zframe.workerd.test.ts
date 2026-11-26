@@ -34,7 +34,7 @@ class WireSocket implements WebSocketLike {
         this.readyState = 1;
         ws.addEventListener("message", (e) => {
           const data = e.data;
-          this.wire.push(typeof data === "string" ? { binary: false, size: data.length } : { binary: true, size: (data as ArrayBuffer).byteLength ?? (data as Blob).size });
+          this.wire.push(typeof data === "string" ? { binary: false, size: data.length } : { binary: true, size: data instanceof ArrayBuffer ? data.byteLength : ArrayBuffer.isView(data) ? data.byteLength : (data as Blob).size });
           this.onmessage?.({ data });
         });
         ws.addEventListener("close", () => this.closed());
@@ -106,7 +106,10 @@ describe("zframe against the real runtime", () => {
     expect(helloOf(ps!).features).not.toContain("zframe");
     const compressed = zs!.wire.filter((f) => f.binary);
     expect(compressed).toHaveLength(1);
-    expect(zs!.wire.filter((f) => !f.binary).every((f) => f.size <= 2048)).toBe(true);
+    // Everything else (`ready`, the small snap) stays text, under the threshold.
+    const textFrames = zs!.wire.filter((f) => !f.binary);
+    expect(textFrames.length).toBeGreaterThan(0);
+    expect(textFrames.every((f) => f.size <= 2048)).toBe(true);
     expect(ps!.wire.every((f) => !f.binary)).toBe(true);
     const text = Math.max(...ps!.wire.map((f) => f.size));
     expect(compressed[0]!.size).toBeLessThan(text / 4);
