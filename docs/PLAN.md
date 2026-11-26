@@ -43,6 +43,7 @@ ember/                     (monorepo, MIT)
     react-native  adaptador de reconexão (AppState/NetInfo), helpers Expo, registro de push (token Expo ou nativo)
     expo-push     lado do aparelho do push E2E: plugin Expo (NSE no iOS), chave do aparelho, tarefa Android (✅)
     offline       StorageAdapter: memory, indexeddb, sqlite, expo-sqlite (✅ Fase 5a); opfs (SQLite-Wasm), tinybase, abas (✅ Fase 5c)
+    presence      presença (online por sala), digitando e cursores sobre o canal efêmero do Shard; /react: usePresence, useTyping, useCursors (✅ 0.10)
     plugins/
       search-fts5   vector-vectorize   ai-search
     components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, migrations, workpool, push, email, agent — files e auth embutidos)
@@ -53,7 +54,7 @@ ember/                     (monorepo, MIT)
     examples/     chat, todo, files-auth-jobs, email-lite   (✅ todos existem; tests no workerd, `bun run check` os cobre)
 ```
 
-**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-workpool`, `ember-email`, `ember-agent`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
+**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-workpool`, `ember-email`, `ember-agent`, `ember-presence`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
 
 ---
 
@@ -149,6 +150,7 @@ export default defineSchema({
 **Protocolo v1** (JSON sobre WebSocket com hibernação ✅; o binário msgpack vem depois):
 - Do cliente: `hello{clientId, auth}`, `subscribe{qid, fn, args, shard, resume?{version,epoch}}`, `unsubscribe`, `mutate{mid, fn, args, shard}`, `action`, `ping`.
 - Do servidor: `snapshot`, `patch{shard, version, changes}` (um por versão), `mutationResult{mid, ok|error, version}`, `authExpired`, `error`, `pong`.
+- ✅ **Canal efêmero** (feature `ephemeral`, 0.10): `join`/`leave`/`pub` de canais declarados em `defineApp({ channels })` (`authorize` síncrono e puro com a identidade verificada), broadcast em memória no Shard: zero linha escrita, nenhuma versão, nada no change log; inscrições no anexo (sobrevivem à hibernação), TTL por heartbeat. Base do `@freecorps/ember-presence`. Contrato em contracts.md ("Feature `ephemeral`").
 - Dedup de mutation por `(identity, clientId, mid)`, guardado por 7 a 14 dias (tabelas de geração, `docs/spikes/rows-written.md`).
 - Ping/pong por auto-response, sem acordar o DO ✅.
 - Sockets e anexos sobrevivem à hibernação ✅. Anexo de socket tem limite de 16 KB ✅: guarda `identity`, `clientId` e as subscriptions do socket (as que não cabem vão para `_ember_subs`), então assinar não grava linha.
