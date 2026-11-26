@@ -328,17 +328,27 @@ export const PREVIEW_BASE = "preview";
 export const PREVIEW_PREFIX = "preview-";
 
 /**
+ * The longest suffix `ember deploy` appends to `ember-<project>-<env>` for a resource of its own (queues `-files`,
+ * `-actions`, `-indexing`): a preview's slug leaves room for it, so every derived name fits Cloudflare's 63 characters.
+ * (Vectorize indexes and AI Search instances budget their own names; component queues add their install's suffix.)
+ */
+export const RESOURCE_SUFFIX_MAX = "-indexing".length;
+
+/**
  * The environment `--preview <branch>` deploys: `preview-<slug>`, the slug being the branch lowercased with every run
- * of other characters turned into one `-`. A slug longer than fits (the environment name is at most 40 characters and
- * the Worker name `ember-<project>-preview-<slug>` at most 63) is cut and ends in 6 hex characters of the branch's
- * sha256, so two long branches with a common prefix stay apart. The same branch always gives the same name.
+ * of other characters turned into one `-`. A slug longer than fits (the environment name is at most 40 characters, and
+ * the Worker name `ember-<project>-preview-<slug>` plus `RESOURCE_SUFFIX_MAX` at most 63) is cut and ends in 6 hex
+ * characters of the branch's sha256, so two long branches with a common prefix stay apart. The same branch always
+ * gives the same name; two branches with the same slug (`feat/x`, `feat-x`) give the same one, and share it.
  */
 export function previewEnvName(project: string, branch: string): string {
   const raw = branch.trim();
   const slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   if (!slug) throw new ConfigError(`--preview: ${JSON.stringify(branch)} has no letters or digits to name an environment after`);
-  const max = Math.min(40 - PREVIEW_PREFIX.length, 63 - workerName(project, PREVIEW_PREFIX).length);
+  const max = Math.min(40 - PREVIEW_PREFIX.length, 63 - RESOURCE_SUFFIX_MAX - workerName(project, PREVIEW_PREFIX).length);
   if (slug.length <= max) return `${PREVIEW_PREFIX}${slug}`;
+  // A cut slug is at least one character, "-" and the 6-character hash.
+  if (max < 8) throw new ConfigError(`--preview: the project name "${project}" is too long for preview environments (ember-${project}-preview-<slug> and its resources must fit 63 characters): a shorter "project" in ember.json makes room`);
   const hash = createHash("sha256").update(raw).digest("hex").slice(0, 6);
   return `${PREVIEW_PREFIX}${slug.slice(0, max - 7).replace(/-+$/, "")}-${hash}`;
 }

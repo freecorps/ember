@@ -5,8 +5,11 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { authSettings, envConfig, isDerivedPreview, previewEnvName, projectFrom, resolveEnv, validateConfig, workerName, workerSettings, type EmberConfigFile, type Project } from "../src/config.ts";
 import { deploy, planDeploy, settingsChanges, versionMetadata, type DeployOptions } from "../src/deploy/index.ts";
+import { indexingQueueName } from "../src/deploy/ai.ts";
+import { filesQueueName } from "../src/deploy/files.ts";
 import { destroy } from "../src/destroy.ts";
 import { envSet } from "../src/env.ts";
+import { withAuthFrom } from "../src/sso.ts";
 import { fakeAccount } from "./fake-account.ts";
 import { TMP } from "./helpers.ts";
 
@@ -158,20 +161,52 @@ describe("ember deploy --preview <branch>", () => {
   it("previewEnvName: a safe, stable slug that fits the environment and Worker names", () => {
     expect(previewEnvName("chat", "feature/Login-Page")).toBe("preview-feature-login-page");
     expect(previewEnvName("chat", "  fix__#42!! ")).toBe("preview-fix-42");
-    expect(previewEnvName("chat", "dependabot/npm_and_yarn/esbuild-0.28")).toBe(previewEnvName("chat", "dependabot/npm_and_yarn/esbuild-0.28"));
+    expect(previewEnvName("chat", "dependabot/npm_and_yarn/esbuild-0.28")).toBe("preview-dependabot-npm-and-yarn-e-826d80");
+    // Branches with the same slug share one preview.
+    expect(previewEnvName("chat", "feat/x")).toBe(previewEnvName("chat", "feat-x"));
     const long = "feature/a-very-long-branch-name-that-goes-on-and-on-forever";
     const a = previewEnvName("chat", long);
     const b = previewEnvName("chat", `${long}-2`);
     expect(a).not.toBe(b);
-    for (const name of [a, b, previewEnvName("a".repeat(40), long)]) {
+    for (const name of [a, b, previewEnvName("a".repeat(30), long)]) {
       expect(name).toMatch(/^preview-[a-z0-9]+(-[a-z0-9]+)*$/);
       expect(name.length).toBeLessThanOrEqual(40);
     }
     expect(a).toMatch(/-[0-9a-f]{6}$/);
-    expect(workerName("a".repeat(40), previewEnvName("a".repeat(40), long)).length).toBeLessThanOrEqual(63);
+    // The Worker and every resource named after it (queues -files, -actions, -indexing) fit Cloudflare's 63.
+    for (const project of ["chat", "a".repeat(30), "b".repeat(31)]) {
+      for (const branch of [long, "b".repeat(80), "x"]) {
+        const env = previewEnvName(project, branch);
+        const worker = workerName(project, env);
+        for (const name of [worker, filesQueueName(project, env), `${worker}-actions`, indexingQueueName(project, env)]) expect(name.length, name).toBeLessThanOrEqual(63);
+      }
+    }
+    // A name that already fit is unchanged (the reserve only cuts slugs that would not have fit their resources).
+    expect(previewEnvName("chat", "feature/Login-Page")).toBe("preview-feature-login-page");
+    // A project name so long that no cut slug fits: a clear error, never a negative slice.
+    expect(previewEnvName("c".repeat(38), "x")).toBe("preview-x");
+    expect(() => previewEnvName("c".repeat(38), long)).toThrow(/project name "c{38}" is too long for preview environments/);
+    expect(() => previewEnvName("c".repeat(40), "x")).toThrow(/too long for preview environments/);
     // Every derived name passes ember.json's own environment-name rule.
     expect(() => validateConfig({ project: "chat", compatibilityDate: "2026-10-01", environments: { [a]: {} } })).not.toThrow();
     expect(() => previewEnvName("chat", "///")).toThrow(/no letters or digits/);
+  });
+
+  it("SSO by name on a preview keeps what it inherits from environments.preview (withAuthFrom)", () => {
+    const p = repo({ limits: { cpuMs: 50 }, auth: { url: "https://app.example.com", from: "identity" }, environments: { prod: {}, preview: { vars: { FLAG: "preview" }, limits: { cpuMs: 120_000 }, placement: "smart", account: "acc2" } } });
+    const env = previewEnvName("chat", "feat/x");
+    const before = { settings: workerSettings(p, env), config: resolveEnv(p, env).config };
+    const sso = withAuthFrom(p, env, "https://identity.example.com");
+    expect(isDerivedPreview(sso, env)).toBe(true);
+    expect(workerSettings(sso, env)).toEqual({ limits: { cpuMs: 120_000 }, placement: "smart" });
+    expect(workerSettings(sso, env)).toEqual(before.settings);
+    expect(resolveEnv(sso, env).config).toMatchObject({ vars: { FLAG: "preview" }, account: "acc2" });
+    // The resolved URL, and still no base auth.url (the preview's issuer is its own workers.dev address).
+    expect(authSettings(sso, env)).toEqual({ from: "https://identity.example.com" });
+    // ember.json itself and the declared environments are untouched.
+    expect(p.config.environments.preview!.auth).toBeUndefined();
+    expect(withAuthFrom(p, "prod", "https://i.example.com").config.environments.prod).toEqual({ auth: { from: "https://i.example.com" } });
+    expect(before.config).toEqual(resolveEnv(p, env).config);
   });
 
   it("derives preview-<slug> from environments.preview; declared names win; auth.url is dropped", () => {
@@ -188,7 +223,7 @@ describe("ember deploy --preview <branch>", () => {
 
   it("deploys an isolated Worker (own name, EMBER_ENV, inherited vars), idempotently, and --destroy removes only it", async () => {
     const cf = fakeAccount({ namespaces: true });
-    const p = repo({ limits: { cpuMs: 50 } });
+    const p = repo({ limits: { cpuMs: 50 }, environments: { prod: {}, preview: { vars: { FLAG: "preview" }, placement: "smart" } } });
     await run(cf, p);
     const env = previewEnvName("chat", "feat/x");
     const first = await run(cf, p, { env });
@@ -199,6 +234,8 @@ describe("ember deploy --preview <branch>", () => {
     const plain = Object.fromEntries(put.metadata.bindings.filter((b: { type: string }) => b.type === "plain_text").map((b: { name: string; text: string }) => [b.name, b.text]));
     expect(plain).toMatchObject({ EMBER_ENV: "preview-feat-x", EMBER_PROJECT: "chat", FLAG: "preview" });
     expect(put.metadata.limits).toEqual({ cpu_ms: 50 });
+    // limits come from the project here; placement from environments.preview (below), both on the first Script PUT.
+    expect(put.metadata.placement).toEqual({ mode: "smart" });
     // The deployment is recorded under the derived name (`ember run --env preview-feat-x` finds it).
     expect(JSON.parse(readFileSync(join(p.stateDir, "deployments.json"), "utf8"))[env].worker).toBe(worker);
     // Again for the same branch: the same Worker, a code-only redeploy.
