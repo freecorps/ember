@@ -123,7 +123,7 @@ export interface MetadataInput {
 type ComponentsLike = Record<
   string,
   {
-    bindings?: Array<{ type: string; name: string; limit?: number; period?: number; destination_address?: string; allowed_destination_addresses?: string[]; allowed_sender_addresses?: string[] }>;
+    bindings?: Array<{ type: string; name: string; limit?: number; period?: number; dataset?: string; destination_address?: string; allowed_destination_addresses?: string[]; allowed_sender_addresses?: string[] }>;
   }
 >;
 
@@ -156,6 +156,13 @@ export function componentBindings(components: ComponentsLike | undefined, projec
           ...(b.allowed_destination_addresses?.length ? { allowed_destination_addresses: b.allowed_destination_addresses } : {}),
           ...(b.allowed_sender_addresses?.length ? { allowed_sender_addresses: b.allowed_sender_addresses } : {}),
         });
+        continue;
+      }
+      if (b.type === "analytics_engine") {
+        // EMBER_METRICS is the runtime's own dataset (execution metrics, RUM): a component gets a binding of its own.
+        if (b.name === "EMBER_METRICS") throw new Error(`Component ${key}: EMBER_METRICS is reserved for Ember's metrics dataset`);
+        if (!b.dataset || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(b.dataset)) throw new Error(`Component ${key}: analytics_engine ${b.name} needs a dataset name ([A-Za-z_][A-Za-z0-9_]*)`);
+        out.push({ type: "analytics_engine", name: b.name, dataset: b.dataset });
         continue;
       }
       if (b.type !== "ratelimit") throw new Error(`Component ${key}: unknown binding type ${b.type}`);

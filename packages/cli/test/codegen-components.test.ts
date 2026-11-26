@@ -207,6 +207,12 @@ describe("codegen with components", () => {
     expect(componentBindings({ a: { bindings: [{ type: "send_email", name: "EMAIL", allowed_sender_addresses: ["x@y.z"] }] } }, "p", "e")).toEqual([
       { type: "send_email", name: "EMAIL", allowed_sender_addresses: ["x@y.z"] },
     ]);
+    // Analytics Engine (the analytics component): a dataset per binding; EMBER_METRICS stays the runtime's.
+    expect(componentBindings({ a: { bindings: [{ type: "analytics_engine", name: "EMBER_ANALYTICS", dataset: "ember_analytics" }] } }, "p", "e")).toEqual([
+      { type: "analytics_engine", name: "EMBER_ANALYTICS", dataset: "ember_analytics" },
+    ]);
+    expect(() => componentBindings({ a: { bindings: [{ type: "analytics_engine", name: "EMBER_METRICS", dataset: "x" }] } }, "p", "e")).toThrow(/reserved/);
+    expect(() => componentBindings({ a: { bindings: [{ type: "analytics_engine", name: "A", dataset: "bad-name" }] } }, "p", "e")).toThrow(/dataset/);
     // Workers AI: one EMBER_AI however many installs ask for it (two agents), and only under that name.
     expect(componentBindings({ a: { bindings: [{ type: "ai", name: "EMBER_AI" }] }, b: { bindings: [{ type: "ai", name: "EMBER_AI" }] } }, "p", "e")).toEqual([{ type: "ai", name: "EMBER_AI" }]);
     expect(() => componentBindings({ a: { bindings: [{ type: "ai", name: "AI" }] } }, "p", "e")).toThrow(/EMBER_AI/);
