@@ -446,7 +446,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
   - Oficiais: `rateLimit` (token bucket e fixed window por chave, transacional; binding da Cloudflare opcional para actions/HTTP), `workflows` (diário + replay sobre o scheduler, ver §8), `migrations` (migrações de dados em lotes por shard, §22 L10), `workpool` (paralelismo limitado por pool e por shard, retries e `onComplete` na transação do resultado; §22 L11), `push` (componente sobre os helpers existentes). `files` e `auth` continuam embutidos (decisão e motivo em contracts.md).
   - ✅ Ganchos (Fase 6): componentes declaram **crons** (`crons: (config) => cronJobs(...)`), **Queues próprias** (`queues: { events: { handler } }`: o deploy cria `ember-<project>-<env>-<install>-<nome>`, liga o producer e o consumer; o `queue()` entrega o lote ao componente) e o **`email()` do Worker** (`email: { match, handler }`); binding `send_email`. Contrato em contracts.md ("Componentes", ganchos).
   - ✅ `agent` (`@freecorps/ember-agent`, §22 L12): threads, mensagens e deltas de streaming no shard de quem chama; geração numa action do app (`assistant.action()`) agendada atomicamente pelo `sendMessage`; tool calls até `maxSteps`; `onUsage` na transação do passo; Workers AI e modelos do AI SDK (estrutural). Contrato em contracts.md ("Agent").
-  - Falta: passos paralelos em workflows.
+  - ✅ Passos paralelos em workflows (`Promise.all` de passos vira um lote do diário, 0.10), `list` e retenção.
 
 ---
 
