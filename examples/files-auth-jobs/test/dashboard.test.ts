@@ -405,9 +405,11 @@ describe("dashboard → runtime (workerd)", () => {
       ["token", "sql.run", "ok"],
       ["token", "sql.run", "ok"],
     ]);
-    // The text is what ran (the point of the log); parameter values are user data, only their count.
-    expect(JSON.parse(log.body.entries[6]!.args!)).toEqual({ sql: "SELECT base, quote, rate FROM fxRates WHERE quote = ? ORDER BY base", params: 1, explain: false, limit: null });
-    expect(JSON.parse(log.body.entries[3]!.args!)).toMatchObject({ sql: "DELETE FROM fxRates" });
-    expect(log.body.entries[6]!.target).toBe("global:main");
+    // The text is what ran (the point of the log); parameter values are user data, only their count. Found by text.
+    const bySql = (text: string) => log.body.entries.find((e) => e.args !== null && (JSON.parse(e.args) as { sql?: string }).sql === text);
+    const first = bySql("SELECT base, quote, rate FROM fxRates WHERE quote = ? ORDER BY base");
+    expect(JSON.parse(first!.args!)).toEqual({ sql: "SELECT base, quote, rate FROM fxRates WHERE quote = ? ORDER BY base", params: 1, explain: false, limit: null });
+    expect(first).toMatchObject({ outcome: "ok", target: "global:main" });
+    expect(bySql("DELETE FROM fxRates")).toMatchObject({ action: "sql.run", outcome: "error" });
   });
 });
