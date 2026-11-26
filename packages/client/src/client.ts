@@ -3332,7 +3332,8 @@ export class EmberClient {
     this.clearTimer(conn, "pingTimer");
     // One measured ping at a time: pongs come back in order, so the first one answers the mark taken first (a ping sent
     // while one is out, after a frame cleared its deadline, is not measured).
-    if (conn.rumPingAt === undefined) conn.rumPingAt = this.rumMark();
+    // Through another tab's shared socket (`multiTab`), the leader answers the ping itself: not a shard round trip.
+    if (conn.rumPingAt === undefined && (conn.ws as { relayed?: unknown } | null)?.relayed !== true) conn.rumPingAt = this.rumMark();
     this.send(conn, PING);
     conn.deadlineTimer = setTimeout(() => {
       conn.deadlineTimer = null;
