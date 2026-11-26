@@ -52,8 +52,10 @@ const age = (at: number | null | undefined) => (typeof at === "number" && at > 0
 
 function state(t: TargetRow, max: number | undefined): { label: string; tone: "ok" | "bad" | "warn" | "info" | undefined; title?: string } {
   if (t.dead) return { label: "parked", tone: "bad", title: `Failed ${t.attempts}${max ? ` of ${max}` : ""} attempts; waits for a resync` };
-  if (t.snapshot) return { label: "resync queued", tone: "info" };
-  if (t.attempts > 0) return { label: `retrying ${t.attempts}${max ? `/${max}` : ""}`, tone: "warn", title: `Next attempt ${fmtTime(t.next_at)}` };
+  const tries = `${t.attempts}${max ? `/${max}` : ""}`;
+  // A failed resync keeps `snapshot = 1` and counts its attempts (parked at maxAttempts): show the retry, not "queued".
+  if (t.snapshot) return t.attempts > 0 ? { label: `resync retrying ${tries}`, tone: "warn", title: `Next attempt ${fmtTime(t.next_at)}` } : { label: "resync queued", tone: "info" };
+  if (t.attempts > 0) return { label: `retrying ${tries}`, tone: "warn", title: `Next attempt ${fmtTime(t.next_at)}` };
   if (t.pending > 0) return { label: "delivering", tone: "info" };
   return { label: "in sync", tone: "ok" };
 }
@@ -162,7 +164,12 @@ function SourcePanel({ name, src, tables, filter, canResync, onResync }: { name:
             <Stat label="Outbox depth" value={src.outbox ? fmtNum(src.outbox.depth) : "—"} tone={src.outbox && src.outbox.depth > 1000 ? "warn" : undefined} hint={name === "global:main" ? "log rows kept" : "rows waiting"} />
             <Stat label="Oldest pending" value={src.outbox ? age(src.outbox.oldestAt) : "—"} tone={src.outbox?.oldestAt && Date.now() - src.outbox.oldestAt > 5 * 60_000 ? "warn" : undefined} hint={src.outbox?.oldestAt ? fmtTime(src.outbox.oldestAt) : undefined} />
             <Stat label="Source seq" value={seq === undefined ? "—" : fmtNum(seq)} />
-            <Stat label="Parked" value={fmtNum(parked)} tone={parked ? "bad" : undefined} hint={name !== "global:main" && src.outbox?.parked ? `targets; ${fmtNum(src.outbox.parked)} rows kept for inspection` : "targets"} />
+            <Stat
+              label="Parked targets"
+              value={fmtNum(parked)}
+              tone={parked ? "bad" : undefined}
+              hint={[src.targets.length >= TARGETS_LISTED ? `of the ${TARGETS_LISTED} listed` : null, name !== "global:main" && src.outbox?.parked ? `${fmtNum(src.outbox.parked)} rows kept for inspection` : null].filter(Boolean).join("; ") || undefined}
+            />
             <Stat label="maxAttempts" value={max === undefined ? "—" : fmtNum(max)} hint="before a batch is parked" />
             {src.journal > 0 && <Stat label="Journal" value={fmtNum(src.journal)} hint="changes not converted yet" />}
           </div>
