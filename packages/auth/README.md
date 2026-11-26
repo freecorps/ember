@@ -40,6 +40,23 @@ const user = ctx.auth.require();         // throws Unauthenticated when signed o
 // a mutation that rechecks the live session: mutation({ sensitive: true, ... })
 ```
 
+The claims are typed from this file: `ember codegen` prints `ClaimsOf<typeof authConfig>` in
+`ember/_generated/claims.d.ts`, and `./_generated/server` types `ctx.auth` and `fromAuth` with it. They are Better
+Auth's (`sid`, `email`, `name`, `emailVerified`), `org?` with the `organization()` plugin, and what `ember.claims`
+returns, optional (only a JWT carries those; an identity from a session token or the session cookie has Better
+Auth's alone):
+
+```ts
+export default defineAuth({
+  plugins: [organization()],
+  ember: { claims: ({ user }) => ({ role: user.role === "admin" ? ("admin" as const) : ("member" as const) }) },
+});
+// ctx.auth.require().claims?.role: "admin" | "member" | undefined; fromAuth("tenant"): a type error
+```
+
+A custom claim that reuses a built-in name (`email`) replaces it in the JWT (`ember.claims` is spread last), so that
+name is typed as either value (`string | number` for `email: 123`).
+
 On the client, any Better Auth client works against `/api/auth/*`; `@freecorps/ember-react-native` has
 `createEmberAuthClient` (session in SecureStore, JWTs for Ember).
 
