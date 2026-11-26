@@ -27,18 +27,23 @@ export const overview = query({
     if (!membership(ctx)) return null;
     const org = ctx.db.query("auth:organization").first();
     if (!org) return null;
+    // The org shard's `auth:user` holds the users of this org's members: one scan, not a lookup per member.
+    const users = new Map(ctx.db.query("auth:user").collect().map((u) => [u.id, u]));
     const members = ctx.db
       .query("auth:member")
       .collect()
       .map((m) => {
-        const user = ctx.db.query("auth:user").withIndex("by_source_id", (q) => q.eq("id", m.userId)).first();
+        const user = users.get(m.userId);
         return { memberId: m.id, userId: m.userId, role: m.role, name: user?.name ?? null, email: user?.email ?? null };
       })
       .sort((a, b) => (a.email ?? "").localeCompare(b.email ?? ""));
+    // Team sizes from one scan of `auth:teamMember` (replica tables have no aggregates), not a count per team.
+    const perTeam = new Map<string, number>();
+    for (const tm of ctx.db.query("auth:teamMember").collect()) perTeam.set(tm.teamId, (perTeam.get(tm.teamId) ?? 0) + 1);
     const teams = ctx.db
       .query("auth:team")
       .collect()
-      .map((t) => ({ name: t.name, members: ctx.db.query("auth:teamMember").withIndex("by_teamId", (q) => q.eq("teamId", t.id)).collect().length }));
+      .map((t) => ({ name: t.name, members: perTeam.get(t.id) ?? 0 }));
     const invitations = ctx.db
       .query("auth:invitation")
       .collect()
