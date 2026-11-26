@@ -229,6 +229,9 @@ export class TypeOracle {
       this.claimsCache = prev;
       return prev.result;
     }
+    // What changed may be resolution metadata (a package.json's `types`/`exports`): the previous program would keep
+    // its module resolutions (same SourceFiles, no invalidation hook), so it is not reused then.
+    if (prev && prev.files.some((f) => f.endsWith("package.json") && !prev.stamp.includes(stampOf([f])))) this.claimsProgram = undefined;
     const probe = resolve(o.generatedDir, "__ember_claims.ts");
     const spec = JSON.stringify(relative(o.generatedDir, o.authConfig).split("\\").join("/").replace(/^(?!\.)/, "./"));
     const virtual = new Map([[probe, `import type config from ${spec};\nimport type { ClaimsOf } from "@freecorps/ember-auth";\nexport type __EmberClaims = ClaimsOf<typeof config>;\n`]]);
@@ -804,7 +807,10 @@ class TypePrinter {
       return elem ? `${this.wrap(elem, indent)}[]` : "unknown[]";
     }
     if (t.flags & ts.TypeFlags.Object) {
-      if (this.isLibType(t)) return this.compilerText(t);
+      // A built-in (`Date`, `Map<string, number>`) prints as the compiler names it, but in inline mode (claims.d.ts,
+      // which imports nothing) not one whose type arguments may name the project's types (`Record<string, Role>`):
+      // that one is expanded structurally, its arguments printed as everything else.
+      if (this.isLibType(t) && !(this.inline && this.hasTypeArguments(t))) return this.compilerText(t);
       const doc = !this.inline && this.documentOf(t);
       if (doc) return `Doc<${JSON.stringify(doc)}>`;
       if (t.getCallSignatures().length || t.getConstructSignatures().length) return "unknown";
@@ -884,6 +890,11 @@ class TypePrinter {
   }
 
   /** Built-in types (Uint8Array, Date, Map...) are printed by name. */
+  private hasTypeArguments(t: ts.Type): boolean {
+    if (t.aliasTypeArguments?.length) return true;
+    return (t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference ? this.checker.getTypeArguments(t as ts.TypeReference).length > 0 : false;
+  }
+
   private isLibType(t: ts.Type): boolean {
     const decls = (t.aliasSymbol ?? t.getSymbol())?.getDeclarations() ?? [];
     return decls.length > 0 && decls.every((d) => this.program.isSourceFileDefaultLibrary(d.getSourceFile()));

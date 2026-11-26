@@ -162,9 +162,37 @@ describe("typed identity claims (ember/auth.config.ts → _generated/claims.d.ts
       writeFileSync(join(sibling, "package.json"), JSON.stringify({ name: "roles", types: "v2.d.ts" }));
       await codegen(project, { oracle: new TypeOracle() });
       expect(gen(project, "claims.d.ts")).toContain('  role?: "beta";');
+      // The same oracle (`ember dev`) too: its previous program must not keep the resolution to v1.d.ts.
+      const same = new TypeOracle();
+      writeFileSync(join(sibling, "package.json"), JSON.stringify({ name: "roles", types: "v1.d.ts" }));
+      await codegen(project, { oracle: same });
+      expect(gen(project, "claims.d.ts")).toContain('  role?: "alpha";');
+      writeFileSync(join(sibling, "package.json"), JSON.stringify({ name: "roles", types: "v2.d.ts" }));
+      await codegen(project, { oracle: same });
+      expect(gen(project, "claims.d.ts")).toContain('  role?: "beta";');
     } finally {
       writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
       rmSync(sibling, { recursive: true, force: true });
+      await codegen(project, { oracle });
+    }
+  });
+
+  it("a built-in generic over a project type (Record<string, Role>) is expanded: claims.d.ts still stands alone", async () => {
+    writeFileSync(
+      join(project.dir, "auth.config.ts"),
+      AUTH_CONFIG(`{ roles: {} as Record<string, Role>, at: new Date() }`).replace("import { organization }", 'type Role = "admin" | "member";\nimport { organization }'),
+    );
+    try {
+      await codegen(project, { oracle });
+      const text = gen(project, "claims.d.ts");
+      expect(text).not.toMatch(/\bRole\b/);
+      expect(text).toContain('"admin" | "member"');
+      expect(text).toContain("at?: Date;");
+      const file = join(project.generatedDir, "claims.d.ts");
+      const program = ts.createProgram([file], OPTIONS);
+      expect(ts.getPreEmitDiagnostics(program).filter((d) => d.file?.fileName === file).map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n"))).toEqual([]);
+    } finally {
+      writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
       await codegen(project, { oracle });
     }
   });
