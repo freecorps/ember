@@ -4,6 +4,7 @@
 // the function; audited as `dashboard.embed.run`).
 import { beforeEach, describe, expect, it } from "vitest";
 import { clearCapabilities, CSP, createDashboard, embedCsp, inlineScriptHashes, type DashboardEnv } from "../src/worker.ts";
+import { frameAncestors } from "../src/embed.ts";
 import { registry } from "./helpers.ts";
 
 const PAGE = `<!doctype html><html><body><p>hi</p><script>window.a = 1;\r\n</script><script type="module">console.log(2)</script><script src="https://evil.example/x.js"></script></body></html>`;
@@ -96,6 +97,10 @@ describe("embed pages", () => {
     expect(res.headers.get("cache-control")).toBe("no-store");
     expect(res.headers.get("set-cookie")).toBeNull();
     expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+    // frame-ancestors: DASHBOARD_ORIGIN's origins when set, never anything that could add a directive.
+    const u = new URL(ORIGIN);
+    expect(frameAncestors({ DASHBOARD_ORIGIN: "https://a.example, https://b.example:8443/" }, u)).toEqual(["https://a.example", "https://b.example:8443"]);
+    expect(frameAncestors({ DASHBOARD_ORIGIN: "https://a.example; script-src *" }, u)).toEqual(["'none'"]);
     // The SPA may frame its own origin (and nothing else may frame the SPA).
     expect(CSP).toContain("frame-src 'self'");
     expect(CSP).toContain("frame-ancestors 'none'");

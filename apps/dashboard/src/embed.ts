@@ -146,6 +146,15 @@ const EMBED_HEADERS = {
   "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), clipboard-read=()",
 };
 
+/**
+ * `frame-ancestors` sources: the dashboard's origins (as for writes), each a plain `scheme://host[:port]` so that no
+ * configured value can add a directive to the header; none valid → `'none'`.
+ */
+export function frameAncestors(env: { DASHBOARD_ORIGIN?: unknown }, url: URL): string[] {
+  const ok = allowedOrigins(env, url).filter((o) => /^https?:\/\/[A-Za-z0-9.-]+(?::\d{1,5})?$|^https?:\/\/\[[0-9A-Fa-f:.]+\](?::\d{1,5})?$/.test(o));
+  return ok.length ? ok : ["'none'"];
+}
+
 /** A refusal shown inside the iframe: plain text, no script. */
 function refusal(status: number, message: string, ancestors: string[]): Response {
   return new Response(`${message}\n`, {
@@ -156,7 +165,7 @@ function refusal(status: number, message: string, ancestors: string[]): Response
 
 /** `GET /embed/<project>/<env><route>?dashboard&exp&sig`: an embed block's page (see the top of this file). */
 export async function serveEmbed(request: Request, env: ProjectEnv & { REGISTRY?: D1Like; DASHBOARD_ORIGIN?: unknown }, url: URL, fetchImpl: typeof fetch): Promise<Response> {
-  const ancestors = allowedOrigins(env, url);
+  const ancestors = frameAncestors(env, url);
   if (request.method !== "GET" && request.method !== "HEAD") return refusal(405, "use GET", ancestors);
   if (!env.REGISTRY) return refusal(500, "the REGISTRY binding is missing", ancestors);
   const s = await checkTicket(env.REGISTRY, url);
