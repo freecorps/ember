@@ -618,7 +618,8 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       // The URLs `ctx.storage` hands out (downloads, proxy uploads) are the test deployment's: served here.
       const stored = await serveStorage(request, url, { bucket, driverOf: (s) => drivers.get(s) ?? null, now });
       if (stored) return stored;
-      if (!routes.length) throw new Error("fetch(): pass the app's http router (emberTest({ http }) / convexTest's `http` module), or an app whose components have routes");
+      // An explicit router with no routes still answers (404); only no router at all is a setup error.
+      if (!options.http && !routes.length) throw new Error("fetch(): pass the app's http router (emberTest({ http }) / convexTest's `http` module), or an app whose components have routes");
       const hit = matchRoute(routes, request.method, url.pathname);
       if (!hit) return new Response(JSON.stringify({ ok: false, error: { code: "not_found", message: "not found" } }), { status: 404, headers: { "content-type": "application/json" } });
       if ("methodMismatch" in hit) return new Response(JSON.stringify({ ok: false, error: { code: "method_not_allowed", message: `${request.method} is not allowed on ${url.pathname}` } }), { status: 405 });

@@ -82,6 +82,13 @@ describe("ctx.storage in actions and HTTP actions", () => {
   };
   const api = anyApi as unknown as ApiFromModules<{ files: typeof files }>;
 
+  it("fetch: an explicit router with no routes answers 404; no router at all is a setup error", async () => {
+    using empty = emberTest({ schema, modules: { files }, http: httpRouter() });
+    expect((await empty.fetch("/missing")).status).toBe(404);
+    using none = emberTest({ schema, modules: { files } });
+    await expect(none.fetch("/missing")).rejects.toThrow(/http router/);
+  });
+
   it("a Buffer is copied: changing it after store() leaves the file, and the file reads back as exactly its bytes", async () => {
     using t = emberTest({ schema, modules: { files } });
     expect(await t.action(api.files.storeBuffer, {})).toEqual({ text: "hello", byteLength: 5, pooled: true });
