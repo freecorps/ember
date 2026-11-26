@@ -67,7 +67,10 @@ export type Identity<Claims = AnyClaims> = {
   iat?: number;
   claims?: Claims;
 };
-/** The names `fromAuth` takes for these claims (any string when they are not declared). */
+/**
+ * The names `fromAuth` takes for these claims: any string when they are not declared (`AnyClaims`), and also when the
+ * declared claims have a string index signature (`{ tenant?: string; [k: string]: unknown }` says any name may be one).
+ */
 export type ClaimName<Claims> = string extends keyof Claims ? string : Extract<keyof Claims, string>;
 /**
  * Who a run is for. `system`: a run the server started by itself (a scheduled job, a cron, a component hook), with no

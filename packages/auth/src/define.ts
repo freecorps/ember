@@ -86,15 +86,39 @@ export type SessionClaims = {
 export type OrganizationClaims = { org?: string };
 
 type Expand<T> = { [K in keyof T]: T[K] };
-type HasPlugin<O, Id extends string> = O extends { plugins?: infer P } ? (P extends ReadonlyArray<infer E> ? ([Extract<E, { id: Id }>] extends [never] ? false : true) : false) : false;
+type IdOf<E> = E extends { id: infer I } ? I : never;
+/**
+ * The plugin list has the plugin `Id`: one of its elements says so, or one's id is not a literal (a list typed
+ * `BetterAuthPlugin[]`, a helper returning a widened plugin): it may be that plugin, and its claims are optional anyway.
+ */
+type HasPlugin<O, Id extends string> = O extends { plugins?: infer P }
+  ? P extends ReadonlyArray<infer E>
+    ? [Extract<E, { id: Id }>] extends [never]
+      ? string extends IdOf<E>
+        ? true
+        : false
+      : true
+    : false
+  : false;
 type CustomClaims<O> = O extends { ember?: { claims?: infer F } } ? (F extends (...args: never) => infer R ? Awaited<R> : {}) : {};
+/** The declared names of `T` (not those of an index signature). */
+type KnownKeys<T> = keyof { [K in keyof T as string extends K ? never : number extends K ? never : symbol extends K ? never : K]: 0 };
+/**
+ * `Base` with `Custom` on top, as `jwt.definePayload` builds the token (`ember.claims`' result is spread last): a name
+ * of both is the base's value (an identity without a JWT) or the custom one (a JWT); the custom names alone are optional
+ * (an index signature of `Custom` too).
+ */
+type WithCustom<Base, Custom, Over extends keyof Base = Extract<keyof Base, KnownKeys<Custom>>> = {
+  [K in keyof Base]: K extends Over ? Base[K] | Custom[K & keyof Custom] : Base[K];
+} & { [K in keyof Custom as K extends Over ? never : K]?: Custom[K] };
 
 /**
  * The claims of an identity signed in with these options: `SessionClaims`, `org` with the organization plugin, and
  * what `ember.claims` returns. Those are optional: only a JWT carries them (an identity from a session token or the
- * session cookie has the Better Auth claims alone).
+ * session cookie has the Better Auth claims alone). A custom claim that reuses a built-in name (`email`) replaces it in
+ * the JWT, so that name is typed as either.
  */
-export type ClaimsOfOptions<O> = Expand<SessionClaims & (HasPlugin<O, "organization"> extends true ? OrganizationClaims : {}) & Partial<CustomClaims<O>>>;
+export type ClaimsOfOptions<O> = Expand<WithCustom<SessionClaims & (HasPlugin<O, "organization"> extends true ? OrganizationClaims : {}), CustomClaims<O>>>;
 
 /**
  * The claims of the identities an `ember/auth.config.ts` signs in (`ClaimsOf<typeof authConfig>`): what codegen prints

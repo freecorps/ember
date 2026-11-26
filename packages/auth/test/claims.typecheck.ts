@@ -1,5 +1,6 @@
 // `ClaimsOf<typeof authConfig>` (docs/design/dx.md §3.7): what codegen prints in `_generated/claims.d.ts`. Checked by
 // `tsc -b`, never run.
+import type { BetterAuthPlugin } from "better-auth";
 import { organization } from "better-auth/plugins";
 import { defineAuth, type ClaimsOf, type SessionClaims } from "../src/index.ts";
 
@@ -30,3 +31,30 @@ assert<Equal<ClaimsOf<typeof factory>["tenant"], string | undefined>>();
 
 // Something that is not a defineAuth value: the session claims.
 assert<Equal<ClaimsOf<{ emailAndPassword: { enabled: true } }>, SessionClaims>>();
+
+// A plugin list that is not a literal tuple: the organization plugin is still seen (by its id, or because a widened
+// plugin's id says nothing), so `org` stays a claim.
+const orgPlugins = [organization()];
+const fromVariable = defineAuth({ plugins: orgPlugins });
+assert<Equal<ClaimsOf<typeof fromVariable>["org"], string | undefined>>();
+const widened: BetterAuthPlugin[] = [organization() as unknown as BetterAuthPlugin];
+const fromWidened = defineAuth({ plugins: widened });
+assert<Equal<keyof ClaimsOf<typeof fromWidened>, keyof Session | "org">>();
+// Plugins whose ids are known and none is the organization one: no `org`.
+const noOrg = defineAuth({ plugins: [{ id: "custom" as const }] });
+assert<Equal<keyof ClaimsOf<typeof noOrg>, keyof Session>>();
+
+// A custom claim reusing a built-in name replaces it in the JWT (spread last): the name is typed as either value,
+// never as an impossible intersection.
+const overriding = defineAuth({ plugins: [organization()], ember: { claims: () => ({ email: 123 as number, org: 7 as number, extra: true as boolean }) } });
+type Over = ClaimsOf<typeof overriding>;
+assert<Equal<Over["email"], string | number>>();
+assert<Equal<Over["org"], string | number | undefined>>();
+assert<Equal<Over["extra"], boolean | undefined>>();
+assert<Equal<Over["sid"], string>>();
+
+// `ember.claims` typed as a plain record: the built-in claims keep their types, any other name is `unknown`.
+const record = defineAuth({ ember: { claims: (): Record<string, unknown> => ({}) } });
+type Rec = ClaimsOf<typeof record>;
+assert<Equal<Rec["sid"], string>>();
+assert<Equal<Rec["anything"], unknown>>();

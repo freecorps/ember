@@ -1,6 +1,6 @@
 // Typed identity claims (docs/design/dx.md §3.7): `Identity<Claims>` in `ctx.auth`, and `fromAuth` names a declared
 // claim. `_generated/server.d.ts` passes the app's claims as the builders' last type argument. Checked by `tsc -b`.
-import { fromAuth, v, type ActionBuilder, type AnyDataModel, type FromAuth, type Identity, type MutationBuilder, type QueryBuilder } from "../src/index.ts";
+import { fromAuth, v, type ActionAuth, type ActionBuilder, type ActionCtx, type AnyDataModel, type Auth, type ClaimName, type FromAuth, type Identity, type MutationBuilder, type QueryBuilder, type ShardDef } from "../src/index.ts";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 const assert = <T extends true>() => {};
@@ -34,12 +34,23 @@ typedFromAuth("tenant");
 
 // @ts-expect-error fromAuth names an undeclared claim: the shard is refused by the builder too
 export const bad = mutation({ shard: { org: fromAuth("tenant") }, handler: () => null });
+// Why: `FromAuth` is covariant in its name (a readonly field), and the builder's shard takes `FromAuth<ClaimName<Claims>>`
+// (the declared names), so another name is not assignable; with undeclared claims any name is.
+assert<Equal<ClaimName<Claims>, "sid" | "email" | "org" | "role">>();
+assert<Equal<FromAuth<"tenant"> extends FromAuth<ClaimName<Claims>> ? true : false, false>>();
+assert<Equal<{ org: FromAuth<"tenant"> } extends ShardDef<{}, Claims> ? true : false, false>>();
+assert<Equal<{ org: FromAuth<"org"> } extends ShardDef<{}, Claims> ? true : false, true>>();
+assert<Equal<{ org: FromAuth<"tenant"> } extends ShardDef<{}> ? true : false, true>>();
+// An index signature in the declared claims says any name may be one.
+assert<Equal<ClaimName<{ tenant?: string; [k: string]: unknown }>, string>>();
 
 export const a = action({
   args: { x: v.number() },
   handler: async (ctx) => {
     const me = await ctx.auth.require();
     assert<Equal<typeof me, Identity<Claims>>>();
+    // `ActionAuth` (and `Auth`) are part of the package's surface.
+    assert<Equal<typeof ctx.auth, ActionAuth<Claims>>>();
     return me.subject;
   },
 });
@@ -61,3 +72,8 @@ export const loose = anyQuery({
     return null;
   },
 });
+
+// The public auth types of the contexts, by name.
+assert<Equal<ActionCtx<AnyDataModel, Claims>["auth"], ActionAuth<Claims>>>();
+assert<Equal<ReturnType<Auth<Claims>["require"]>, Identity<Claims>>>();
+assert<Equal<ReturnType<ActionAuth["require"]>, Promise<Identity<Record<string, unknown>>>>>();

@@ -54,6 +54,9 @@ export default defineAuth({
 // ctx.auth.require().claims?.role: "admin" | "member" | undefined; fromAuth("tenant"): a type error
 ```
 
+A custom claim that reuses a built-in name (`email`) replaces it in the JWT (`ember.claims` is spread last), so that
+name is typed as either value (`string | number` for `email: 123`).
+
 On the client, any Better Auth client works against `/api/auth/*`; `@freecorps/ember-react-native` has
 `createEmberAuthClient` (session in SecureStore, JWTs for Ember).
 
