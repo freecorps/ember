@@ -65,7 +65,11 @@ const schema = defineSchema({
       /** `order` of the last prompt (the next one gets +1). */
       lastOrder: v.number(),
       updatedAt: v.number(),
-    }).index("by_user", ["userId", "updatedAt"]),
+    })
+      .index("by_user", ["userId", "updatedAt"])
+      // The dashboard's thread list (`dashboard:threads`): every thread by activity, and one status by activity.
+      .index("by_updated", ["updatedAt"])
+      .index("by_status", ["status", "updatedAt"]),
     messages: defineTable({
       thread: v.id("threads"),
       userId: v.optional(v.string()),
@@ -130,7 +134,7 @@ function checkSearch(ctx: { component: { config: AgentInstallConfig | undefined 
   if (!searchOn(ctx)) throw new EmberError("ValidationError", SEARCH_OFF);
 }
 
-const { query, mutation, internalMutation } = componentBuilders<typeof schema, AgentInstallConfig | undefined>();
+const { query, mutation, internalMutation, internalQuery } = componentBuilders<typeof schema, AgentInstallConfig | undefined>();
 
 type DM = DataModelFromSchema<typeof schema>;
 type Ctx = ComponentCtx<typeof schema, AgentInstallConfig | undefined>["mutation"];
@@ -192,6 +196,25 @@ const DELETE_BATCH = 200;
  * seqs `[n + 1 - 16^k, n]` into the first one. Rows per streaming message stay under 15 per level (16^level ≥ batches).
  */
 export const DELTA_FANOUT = 16;
+
+/** At most 500 characters of a timeline detail (null when empty). */
+const clip = (s: string): string | null => (s.length > 500 ? `${s.slice(0, 500)}…` : s || null);
+
+/** A message with no text (a tool call, a tool result): its tool parts, one line each (args/result as JSON, bounded). */
+function toolSummary(parts: readonly MessagePart[]): string {
+  const json = (x: unknown) => {
+    try {
+      const s = JSON.stringify(x) ?? "";
+      return s.length > 200 ? `${s.slice(0, 200)}…` : s;
+    } catch {
+      return "…";
+    }
+  };
+  return parts
+    .map((p) => (p.type === "tool-call" ? `→ ${p.toolName}(${json(p.args)})` : p.type === "tool-result" ? `← ${p.toolName}${p.isError ? " (error)" : ""}: ${json(p.result)}` : null))
+    .filter((x): x is string => x !== null)
+    .join("\n");
+}
 
 const textOf = (parts: readonly MessagePart[]) =>
   parts
@@ -736,10 +759,92 @@ export const functions = {
   },
 };
 
+// ------------------------------------------------------------------------------------------------ dashboard
+
+/** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
+const dashboardFunctions = {
+  /**
+   * Threads in this shard by activity, most recent first: one user's (`by_user`; a status filters that user's), one
+   * status's (`by_status`) or all (`by_updated`). Each page is a range of an index, never a scan of the table.
+   */
+  threads: internalQuery({
+    args: { userId: v.optional(v.string()), status: v.optional(v.union(v.literal("active"), v.literal("archived"))), paginationOpts: paginationOptsValidator },
+    handler: (ctx, a) => {
+      const q =
+        a.userId !== undefined
+          ? ctx.db.query("threads").withIndex("by_user", (r) => r.eq("userId", a.userId)).order("desc")
+          : a.status !== undefined
+            ? ctx.db.query("threads").withIndex("by_status", (r) => r.eq("status", a.status!)).order("desc")
+            : ctx.db.query("threads").withIndex("by_updated").order("desc");
+      const page = (a.userId !== undefined && a.status !== undefined ? q.filter((f) => f.eq(f.field("status"), a.status!)) : q).paginate(a.paginationOpts);
+      return {
+        ...page,
+        // `lastOrder` is the order of the last prompt, -1 before the first one.
+        page: page.page.map((t) => ({ _id: t._id, userId: t.userId ?? null, title: t.title ?? null, status: t.status, prompts: t.lastOrder + 1, tokens: t.usage.totalTokens ?? null, updatedAt: t.updatedAt })),
+      };
+    },
+  }),
+  /** One thread with its last 100 messages, oldest first (a timeline); null when unknown. */
+  thread: internalQuery({
+    args: { threadId: v.string() },
+    handler: (ctx, { threadId }) => {
+      const t = thread(ctx, threadId);
+      if (!t) return null;
+      const messages = ctx.db
+        .query("messages")
+        .withIndex("by_thread", (q) => q.eq("thread", t._id))
+        .order("desc")
+        .take(100)
+        .reverse()
+        .map((m) => ({ at: m._creationTime, title: `${m.role}${m.agentName ? ` (${m.agentName})` : ""}${m.model ? ` · ${m.model}` : ""}`, status: m.status, detail: m.error ?? clip(m.text || toolSummary(m.parts)) }));
+      return { ...publicThread(t), messages };
+    },
+  }),
+};
+
 export const agent = defineComponent({
   name: "agent",
   schema,
-  functions,
+  functions: { ...functions, dashboard: dashboardFunctions },
+  // The threads' screen in the Ember Dashboard (contracts.md "Telas declarativas"): threads live per shard.
+  dashboard: {
+    label: "Agent",
+    icon: "bot",
+    description: "Threads and their messages (a timeline of prompts, steps and tool calls); archive or delete a thread.",
+    tabs: [
+      {
+        id: "threads",
+        label: "Threads",
+        blocks: [
+          {
+            kind: "table",
+            id: "threads",
+            query: dashboardFunctions.threads,
+            columns: [
+              { label: "Title", path: "title" },
+              { label: "User", path: "userId", format: "code" },
+              { label: "Status", path: "status", format: "badge" },
+              { label: "Prompts", path: "prompts", format: "number" },
+              { label: "Tokens", path: "tokens", format: "number" },
+              { label: "Updated", path: "updatedAt", format: "ago" },
+            ],
+            detail: {
+              query: dashboardFunctions.thread,
+              fromRow: { threadId: "_id" },
+              sections: [
+                { kind: "kv", items: [{ label: "Title", path: "title" }, { label: "Summary", path: "summary" }, { label: "Status", path: "status", format: "badge" }, { label: "Usage", path: "usage", format: "json" }] },
+                { kind: "timeline", label: "Messages", path: "messages", time: "at", title: "title", status: "status", detail: "detail" },
+              ],
+            },
+            rowActions: [
+              { id: "archive", label: "Archive", fn: functions.lib.updateThread, args: { patch: { status: "archived" } }, fromRow: { threadId: "_id" } },
+              { id: "delete", label: "Delete", fn: functions.lib.deleteThread, fromRow: { threadId: "_id" }, destructive: true, description: "Deletes the thread with its messages." },
+            ],
+          },
+        ],
+      },
+    ],
+  },
   config: v.optional(v.object({ workersAi: v.optional(v.boolean()), search: v.optional(v.boolean()) })),
   bindings: (config) => (config?.workersAi === false ? [] : [{ type: "ai", name: "EMBER_AI" }]),
   // The FTS5 index only where search is on (AgentInstallConfig.search).
