@@ -373,6 +373,7 @@ export class Importer {
     const encoded = docs.map((doc) => {
       const f = encodeFields(layout, doc);
       const values: SqlValue[] = cols.map((c) => (c === "_id" ? doc._id : c === "_creationTime" ? doc._creationTime + 0 : c in f ? f[c]! : null));
+      // `k.fields` carries the tiebreakers (always present): sparse means "a declared field is absent", as in the engine.
       keys.forEach((k, i) => (values[cols.length - keys.length + i] = indexKey(doc, k.fields, k.sparse)));
       // Non-finite numbers and -0 never reach a column (they escape to `_json`), so every value has a JSON form.
       return { values, json: JSON.stringify(values.map((x) => (x instanceof Uint8Array ? hex(x) : x))) };

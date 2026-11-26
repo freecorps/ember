@@ -70,6 +70,8 @@ export const readSetSparse = (m: SchemaManifest, table: string, index: string): 
 /**
  * The stored key of a db index: `docKey`, or null for a sparse index when one of `fields` is absent (`undefined`): the
  * document is not in the index (the key column holds NULL, outside the partial SQLite index and every key range).
+ * Callers pass `indexFields` (the declared fields plus the `_creationTime`/`_id` tiebreakers): every document has those,
+ * so the test is the declared fields' presence, the same in the engine, migrations, the importer, matchIndex, offline.
  */
 export function indexKey(doc: Doc, fields: readonly string[], sparse: boolean | undefined): Uint8Array | null {
   if (sparse) for (const f of fields) if (fieldOf(doc, f) === undefined) return null;
