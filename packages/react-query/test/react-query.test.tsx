@@ -751,6 +751,58 @@ describe("identity change (CWE-524): observed queries keep nothing of the previo
     ember.close();
   });
 
+  it("a newer snapshot that arrives while the HTTP read after a switch is out wins over that (older) HTTP answer", async () => {
+    let n = 1;
+    const server = new FakeEmberServer({
+      verify: (token) => ({ subject: (JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString()) as { sub: string }).sub }),
+      queries: {
+        "me:secret": (db, _args, ctx) => {
+          db.where("bumps", "k", "k");
+          return `${ctx.identity?.subject} #${n}`;
+        },
+      },
+      mutations: {
+        "me:bump": (db) => {
+          n++;
+          db.insert("bumps", { k: "k" });
+        },
+      },
+    });
+    let gate: (() => void) | null = null;
+    let held = 0;
+    // The HTTP query is answered now (#1) but handed back only when the gate opens.
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const res = await server.fetch(input, init);
+      if (new URL(String(input)).pathname.startsWith("/api/query") && gate === null && held === 0) {
+        held++;
+        await new Promise<void>((r) => (gate = r));
+      }
+      return res;
+    };
+    const ember = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch, connectivity: null, heartbeat: false, defaultShard: SHARD, auth: () => jwt("ana") });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    new EmberQueryClient(ember).connect(queryClient);
+    function Secret() {
+      const { data, status } = useQuery(emberQuery(secret, {}));
+      return <div data-testid="secret">{status === "success" ? String(data) : status}</div>;
+    }
+    render(<QueryClientProvider client={queryClient}><Secret /></QueryClientProvider>);
+    await waitFor(() => expect(screen.getByTestId("secret").textContent).toBe("ana #1"));
+    // A new source for the same user: the read goes over HTTP (answered #1, held back) ...
+    act(() => ember.setAuth(() => jwt("ana")));
+    await waitFor(() => expect(gate).not.toBeNull());
+    // ... while the subscription delivers #2.
+    await act(async () => void (await ember.mutation(unsafeRef<"mutation">("me:bump"), {})));
+    await waitFor(() => expect(screen.getByTestId("secret").textContent).toBe("ana #2"));
+    await act(async () => {
+      gate!();
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(screen.getByTestId("secret").textContent).toBe("ana #2");
+    expect(queryClient.getQueryData(emberQuery(secret, {}).queryKey)).toBe("ana #2");
+    ember.close();
+  });
+
   it("a new source for the same user (no new snapshot: the shard sees a renewal): the value comes back over HTTP", async () => {
     const { server, ember, queryClient, wrap, key } = identitySetup();
     wrap();

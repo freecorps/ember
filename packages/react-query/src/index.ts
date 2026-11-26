@@ -454,7 +454,33 @@ export class EmberQueryClient {
     // After an identity change, until the subscription hands over a new snapshot: what it holds (or is about to show
     // again, while the token is fetched) is the previous identity's. Read over HTTP, as whoever is signed in now.
     if (l?.stale && (now === l.stale || now.status === "loading")) {
-      return (this.client.query as (r: QueryReference, a: unknown, o: unknown) => Promise<unknown>)(ref, args, { ...opts, transport: "http" });
+      // Whichever comes first: the HTTP answer, or a newer snapshot the subscription accepts meanwhile (then the HTTP
+      // answer, older, is dropped: TanStack writes the fetch's result, so it must be the newer one).
+      const live = l;
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const entry = {
+          key,
+          resolve: (v: unknown) => !settled && ((settled = true), resolve(v)),
+          reject: (e: unknown) => !settled && ((settled = true), reject(e)),
+        };
+        (live.fetching ??= []).push(entry);
+        const leave = () => {
+          if (!live.fetching) return;
+          live.fetching = live.fetching.filter((f) => f !== entry);
+          if (!live.fetching.length) live.fetching = undefined;
+        };
+        (this.client.query as (r: QueryReference, a: unknown, o: unknown) => Promise<unknown>)(ref, args, { ...opts, transport: "http" }).then(
+          (v) => {
+            leave();
+            entry.resolve(v);
+          },
+          (e: unknown) => {
+            leave();
+            entry.reject(e);
+          },
+        );
+      });
     }
     if (now.status === "success") return Promise.resolve(now.value);
     // An error already there is not sent again: waiting for the next snapshot would never settle.
