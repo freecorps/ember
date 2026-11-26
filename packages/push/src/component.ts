@@ -44,7 +44,10 @@ const claimedRow = v.object({ id: v.id("pendingReceipts"), attempt: v.number() }
 const schema = defineSchema({
   tables: {
     /** `by_provider`: device count per provider (`lib:count` reads it instead of the rows). */
-    devices: pushDevicesTable().aggregate("by_provider", { by: ["provider"] }),
+    devices: pushDevicesTable()
+      // The dashboard's device list of one provider, most recently registered first (`dashboard:devices`).
+      .index("by_provider_updated", ["provider", "updatedAt"])
+      .aggregate("by_provider", { by: ["provider"] }),
     /**
      * Expo tickets waiting for their receipts: one row per send (at most `EXPO_RECEIPTS_CHUNK` tickets; a bigger send
      * takes several), checked by `lib:drainReceipts` up to `EXPO_RECEIPTS_CHUNK` tickets (one Expo request) at a time.
@@ -599,25 +602,40 @@ function pruneStep(ctx: MutationCtx, before: number, olderThanMs: number, limit:
 
 // ------------------------------------------------------------------------------------------------ dashboard
 
+/** Pending receipt checks the dashboard counts one by one (more read as `"1000+"`). */
+const RECEIPTS_SHOWN = 1000;
+
 /** A push token as the dashboard shows it: enough to recognize it, not enough to use it. */
 const maskToken = (t: string) => (t.length > 16 ? `${t.slice(0, 12)}…${t.slice(-4)}` : "…");
 
 /** What the dashboard's screen reads and does (module `dashboard`, internal: never part of the component's API). */
 const dashboardFunctions = {
-  /** Devices in this shard and pending receipt checks. */
+  /**
+   * Devices in this shard and pending receipt checks. The checks are counted up to 1000 (reading at most 1001 rows):
+   * past that, `"1000+"`.
+   */
   overview: internalQuery({
     args: {},
     handler: (ctx) => {
       const count = (provider?: string) => ctx.runQuery(unsafeRef<"query">("lib:count"), provider !== undefined ? { provider } : {}) as number;
-      return { total: count(), expo: count("expo"), apns: count("apns"), fcm: count("fcm"), pendingReceipts: ctx.db.query("pendingReceipts").take(1001).length };
+      const pending = ctx.db.query("pendingReceipts").take(RECEIPTS_SHOWN + 1).length;
+      return { total: count(), expo: count("expo"), apns: count("apns"), fcm: count("fcm"), pendingReceipts: pending > RECEIPTS_SHOWN ? `${RECEIPTS_SHOWN}+` : pending };
     },
   }),
-  /** Devices, most recently registered first (one user's, or one provider's); tokens masked. */
+  /**
+   * Devices, most recently registered first: one user's (`by_user`; a provider filters that user's few), one
+   * provider's (`by_provider_updated`) or all (`by_updated`). Each page is a range of an index; tokens masked.
+   */
   devices: internalQuery({
     args: { userId: v.optional(v.string()), provider: v.optional(v.union(v.literal("expo"), v.literal("apns"), v.literal("fcm"))), paginationOpts: paginationOptsValidator },
     handler: (ctx, a) => {
-      const base = a.userId !== undefined ? ctx.db.query(TABLE).withIndex("by_user", (q) => q.eq("userId", a.userId!)) : ctx.db.query(TABLE).withIndex("by_updated").order("desc");
-      const page = (a.provider !== undefined ? base.filter((f) => f.eq(f.field("provider"), a.provider!)) : base).paginate(a.paginationOpts);
+      const q =
+        a.userId !== undefined
+          ? ctx.db.query(TABLE).withIndex("by_user", (r) => r.eq("userId", a.userId!))
+          : a.provider !== undefined
+            ? ctx.db.query(TABLE).withIndex("by_provider_updated", (r) => r.eq("provider", a.provider!)).order("desc")
+            : ctx.db.query(TABLE).withIndex("by_updated").order("desc");
+      const page = (a.userId !== undefined && a.provider !== undefined ? q.filter((f) => f.eq(f.field("provider"), a.provider!)) : q).paginate(a.paginationOpts);
       return {
         ...page,
         page: page.page.map((d) => ({ _id: d._id, userId: d.userId, provider: d.provider, platform: d.platform ?? null, deviceName: d.deviceName ?? null, environment: d.environment ?? null, token: maskToken(d.token), voip: d.voipToken !== undefined, sealed: d.publicKey !== undefined, updatedAt: d.updatedAt })),
