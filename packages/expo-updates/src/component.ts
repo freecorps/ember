@@ -294,7 +294,15 @@ const fileState = (ctx: ReadCtx, id: string) => ctx.storage.getMetadata(id)?.sta
  * in flight stay referenced (their publishers confirm them); the others (finished duplicates, failed) are let go.
  */
 function promoteReady(ctx: Ctx["mutation"], row: AssetRow): boolean {
-  if (fileState(ctx, row.file) === "ready") return true;
+  if (fileState(ctx, row.file) === "ready") {
+    // Ready already: the uploads still listed beside it go once out of their grace (or finished, or failed).
+    if (row.pending?.length || row.fileExpiresAt !== undefined) {
+      const { fileExpiresAt: _own, ...beside } = row; // the row's own file is the ready one: only the others
+      const pending = pendingUploads(ctx, beside).filter((u) => u.file !== row.file);
+      if (pending.length !== (row.pending?.length ?? 0) || row.fileExpiresAt !== undefined) ctx.db.patch(row._id, { fileExpiresAt: undefined, pending: pending.length ? pending : undefined });
+    }
+    return true;
+  }
   const file = [row.file, ...(row.pending ?? []).map((u) => u.file)].find((f) => fileState(ctx, f) === "ready");
   if (!file) return false;
   const pending = pendingUploads(ctx, row).filter((u) => u.file !== file);

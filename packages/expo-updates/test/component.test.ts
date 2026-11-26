@@ -213,6 +213,26 @@ describe("expo updates component", () => {
     expect(r.updates).toHaveLength(1);
   });
 
+  test("with the newer upload confirmed, the older one still pending is let go once out of its grace", async () => {
+    const t = harness();
+    const body = "two-tickets";
+    const prep = async () =>
+      ((await t.mutation(m("prepareAssets"), { assets: [{ sha256: hex(body), size: body.length, contentType: "application/javascript" }] })) as Array<{ exists: boolean; upload?: { url: string; headers: Record<string, string>; storageId: string; shard: string; token: string } }>)[0]!;
+    const first = (await prep()).upload!;
+    const second = (await prep()).upload!;
+    expect((await t.fetch(second.url, { method: "PUT", headers: second.headers, body })).status).toBe(200);
+    expect((await t.fetch("/api/storage/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shard: second.shard, storageId: second.storageId, token: second.token }) })).status).toBe(200);
+    // Storage collects a file nothing references (the shards' file GC runs on `advance`).
+    const stateOf = (id: string) => t.run((ctx) => ctx.storage.getMetadata(id as never)?.state ?? "gone");
+    expect((await prep()).exists).toBe(true); // ready; the first, still in flight, stays referenced
+    await t.advance(26 * 3600_000); // past its expiry and its grace
+    expect(await stateOf(first.storageId)).toBe("pending");
+    expect((await prep()).exists).toBe(true); // the row lets it go
+    await t.advance(26 * 3600_000);
+    expect(await stateOf(first.storageId)).toBe("gone");
+    expect(await stateOf(second.storageId)).toBe("ready");
+  });
+
   test("a rollback finds the previous release past many copies of the current one", async () => {
     const t = harness();
     const h = (b: string) => createHash("sha256").update(b).digest("base64url");
