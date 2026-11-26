@@ -26,7 +26,7 @@ import {
 import { parse, stableStringify, stringify } from "./wire.ts";
 import type { PageHost } from "./paginate.ts";
 import { RoutedStore, type ClaimRoute } from "./route.ts";
-import { FrameQueue, withoutDeliveries, zframeSupported } from "./zframe.ts";
+import { FrameQueue, withoutStale, zframeSupported } from "./zframe.ts";
 import type { CachedSnapshot, SnapshotCache } from "./snapshot-cache.ts";
 // Type-only: the multi-tab hub and the upload helpers are subpaths (`@freecorps/ember-client/multitab`, `/files`), or a
 // lazy `import()` for the old options, never in the static graph of an app that does not use them.
@@ -765,6 +765,10 @@ export class EmberClient {
       if (c) this.send(c, m);
     },
     report: (e, shard) => this.report(e, { shard }),
+    joinedFirst: (shard) => {
+      const c = this.conns.get(shard);
+      if (c) this.keepaliveNow(c);
+    },
   });
   private readonly subs = new Map<string, Sub>();
   /** `subs` by shard and by function: a socket's own (`needed`, `hello`, `ready`) and `getAllQueries` walk only theirs. */
@@ -2753,13 +2757,16 @@ export class EmberClient {
     if ("binaryType" in ws) (ws as { binaryType: string }).binaryType = "arraybuffer";
     // Each frame tagged with the identity the socket had when it arrived: a compressed one decoded after an `auth` for
     // someone else (sent meanwhile) carries the previous identity's values. Its `snap`/`patch` are dropped (the shard
-    // sends every subscription a fresh `snap` under the new identity, after that `auth`); the rest is handled.
+    // sends every subscription a fresh `snap` under the new identity, after that `auth`), and so is its channel traffic
+    // (`msg`, and the member lists of `joined`/`members`: those channels are joined again, so their list is the one
+    // the identity now sees); the rest is handled.
     const inbox = new FrameQueue<string>(
       (text, arrivedAs) => {
         if (conn.ws !== ws) return;
         if (arrivedAs === this.connIdentityKey(conn)) return this.onFrame(conn, text);
-        const kept = withoutDeliveries(text);
-        if (kept !== null) this.onFrame(conn, kept);
+        const kept = withoutStale(text);
+        if (kept.text !== null) this.onFrame(conn, kept.text);
+        if (kept.channels.length) this.chans.resync(conn.shard, kept.channels);
       },
       (e) => {
         if (conn.ws === ws) this.report(new EmberError("bad_frame", `could not decode a compressed frame: ${(e as Error)?.message ?? String(e)}`), { shard: conn.shard });
@@ -3188,6 +3195,21 @@ export class EmberClient {
     this.clearTimer(conn, "pingTimer");
     const interval = hb?.intervalMs ?? 25_000;
     this.pingAfter(conn, Math.round(interval * (1 - this.random() / 5)));
+  }
+
+  /**
+   * The socket's first channel was just joined: a ping armed for later than the channel keepalive (a `heartbeat`
+   * interval above it) is moved up to that deadline, counted from the last frame sent, so the shard hears from the
+   * socket before its TTL. The interval stays as configured otherwise (and when no channel is joined).
+   */
+  private keepaliveNow(conn: Conn): void {
+    const hb = this.options.heartbeat;
+    if (hb === false || !conn.ready || !conn.pingTimer || conn.deadlineTimer) return;
+    const interval = hb?.intervalMs ?? 25_000;
+    if (interval <= CHANNEL_KEEPALIVE_MS) return;
+    this.clearTimer(conn, "pingTimer");
+    const quiet = Math.round(interval * (1 - this.random() / 5));
+    this.pingAfter(conn, quiet, Math.max(0, Math.min(quiet, CHANNEL_KEEPALIVE_MS - (Date.now() - (conn.sentAt ?? 0)))));
   }
 
   /**

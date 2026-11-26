@@ -77,13 +77,20 @@ export interface ChannelHost {
   ready(shard: string): { ephemeral: boolean } | null;
   send(shard: string, m: ClientMessage): void;
   report(e: EmberError, shard: string): void;
+  /** The first channel of the shard is joined now: its socket must start sending often enough for the shard's TTL. */
+  joinedFirst?(shard: string): void;
 }
 
 interface Entry {
   shard: string;
   name: string;
   handles: number;
+  /** The state asked for (`open`, `setState`): what the next `join` sends. */
   state: { v: unknown } | undefined;
+  /** The state the shard holds for this member (its own entry in the last `joined`; undefined: none). */
+  accepted: { v: unknown } | undefined;
+  /** The last `join` out, under its `ref`, with the state it asked for, until the shard answers it. */
+  asked: { ref: number; state: { v: unknown } | undefined } | null;
   status: ChannelStatus;
   error: EmberError | null;
   self: string | null;
@@ -105,11 +112,16 @@ const EMPTY: readonly ChannelMember[] = Object.freeze([]);
  */
 export const CHANNEL_KEEPALIVE_MS = 30_000;
 
+/** Refusals of a member state itself (its JSON too large, or its validator): that state is not asked for again. */
+const STATE_REFUSALS = new Set(["invalid_state", "too_large"]);
+
 export class Channels {
   private readonly entries = new Map<string, Entry>();
   private readonly byShard = new Map<string, Set<Entry>>();
   /** Bumped by every `auth` that goes out: a refusal of a join sent before it was about the identity before. */
   private gen = 0;
+  /** `ref` of the next `join`: its answer (`joined`, `left`, `err`) carries it. */
+  private nextRef = 0;
 
   constructor(private readonly host: ChannelHost) {}
 
@@ -129,7 +141,7 @@ export class Channels {
     const key = `${shard}\u0000${name}`;
     let e = this.entries.get(key);
     if (!e) {
-      e = { shard, name, handles: 0, state: undefined, status: "connecting", error: null, self: null, byId: new Map(), members: EMPTY, listeners: new Set(), watchers: new Set(), retry: null, sentGen: null };
+      e = { shard, name, handles: 0, state: undefined, accepted: undefined, asked: null, status: "connecting", error: null, self: null, byId: new Map(), members: EMPTY, listeners: new Set(), watchers: new Set(), retry: null, sentGen: null };
       this.entries.set(key, e);
       let set = this.byShard.get(shard);
       if (!set) this.byShard.set(shard, (set = new Set()));
@@ -147,7 +159,8 @@ export class Channels {
       status: () => (mine.left ? "closed" : entry.status),
       error: () => entry.error,
       members: () => (mine.left ? EMPTY : entry.members) as readonly ChannelMember<S>[],
-      self: () => (mine.left ? null : entry.self),
+      // Only while joined: after the socket dropped, the id was the previous socket's (the next one gets another).
+      self: () => (mine.left || entry.status !== "joined" ? null : entry.self),
       publish: (data: T) => {
         if (mine.left || entry.status !== "joined" || !this.host.ready(shard)?.ephemeral) return false;
         this.host.send(shard, { t: "pub", ch: name, data });
@@ -202,6 +215,7 @@ export class Channels {
     const was = e.status;
     e.status = "closed";
     e.self = null;
+    e.asked = null;
     e.byId.clear();
     e.members = EMPTY;
     if (sendLeave && (was === "joined" || was === "connecting") && this.host.ready(e.shard)?.ephemeral) this.host.send(e.shard, { t: "leave", ch: e.name });
@@ -213,8 +227,25 @@ export class Channels {
     const r = this.host.ready(e.shard);
     if (!r) return;
     if (!r.ephemeral) return this.unsupported(e);
-    this.host.send(e.shard, e.state ? { t: "join", ch: e.name, state: e.state.v } : { t: "join", ch: e.name });
+    const ref = this.nextRef++;
+    this.host.send(e.shard, e.state ? { t: "join", ch: e.name, state: e.state.v, ref } : { t: "join", ch: e.name, ref });
+    e.asked = { ref, state: e.state };
     e.sentGen = this.gen;
+  }
+
+  /**
+   * The shard answered the last `join` with a refusal (`left`, or `err` for a member that stays in): a member state it
+   * refused for what it is goes back to the one it holds (none: no state), so no later `join` asks for it again.
+   * True when the state asked for changed.
+   */
+  private refused(e: Entry, ref: number | undefined, code: string): boolean {
+    const asked = e.asked;
+    if (ref === undefined || !asked || asked.ref !== ref) return false;
+    e.asked = null;
+    // Another `setState` since: that one is still to be tried.
+    if (!STATE_REFUSALS.has(code) || !asked.state || e.state !== asked.state) return false;
+    e.state = e.accepted;
+    return true;
   }
 
   /** Too many joins at once: again a second later (and then every second until the shard's socket is ready again). */
@@ -253,8 +284,11 @@ export class Channels {
 
   /** The shard's socket said `ready`: every channel of it joins (again). */
   onReady(shard: string): void {
+    const ephemeral = this.host.ready(shard)?.ephemeral === true;
     for (const e of this.byShard.get(shard) ?? []) {
-      if (e.status !== "unsupported") e.status = "connecting";
+      // `unsupported` stays only on a socket that does not speak "ephemeral" either: one that does gets the join.
+      if (e.status !== "unsupported" || ephemeral) e.status = "connecting";
+      e.asked = null;
       this.sendJoin(e);
       this.notify(e);
     }
@@ -279,6 +313,17 @@ export class Channels {
     for (const e of this.byShard.get(shard) ?? []) if (e.status === "refused") this.sendJoin(e);
   }
 
+  /**
+   * Member lists of these channels were dropped (a frame of the identity before, decoded after an `auth`): joined again,
+   * so the shard answers with the list as the identity now sees it (or refuses it).
+   */
+  resync(shard: string, names: readonly string[]): void {
+    for (const name of new Set(names)) {
+      const e = this.entries.get(`${shard}\u0000${name}`);
+      if (e && (e.status === "joined" || e.status === "connecting")) this.sendJoin(e);
+    }
+  }
+
   /** `close()` of the client. */
   closeAll(): void {
     for (const e of [...this.entries.values()]) this.forget(e, false);
@@ -291,14 +336,20 @@ export class Channels {
         const e = this.entries.get(`${shard}\u0000${m.ch}`);
         // `unsupported`: the shard's `ready` did not speak "ephemeral" (a stray frame does not make it joined).
         if (!e || e.status === "unsupported") return true;
+        const first = !this.joined(shard);
         e.sentGen = null;
+        if (m.ref !== undefined && e.asked?.ref === m.ref) e.asked = null;
         e.status = "joined";
         e.error = null;
         e.self = m.self;
         e.byId.clear();
         for (const x of m.members) e.byId.set(x.id, { id: x.id, user: x.user ?? null, state: x.state });
+        // What the shard holds for this member: the state a refused update goes back to.
+        const me = e.byId.get(m.self);
+        e.accepted = me && me.state !== undefined ? { v: me.state } : undefined;
         this.rebuild(e);
         this.notify(e);
+        if (first) this.host.joinedFirst?.(shard);
         return true;
       }
       case "members": {
@@ -332,13 +383,16 @@ export class Channels {
           return true;
         }
         e.sentGen = null;
+        const reverted = this.refused(e, m.ref, m.code);
         e.status = "refused";
         e.error = new EmberError(m.code, m.message);
         e.self = null;
         e.byId.clear();
         e.members = EMPTY;
         this.notify(e);
-        if (m.code === "rate_limited") this.retryLater(e);
+        // Its state refused (an update made offline, say): in again with the one the shard last accepted.
+        if (reverted) this.sendJoin(e);
+        else if (m.code === "rate_limited") this.retryLater(e);
         return true;
       }
       case "published":
@@ -348,6 +402,8 @@ export class Channels {
         if (m.ch === undefined) return false;
         const e = this.entries.get(`${shard}\u0000${m.ch}`);
         if (!e) return true;
+        // A refused update of a member that stays in: it keeps the state the shard holds.
+        this.refused(e, m.ref, m.code);
         e.error = new EmberError(m.code, m.message);
         this.notify(e);
         return true;

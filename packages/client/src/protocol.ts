@@ -28,7 +28,7 @@ export type ClientMessage =
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated (new `snap`s). */
   | { t: "auth"; token: string | null }
   /** Feature "ephemeral" (v1.6): join a channel (again: update the member state; without `state`, keep it). */
-  /** `ref` (the `multiTab` leader's): the answer to this frame carries it. */
+  /** `ref` (the client's channels pick one per `join`; the `multiTab` leader its own): the answer to this frame carries it. */
   | { t: "join"; ch: string; state?: unknown; ref?: number }
   | { t: "leave"; ch: string }
   /** Feature "ephemeral": broadcast to the channel's other members (`ref`: answered `published` or `err` with it). */

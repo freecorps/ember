@@ -776,14 +776,19 @@ interface GroupChan {
 /**
  * A tab's `join` or `pub` out on the shared socket, under the leader's `ref` (the shard answers each with that `ref`):
  * its answer goes to that tab, and a `pub` (`msg`, the frame the other tabs get) reaches them only once the shard
- * says it went out (`published`), never one it refused.
+ * says it went out (`published`), never one it refused. The tab's own `ref` (its client's channels send one with every
+ * `join`) goes back on that answer, as the shard would have answered it.
  */
 interface ChanRef {
   m: Member;
   ch: string;
   c: GroupChan;
   msg?: Record<string, unknown>;
+  tabRef?: number | undefined;
 }
+
+/** `msg` with the tab's own `ref` (none: as it is). */
+const withRef = (msg: Record<string, unknown>, ref: number | undefined): Record<string, unknown> => (ref === undefined ? msg : { ...msg, ref });
 
 /** A `resume` as a tab's `sub` carries it. */
 type Resume = { version?: unknown; epoch?: unknown; ik?: unknown };
@@ -1476,11 +1481,12 @@ class Leader {
    * to the socket that sent it) only once the shard answers `published`: what it refuses reaches no tab.
    */
   private chanFrame(m: Member, g: Group, msg: Record<string, unknown>, ch: string, out: unknown[], back: unknown[]): void {
+    const tabRef = msg.t !== "leave" && typeof msg.ref === "number" ? msg.ref : undefined;
     if (msg.t !== "leave" && this.lapsed(m)) {
       // As the shard with an expired socket: refused, and nothing reaches it until its `auth`.
       const error = { code: "auth_expired", message: 'the token expired; send {t:"auth"} with a fresh one' };
       back.push({ t: "authExpired" });
-      back.push(msg.t === "join" ? { t: "left", ch, ...error } : { t: "err", ...error, ch });
+      back.push(withRef(msg.t === "join" ? { t: "left", ch, ...error } : { t: "err", ...error, ch }, tabRef));
       return;
     }
     if (msg.t === "join") {
@@ -1491,12 +1497,12 @@ class Leader {
       if (c.joined && (state === undefined || state === c.state)) {
         c.waiting.delete(m);
         c.in.add(m);
-        back.push(JSON.parse(this.joinedOf(ch, c)));
+        back.push(withRef(JSON.parse(this.joinedOf(ch, c)) as Record<string, unknown>, tabRef));
         return;
       }
       // A tab already in stays in (its messages keep coming) while its state update waits for the shard.
       if (!c.in.has(m)) c.waiting.add(m);
-      out.push({ ...msg, ref: this.chanRef(g, { m, ch, c }) });
+      out.push({ ...msg, ref: this.chanRef(g, { m, ch, c, tabRef }) });
       return;
     }
     if (msg.t === "leave") {
@@ -1507,12 +1513,12 @@ class Leader {
     const c = g.chans.get(ch);
     if (!c?.joined || !c.in.has(m)) {
       // Not in (yet): as the shard would answer, without asking it.
-      back.push({ t: "err", code: "not_joined", message: `join ${ch} before publishing to it`, ch });
+      back.push(withRef({ t: "err", code: "not_joined", message: `join ${ch} before publishing to it`, ch }, tabRef));
       return;
     }
     const user = c.joined.members.get(c.joined.self)?.user ?? null;
     const relay = { t: "msg", ch, from: c.joined.self, user, data: msg.data };
-    out.push({ ...msg, ref: this.chanRef(g, { m, ch, c, msg: relay }) });
+    out.push({ ...msg, ref: this.chanRef(g, { m, ch, c, msg: relay, tabRef }) });
   }
 
   private chanRef(g: Group, r: ChanRef): number {
@@ -1550,7 +1556,7 @@ class Leader {
         c.joined = { self: String(msg.self), members };
         const self = members.get(c.joined.self);
         c.state = self && "state" in self ? JSON.stringify(self.state) : undefined;
-        for (const m of [...c.in, ...c.waiting]) to(m, msg);
+        for (const m of [...c.in, ...c.waiting]) to(m, m === r?.m ? withRef(msg, r.tabRef) : msg);
         for (const m of c.waiting) c.in.add(m);
         c.waiting.clear();
         return;
@@ -1572,21 +1578,21 @@ class Leader {
           c.waiting.delete(r.m);
           r.m.chans.delete(ch);
           if (!c.in.size && !c.waiting.size) g.chans.delete(ch);
-          to(r.m, msg);
+          to(r.m, withRef(msg, r.tabRef));
           return;
         }
         // Not (or no longer) a member on the shard: every tab in it is out.
         g.chans.delete(ch);
         for (const m of [...c.in, ...c.waiting]) {
           m.chans.delete(ch);
-          to(m, msg);
+          to(m, m === r?.m ? withRef(msg, r.tabRef) : msg);
         }
         return;
       default:
         if (r) {
           // This tab's own refusal (a `pub`, or a state update: the shared socket stays in, with the state it had).
           if (!r.m.chans.has(ch)) return;
-          to(r.m, msg);
+          to(r.m, withRef(msg, r.tabRef));
           if (!r.msg && c.joined && c.waiting.delete(r.m)) {
             c.in.add(r.m);
             to(r.m, JSON.parse(this.joinedOf(ch, c)));

@@ -1,9 +1,9 @@
 // `client.channel()` (feature "ephemeral") over the fake server: members and messages, handles of one channel, joins
 // again on a new socket and after an identity change, an older runtime, the keep-alive ping of a listening socket, and
 // the multiTab leader (one join for the tabs of a group, messages handed between them, the last tab out leaves).
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeClient, messagesServer, tick, until } from "./helpers.ts";
-import { FakeBrowser, type FakeSocket } from "../src/testing.ts";
+import { FakeBrowser, FakeEmberServer, type FakeServerOptions, type FakeSocket } from "../src/testing.ts";
 import type { ChannelMessage, EmberClient } from "../src/index.ts";
 
 const open: EmberClient[] = [];
@@ -81,12 +81,162 @@ describe("client.channel()", () => {
     await until(() => room.status() === "connecting");
     await until(() => room.status() === "joined" && s.history.length === 2);
     // On the new socket (not by its order among the channels' joins).
-    expect(s.history[1]!.sent.filter((m) => typeof m === "object" && m.t === "join" && m.ch === "room:3")).toEqual([{ t: "join", ch: "room:3", state: { n: 1 } }]);
+    expect(s.history[1]!.sent.filter((m) => typeof m === "object" && m.t === "join" && m.ch === "room:3")).toEqual([{ t: "join", ch: "room:3", state: { n: 1 }, ref: expect.any(Number) }]);
     a.signIn("user:ana");
     await until(() => vip.status() === "joined");
     expect(vip.members().map((m) => m.user)).toEqual(["ana"]);
     a.signIn(null);
     await until(() => vip.status() === "refused");
+  });
+
+  it("self() is the member id only while joined: not the dropped socket's while it reconnects", async () => {
+    const s = server();
+    const a = client(s, "user:ana");
+    const ch = a.channel("room:self");
+    await until(() => ch.status() === "joined");
+    const first = ch.self();
+    expect(first).toBe(s.history[0]!.memberId);
+    s.refuseConnections = 1_000;
+    s.history[0]!.drop();
+    await until(() => ch.status() === "connecting");
+    expect(ch.self()).toBeNull();
+    // The member list stays until the next socket's `joined`.
+    expect(ch.members().map((m) => m.user)).toEqual(["ana"]);
+    s.refuseConnections = 0;
+    await until(() => ch.status() === "joined");
+    expect(ch.self()).toBe(s.history.at(-1)!.memberId);
+    expect(ch.self()).not.toBe(first);
+  });
+
+  it("a state update the shard refused is not sent again on the next socket: the one it accepted is", async () => {
+    const s = server({
+      ephemeral: {
+        authorize: () => true,
+        state: (st) => (typeof (st as { color?: unknown } | undefined)?.color === "string" ? undefined : "invalid_state"),
+      },
+    });
+    const a = client(s, "user:ana");
+    const ch = a.channel<unknown, { color: unknown }>("room:st", { state: { color: "red" } });
+    await until(() => ch.status() === "joined");
+    ch.setState({ color: 42 });
+    await until(() => ch.error()?.code === "invalid_state");
+    expect(ch.status()).toBe("joined");
+    const joins = (ws: FakeSocket) => ws.sent.filter((m) => typeof m === "object" && m.t === "join").map((m) => (m as { state?: unknown }).state);
+    s.history[0]!.drop();
+    await until(() => ch.status() === "joined" && s.history.length === 2);
+    expect(joins(s.history[1]!)).toEqual([{ color: "red" }]);
+    expect(ch.members()[0]!.state).toEqual({ color: "red" });
+
+    // One made while there is no socket has not been tried: it goes out on the next one.
+    s.refuseConnections = 1_000;
+    s.history[1]!.drop();
+    await until(() => ch.status() === "connecting");
+    ch.setState({ color: "green" });
+    s.refuseConnections = 0;
+    await until(() => ch.status() === "joined" && ch.members()[0]?.state?.color === "green");
+    expect(joins(s.history.at(-1)!)).toEqual([{ color: "green" }]);
+
+    // Refused on a new socket (so not in: `left`): in again with the one the shard accepted last.
+    s.refuseConnections = 1_000;
+    s.history.at(-1)!.drop();
+    await until(() => ch.status() === "connecting");
+    ch.setState({ color: null });
+    s.refuseConnections = 0;
+    await until(() => joins(s.history.at(-1)!).length === 2 && ch.status() === "joined");
+    expect(joins(s.history.at(-1)!)).toEqual([{ color: null }, { color: "green" }]);
+    expect(ch.members()[0]!.state).toEqual({ color: "green" });
+  });
+
+  it("unsupported on an older runtime, joined once a socket speaks ephemeral", async () => {
+    const s = messagesServer();
+    const a = client(s, "user:ana");
+    const ch = a.channel("room:up");
+    await until(() => ch.status() === "unsupported");
+    (s as unknown as { opts: FakeServerOptions }).opts.ephemeral = true;
+    s.history.at(-1)!.drop();
+    await until(() => ch.status() === "joined");
+    expect(ch.error()).toBeNull();
+    expect(ch.self()).toBe(s.history.at(-1)!.memberId);
+  });
+
+  it("a heartbeat interval above the channel keepalive: the first ping moves up to it once a channel joins", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const s = server();
+      const a = client(s, "user:ana", { heartbeat: { intervalMs: 200_000, timeoutMs: 10_000 } });
+      const ch = a.channel("room:hb");
+      await vi.advanceTimersByTimeAsync(20);
+      expect(ch.status()).toBe("joined");
+      const pings = () => s.history[0]!.sent.filter((m) => m === "ping").length;
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(pings()).toBe(0);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(pings()).toBe(1);
+      a.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("channel frames that arrived compressed under the identity before an auth are dropped; the channel is joined again", async () => {
+    // A compressed frame decodes asynchronously: here it waits on `gate`, so the `auth` surely goes out meanwhile.
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    const Real = globalThis.DecompressionStream;
+    class Gated {
+      readonly readable: ReadableStream<Uint8Array>;
+      readonly writable: WritableStream<Uint8Array>;
+      constructor() {
+        const ts = new TransformStream<Uint8Array, Uint8Array>({
+          async transform(chunk, c) {
+            await gate;
+            c.enqueue(chunk);
+          },
+        });
+        this.readable = ts.readable;
+        this.writable = ts.writable;
+      }
+    }
+    globalThis.DecompressionStream = Gated as unknown as typeof DecompressionStream;
+    try {
+      const s = server();
+      const a = client(s, "user:ana");
+      const b = client(s, "user:bia");
+      const ca = a.channel<string>("room:z");
+      const cb = b.channel<string>("room:z");
+      const got: string[] = [];
+      ca.subscribe((m) => got.push(m.data));
+      await until(() => ca.status() === "joined" && cb.status() === "joined" && ca.members().length === 2);
+      const ws = s.history.find((x) => x.identity?.subject === "ana")!;
+      const joinsBefore = ws.sent.filter((m) => typeof m === "object" && m.t === "join").length;
+      // Sent to ana (a message, a member list) and compressed; decoded only once the socket runs as carl.
+      const frame = JSON.stringify([
+        { t: "msg", ch: "room:z", from: "m-bia", user: "bia", data: "for ana only" },
+        { t: "members", ch: "room:z", join: [{ id: "m-x", user: "secret" }] },
+      ]);
+      ws.onmessage?.({ data: new TextEncoder().encode(frame).buffer });
+      a.signIn("user:carl");
+      await until(() => ws.sent.some((m) => typeof m === "object" && m.t === "auth"));
+      open();
+      await until(() => ws.sent.filter((m) => typeof m === "object" && m.t === "join").length > joinsBefore);
+      await until(() => ca.members().some((m) => m.self && m.user === "carl"));
+      expect(got).toEqual([]);
+      expect(ca.members().map((m) => m.user).sort()).toEqual(["bia", "carl"]);
+    } finally {
+      globalThis.DecompressionStream = Real;
+    }
+  });
+
+  it("the fake server's own decoder takes ref on join and pub (a non-negative integer, as the runtime's)", async () => {
+    const s = new FakeEmberServer({ ephemeral: true });
+    const a = client(s, null);
+    const ch = a.channel("room:ref");
+    await until(() => ch.status() === "joined");
+    const ws = s.history[0]!;
+    ws.send(JSON.stringify({ t: "pub", ch: "room:ref", data: 1, ref: 7 }));
+    await until(() => ws.received.some((m) => m !== "pong" && m.t === "published" && m.ref === 7));
+    ws.send(JSON.stringify({ t: "join", ch: "room:ref", ref: -1 }));
+    await until(() => ws.received.some((m) => m !== "pong" && m.t === "err" && m.code === "bad_frame" && m.message.includes("ref")));
   });
 
   it("an older runtime: unsupported, nothing sent; a stray joined does not make it joined", async () => {
@@ -223,6 +373,27 @@ describe("client.channel()", () => {
     } finally {
       clearInterval(timer);
     }
+  });
+
+  it("multiTab: a tab's state update the shard refused is not sent again on the next shared socket", async () => {
+    const s = server({
+      ephemeral: {
+        authorize: () => true,
+        state: (st) => (typeof (st as { color?: unknown } | undefined)?.color === "string" ? undefined : "invalid_state"),
+      },
+    });
+    const t = new FakeBrowser().tab();
+    const a = client(s, "user:ana", { multiTab: { locks: t.locks, BroadcastChannel: t.BroadcastChannel, lifecycle: false, clientIdTimeoutMs: 100 } });
+    await until(() => a.tabRole === "leader");
+    const ch = a.channel<unknown, { color: unknown }>("room:mts", { state: { color: "red" } });
+    await until(() => ch.status() === "joined");
+    ch.setState({ color: 42 });
+    await until(() => ch.error()?.code === "invalid_state");
+    const n = s.history.length;
+    s.history.at(-1)!.drop();
+    await until(() => s.history.length > n && ch.status() === "joined");
+    const joins = s.history.at(-1)!.sent.filter((m) => typeof m === "object" && m.t === "join").map((m) => (m as { state?: unknown }).state);
+    expect(joins).toEqual([{ color: "red" }]);
   });
 
   it("multiTab: one join for the tabs of an identity; messages between them come from the leader; the last tab out leaves", async () => {
