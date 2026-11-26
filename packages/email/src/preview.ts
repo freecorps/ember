@@ -20,10 +20,14 @@ const list = $("list"), view = $("view"), status = $("status");
 const shadow = $("html").attachShadow({ mode: "open" });
 const say = (t) => { status.textContent = t; };
 const failed = (e) => say((e && e.code ? e.code + ": " : "") + (e && e.message ? e.message : String(e)));
+// Answers may arrive out of order: only the latest pick is drawn (an earlier one's answer, or error, is dropped).
+let picked = 0;
 async function show(id) {
+  const mine = ++picked;
   say("Loading…");
   try {
     const e = await dash.query("dashboard:preview", { id });
+    if (mine !== picked) return;
     if (!e) return say("This email is gone.");
     $("subject").textContent = e.subject;
     $("meta").textContent = "From " + e.from + " to " + e.to + " · " + e.status;
@@ -31,7 +35,7 @@ async function show(id) {
     $("text").textContent = e.html ? "" : (e.text || (e.template ? "Rendered from the template " + e.template + " when it is sent." : "(no body)"));
     view.hidden = false;
     say("");
-  } catch (e) { failed(e); }
+  } catch (e) { if (mine === picked) failed(e); }
   dash.resize();
 }
 async function load() {
