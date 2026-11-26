@@ -4,6 +4,7 @@
 import { v } from "@freecorps/ember-server";
 import { internal } from "./_generated/api";
 import { action, internalQuery, mutation, query } from "./_generated/server";
+import { errors } from "./errors";
 
 /** Sets a rate (global:main: the only shard that writes `fxRates`). */
 export const setRate = mutation({
@@ -34,7 +35,7 @@ export const convert = mutation({
   args: { org: v.string(), rateId: v.id("fxRates"), amount: v.number() },
   handler: (ctx, { org, rateId, amount }) => {
     const r = ctx.db.get(rateId);
-    if (!r) throw new Error(`rate ${rateId} has not reached this shard yet`);
+    if (!r) throw errors.RateNotReplicated({ rateId });
     return ctx.db.insert("quotes", { org, rateId, amount, converted: amount * r.rate });
   },
 });

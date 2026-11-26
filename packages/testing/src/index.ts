@@ -10,8 +10,12 @@
 //
 // One shard per name (`<kind>:<key>`), created on first use: calls route like the client does (the function's routing
 // argument or, for `fromAuth`, the claim of `withIdentity`'s identity, the `shard` option, else `defaultShard`). Actions run in-process with `ctx.runQuery` / `ctx.runMutation` /
-// `ctx.runAction` / the scheduler / `ctx.env`; files, Vectorize, AI Search, images and the browser are not emulated.
-// Components: pass `app` (`ember/ember.config.ts`'s default export) and they are composed in, as the Worker does.
+// `ctx.runAction` / the scheduler / `ctx.env` / `ctx.storage` (in memory, storage.ts); Vectorize, AI Search, images and the
+// browser are not emulated. Components: pass `app` (`ember/ember.config.ts`'s default export) and they are composed in,
+// as the Worker does. `t.measure(fn)` / `t.lastStats()` give the engine's usage counters; `t.close()` (or `using t =
+// emberTest(...)`) frees the SQLite databases.
+
+import { AsyncLocalStorage } from "node:async_hooks";
 
 import {
   checkAccess,
@@ -55,6 +59,7 @@ import {
   type ScheduledReader,
   type SchemaDefinition,
   type TriggersDefinition,
+  type Usage,
 } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import {
@@ -72,6 +77,7 @@ import {
   type ShardSpec,
   type Visibility,
 } from "@freecorps/ember-values";
+import { collectFiles, MemoryBucket, memoryStorage, serveStorage, STORAGE_ORIGIN, testSigner } from "./storage.ts";
 
 type Ref<T extends "query" | "mutation" | "action"> = FunctionReference<T, Visibility, object, unknown, ErrorSpec, ShardSpec | null>;
 type Options = { shard?: string };
@@ -96,7 +102,10 @@ export interface EmberTestOptions {
   app?: AppDefinition;
   /** Start of the test clock (ms). Default: a fixed instant, so `_creationTime`s are reproducible. */
   now?: number;
-  /** Project limits, as `defineApp({ limits })` (functions' own `limits` apply over them). */
+  /**
+   * Project limits, as `defineApp({ limits })` (functions' own `limits` apply over them). Default: `app`'s
+   * (`defineApp({ limits })`, as the Worker uses them); set both and these win, key by key.
+   */
   limits?: Partial<Limits>;
   /**
    * An outside clock instead of the harness's own (`() => Date.now()`, so vitest fake timers drive it): `now` is
@@ -112,6 +121,17 @@ export interface EmberTestOptions {
    * `@freecorps/ember-auth` for Better Auth organizations. Read-only for functions; fill them with `t.seedReplica`.
    */
   replicas?: ReplicaTableSpec[];
+}
+
+/**
+ * What a run used, from the engine's own counters (the ones `limits` are checked against): SQLite rows read and
+ * written, and documents read. Summed over every query and mutation the run executed (an action's `ctx.runQuery` /
+ * `ctx.runMutation` included).
+ */
+export interface ExecutionStats {
+  rowsRead: number;
+  rowsWritten: number;
+  documentsRead: number;
 }
 
 /** An application error of `F`, as a test sees it (code and typed data). */
@@ -153,6 +173,25 @@ export interface EmberTest {
    * does in the background. `finishScheduled` and `advance` sync first too. Returns the rows applied.
    */
   syncReplicas(): Promise<number>;
+  /**
+   * Runs `fn` and returns what it returned with the usage of every query and mutation it ran through this harness
+   * (nested in actions, and scheduled jobs it ran with `finishScheduled`/`advance` too): `const { stats } = await
+   * t.measure(() => t.query(api.messages.list, { roomId })); expect(stats.rowsRead).toBeLessThan(50)`. Concurrent
+   * calls outside `fn` do not count.
+   */
+  measure<R>(fn: () => R | PromiseLike<R>): Promise<{ value: Awaited<R>; stats: ExecutionStats }>;
+  /**
+   * The usage of the last call that finished (`query`, `mutation`, `action`, `run`, `fetch`, or the last scheduled
+   * job `finishScheduled`/`advance`/`runScheduled` ran), or null before any.
+   */
+  lastStats(): ExecutionStats | null;
+  /**
+   * Frees the harness: closes its SQLite databases, drops pending jobs and stored files. Later calls throw. Also
+   * `using t = emberTest(...)`, or `await using` to wait for calls still running first.
+   */
+  close(): void;
+  [Symbol.dispose](): void;
+  [Symbol.asyncDispose](): Promise<void>;
 }
 
 export function emberTest(options: EmberTestOptions): EmberTest {
@@ -180,6 +219,45 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     return r.name;
   };
   const drivers = new Map<string, ReturnType<typeof createNodeSqliteDriver>>();
+  /** The R2 bucket of `ctx.storage` (storage.ts). */
+  const bucket = new MemoryBucket();
+  let closed = false;
+  /** Top-level calls not settled yet (`await using` waits for them). */
+  const inFlight = new Set<Promise<unknown>>();
+  // Usage (`measure` / `lastStats`): each top-level call and each `measure` opens a collector in the async context;
+  // an engine run adds its usage to every collector up the chain, so concurrent calls never mix.
+  type Collector = ExecutionStats & { call: boolean; parent: Collector | undefined };
+  const usageScope = new AsyncLocalStorage<Collector>();
+  let last: ExecutionStats | null = null;
+  const record = (u: Usage | undefined) => {
+    if (!u) return;
+    for (let c = usageScope.getStore(); c; c = c.parent) {
+      c.rowsRead += u.rowsRead;
+      c.rowsWritten += u.rowsWritten;
+      c.documentsRead += u.documentsRead;
+    }
+  };
+  const statsOf = (c: Collector): ExecutionStats => ({ rowsRead: c.rowsRead, rowsWritten: c.rowsWritten, documentsRead: c.documentsRead });
+  // `parent` is explicit: a job whose walk found no `measure` above has none (a default would hand it the caller's).
+  const collector = (call: boolean, parent: Collector | undefined): Collector => ({ rowsRead: 0, rowsWritten: 0, documentsRead: 0, call, parent });
+  /**
+   * A call from the test (not one nested in a running action): its own collector, `lastStats` when it settles.
+   * `job`: a scheduled job, always a call of its own, even when its timer (convexTest) carries the async context of the
+   * call that scheduled it; only the `measure`s around count it too.
+   */
+  const tracked = <R>(fn: () => Promise<R>, job = false): Promise<R> => {
+    if (closed) return Promise.reject(new Error("emberTest: this harness is closed (t.close())"));
+    let parent = usageScope.getStore();
+    if (job) while (parent?.call) parent = parent.parent;
+    else for (let c = parent; c; c = c.parent) if (c.call) return fn();
+    const c = collector(true, parent);
+    const p = usageScope.run(c, fn).finally(() => {
+      last = statsOf(c);
+      inFlight.delete(p);
+    });
+    inFlight.add(p);
+    return p;
+  };
   // `.replicated()` tables: global:main's changes, in order, and how far each other shard got.
   const replicated = new Set(replicatedTablesOf(schema.manifest));
   const bcast: ReplicaRow[] = [];
@@ -217,7 +295,29 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         .map(({ shard: _s, ...job }) => structuredClone(job)),
   });
 
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    jobs.length = 0;
+    for (const d of drivers.values()) {
+      try {
+        d.close();
+      } catch {
+        // already closed
+      }
+    }
+    drivers.clear();
+    engines.clear();
+    bucket.clear();
+  };
+
+  /** The app's limits (`defineApp({ limits })`), with `options.limits` over them. */
+  // An `undefined` override does not erase the app's value (the engine would fall back to its default).
+  const overrides = Object.fromEntries(Object.entries(options.limits ?? {}).filter(([, v]) => v !== undefined));
+  const limits = options.app || options.limits ? { ...options.app?.limits, ...overrides } : undefined;
+
   const engineOf = (shard: string): Engine => {
+    if (closed) throw new Error("emberTest: this harness is closed (t.close())");
     let e = engines.get(shard);
     if (!e) {
       const driver = createNodeSqliteDriver();
@@ -231,7 +331,9 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         shardName: () => shard,
         ...(triggers ? { triggers } : {}),
         scheduledFunctions: readerOf(shard),
-        ...(options.limits ? { limits: options.limits } : {}),
+        // `ctx.storage` of queries and mutations over the shard's `_files`, with the test deployment's URLs.
+        storage: { shard: () => shard, signer: testSigner },
+        ...(limits ? { limits } : {}),
       });
       e.migrate();
       engines.set(shard, e);
@@ -320,7 +422,9 @@ export function emberTest(options: EmberTestOptions): EmberTest {
 
     const runQuery = (name: AnyFunctionReference | string, args: unknown, shard: string) => {
       try {
-        return engineOf(shard).runQuery(name as never, args ?? {}, auth).value;
+        const r = engineOf(shard).runQuery(name as never, args ?? {}, auth);
+        record(r.usage);
+        return r.value;
       } catch (e) {
         return asClientError(e);
       }
@@ -332,6 +436,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       } catch (e) {
         return asClientError(e);
       }
+      record(r.usage);
       logChanges(shard, r.changes);
       queue(shard, r.scheduled, r.cancelled);
       return r.value;
@@ -421,7 +526,15 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         },
         env: { ...(options.env ?? {}) },
         now: now(),
-        storage: unsupported("ctx.storage"),
+        storage: memoryStorage({
+          shard,
+          driver: () => {
+            engineOf(shard);
+            return drivers.get(shard)!;
+          },
+          bucket,
+          now,
+        }),
         images: unsupported("ctx.images"),
         browser: unsupported("ctx.browser"),
         vectorSearch: () => Promise.reject(new Error("ctx.vectorSearch is not emulated by @freecorps/ember-testing")),
@@ -438,8 +551,11 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       const system = make(null, true);
       setState(j.id, { kind: "inProgress" });
       try {
-        if (j.kind === "mutation") await system.mutation(namedRef<"mutation">(j.fn), j.args as Record<string, unknown>, { shard: j.shard });
-        else await (system as unknown as { _action(name: string, args: unknown, shard: string): Promise<unknown> })._action(j.fn, j.args, j.shard);
+        // A job is a call of its own for `lastStats` (inside `measure`, it counts there too).
+        await tracked(async () => {
+          if (j.kind === "mutation") await system.mutation(namedRef<"mutation">(j.fn), j.args as Record<string, unknown>, { shard: j.shard });
+          else await (system as unknown as { _action(name: string, args: unknown, shard: string): Promise<unknown> })._action(j.fn, j.args, j.shard);
+        }, true);
       } catch (e) {
         setState(j.id, { kind: "failed", error: `${(e as { code?: string }).code ?? "Error"}: ${(e as Error)?.message ?? String(e)}` });
         throw e;
@@ -447,54 +563,89 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       setState(j.id, { kind: "success" });
     };
 
+    const runInline = async <R>(fn: (ctx: MutationCtx) => R, opts?: Options): Promise<R> => {
+      const shard = opts?.shard ?? defaultShard;
+      // A callback that returns a Promise (`async (ctx) => { await ctx.db.insert(...) }`, as Convex tests write it):
+      // what runs before its first real await is the mutation; the rest runs after the commit, each statement on
+      // its own (fine for setup and inspection, not atomic). Jobs it schedules are queued once it settles.
+      let pending: PromiseLike<unknown> | undefined;
+      const inline = {
+        [Symbol.for("ember.function")]: true,
+        type: "mutation",
+        visibility: "internal",
+        args: { kind: "object", fields: {} },
+        handler: (ctx: MutationCtx) => {
+          const out = fn(ctx);
+          if (out && typeof (out as { then?: unknown }).then === "function") {
+            pending = out as unknown as PromiseLike<unknown>;
+            return undefined;
+          }
+          return out;
+        },
+      };
+      const r = engineOf(shard).runMutation(inline as never, {}, auth);
+      record(r.usage);
+      // After its first await the callback's statements still add to the engine's usage object: count only what
+      // they added, once it settles.
+      const before = r.usage ? { rowsRead: r.usage.rowsRead, rowsWritten: r.usage.rowsWritten, documentsRead: r.usage.documentsRead } : undefined;
+      logChanges(shard, r.changes);
+      if (!pending) {
+        queue(shard, r.scheduled, r.cancelled);
+        return r.value as never;
+      }
+      try {
+        return (await pending) as never;
+      } finally {
+        // The engine hands back its own lists: what the callback scheduled after the commit is in them too.
+        queue(shard, r.scheduled, r.cancelled);
+        if (r.usage && before) {
+          record({
+            ...r.usage,
+            rowsRead: r.usage.rowsRead - before.rowsRead,
+            rowsWritten: r.usage.rowsWritten - before.rowsWritten,
+            documentsRead: r.usage.documentsRead - before.documentsRead,
+          });
+        }
+      }
+    };
+
+    const fetchRoute = async (path: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(path, STORAGE_ORIGIN);
+      const request = new Request(url, init);
+      // The URLs `ctx.storage` hands out (downloads, proxy uploads) are the test deployment's: served here.
+      const stored = await serveStorage(request, url, { bucket, driverOf: (s) => drivers.get(s) ?? null, now });
+      if (stored) return stored;
+      const router = options.http;
+      if (!router) throw new Error("fetch(): pass the app's http router (emberTest({ http }) / convexTest's `http` module)");
+      const hit = matchRoute(router.routes, request.method, url.pathname);
+      if (!hit) return new Response(JSON.stringify({ ok: false, error: { code: "not_found", message: "not found" } }), { status: 404, headers: { "content-type": "application/json" } });
+      if ("methodMismatch" in hit) return new Response(JSON.stringify({ ok: false, error: { code: "method_not_allowed", message: `${request.method} is not allowed on ${url.pathname}` } }), { status: 405 });
+      const route = hit.route;
+      const shard = typeof route.shard === "function" ? route.shard(request) : (route.shard ?? defaultShard);
+      const res = await route.handler.handler(actionCtx(shard) as never, request);
+      if (!(res instanceof Response)) throw new Error(`fetch(): ${route.method} ${url.pathname} did not return a Response`);
+      return res;
+    };
+
     const t: EmberTest & { _action(name: string, args: unknown, shard: string): Promise<unknown> } = {
-      async query(ref, ...rest) {
-        const { args, opts } = split(rest);
-        return runQuery(ref, args, shardOf(ref, args, opts?.shard, identity));
-      },
-      async mutation(ref, ...rest) {
-        const { args, opts } = split(rest);
-        return runMutation(ref, args, shardOf(ref, args, opts?.shard, identity));
-      },
-      async action(ref, ...rest) {
-        const { args, opts } = split(rest);
-        return runAction(getFunctionName(ref), args, shardOf(ref, args, opts?.shard, identity), false);
-      },
+      query: (ref, ...rest) =>
+        tracked(async () => {
+          const { args, opts } = split(rest);
+          return runQuery(ref, args, shardOf(ref, args, opts?.shard, identity));
+        }),
+      mutation: (ref, ...rest) =>
+        tracked(async () => {
+          const { args, opts } = split(rest);
+          return runMutation(ref, args, shardOf(ref, args, opts?.shard, identity));
+        }),
+      action: (ref, ...rest) =>
+        tracked(async () => {
+          const { args, opts } = split(rest);
+          return runAction(getFunctionName(ref), args, shardOf(ref, args, opts?.shard, identity), false);
+        }),
       _action: (name, args, shard) => runAction(name, args, shard, true),
       withIdentity: (id) => make({ ...id } as Identity),
-      async run(fn, opts) {
-        const shard = opts?.shard ?? defaultShard;
-        // A callback that returns a Promise (`async (ctx) => { await ctx.db.insert(...) }`, as Convex tests write it):
-        // what runs before its first real await is the mutation; the rest runs after the commit, each statement on
-        // its own (fine for setup and inspection, not atomic). Jobs it schedules are queued once it settles.
-        let pending: PromiseLike<unknown> | undefined;
-        const inline = {
-          [Symbol.for("ember.function")]: true,
-          type: "mutation",
-          visibility: "internal",
-          args: { kind: "object", fields: {} },
-          handler: (ctx: MutationCtx) => {
-            const out = fn(ctx);
-            if (out && typeof (out as { then?: unknown }).then === "function") {
-              pending = out as unknown as PromiseLike<unknown>;
-              return undefined;
-            }
-            return out;
-          },
-        };
-        const r = engineOf(shard).runMutation(inline as never, {}, auth);
-        logChanges(shard, r.changes);
-        if (!pending) {
-          queue(shard, r.scheduled, r.cancelled);
-          return r.value as never;
-        }
-        try {
-          return (await pending) as never;
-        } finally {
-          // The engine hands back its own lists: what the callback scheduled after the commit is in them too.
-          queue(shard, r.scheduled, r.cancelled);
-        }
-      },
+      run: (fn, opts) => tracked(() => runInline(fn, opts)),
       scheduled: () => [...jobs],
       async advance(ms) {
         if (external) throw new Error("advance(): this harness reads an outside clock (options.clock): move it, then runScheduled(id)");
@@ -503,9 +654,13 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         let n = 0;
         while (jobs.length && jobs[0]!.runAt <= until) {
           await runJob(jobs[0]!);
+          // As finishScheduled: the next job (and the test, after) reads `.replicated()` tables as delivered so far.
+          syncReplicated();
           n++;
         }
         reach(until);
+        // The shards' file GC runs on their alarm: files stored and never referenced go after the grace period.
+        for (const [shard, d] of drivers) collectFiles(d, shard, bucket, now());
         return n;
       },
       async finishScheduled(maxJobs = 1000) {
@@ -526,20 +681,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         await runJob(j);
         return true;
       },
-      async fetch(path, init) {
-        const router = options.http;
-        if (!router) throw new Error("fetch(): pass the app's http router (emberTest({ http }) / convexTest's `http` module)");
-        const url = new URL(path, "http://ember.test");
-        const request = new Request(url, init);
-        const hit = matchRoute(router.routes, request.method, url.pathname);
-        if (!hit) return new Response(JSON.stringify({ ok: false, error: { code: "not_found", message: "not found" } }), { status: 404, headers: { "content-type": "application/json" } });
-        if ("methodMismatch" in hit) return new Response(JSON.stringify({ ok: false, error: { code: "method_not_allowed", message: `${request.method} is not allowed on ${url.pathname}` } }), { status: 405 });
-        const route = hit.route;
-        const shard = typeof route.shard === "function" ? route.shard(request) : (route.shard ?? defaultShard);
-        const res = await route.handler.handler(actionCtx(shard) as never, request);
-        if (!(res instanceof Response)) throw new Error(`fetch(): ${route.method} ${url.pathname} did not return a Response`);
-        return res;
-      },
+      fetch: (path, init) => tracked(() => fetchRoute(path, init)),
       now,
       engine: (shard = defaultShard) => engineOf(shard),
       async seedReplica(table, rows, opts) {
@@ -564,6 +706,19 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         if ((out.value as { resync?: boolean } | null)?.resync) throw new Error(`seedReplica: ${shard} is behind on ${source} (its replica state changed outside seedReplica)`);
         // Only once applied: a refused seed must not leave the counter ahead of the shard (later seeds would be a gap).
         seeded.set(key, s);
+      },
+      async measure(fn) {
+        if (closed) throw new Error("emberTest: this harness is closed (t.close())");
+        const c = collector(false, usageScope.getStore());
+        const value = await usageScope.run(c, async () => fn());
+        return { value, stats: statsOf(c) };
+      },
+      lastStats: () => (last ? { ...last } : null),
+      close,
+      [Symbol.dispose]: close,
+      async [Symbol.asyncDispose]() {
+        while (inFlight.size) await Promise.allSettled([...inFlight]);
+        close();
       },
     };
     return t;
