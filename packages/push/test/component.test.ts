@@ -16,7 +16,8 @@ import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent, pushFunctions,
   setPushSeal, PushNotifications, registerPushDevice, toBase64url } from "../src/index.ts";
-import { RECEIPTS_DRAIN_LEASE_MS, RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_FRESH_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
+import { PUSH_PRUNE_RETRY_MS, RECEIPTS_DRAIN_LEASE_MS, RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_FRESH_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
+import { pruneStalePushDevices } from "../src/devices.ts";
 import { fakeApns, fakeFcm, hexToken } from "./fakes.ts";
 import { apnsKey, serviceAccount } from "./keys.ts";
 
@@ -212,6 +213,22 @@ describe("push component", () => {
     expect(count({ db }, { provider: "expo" })).toBe(0);
     const broken = { ...db, aggregate: () => { throw new Error("other"); } };
     expect(() => count({ db: broken }, {})).toThrow("other");
+  });
+
+  test("pruneStale while by_updated is still backfilling: deletes nothing, does not throw, and tries again later", () => {
+    const db = {
+      query: () => ({
+        withIndex: () => {
+          throw Object.assign(new Error("Index devices.by_updated is still backfilling"), { code: "IndexNotReady" });
+        },
+      }),
+    };
+    const scheduled: Array<{ ms: number; fn: string }> = [];
+    const scheduler = { runAfter: (ms: number, fn: unknown) => scheduled.push({ ms, fn: String((fn as { name?: string })?.name ?? fn) }) };
+    const prune = pushFunctions.lib.pruneStale.handler as (ctx: unknown, a: { olderThanMs: number }) => number;
+    expect(prune({ db, scheduler, now: 100 * 24 * 3600_000 }, { olderThanMs: 7 * 24 * 3600_000 })).toBe(0);
+    expect(scheduled.map((s) => s.ms)).toEqual([PUSH_PRUNE_RETRY_MS]);
+    expect(pruneStalePushDevices({ db: db as never, now: 100 * 24 * 3600_000 }, 7 * 24 * 3600_000)).toEqual({ deleted: 0, more: false, notReady: true });
   });
 
   test("pruneStale deletes devices not registered for a while, in batches continued by a job; fresh ones stay", async () => {

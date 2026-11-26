@@ -130,7 +130,9 @@ Urgency follows Brigade's relay as its README documents it (Brigade's `low`/`hig
   `sendFcm`, `sendExpoMessages` and `sendPush`, `checkPushReceipts`) takes `sharedPushLimiter`, one per isolate, so
   sends running at once share the 5. Pass `limiter: createPushLimiter(2)` for a smaller cap. A slot is freed when its
   response body is read to the end, cancelled (retried answers are cancelled unread) or the send's signal aborts;
-  one held past `PUSH_SLOT_HOLD_MS` (60 s) is taken back.
+  one held past `PUSH_SLOT_HOLD_MS` (60 s) is taken back, without cancelling the request that held it (so a dead
+  invocation cannot hold it forever). The cap of 5 is therefore firm only while no request runs longer than 60 s: a
+  reclaimed slot can admit a sixth request while the slow one is still running.
 - The APNs provider token (ES256 over the `.p8`) is reused for 40 minutes. The FCM access token (RS256
   service-account assertion) is kept until 5 minutes before it expires; concurrent sends share one exchange, and a
   401 refetches it once for every send that saw the same token.

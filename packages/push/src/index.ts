@@ -64,7 +64,7 @@ export {
   type PushProviderName,
   type RegisterPushDeviceInput,
 } from "./devices.ts";
-export { apnsOptionsFromEnv, fcmOptionsFromEnv, pushComponent, pushFunctions, PushNotifications, setPushSeal, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";
+export { apnsOptionsFromEnv, fcmOptionsFromEnv, PUSH_PRUNE_RETRY_MS, pushComponent, pushFunctions, PushNotifications, setPushSeal, type PushComponentApi, type PushInstallConfig, type DeliveryResult } from "./component.ts";
 export { decodeJwt, importSigningKey, pemToDer, signJwt, verifyJwt, type CredentialsError, type JwtAlgorithm } from "./jwt.ts";
 export {
   DEFAULT_PUSH_FALLBACK,

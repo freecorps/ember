@@ -79,7 +79,11 @@ export function fullAt(c: RateLimitConfig, s: RateLimitState): number {
   const missing = capacityOf(c) - s.value;
   if (!(missing > 0)) return s.ts;
   if (c.kind === "token bucket") return s.ts + Math.ceil((missing * c.period) / c.rate);
-  return s.ts + Math.ceil(missing / c.rate) * c.period;
+  // Fixed window: tokens come only at the config's window boundaries; a state stored under another period (the
+  // config changed) may not sit on one, so the due time rounds up to the next boundary (no change when aligned).
+  const start = c.start ?? 0;
+  const due = s.ts + Math.ceil(missing / c.rate) * c.period;
+  return due + ((((start - due) % c.period) + c.period) % c.period);
 }
 
 /**

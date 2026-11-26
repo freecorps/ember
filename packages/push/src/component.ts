@@ -583,11 +583,17 @@ export const pushFunctions = {
   },
 };
 
+/** How long `lib:pruneStale` waits to try again while the `by_updated` index backfills. */
+export const PUSH_PRUNE_RETRY_MS = 60_000;
+
 /** One batch of `lib:pruneStale` (devices with `updatedAt <= before`), and the next job while the batch is full. */
 function pruneStep(ctx: MutationCtx, before: number, olderThanMs: number, limit: number | undefined): number {
   // `now` pinned to the first call's cutoff, so the follow-up jobs delete the same set (not what aged since).
   const r = pruneStalePushDevices({ db: ctx.db, now: before + olderThanMs }, olderThanMs, { table: TABLE, limit: limit ?? PUSH_PRUNE_BATCH });
-  if (r.more) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:pruneStaleNext"), { before, olderThanMs, ...(limit !== undefined ? { limit } : {}) });
+  const next = { before, olderThanMs, ...(limit !== undefined ? { limit } : {}) };
+  if (r.more) ctx.scheduler.runAfter(0, unsafeRef<"mutation">("lib:pruneStaleNext"), next);
+  // `by_updated` still backfilling: the same cut again once it may be ready.
+  else if (r.notReady) ctx.scheduler.runAfter(PUSH_PRUNE_RETRY_MS, unsafeRef<"mutation">("lib:pruneStaleNext"), next);
   return r.deleted;
 }
 
