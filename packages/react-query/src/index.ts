@@ -274,7 +274,12 @@ export class EmberQueryClient {
     if (!isEmberQueryKey(key) || key[3] === "skip") return Promise.reject(new Error("Ember: not an ember query key"));
     const { args, opts } = this.target(key);
     const byKey = this.liveByKey.get(key);
-    const ref = refFor(key, byKey?.query);
+    let hash: string | undefined;
+    const hashOf = () => (hash ??= emberQueryKeyHashFn(key));
+    // A key nobody's `emberQuery` built (restored from a persisted cache) and not live (always so in SSR): its query,
+    // whose observers' own keys route it, comes from the cache.
+    const query = byKey?.query ?? (keyRefs.has(key) ? undefined : this.queryClient?.getQueryCache().get(hashOf()));
+    const ref = refFor(key, query);
     if (this.ssr) {
       const qc = this.queryClient;
       return this.client.fetchForHydration(ref, args, opts).then((h) => (qc ? keepMeta(qc, key, h) : h.value));
@@ -284,7 +289,7 @@ export class EmberQueryClient {
     // An error already there is not sent again: waiting for the next snapshot would never settle.
     if (now.status === "error") return Promise.reject(now.error);
     // Observed: its live subscription (`watch`) brings the value.
-    const l = byKey && this.live.get(byKey.query.queryHash) === byKey ? byKey : this.live.get(emberQueryKeyHashFn(key));
+    const l = byKey && this.live.get(byKey.query.queryHash) === byKey ? byKey : this.live.get(hashOf());
     if (l) return new Promise((resolve, reject) => (l.fetching ??= []).push({ key, resolve, reject }));
     return this.fetchOnce(ref, args, opts);
   }
