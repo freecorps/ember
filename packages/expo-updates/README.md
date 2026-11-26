@@ -78,9 +78,11 @@ the signature is RSASSA-PKCS1-v1_5 with SHA-256 through WebCrypto. Requests that
   (base64url SHA-256), `key` (Metro's asset hash, what the bundle looks assets up by), `contentType`,
   `fileExtension` and `url`.
 - `noUpdateAvailable` (protocol 1) when the client already runs that update, when nothing is published, or when the
-  channel or branch is paused (the kill switch); `rollBackToEmbedded` after a rollback to the embedded update
+  channel is paused, or the branch the install falls on is (the kill switch); `rollBackToEmbedded` after a rollback to the embedded update
   (`noUpdateAvailable` if the client already runs the embedded one). Protocol 0 and the JSON form have no directives:
-  204 for "nothing new", 406 for a rollback.
+  204 for "nothing new", 406 for a rollback; protocol 0 gets the manifest even when it is the current one (the client
+  compares the ids). `accept` picks the form by q-value, the most specific range deciding (`multipart/mixed;q=0, */*`
+  is JSON); the JSON form answers with the media type chosen (`application/json` or `application/expo+json`).
 
 `GET /<install>/assets?key=<sha256 hex>` serves the bytes from R2 with the asset's `Content-Type` and
 `Cache-Control: public, max-age=31536000, immutable` (the URL is the content address: it never changes).
@@ -95,7 +97,8 @@ the signature is RSASSA-PKCS1-v1_5 with SHA-256 through WebCrypto. Requests that
   (default 30) before the shard is asked again;
 - the **rendered (signed) response**, keyed by channel, platform, runtime version, the plan's version, the install's
   **rollout side** (not its id), what the client already runs (only as "this one / the embedded one / another"),
-  protocol, format and signature. A new version never reads an old response.
+  protocol, format and signing key (a digest of the PEM: a rotated key never serves an old signature). A new version
+  never reads an old response.
 
 So an app open is two cache lookups and no Durable Object; each edge location reads the shard once per
 `planTtlSeconds` per (channel, platform, runtime version), and signs once per response key. Measured in
@@ -109,7 +112,9 @@ defineApp().use(expoUpdates, { config: { cache: { planTtlSeconds: 10 } } }); // 
 
 The Cache API stores entries on zones (a custom domain); on `*.workers.dev` everything works, uncached.
 
-Assets are cached at the edge on first fetch (one shard read and one R2 read per location and asset).
+Assets are cached at the edge on first fetch (one shard read and one R2 read per location and asset), streamed: a
+bundle is never held in the Worker's memory. An `assetsUrl` (install option, e.g. a CDN in front of the route) may
+carry its own query string; `key` is added to it.
 
 ## Publishing and operating
 
@@ -134,7 +139,9 @@ ember expo list
   its installs to a second branch.
 - **Rollback** takes the head out (`rolledBack`) and republishes the previous update as a new one (clients only move
   to a newer `createdAt`), or publishes `rollBackToEmbedded` with `--to-embedded` or when there is no previous update.
-- **Kill switch**: a paused channel or branch answers `noUpdateAvailable`; clients keep what they run.
+- **Kill switch**: a paused channel answers `noUpdateAvailable` to all its installs; a paused branch, to the installs
+  it serves (on every channel, also as a rollout branch: installs of such a channel on its other branch keep
+  updating). Clients keep what they run. A branch serves at most 1000 channels (`MAX_CHANNELS_PER_BRANCH`).
 
 The same operations are on the component's screen in the Ember Dashboard (channels, branches, updates with their
 manifest and assets; rollout, rollback and kill switch, the destructive ones behind a confirmation).
