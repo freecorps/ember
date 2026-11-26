@@ -53,7 +53,7 @@ const schema = defineSchema({
   },
 });
 
-const { query, mutation, internalMutation } = componentBuilders<typeof schema, undefined>();
+const { query, mutation, internalMutation, internalQuery } = componentBuilders<typeof schema, undefined>();
 
 type Ctx = ComponentCtx<typeof schema, undefined>["mutation"];
 type ReadCtx = ComponentCtx<typeof schema, undefined>["query"];
@@ -287,6 +287,21 @@ export const functions = {
       },
     }),
 
+    /**
+     * Every migration in this shard with its function handle (the dashboard's table: resuming one runs `lib:start`
+     * with its name and handle).
+     */
+    runs: internalQuery({
+      args: { status: v.optional(status) },
+      handler: (ctx, { status: s }) =>
+        ctx.db
+          .query("migrations")
+          .withIndex("by_name")
+          .collect()
+          .filter((r) => s === undefined || r.status === s)
+          .map((r) => ({ ...view(r), fn: r.fn, function: r.fn.startsWith("&") ? r.fn.slice(1) : r.fn, pendingJob: r.pendingJob ?? null })),
+    }),
+
     // ---------------------------------------------------------------------------------------- internal loop
 
     /** Batches while the job's budget lasts: the app's function and the cursor commit together. */
@@ -360,4 +375,64 @@ export const functions = {
 /** Documents per batch when neither the definition nor the run says. */
 export const DEFAULT_BATCH_SIZE = 100;
 
-export const migrations = defineComponent({ name: "migrations", schema, functions });
+const lib = functions.lib;
+
+export const migrations = defineComponent({
+  name: "migrations",
+  schema,
+  functions,
+  // The migrations' screen in the Ember Dashboard (contracts.md "Telas declarativas"): per shard, where each one runs.
+  dashboard: {
+    label: "Data migrations",
+    icon: "database",
+    description: "Batched data migrations in this shard: progress, errors; cancel, resume, or start over. Across shards: `ember migrations`.",
+    tabs: [
+      {
+        id: "runs",
+        label: "Migrations",
+        blocks: [
+          {
+            kind: "table",
+            id: "runs",
+            query: lib.runs,
+            rowKey: "name",
+            columns: [
+              { label: "Migration", path: "name", format: "code" },
+              { label: "Status", path: "status", format: "badge" },
+              { label: "Processed", path: "processed", format: "number" },
+              { label: "Changed", path: "changed", format: "number" },
+              { label: "Batches", path: "batches", format: "number" },
+              { label: "Updated", path: "updatedAt", format: "ago" },
+            ],
+            detail: {
+              query: lib.status,
+              fromRow: { name: "name" },
+              sections: [
+                {
+                  kind: "kv",
+                  items: [
+                    { label: "Status", path: "status", format: "badge" },
+                    { label: "Processed", path: "processed", format: "number" },
+                    { label: "Changed", path: "changed", format: "number" },
+                    { label: "Failed batches", path: "failed", format: "number" },
+                    { label: "Batch size", path: "batchSize", format: "number" },
+                    { label: "Cursor", path: "cursor", format: "code" },
+                    { label: "Started", path: "startedAt", format: "date" },
+                    { label: "Finished", path: "finishedAt", format: "date" },
+                  ],
+                },
+                { kind: "stacktrace", label: "Last error", path: "lastError" },
+                { kind: "json", label: "Next in the chain", path: "next" },
+              ],
+            },
+            rowActions: [
+              { id: "cancel", label: "Cancel", fn: lib.cancel, fromRow: { name: "name" }, description: "Stops after the batch in flight." },
+              { id: "resume", label: "Resume", fn: lib.start, fromRow: { name: "name", fn: "fn" }, description: "A failed or canceled migration resumes from its cursor; a running or done one is left as is." },
+              { id: "restart", label: "Start over", fn: lib.start, args: { reset: true }, fromRow: { name: "name", fn: "fn" }, destructive: true, description: "Runs it again from the beginning, counters cleared." },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+});

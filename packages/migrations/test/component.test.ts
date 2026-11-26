@@ -464,3 +464,31 @@ describe("migrations component", () => {
   const later: Promise<boolean> = m.cancel(ac, "defs:addPlan");
   return [s, started, later];
 };
+
+describe("migrations dashboard", () => {
+  test("the spec names the component's own functions; runs/cancel/start do what the screen shows", () => {
+    const [spec] = composeApp({ schema, functions: { defs, api }, app }).dashboards;
+    expect(spec).toMatchObject({ key: "migrations", component: "migrations", scope: "shard" });
+    expect(Object.keys(spec!.functions).sort()).toEqual(["@migrations/lib:cancel", "@migrations/lib:runs", "@migrations/lib:start", "@migrations/lib:status"]);
+    // `Start over` is destructive, so is every action running lib:start (the confirmation is per function).
+    expect(spec!.functions["@migrations/lib:start"]).toMatchObject({ type: "mutation", destructive: true });
+    const h = harness();
+    h.mutate("api:seed", { n: 6 });
+    probe.failOn = "org4";
+    h.mutate("api:run", { name: "addPlan" });
+    h.tick();
+    const runs = h.engine.runQuery("@migrations/lib:runs", {}).value as Array<{ name: string; status: string; fn: string; function: string }>;
+    expect(runs.map((r) => [r.name, r.status, r.function])).toEqual([["defs:addPlan", "failed", "defs:addPlan"]]);
+    expect((h.engine.runQuery("@migrations/lib:runs", { status: "done" }).value as unknown[]).length).toBe(0);
+    // "Resume" is lib:start with the row's name and handle: it continues from the cursor.
+    probe.failOn = "";
+    h.mutate("@migrations/lib:start", { name: runs[0]!.name, fn: runs[0]!.fn });
+    h.tick();
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 6 });
+    // "Start over": reset.
+    h.mutate("@migrations/lib:start", { name: runs[0]!.name, fn: runs[0]!.fn, reset: true });
+    expect(h.status("addPlan")).toMatchObject({ status: "running", processed: 0 });
+    expect(h.mutate("@migrations/lib:cancel", { name: runs[0]!.name })).toBe(true);
+    expect(h.status("addPlan")).toMatchObject({ status: "canceled" });
+  });
+});
