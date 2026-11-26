@@ -120,11 +120,11 @@ export type AgentInstallConfig = {
   search?: boolean;
 };
 
+const SEARCH_OFF = "agent: full-text search is off; install the component with { config: { search: true } }";
+const searchOn = (ctx: { component: { config: AgentInstallConfig | undefined } }) => ctx.component.config?.search === true;
 /** The search index, only in an install with `{ search: true }`. */
 function checkSearch(ctx: { component: { config: AgentInstallConfig | undefined } }) {
-  if (ctx.component.config?.search !== true) {
-    throw new EmberError("ValidationError", "agent: full-text search is off; install the component with { config: { search: true } }");
-  }
+  if (!searchOn(ctx)) throw new EmberError("ValidationError", SEARCH_OFF);
 }
 
 const { query, mutation, internalMutation } = componentBuilders<typeof schema, AgentInstallConfig | undefined>();
@@ -320,6 +320,7 @@ function contextFor(ctx: ReadCtx, m: MessageDoc, recent: number, search: { text:
     const inWindow = new Set(window.map((x) => x._id));
     const first = window[0];
     const before = (x: MessageDoc) => !first || x.order < first.order || (x.order === first.order && x.stepOrder < first.stepOrder);
+    // `start` refused a search before writing anything; this guards any other caller.
     checkSearch(ctx);
     const hits = ctx.db
       .query("messages")
@@ -478,7 +479,9 @@ export const functions = {
         if (messageId) out.messageId = messageId;
         if (a.generate) {
           if (order < 0) throw new EmberError("ValidationError", "agent: nothing to answer in an empty thread");
-          // After a prompt inserted here, the turn holds only it (step 0): no read for the next step.
+          // After a prompt inserted here, the turn holds only it (step 0): no read for the next step. A prompt opens
+          // order `lastOrder + 1`, which nothing holds yet: only `send` creates orders, and it always moves
+          // `lastOrder` to them; a response without a prompt, tool messages and next steps use an existing order.
           const last = messageId
             ? undefined
             : ctx.db
@@ -606,6 +609,12 @@ export const functions = {
       handler: (ctx, a): { runId: string; threadId: string; userId?: string; agentName?: string; context: ContextMessage[] } | null => {
         const m = message(ctx, a.messageId);
         if (!m || m.status !== "pending") return null;
+        // `contextOptions.searchOtherMessages` on an install without search: checked before the message is touched,
+        // and the step fails with the reason (a throw would leave it pending while its job is retried and gives up).
+        if (a.search && !searchOn(ctx)) {
+          ctx.db.patch(m._id, { status: "failed", error: SEARCH_OFF, job: undefined });
+          return null;
+        }
         const runId = `${ctx.now.toString(36)}-${Math.floor(ctx.random() * 2 ** 48).toString(36)}`;
         ctx.db.patch(m._id, { status: "streaming", runId, job: undefined });
         // The prompt of this turn is what the context search looks for.
@@ -672,7 +681,9 @@ export const functions = {
         ctx.db.patch(m._id, { parts: a.parts, status: "success", runId: undefined, ...(a.next ? {} : { finishReason: "tool-calls" }) });
         if (!a.next) return { ok: true };
         // The step's own action/onUsage (`finishStep` copies them on the tool message); a tool message from before
-        // 0.10 has neither: read from the step before it.
+        // 0.10 has neither: read from the step before it. That step always exists: `finishStep` inserts a tool message
+        // only right after the assistant step it answers (stepOrder + 1, so never step 0), and a turn's messages are
+        // deleted only with the whole thread.
         const prev =
           m.action !== undefined
             ? m

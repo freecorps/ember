@@ -591,13 +591,20 @@ describe("agent: fewer writes and reads (PR 3a)", () => {
     expect((h.query("chat:usageRows", {}) as any[]).length).toBe(4);
   });
 
-  test("full-text search is opt-in: the default install has no FTS5 index (no FTS rows per message) and refuses search", () => {
+  test("full-text search is opt-in: the default install has no FTS5 index (no FTS rows per message) and refuses search", async () => {
     const h = harness({ schema, functions, app: appWithoutSearch });
     const fts = (x: H) => x.sql(`SELECT name FROM sqlite_master WHERE name LIKE 'agent$messages__search_text%'`);
     expect(fts(h)).toEqual([]);
     const threadId = h.mutate("chat:createThread", { userId: "ana" }) as string;
     h.mutate("chat:save", { threadId, text: "the order shipped" });
     expect(() => h.query("chat:search", { threadId, text: "order" })).toThrow(/full-text search is off/);
+    // an agent with contextOptions.searchOtherMessages there: the step fails with the reason before it is streamed
+    // (a throw in lib:start would leave it pending while its job is retried)
+    models.current = mockModel([{ text: "never" }]);
+    h.mutate("chat:send", { threadId, text: "where is my order?" });
+    await h.tick();
+    expect(thread(h, threadId).at(-1)).toMatchObject({ role: "assistant", status: "failed", text: "" });
+    expect(h.sql(`SELECT "error", "job", "runId" FROM "agent$messages" WHERE "role" = 'assistant'`)).toEqual([{ error: expect.stringMatching(/full-text search is off/), job: null, runId: null }]);
     // `{ search: true }`: the same index as before 0.10 (searchable)
     const on = setup();
     expect(fts(on).length).toBeGreaterThan(0);

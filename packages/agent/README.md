@@ -118,7 +118,8 @@ All tables live in the shard of whoever calls, next to the app's tables:
 
 `text` has a full-text index (`searchMessages`, and the optional context search) only when the component is installed
 with `{ config: { search: true } }` (since 0.10). Without it no FTS5 index exists, so message writes cost no FTS rows,
-and a search fails with `ValidationError`. An install that searched before sets the option in the deploy that
+and `searchMessages` fails with `ValidationError` (an agent with `searchOtherMessages` there gets its step `failed`
+with that error, before it streams). An install that searched before sets the option in the deploy that
 upgrades: it is the same index, so nothing is rebuilt; turning it on later backfills it.
 
 ## Context
