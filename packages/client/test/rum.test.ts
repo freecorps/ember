@@ -168,6 +168,29 @@ describe("RUM", () => {
     c.stop();
   });
 
+  it("one ack sample per mutation: an auth_expired answer that is resent is not measured, its final answer is", async () => {
+    const server = messagesServer({ colo: "GRU" });
+    const sink = withRumSink(server);
+    let n = 0;
+    const client = makeClient(server, { fetch: sink.fetch, rum: { sampleRate: 1 }, random: () => 0.01, auth: () => `user:u${++n}` });
+    const acks: number[] = [];
+    const inner = client as unknown as { rumRecord: (m: string, shard: string, colo: string | undefined, at: number) => void };
+    const record = inner.rumRecord.bind(client);
+    inner.rumRecord = (m, shard, colo, at) => {
+      if (m === "ack") acks.push(at);
+      record(m, shard, colo, at);
+    };
+    const off = client.subscribe(api.messages.list, { channel: "c" }, { shard: SHARD }, () => {});
+    await until(() => client.connectionState().connected);
+    server.expireAuth(SHARD, false); // the mut itself bounces with auth_expired, then goes again
+    await client.mutation(api.messages.send, { channel: "c", body: "x" }, { shard: SHARD });
+    const muts = server.open()[0]!.sent.filter((m) => m !== "ping" && m.t === "mut");
+    expect(muts).toHaveLength(2);
+    expect(acks).toHaveLength(1);
+    off();
+    client.close();
+  });
+
   it("an ack mark goes when its mutation never gets mres (closed client), and the marks in flight are bounded", async () => {
     const server = messagesServer({ colo: "GRU" });
     const sink = withRumSink(server);

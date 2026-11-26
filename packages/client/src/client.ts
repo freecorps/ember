@@ -843,11 +843,15 @@ export class EmberClient {
       this.rumWanted = true;
       void import("./rum.ts").then(
         (m) => {
-          if (this.closed) return;
-          this.rum = new m.RumCollector(`${this.httpBase}/api/_ember/rum`, rum, this.fetchImpl);
-          // What was measured while the chunk loaded (the page's first connect, its first values).
-          for (const x of this.rumEarly ?? []) this.rum.record(x.m, x.shard, x.colo, x.ms);
+          const early = this.rumEarly ?? [];
           this.rumEarly = null;
+          // Closed while the chunk loaded: what was measured meanwhile still goes out, once, and nothing starts.
+          if (this.closed && !early.length) return;
+          const c = new m.RumCollector(`${this.httpBase}/api/_ember/rum`, rum, this.fetchImpl);
+          // What was measured while the chunk loaded (the page's first connect, its first values).
+          for (const x of early) c.record(x.m, x.shard, x.colo, x.ms);
+          if (this.closed) c.stop();
+          else this.rum = c;
         },
         () => {
           this.rumWanted = false;
@@ -2896,6 +2900,7 @@ export class EmberClient {
     conn.batchPipelined = undefined;
     conn.lastToken = undefined;
     conn.colo = undefined; // RUM: the next socket may land in another colo; samples wait for its `ready`
+    conn.rumPingAt = undefined; // its pong never comes
     // Waiting acks stay: the next socket of the same identity sends them (`onReady`).
     if (conn.ackTimer) clearTimeout(conn.ackTimer);
     conn.ackTimer = null;
@@ -3224,7 +3229,9 @@ export class EmberClient {
     const hb = this.options.heartbeat;
     if (hb === false || !conn.ready || conn.deadlineTimer) return;
     this.clearTimer(conn, "pingTimer");
-    conn.rumPingAt = this.rumMark();
+    // One measured ping at a time: pongs come back in order, so the first one answers the mark taken first (a ping sent
+    // while one is out, after a frame cleared its deadline, is not measured).
+    if (conn.rumPingAt === undefined) conn.rumPingAt = this.rumMark();
     this.send(conn, PING);
     conn.deadlineTimer = setTimeout(() => {
       conn.deadlineTimer = null;
@@ -3444,11 +3451,14 @@ export class EmberClient {
       case "mres": {
         const p = this.pendingByMid.get(String(m.mid));
         if (!p || p.record.shard !== conn.shard) return;
-        const sentAt = this.rumMutAt.get(String(m.mid));
-        if (sentAt !== undefined) {
+        // RUM "ack": one sample per mutation, from its final answer (an auth_expired that is resent keeps the mark; the
+        // resend takes a new one).
+        const ackSample = () => {
+          const sentAt = this.rumMutAt.get(String(m.mid));
+          if (sentAt === undefined) return;
           this.rumMutAt.delete(String(m.mid));
           this.rumRecord("ack", conn.shard, conn.colo, sentAt);
-        }
+        };
         if (!m.ok && m.error.code === "auth_expired" && !p.authRetried) {
           // Refused before running (not deduped): re-auth, then resend once with the same mid.
           p.authRetried = true;
@@ -3459,11 +3469,15 @@ export class EmberClient {
           void this.reauth(conn).then((r) => {
             if (this.pendingByMid.get(p.record.mid) !== p) return;
             if (r === "sent") this.sendMut(conn, p);
-            else if (r === "failed") this.settle(conn, p, m);
+            else if (r === "failed") {
+              ackSample();
+              this.settle(conn, p, m);
+            }
             // "gone": the next socket resends every pending mutation after `ready`
           });
           return;
         }
+        ackSample();
         return this.settle(conn, p, m);
       }
       case "err": {
