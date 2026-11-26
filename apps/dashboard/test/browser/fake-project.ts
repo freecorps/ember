@@ -137,6 +137,8 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
     json({ ok: false, error: { code: "no_local_auth", message: `auth is handled by ${state.authFrom}: users, sessions, revocation and key rotation live there (remote auth, no local Auth DO)` } }, 404);
   /** Every admin call the project got (`<METHOD> <path>[?shard=...]`): the dashboard's cost to the project. */
   const calls: string[] = [];
+  /** Stuck rows of `org:pages` queued for GC (gone from later listings). */
+  const stuckGone = new Set<string>();
   /** Writes held until released (`@lab/lib:add` with label "slow"): a write in flight. */
   const held: Array<() => void> = [];
   const svc = {
@@ -190,16 +192,20 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           if (body.explain === true) return json({ ok: true, value: { columns: ["id", "parent", "notused", "detail"], rows: [[2, 0, 0, "SCAN messages"]], rowsRead: 0, rowsWritten: 0, truncated: false, ms: 0.2, explain: true, plan: [{ id: 2, detail: "SCAN messages", children: [] }] } });
           return json({ ok: true, value: { columns: ["_id", "author", "body"], rows: [["messages_1", "ana", `a, "quoted" ${XSS}`], ["messages_2", "=cmd()", null]], rowsRead: 2, rowsWritten: 0, truncated: true, ms: 0.4, explain: false } });
         }
+        if (p === "replicas/resync" && body.shard === "org:acme") await new Promise<void>((r) => held.push(r));
         if (p === "replicas/resync") return json({ ok: true, value: { [String(body.source)]: { ok: true, targets: 1 } } });
         if (p === "files/orphans") {
           // Two pages: the first two objects, then the last one.
           const second = body.cursor === "page2";
+          // A one-hour grace: the whole bucket in one page, nothing confirmed, a shard that did not answer.
+          if (body.graceMs === 3_600_000) return json({ ok: true, value: { scanned: 2, foreign: 0, young: 0, orphans: [], deleted: 0, skipped: [{ shard: "org:down", keys: 2, code: "unreachable", message: "org:down did not answer" }], graceMs: body.graceMs, cursor: null, done: true } });
           return json({ ok: true, value: { scanned: second ? 3 : 5, foreign: second ? 0 : 1, young: second ? 1 : 1, orphans: second ? ORPHANS.slice(2) : ORPHANS.slice(0, 2), deleted: 0, skipped: [], graceMs: body.graceMs ?? 86_400_000, cursor: second ? null : "page2", done: second } });
         }
         if (p === "files/orphans/delete") {
           const keys = body.keys as string[];
           return json({ ok: true, value: { deleted: ORPHANS.filter((x) => keys.includes(x.key) && x.key !== REFERENCED_ORPHAN).map(({ key, shard, size }) => ({ key, shard, size })), refused: keys.includes(REFERENCED_ORPHAN) ? [{ key: REFERENCED_ORPHAN, reason: "referenced" }] : [], skipped: [], graceMs: body.graceMs } });
         }
+        if (p === "files/stuck/delete" && body.shard === "org:pages") for (const id of body.ids as string[]) stuckGone.add(id);
         if (p === "files/stuck/delete") return json({ ok: true, value: { queued: (body.ids as string[]).filter((id) => id !== "_storage_used"), refused: [], graceMs: body.graceMs } });
         if (p === "restore") return json({ ok: true, shard: body.shard, restoredTo: body.bookmark, undo: "0000000a-0000000b-0000000c-feedfacefeedface", version: 9, epoch: "e2", schemaVersion: "abc" });
       }
@@ -241,7 +247,7 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
               enabled: true,
               journal: 0,
               convert: null,
-              targets: [target({ target: "org:down", last_seq: 120, attempts: 10, dead: 1, last_error: `org:down is unreachable ${XSS}`, pending: 3, oldest_at: now - 25 * 60_000 }), target({ target: "org:acme", last_seq: 140, pending: 0 })],
+              targets: [target({ target: "org:down", last_seq: 120, attempts: 10, dead: 1, last_error: `org:down is unreachable ${XSS}`, pending: 3, oldest_at: now - 25 * 60_000 }), target({ target: "org:acme", last_seq: 140, pending: 0 }), target({ target: "org:rebuild", last_seq: 90, snapshot: 1, attempts: 3, next_at: now + 60_000, last_error: "snapshot page refused" })],
               next: null,
               outbox: { seq: 152, depth: 3, parked: 2, oldestAt: now - 25 * 60_000 },
               maxAttempts: 10,
@@ -249,6 +255,16 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
             "global:main": { enabled: true, journal: 0, seq: 77, targets: [target({ target: "org:beta", kind: "org", last_seq: 70, scan_seq: 70, attempts: 2, pending: 7, oldest_at: now - 90_000, last_error: "timeout" })], next: now + 5000, outbox: { seq: 77, depth: 7, parked: 0, oldestAt: now - 90_000 }, maxAttempts: 10 },
           },
         });
+      }
+      if (p === "files/stuck" && url.searchParams.get("shard") === "org:pages") {
+        // 51 stuck rows: 50 on the first page (with the totals), the rest after `p49`.
+        const all = Array.from({ length: 51 }, (_, i) => `_storage_p${String(i).padStart(2, "0")}`).filter((id) => !stuckGone.has(id));
+        const after = url.searchParams.get("cursor");
+        const from = after ? all.findIndex((id) => id > after) : 0;
+        const ids = from < 0 ? [] : all.slice(from, from + 50);
+        const rows = ids.map((id) => ({ id, state: "pending", key: `t/x/${id}`, size: 10, contentType: null, refcount: 0, createdAt: Date.now() - 2 * 86_400_000 }));
+        const done = from < 0 || from + 50 >= all.length;
+        return json({ ok: true, value: { rows, cursor: done ? null : ids.at(-1), done, ...(after ? {} : { totals: { count: all.length, bytes: all.length * 10, referenced: 0 } }), graceMs: 86_400_000 } });
       }
       if (p === "files/stuck") {
         const rows = [

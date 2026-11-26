@@ -1097,6 +1097,8 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     const down = auth.locator("tr", { hasText: "org:down" });
     await down.getByText("parked").waitFor();
     // Lag: the target's acked seq against the source's, what waits and since when; the error as text.
+    // A resync that failed and waits to retry says so (it keeps `snapshot = 1`), with its attempts.
+    await auth.locator("tr", { hasText: "org:rebuild" }).getByText("resync retrying 3/10").waitFor();
     await expect.poll(() => down.textContent()).toContain("120 / 152");
     expect(await down.textContent()).toContain("3 pending · oldest 25m");
     await down.getByText(`org:down is unreachable ${XSS}`).waitFor();
@@ -1105,6 +1107,7 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     expect(outbox).toMatch(/Outbox depth3/);
     expect(outbox).toMatch(/Oldest pending25m/);
     expect(outbox).toMatch(/maxAttempts10/);
+    expect(outbox).toMatch(/Parked targets1/);
     const beta = page.getByRole("table", { name: "Targets of global:main" }).locator("tr", { hasText: "org:beta" });
     await beta.getByText("retrying 2/10").waitFor();
     expect(await beta.textContent()).toContain("7 pending · oldest 1m");
@@ -1114,8 +1117,17 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await page.getByRole("dialog").getByRole("button", { name: "Resync", exact: true }).click();
     await page.getByText("Resync of org:down queued").waitFor();
     expect(prod.posts.at(-1)).toEqual({ path: "replicas/resync", body: { shard: "org:down", source: "auth" } });
+    // While a resync is in flight its dialog stays, Esc included: the answer never lands in another target's dialog.
+    await auth.locator("tr", { hasText: "org:acme" }).getByRole("button", { name: "Resync org:acme" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Resync", exact: true }).click();
+    await expect.poll(() => prod.held.length).toBe(1);
+    await page.keyboard.press("Escape");
+    expect(await page.getByRole("dialog", { name: "Resync org:acme?" }).isVisible()).toBe(true);
+    prod.release();
+    await page.getByText("Resync of org:acme queued").waitFor();
+    await expect.poll(() => page.getByRole("dialog").count()).toBe(0);
     await page.goto(`${origin}/#/p/chat/prod/audit`);
-    await page.getByRole("table", { name: "Audit log" }).getByText("replica.resync").waitFor();
+    await expect.poll(() => page.getByRole("table", { name: "Audit log" }).getByText("replica.resync").count()).toBe(2);
     expect(problems).toEqual([]);
     await close();
     // The read role sees the same screen, without the resync.
@@ -1172,6 +1184,34 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     const audit = page.getByRole("table", { name: "Audit log" });
     await audit.getByText("file.orphans_delete").waitFor();
     await audit.getByText("file.stuck_delete").waitFor();
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("storage cleanup: a scan with a silent shard confirms nothing; stuck uploads page by page, the selection per page, totals fresh after a GC", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/storage/org:pages");
+    await page.getByLabel("Grace period").selectOption({ label: "1 hour" });
+    await page.getByRole("button", { name: "Scan bucket" }).click();
+    await page.getByText("org:down could not answer (unreachable)").waitFor();
+    await page.getByText("No orphans confirmed: some shards did not answer (above).").waitFor();
+    expect(await page.getByText("No orphans in the bucket.").count()).toBe(0);
+    const stuck = page.getByRole("table", { name: "Stuck files" });
+    await stuck.getByText("_storage_p00").waitFor();
+    await expect.poll(() => page.getByLabel("Stuck totals").textContent()).toMatch(/Stuck rows51/);
+    // Picked on page one, then the page changes: the pick does not travel to a page where it is not shown.
+    await page.getByLabel("Select _storage_p00").check();
+    await page.getByRole("button", { name: "Next →" }).click();
+    await stuck.getByText("_storage_p50").waitFor();
+    await page.getByLabel("Select _storage_p50").check();
+    await page.getByRole("button", { name: "Queue 1 for GC…" }).click();
+    await page.getByRole("dialog").getByLabel("Type org:pages to confirm").fill("org:pages");
+    await page.getByRole("dialog").getByRole("button", { name: "Queue for GC" }).click();
+    await page.getByText("Queued 1 for GC").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "files/stuck/delete", body: { shard: "org:pages", ids: ["_storage_p50"], graceMs: 3_600_000 } });
+    // Back on page one with fresh totals (the later page has none and is empty now).
+    await page.getByText("page 1", { exact: true }).waitFor();
+    await expect.poll(() => page.getByLabel("Stuck totals").textContent()).toMatch(/Stuck rows50/);
+    await stuck.getByText("_storage_p00").waitFor();
     expect(problems).toEqual([]);
     await close();
   });

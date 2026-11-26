@@ -130,11 +130,12 @@ function Orphans({ project, env, graceMs }: { project: string; env: string; grac
       title="R2 orphans"
       actions={
         <>
-          <button type="button" className="primary" disabled={busy} onClick={() => void next(true)}>
+          {/* Scans and deletes never overlap: a scan answered after a delete would list the deleted objects again. */}
+          <button type="button" className="primary" disabled={busy || deleting} onClick={() => void next(true)}>
             {busy && !scan ? "Scanning…" : scan ? "Scan again" : "Scan bucket"}
           </button>
           {scan && !scan.done && (
-            <button type="button" disabled={busy} onClick={() => void next(false)}>
+            <button type="button" disabled={busy || deleting} onClick={() => void next(false)}>
               {busy ? "Scanning…" : "Scan next page"}
             </button>
           )}
@@ -184,7 +185,7 @@ function Orphans({ project, env, graceMs }: { project: string; env: string; grac
         <>
           <Table
             label="Orphans"
-            empty={scan.done ? "No orphans in the bucket." : "No orphans in what was scanned so far."}
+            empty={!scan.done ? "No orphans in what was scanned so far." : scan.skipped.length ? "No orphans confirmed: some shards did not answer (above)." : "No orphans in the bucket."}
             rowKeys={found.map((o) => o.key)}
             cols={[
               {
@@ -209,7 +210,7 @@ function Orphans({ project, env, graceMs }: { project: string; env: string; grac
                 {fmtNum(pickedList.length)} selected ({fmtBytes(pickedBytes)}){found.length > DELETE_MAX ? `, up to ${DELETE_MAX} per delete` : ""}
               </span>
               <span className="spacer" />
-              <button type="button" className="danger" disabled={!pickedList.length} onClick={() => (setDeleteError(null), setConfirming(true))}>
+              <button type="button" className="danger" disabled={!pickedList.length || busy} onClick={() => (setDeleteError(null), setConfirming(true))}>
                 Delete selected…
               </button>
             </div>
@@ -260,7 +261,12 @@ function Stuck({ project, env, shard, graceMs }: { project: string; env: string;
   useEffect(() => {
     if (list.data?.value.totals) setTotals(list.data.value.totals);
   }, [list.data]);
+  // The selection is the page's own (cleared when the page changes): the dialog acts only on rows shown.
   const [picked, setPicked] = useState<Set<string>>(new Set());
+  const page = (next: (c: Array<string | null>) => Array<string | null>) => {
+    setPicked(new Set());
+    setCursors(next);
+  };
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
@@ -286,7 +292,7 @@ function Stuck({ project, env, shard, graceMs }: { project: string; env: string;
           )}
           <Table
             label="Stuck files"
-            empty="No stuck uploads on this shard."
+            empty={cursors.length > 1 ? "No stuck uploads on this page." : "No stuck uploads on this shard."}
             rowKeys={rows.map((r) => r.id)}
             cols={[
               { h: s.isAdmin ? <input type="checkbox" checked={all} disabled={!free.length} onChange={() => setPicked(all ? new Set() : new Set(free.map((r) => r.id)))} aria-label="Select all stuck files" /> : "" },
@@ -308,7 +314,7 @@ function Stuck({ project, env, shard, graceMs }: { project: string; env: string;
                     setPicked((p) => {
                       const n = new Set(p);
                       if (n.has(r.id)) n.delete(r.id);
-                      else n.add(r.id);
+                      else if (n.size < DELETE_MAX) n.add(r.id);
                       return n;
                     })
                   }
@@ -332,11 +338,11 @@ function Stuck({ project, env, shard, graceMs }: { project: string; env: string;
               </button>
             )}
             <span className="spacer" />
-            <button type="button" disabled={cursors.length < 2} onClick={() => setCursors((c) => c.slice(0, -1))}>
+            <button type="button" disabled={cursors.length < 2} onClick={() => page((c) => c.slice(0, -1))}>
               ← Prev
             </button>
             <span className="muted small">page {cursors.length}</span>
-            <button type="button" disabled={list.data.value.done} onClick={() => setCursors((c) => [...c, list.data!.value.cursor])}>
+            <button type="button" disabled={list.data.value.done} onClick={() => page((c) => [...c, list.data!.value.cursor])}>
               Next →
             </button>
           </div>
@@ -358,7 +364,9 @@ function Stuck({ project, env, shard, graceMs }: { project: string; env: string;
             s.toast({ text: `Queued ${r.value.queued.length} for GC`, ...(r.value.refused.length ? { detail: r.value.refused.map((x) => `${x.id}: ${REASONS[x.reason] ?? x.reason}`).join("; ") } : {}) });
             setPicked(new Set());
             setConfirming(false);
-            list.reload();
+            // Back to the first page: the totals come with it (a later page has none, and may now be empty).
+            if (cursors.length > 1) setCursors([null]);
+            else list.reload();
           } catch (e) {
             setError(e as ApiError);
           } finally {
