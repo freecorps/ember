@@ -1,7 +1,7 @@
 // `ember mcp`: the JSON-RPC/MCP protocol (handshake, tools/list, errors, stdio framing) and every tool, on the sample
 // project of `ember init` (code tools) and fakes of the runtime's admin endpoints / Cloudflare (live tools).
 import { spawn } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PassThrough } from "node:stream";
@@ -126,11 +126,32 @@ describe("MCP protocol", () => {
     expect(bad.content[0]!.text).toMatch(/arguments\.table: must be a string/);
     expect(bad.content[0]!.text).toMatch(/arguments\.extra: unknown property/);
     expect((await call(s, "types", {})).content[0]!.text).toMatch(/arguments\.name: is required/);
-    // A batch: one answer per request, none for the notification.
-    const batch = (await s.handleLine(JSON.stringify([{ jsonrpc: "2.0", id: "a", method: "ping" }, { jsonrpc: "2.0", method: "notifications/initialized" }]))) as any[];
-    expect(batch).toEqual([{ jsonrpc: "2.0", id: "a", result: {} }]);
+    // A batch: only in the revisions that have them (2025-03-26 and before); one answer per request, none for the notification.
+    const line = JSON.stringify([{ jsonrpc: "2.0", id: "a", method: "ping" }, { jsonrpc: "2.0", method: "notifications/initialized" }]);
+    expect(((await s.handleLine(line)) as any).error).toMatchObject({ code: -32600, message: expect.stringMatching(/batches are not part of MCP before initialize/) });
+    await rpc(s, "initialize", { protocolVersion: "2025-03-26" });
+    expect(await s.handleLine(line)).toEqual([{ jsonrpc: "2.0", id: "a", result: {} }]);
+    for (const v of ["2025-06-18", "2025-11-25"]) {
+      await rpc(s, "initialize", { protocolVersion: v });
+      expect(((await s.handleLine(line)) as any).error, v).toMatchObject({ code: -32600, message: expect.stringContaining(`not part of MCP ${v}`) });
+    }
     // A response from the client (the server sends no requests) is ignored.
     expect(await s.handle({ jsonrpc: "2.0", id: 9, result: {} })).toBeNull();
+  });
+
+  it("request ids: a string or an integer; null, fractions and other types are refused before anything runs", async () => {
+    let ran = 0;
+    const logged: string[] = [];
+    const s = new McpServer({ name: "t", version: "1", log: (l) => logged.push(l), tools: [{ name: "t", description: "counts", inputSchema: { type: "object" }, call: async () => (ran++, { text: "ran" }) }] });
+    const req = (id: unknown) => s.handle({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "t" } });
+    for (const id of [null, 1.5, true, { a: 1 }, [1]]) expect(await req(id), JSON.stringify(id)).toEqual({ jsonrpc: "2.0", id: null, error: { code: -32600, message: expect.stringMatching(/id must be a string or an integer/) } });
+    expect(ran).toBe(0);
+    // Without an id it would be a notification, never answered: a tools/call is not run (and said on stderr).
+    expect(await s.handle({ jsonrpc: "2.0", method: "tools/call", params: { name: "t" } })).toBeNull();
+    expect(ran).toBe(0);
+    expect(logged).toEqual([expect.stringMatching(/ignored tools\/call without an id/)]);
+    for (const id of [7, "x", 0, -3]) expect(((await req(id)) as any).id).toBe(id);
+    expect(ran).toBe(4);
   });
 
   it("validate: the JSON Schema subset tool inputs use", () => {
@@ -139,6 +160,9 @@ describe("MCP protocol", () => {
     expect(validate(schema, { n: 1.5 })).toEqual(["arguments.n: must be an integer"]);
     expect(validate(schema, { n: 0, s: "b", l: [1] })).toEqual(["arguments.n: must be >= 1", "arguments.s: must match ^a", 'arguments.s: must be one of "ab", "ac"', "arguments.l[0]: must be a boolean"]);
     expect(validate(schema, [])).toEqual(["arguments: must be an object"]);
+    // Only the schema's own properties count: an inherited name is an unknown property, not a declared one.
+    expect(validate(schema, { n: 1, toString: "x", constructor: 1 })).toEqual([expect.stringMatching(/^arguments\.toString: unknown property/), expect.stringMatching(/^arguments\.constructor: unknown property/)]);
+    expect(validate({ type: "object", required: ["toString"] }, {})).toEqual(["arguments.toString: is required"]);
   });
 
   it("stdio: one JSON message per line in, one per line out; console.log never reaches the protocol stream", async () => {
@@ -411,31 +435,46 @@ describe("MCP tools", () => {
 
 describe("ember mcp (the CLI process)", () => {
   it("serves the project over stdio: initialize, tools/list, a call; stdout carries only protocol lines", async () => {
+    // Its own project, whose function module writes through console while it loads (codegen evaluates it in the
+    // server's process): console.dir/table/group/info/log all go to stderr, never onto the protocol stream.
+    const own = sampleProject("mcp-cli");
+    const mod = join(own.dir, "messages.ts");
+    writeFileSync(mod, `console.dir({ loaded: "dir" }); console.table([{ loaded: "table" }]); console.group("group"); console.groupEnd(); console.info("info"); console.log("log"); console.count("count");\n${readFileSync(mod, "utf8")}`);
     const bin = fileURLToPath(new URL("../bin/ember.js", import.meta.url));
-    const child = spawn(process.execPath, [bin, "mcp", "--allow-env", "prod"], { cwd: project.root, env: { ...process.env, EMBER_ADMIN_TOKEN: "" }, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [bin, "mcp", "--allow-env", "prod"], { cwd: own.root, env: { ...process.env, EMBER_ADMIN_TOKEN: "" }, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (b: Buffer) => (stdout += b.toString()));
     child.stderr.on("data", (b: Buffer) => (stderr += b.toString()));
-    const send = (m: unknown) => child.stdin.write(`${JSON.stringify(m)}\n`);
-    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "e2e", version: "1" } } });
-    send({ jsonrpc: "2.0", method: "notifications/initialized" });
-    send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-    send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "functions", arguments: { visibility: "internal" } } });
-    // Answers come as their tools finish: wait for all three, then close stdin (the server exits at end of input).
-    // A child that dies early (a startup error) ends the wait at once, with its stderr in the failure.
-    let exited: number | null | undefined;
-    const exit = new Promise<number | null>((r) => child.on("exit", (c) => r((exited = c))));
-    for (let i = 0; i < 600 && exited === undefined && stdout.split("\n").filter(Boolean).length < 3; i++) await new Promise((r) => setTimeout(r, 100));
-    child.stdin.end();
-    const code = await exit;
-    expect(code, stderr).toBe(0);
+    // `close`: the process exited and both pipes are drained (every line read before the assertions).
+    const closed = new Promise<number | null>((r) => child.on("close", (c) => r(c)));
+    let done = false;
+    void closed.then(() => (done = true));
+    // A hung tool would keep the server waiting after stdin closes: the deadline kills it (and the test fails).
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 90_000);
+    try {
+      const send = (m: unknown) => child.stdin.write(`${JSON.stringify(m)}\n`);
+      send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "e2e", version: "1" } } });
+      send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+      send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "functions", arguments: { visibility: "internal" } } });
+      // Answers come as their tools finish: wait for all three, then close stdin (the server exits at end of input).
+      // A child that dies early (a startup error) ends the wait at once, with its stderr in the failure.
+      for (let i = 0; i < 600 && !done && stdout.split("\n").filter(Boolean).length < 3; i++) await new Promise((r) => setTimeout(r, 100));
+      child.stdin.end();
+      const code = await closed;
+      expect(code, stderr).toBe(0);
+    } finally {
+      clearTimeout(deadline);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      cleanup(own);
+    }
     const msgs = stdout.split("\n").filter(Boolean).map((l) => JSON.parse(l));
     expect(msgs.map((m) => m.id).sort()).toEqual([1, 2, 3]);
     expect(msgs.find((m) => m.id === 1).result.instructions).toMatch(/Deployed environments this server may read: prod/);
     expect(msgs.find((m) => m.id === 2).result.tools).toHaveLength(9);
     expect(msgs.find((m) => m.id === 3).result.structuredContent.functions.map((f: { name: string }) => f.name)).toEqual(["messages:trim"]);
     expect(stderr).toMatch(/ember mcp: chat on stdio/);
+    for (const x of ["loaded: 'dir'", "table", "group", "info", "log", "count: 1"]) expect(stderr).toContain(x);
   }, 120_000);
 });
-

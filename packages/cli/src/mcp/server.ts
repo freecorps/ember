@@ -3,11 +3,15 @@
 // No SDK: the protocol surface is small and the CLI keeps its dependencies few. Spec:
 // https://modelcontextprotocol.io/specification (versions 2024-11-05 through 2025-11-25 are accepted).
 
+import { Console } from "node:console";
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
 /** Protocol versions this server speaks, newest first (`initialize` answers the client's when it is one of them). */
 export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"] as const;
+
+/** Revisions that allow JSON-RPC batches (2025-06-18 removed them; before `initialize` none is negotiated yet). */
+const BATCH_VERSIONS: readonly string[] = ["2025-03-26", "2024-11-05"];
 
 /** A JSON Schema (the subset `validate` checks: what tool inputs use). */
 export interface JsonSchema {
@@ -71,9 +75,11 @@ export function validate(schema: JsonSchema, value: unknown, at = "arguments"): 
   const t = schema.type;
   if (t === "object") {
     if (!isObject(value)) return [`${at}: must be an object`];
-    for (const r of schema.required ?? []) if (value[r] === undefined) out.push(`${at}.${r}: is required`);
+    const props = schema.properties ?? {};
+    for (const r of schema.required ?? []) if (!Object.hasOwn(value, r) || value[r] === undefined) out.push(`${at}.${r}: is required`);
     for (const [k, v] of Object.entries(value)) {
-      const p = schema.properties?.[k];
+      // Own properties only: an inherited name (`toString`) is not a declared argument.
+      const p = Object.hasOwn(props, k) ? props[k] : undefined;
       if (!p) {
         if (schema.additionalProperties === false) out.push(`${at}.${k}: unknown property (known: ${Object.keys(schema.properties ?? {}).join(", ") || "none"})`);
         continue;
@@ -117,6 +123,8 @@ export class McpServer {
   readonly tools: Map<string, McpTool>;
   private readonly log: (line: string) => void;
   private readonly o: McpServerOptions;
+  /** The revision `initialize` negotiated (undefined before it). */
+  protocolVersion: string | undefined;
   constructor(o: McpServerOptions) {
     this.o = o;
     this.tools = new Map(o.tools.map((t) => [t.name, t]));
@@ -132,6 +140,9 @@ export class McpServer {
       return { jsonrpc: "2.0", id: null, error: { code: PARSE_ERROR, message: "Parse error: not JSON" } };
     }
     if (Array.isArray(msg)) {
+      if (this.protocolVersion === undefined || !BATCH_VERSIONS.includes(this.protocolVersion)) {
+        return { jsonrpc: "2.0", id: null, error: { code: INVALID_REQUEST, message: `Invalid Request: JSON-RPC batches are not part of MCP ${this.protocolVersion ?? "before initialize"} (only ${BATCH_VERSIONS.join(", ")}): send one message per line` } };
+      }
       if (!msg.length) return { jsonrpc: "2.0", id: null, error: { code: INVALID_REQUEST, message: "Invalid Request: empty batch" } };
       const out = (await Promise.all(msg.map((m) => this.handle(m)))).filter((r): r is JsonRpcResponse => r !== null);
       return out.length ? out : null;
@@ -147,8 +158,18 @@ export class McpServer {
       return { jsonrpc: "2.0", id, error: { code: INVALID_REQUEST, message: "Invalid Request: expected a JSON-RPC 2.0 request" } };
     }
     const req = msg as unknown as JsonRpcRequest;
-    const notification = req.id === undefined || req.id === null;
+    // MCP: a request's id is a string or an integer (never null); a notification has none. Nothing runs for a bad id.
+    if ("id" in msg && msg.id !== undefined && !(typeof msg.id === "string" || (typeof msg.id === "number" && Number.isInteger(msg.id)))) {
+      return { jsonrpc: "2.0", id: null, error: { code: INVALID_REQUEST, message: "Invalid Request: id must be a string or an integer (MCP requests never use null)" } };
+    }
+    const notification = req.id === undefined;
     const id = notification ? null : req.id!;
+    // A notification is never answered, so only `notifications/*` (which need nothing done) is one: a method that
+    // does work (tools/call) without an id is not run.
+    if (notification && !req.method.startsWith("notifications/")) {
+      this.log(`ember mcp: ignored ${req.method} without an id (a request needs one; nothing was run)`);
+      return null;
+    }
     const ok = (result: unknown): JsonRpcResponse | null => (notification ? null : { jsonrpc: "2.0", id, result });
     const fail = (code: number, message: string, data?: unknown): JsonRpcResponse | null => (notification ? null : { jsonrpc: "2.0", id, error: { code, message, ...(data !== undefined ? { data } : {}) } });
     switch (req.method) {
@@ -159,6 +180,7 @@ export class McpServer {
         const supported = asked !== undefined && (PROTOCOL_VERSIONS as readonly string[]).includes(asked);
         const protocolVersion = supported ? asked : PROTOCOL_VERSIONS[0];
         if (!supported) this.log(`ember mcp: the client asked for protocol ${asked === undefined ? "(none)" : JSON.stringify(asked)}, which this server does not speak (${PROTOCOL_VERSIONS.join(", ")}): answering ${protocolVersion}`);
+        this.protocolVersion = protocolVersion;
         return ok({
           protocolVersion,
           capabilities: { tools: { listChanged: false } },
@@ -205,8 +227,9 @@ function toolResult(o: ToolOutput) {
 
 /**
  * Serves `server` on a pair of streams (stdin/stdout by default) until the input ends. Requests are handled as they
- * arrive (a slow tool does not hold up `ping`); each response is one line. Anything the process prints with
- * `console.log` would corrupt the protocol, so it goes to stderr while serving.
+ * arrive (a slow tool does not hold up `ping`); each response is one line. Anything the process prints through
+ * `console` (log, info, dir, table, group, time...: the project's modules load in this process) would corrupt the
+ * protocol, so every console method writes to stderr while serving.
  */
 export async function serveStdio(server: McpServer, input: Readable = process.stdin, output: Writable = process.stdout): Promise<void> {
   const restore = output === process.stdout ? redirectConsole() : () => {};
@@ -230,10 +253,17 @@ export async function serveStdio(server: McpServer, input: Readable = process.st
 }
 
 function redirectConsole(): () => void {
-  const saved = { log: console.log, info: console.info, debug: console.debug };
-  const toErr = (...a: unknown[]) => console.error(...a);
-  console.log = toErr;
-  console.info = toErr;
-  console.debug = toErr;
-  return () => Object.assign(console, saved);
+  const toErr = new Console({ stdout: process.stderr, stderr: process.stderr });
+  const target = console as unknown as Record<string, unknown>;
+  const source = toErr as unknown as Record<string, unknown>;
+  const saved = new Map<string, unknown>();
+  for (const k of Object.getOwnPropertyNames(console)) {
+    const f = source[k];
+    if (typeof target[k] !== "function" || typeof f !== "function") continue;
+    saved.set(k, target[k]);
+    target[k] = f.bind(toErr);
+  }
+  return () => {
+    for (const [k, f] of saved) target[k] = f;
+  };
 }
