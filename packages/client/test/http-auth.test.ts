@@ -257,4 +257,38 @@ describe("hydrate and whose read it is", () => {
     expect(c.watchQuery(q, {}).getSnapshot().status).toBe("loading");
     c.close();
   });
+
+  it("a serialized entry (from a server render) is never shown after the identity changed, not even the same one again", async () => {
+    const server = { fn: "notes:list", args: {}, shard: "global:main", value: ["ana's"], version: 1, epoch: "e", ik: "k" };
+    const other = { ...server, args: { page: 2 }, value: ["ana's too"] };
+    // setAuth: the page's preload handed over again (a remount), and one the app kept but never handed over.
+    const { c } = client(worker().fetch, [jwt("ana", 3600)]);
+    c.hydrate(server);
+    await c.query(q, { other: 1 }); // ana
+    expect(c.dehydrate()).toEqual([server]);
+    c.setAuth(() => jwt("bob", 3600));
+    await c.query(q, { other: 2 }); // bob
+    c.hydrate(server, other);
+    expect(c.dehydrate()).toEqual([]);
+    expect(c.watchQuery(q, {}).getSnapshot().status).toBe("loading");
+    expect(c.watchQuery(q, { page: 2 }).getSnapshot().status).toBe("loading");
+    c.close();
+    // Signed out: nobody's either.
+    const { c: c2 } = client(worker().fetch, [jwt("ana", 3600)]);
+    c2.hydrate(server);
+    await c2.query(q, { other: 1 });
+    c2.clearAuth();
+    c2.hydrate(server);
+    expect(c2.dehydrate()).toEqual([]);
+    c2.close();
+    // The same source answering for someone else (no setAuth): the first identity's entries only.
+    const { c: c3 } = client(worker().fetch, [jwt("ana", 10), jwt("bob", 3600)]);
+    await c3.query(q, { other: 1 }); // ana
+    c3.hydrate(other);
+    expect(c3.dehydrate()).toEqual([other]);
+    await c3.query(q, { other: 2 }); // renewed: bob
+    c3.hydrate(server);
+    expect(c3.dehydrate()).toEqual([]);
+    c3.close();
+  });
 });

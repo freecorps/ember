@@ -612,6 +612,14 @@ export class EmberClient {
    * anyone else, and once `setAuth` replaced that source (even before the new one answers).
    */
   private readonly hydrationOwners = new WeakMap<HydratedQuery, { owner: string; authGen: number }>();
+  /**
+   * Whose a serialized entry (from a server render: no `hydrationOwners` record) is: undefined until the client learns
+   * who it runs as (the first identity, the one the page was rendered for), then that identity's; null once the
+   * identity changed (`setAuth` replaced or removed a source in use, or the fetcher answered for someone else). Then
+   * nothing says whom a serialized entry was read for (a preload the app kept from before the switch, a remount that
+   * hands it over again): it is never shown, and the hook waits for the live value.
+   */
+  private serializedOwner: string | null | undefined = undefined;
   private storedIdentity: LocalIdentity | null = null;
   private readonly syncOffs: Array<() => void> = [];
   private readonly random: () => number;
@@ -871,7 +879,9 @@ export class EmberClient {
   setAuth(fetcher: AuthTokenFetcher | undefined): void {
     // A source replacing one in use may answer for someone else: until its token says who, the stored identity is not
     // who local queries run as. (The first source of a client built without one keeps the last session's, as `auth`.)
-    const replaced = !!fetcher && (this.authFetcher !== undefined || this.tokenSeen);
+    const inUse = this.authFetcher !== undefined || this.tokenSeen;
+    const replaced = !!fetcher && inUse;
+    if (inUse) this.serializedOwner = null;
     this.authFetcher = fetcher;
     this.authGen++;
     if (replaced) this.storedCurrent = false;
@@ -1080,6 +1090,8 @@ export class EmberClient {
     // Hydrated values are the first identity's the client learns (the one the server rendered for, normally), and
     // nobody else's: a fetcher that now answers for someone else does not hand them over (nor `dehydrate()`).
     const owner = id ? identityCacheKey(id) : "anon";
+    if (this.serializedOwner === undefined) this.serializedOwner = owner;
+    else if (this.serializedOwner !== owner) this.serializedOwner = null;
     for (const [key, h] of this.hydrated) {
       if (h.owner === undefined) h.owner = owner;
       else if (h.owner !== owner) this.hydrated.delete(key);
@@ -1824,8 +1836,11 @@ export class EmberClient {
       const local = this.hydrationOwners.get(h);
       if (local && local.authGen !== this.authGen) continue;
       const current = this.currentOwner();
-      const owner = local?.owner ?? current;
+      // A serialized entry: the first identity's (`serializedOwner`), never anyone's after a switch.
+      if (!local && (this.serializedOwner === null || (this.serializedOwner !== undefined && current !== undefined && current !== this.serializedOwner))) continue;
+      const owner = local?.owner ?? this.serializedOwner ?? current;
       if (owner !== undefined && current !== undefined && owner !== current) continue;
+      if (!local && this.serializedOwner === undefined && current !== undefined) this.serializedOwner = current;
       const sub = this.subs.get(key);
       if (sub?.confirmed) continue;
       if (sub) {

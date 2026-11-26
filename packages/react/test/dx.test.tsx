@@ -315,4 +315,36 @@ describe("EmberHydrate / usePreloadedQuery", () => {
     ssr.close();
     client.close();
   });
+
+  it("a preload the app still holds is not shown after an account switch: a remount suspends until the live value", async () => {
+    const { server } = setup();
+    const jwt = (sub: string) => `x.${Buffer.from(JSON.stringify({ sub, exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")}.y`;
+    const client = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: server.fetch, connectivity: null, heartbeat: false, defaultShard: SHARD, auth: () => jwt("ana") });
+    // What the server rendered for Ana (serialized: no record of whose read it is in this client).
+    const anas: Preloaded<typeof api.todos.list> = { fn: "todos:list", args: { list: "s" }, shard: SHARD, value: [{ _id: "x", list: "s", title: "ana's secret", done: false }], version: 1, epoch: "e", ik: "k" };
+    const seen: string[] = [];
+    function View({ p }: { p: Preloaded<typeof api.todos.list> }) {
+      const t = usePreloadedQuery(p);
+      seen.push(t.map((x) => x.title).join(","));
+      return <div data-testid="s">{t.map((x) => x.title).join(",") || "empty"}</div>;
+    }
+    const ui = (
+      <EmberProvider client={client}>
+        <Suspense fallback={<div data-testid="s">fallback</div>}>
+          <View p={anas} />
+        </Suspense>
+      </EmberProvider>
+    );
+    const first = render(ui);
+    expect(screen.getByTestId("s").textContent).toBe("ana's secret");
+    await waitFor(() => expect(screen.getByTestId("s").textContent).toBe("empty")); // live, as Ana
+    first.unmount();
+    act(() => client.setAuth(() => jwt("bob")));
+    seen.length = 0;
+    render(ui); // the same preload object handed over again
+    expect(screen.getByTestId("s").textContent).toBe("fallback");
+    await waitFor(() => expect(screen.getByTestId("s").textContent).toBe("empty"));
+    expect(seen).not.toContain("ana's secret");
+    client.close();
+  });
 });
