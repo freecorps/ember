@@ -25,6 +25,9 @@ import {
   bucketMinutes,
   jobHistorySql,
   parseJobHistory,
+  rumAggregate,
+  RUM_MAX_ROWS,
+  rumSql,
   parseUsageTotals,
   usageTotalsSql,
 } from "./metrics-sql.ts";
@@ -868,6 +871,21 @@ export const ROUTES: Route[] = [
       if (s instanceof Response) return s;
       const r = await analytics(c, () => shardStatsSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", project: s.project, env: s.env, sinceHours: hoursOf(c.q) }));
       return r instanceof Response ? r : json({ ok: true, shards: parseShardStats(r) });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/rum",
+    role: "read",
+    summary: "real-user latency (RUM batches of the clients, Analytics Engine): p50/p95 per metric and per country × shard colo",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const r = await analytics(c, () => rumSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...s, sinceHours: hoursOf(c.q) }));
+      if (r instanceof Response) return r;
+      // More groups than the cap: some buckets are missing, so no percentile is honest. Narrower window, then.
+      if ((r.data?.length ?? 0) > RUM_MAX_ROWS) return err(422, "too_many_groups", `more than ${RUM_MAX_ROWS} latency groups in this window: pick a shorter one`);
+      return json({ ok: true, ...rumAggregate(r) });
     },
   },
   {

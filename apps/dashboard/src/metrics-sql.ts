@@ -70,7 +70,8 @@ const lit = (s: string) => `'${s.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
 
 export function functionStatsSql(o: { dataset: string; project?: string; env?: string; sinceHours?: number; limit?: number }): string {
   if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
-  const where = scopeWhere(o);
+  // RUM batches share the dataset (blob5 = 'rum', runtime rum.ts): not executions.
+  const where = [...scopeWhere(o), "blob5 != 'rum'"];
   const w = "_sample_interval * double5";
   return [
     "SELECT blob1 AS project, blob2 AS env, blob4 AS fn, blob5 AS kind, blob9 AS timing,",
@@ -176,7 +177,7 @@ function scopeWhere(o: { project?: string; env?: string; sinceHours?: number }):
 /** Busiest shards (blob8) of a project/env: calls, errors, rows read and written. */
 export function shardStatsSql(o: { dataset: string; project?: string; env?: string; sinceHours?: number; limit?: number }): string {
   if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
-  const where = [...scopeWhere(o), "blob8 != ''"];
+  const where = [...scopeWhere(o), "blob8 != ''", "blob5 != 'rum'"];
   const w = "_sample_interval * double5";
   return [
     "SELECT blob8 AS shard,",
@@ -328,4 +329,81 @@ export async function analyticsSql(o: { accountId: string; token: string; sql: s
 export async function queryFunctionStats(o: { accountId: string; token: string; dataset: string; project?: string; env?: string; sinceHours?: number; fetch?: typeof fetch }): Promise<FunctionStats[]> {
   const sql = functionStatsSql(o);
   return parseFunctionStats(await analyticsSql({ accountId: o.accountId, token: o.token, sql, ...(o.fetch ? { fetch: o.fetch } : {}) }));
+}
+
+// ------------------------------------------------------------------------------------------- real-user latency
+
+/**
+ * RUM points (runtime rum.ts: `blob5 = 'rum'`, one point per metric, shard kind, DO colo and log bucket): weighted
+ * samples per metric × country × DO colo × bucket. Percentiles come from the summed histograms (`rumAggregate`).
+ */
+/** Groups (metric × country × colo × bucket) `/api/rum` sums; one more is asked to tell a truncated answer. */
+export const RUM_MAX_ROWS = 20_000;
+
+export function rumSql(o: { dataset: string; project: string; env: string; sinceHours: number }): string {
+  if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
+  const where = [...scopeWhere(o), "blob5 = 'rum'"];
+  return [
+    "SELECT blob4 AS metric, blob10 AS country, blob12 AS colo, double10 AS bucket,",
+    "  SUM(_sample_interval * double11 * double12) AS n",
+    `FROM ${o.dataset}`,
+    `WHERE ${where.join(" AND ")}`,
+    "GROUP BY metric, country, colo, bucket",
+    // One row past the cap: a truncated histogram would give a false p95 (the endpoint refuses it then).
+    `LIMIT ${RUM_MAX_ROWS + 1}`,
+  ].join("\n");
+}
+
+/** A bucket's representative ms: the runtime's `rumBucketMs` (buckets are `floor(2·log2(ms + 1))`). */
+export function rumBucketMs(b: number): number {
+  return Math.round((2 ** ((b + 0.5) / 2) - 1) * 100) / 100;
+}
+
+export interface RumCell {
+  metric: string;
+  country: string;
+  colo: string;
+  /** Weighted samples (each sample stands for 1/sampleRate sessions'). */
+  n: number;
+  p50: number;
+  p95: number;
+}
+
+function quantiles(h: Map<number, number>): { n: number; p50: number; p95: number } {
+  const b = [...h.entries()].sort((x, y) => x[0] - y[0]);
+  const n = b.reduce((a, [, c]) => a + c, 0);
+  const at = (q: number) => {
+    let acc = 0;
+    for (const [i, c] of b) {
+      acc += c;
+      if (acc >= q * n) return rumBucketMs(i);
+    }
+    return b.length ? rumBucketMs(b[b.length - 1]![0]) : 0;
+  };
+  return { n, p50: at(0.5), p95: at(0.95) };
+}
+
+/** Per metric (all countries and colos), and per metric × country × DO colo ("" = not known yet). */
+export function rumAggregate(body: { data?: Array<Record<string, unknown>> }): { metrics: RumCell[]; cells: RumCell[] } {
+  const cells = new Map<string, { metric: string; country: string; colo: string; h: Map<number, number> }>();
+  const totals = new Map<string, Map<number, number>>();
+  for (const r of body.data ?? []) {
+    const metric = String(r.metric ?? "");
+    const country = String(r.country ?? "") || "XX";
+    const colo = String(r.colo ?? "");
+    const bucket = Math.round(Number(r.bucket) || 0);
+    const n = Number(r.n) || 0;
+    if (!metric || n <= 0) continue;
+    const key = `${metric}\n${country}\n${colo}`;
+    const c = cells.get(key) ?? { metric, country, colo, h: new Map<number, number>() };
+    c.h.set(bucket, (c.h.get(bucket) ?? 0) + n);
+    cells.set(key, c);
+    const t = totals.get(metric) ?? new Map<number, number>();
+    t.set(bucket, (t.get(bucket) ?? 0) + n);
+    totals.set(metric, t);
+  }
+  return {
+    metrics: [...totals.entries()].map(([metric, h]) => ({ metric, country: "", colo: "", ...quantiles(h) })),
+    cells: [...cells.values()].map((c) => ({ metric: c.metric, country: c.country, colo: c.colo, ...quantiles(c.h) })).sort((a, b) => b.n - a.n),
+  };
 }
