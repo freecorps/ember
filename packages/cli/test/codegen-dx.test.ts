@@ -3,10 +3,10 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import ts from "typescript";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { contractsFromApiDts, currentManifest } from "../src/codegen/current.ts";
+import { contractsFromApiDts, currentManifest, sourcesHash } from "../src/codegen/current.ts";
 import { codegen, type CodegenResult } from "../src/codegen/index.ts";
 import type { Project } from "../src/config.ts";
 import { cleanup, sampleProject } from "./helpers.ts";
@@ -401,12 +401,64 @@ describe("codegen DX (docs/design/dx.md)", () => {
     writeFileSync(join(project.root, "shared.ts"), "export type Shared = { n: number };\n");
     writeFileSync(join(project.dir, "shared_user.ts"), 'import type { Shared } from "../shared";\nimport { query } from "./_generated/server";\nexport const shared = query((): Shared => ({ n: 1 }));\n');
     await codegen(project);
-    expect(currentManifest(project)?.manifest.sources?.files).toEqual(["shared.ts"]);
+    // Imported for its type only, it is still a source.
+    expect(currentManifest(project)?.manifest.sources?.files).toContain("shared.ts");
     writeFileSync(join(project.root, "shared.ts"), "export type Shared = { n: number; m: string };\n");
     expect(currentManifest(project)).toBeNull();
     rmSync(join(project.dir, "shared_user.ts"));
     rmSync(join(project.root, "shared.ts"));
     await codegen(project);
+    expect(currentManifest(project)).not.toBeNull();
+  });
+
+  it("the sources cover a sibling workspace package (../) and what only the evaluated entry points import", async () => {
+    const sibling = `${project.root}-shared`;
+    const siblingRel = `../${basename(sibling)}/types.ts`;
+    mkdirSync(sibling, { recursive: true });
+    try {
+      writeFileSync(join(sibling, "types.ts"), "export type Remote = { id: string };\n");
+      writeFileSync(join(project.dir, "remote.ts"), `import type { Remote } from "../${siblingRel}";\nimport { query } from "./_generated/server";\nexport const remote = query((): Remote => ({ id: "r" }));\n`);
+      // ember/http.ts is evaluated (routes), never part of the type-checked program.
+      writeFileSync(join(project.root, "route-shapes.ts"), 'import { v } from "@freecorps/ember-server";\nexport const shape = v.object({ ok: v.boolean() });\n');
+      writeFileSync(
+        join(project.dir, "http.ts"),
+        'import { httpRouter } from "@freecorps/ember-server";\nimport { shape } from "../route-shapes";\n\nexport default httpRouter().route({ method: "GET", path: "/ok", returns: shape, handler: async () => ({ ok: true }) });\n',
+      );
+      await codegen(project);
+      const files = currentManifest(project)?.manifest.sources?.files ?? [];
+      expect(files).toEqual(expect.arrayContaining([siblingRel, "route-shapes.ts"]));
+      // Installed dependencies stay out (package.json and the lockfile stand for them).
+      expect(files.some((f) => f.split("/").includes("node_modules"))).toBe(false);
+      writeFileSync(join(sibling, "types.ts"), "export type Remote = { id: string; n: number };\n");
+      expect(currentManifest(project)).toBeNull();
+      await codegen(project);
+      expect(currentManifest(project)).not.toBeNull();
+      writeFileSync(join(project.root, "route-shapes.ts"), 'import { v } from "@freecorps/ember-server";\nexport const shape = v.object({ ok: v.boolean(), at: v.number() });\n');
+      expect(currentManifest(project)).toBeNull();
+    } finally {
+      rmSync(sibling, { recursive: true, force: true });
+      rmSync(join(project.dir, "remote.ts"), { force: true });
+      rmSync(join(project.dir, "http.ts"), { force: true });
+      rmSync(join(project.root, "route-shapes.ts"), { force: true });
+      await codegen(project);
+    }
+  });
+
+  it("a manifest naming paths codegen never writes (absolute, node_modules) is not trusted", async () => {
+    await codegen(project);
+    const file = join(project.generatedDir, "manifest.json");
+    const original = readFileSync(file, "utf8");
+    const m = JSON.parse(original) as { sources: { hash: string; files?: string[] } };
+    try {
+      for (const bad of ["/etc/hosts", "node_modules/x/index.ts", "../a/node_modules/b.ts"]) {
+        // With a matching hash: only the paths make it refused.
+        const files = [...(m.sources.files ?? []), bad];
+        writeFileSync(file, JSON.stringify({ ...m, sources: { hash: sourcesHash(project, files), files } }));
+        expect(currentManifest(project)).toBeNull();
+      }
+    } finally {
+      writeFileSync(file, original);
+    }
     expect(currentManifest(project)).not.toBeNull();
   });
 });

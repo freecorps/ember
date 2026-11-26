@@ -18,7 +18,10 @@ const ROOT_FILES = ["ember.json", "package.json", "tsconfig.json"];
 export interface SourcesStamp {
   /** sha256 of the sources (see `sourcesHash`). */
   hash: string;
-  /** Files outside ember/ (relative to the project root) the functions import, hashed too. */
+  /**
+   * Files outside ember/ that codegen read (relative to the project root; `../` for a sibling workspace package), hashed
+   * too: imported by the functions, or by what codegen evaluated (`ember/http.ts`, auth.config.ts...).
+   */
   files?: string[];
 }
 
@@ -39,18 +42,21 @@ function functionFiles(dir: string): string[] {
   return out.sort();
 }
 
+/** A path `sources.files` may hold: relative (`../` allowed: a sibling workspace package), never under node_modules. */
+const isSourcePath = (rel: string) => rel.length > 0 && !rel.includes("\u0000") && !isAbsolute(rel) && !/^[A-Za-z]:/.test(rel) && !rel.split(/[\\/]/).includes("node_modules");
+
 /**
- * The files of the program codegen type-checked that live in the project but outside ember/ (`../shared/types.ts`):
- * neither node_modules nor the packages of a monorepo around it.
+ * The files codegen read (`files`: the type-checked program's, the evaluated bundle's) that are outside ember/: in the
+ * project (`shared/types.ts`) or around it (`../shared/src/types.ts`, a sibling workspace package), but not installed
+ * dependencies (node_modules, whose changes package.json and the lockfile stand for).
  */
-export function outsideFiles(project: Project, programFiles: string[]): string[] {
+export function outsideFiles(project: Project, files: Iterable<string>): string[] {
   const out = new Set<string>();
-  for (const f of programFiles) {
-    const rel = relative(project.root, f);
-    if (rel.startsWith("..") || isAbsolute(rel)) continue;
+  for (const f of files) {
     const inFunctions = relative(project.dir, f);
     if (!inFunctions.startsWith("..") && !isAbsolute(inFunctions)) continue;
-    if (rel.split(/[\\/]/).includes("node_modules")) continue;
+    const rel = relative(project.root, f);
+    if (!isSourcePath(rel)) continue;
     out.add(toPosix(rel));
   }
   return [...out].sort();
@@ -85,7 +91,10 @@ export function currentManifest(project: Project): { manifest: EmberManifest; ap
   }
   const stamp = manifest.sources;
   if (!stamp || typeof stamp.hash !== "string") return null;
-  if (sourcesHash(project, Array.isArray(stamp.files) ? stamp.files : []) !== stamp.hash) return null;
+  const files = stamp.files ?? [];
+  // Paths as codegen writes them, or the manifest is not one to trust (nothing outside those is read).
+  if (!Array.isArray(files) || !files.every((f) => typeof f === "string" && isSourcePath(f))) return null;
+  if (sourcesHash(project, files) !== stamp.hash) return null;
   return { manifest, api: readFileSync(apiFile, "utf8") };
 }
 

@@ -271,7 +271,7 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   generated.set("api.d.ts", rendered.text);
   generated.set("api.d.ts.map", rendered.map);
   generated.set("types.d.ts", typesDts(named));
-  const outside = outsideFiles(project, oracle.programFiles());
+  const outside = outsideFiles(project, [...oracle.programFiles(), ...(loaded.inputs ?? [])]);
   const sources: SourcesStamp = { hash: sourcesHash(project, outside), ...(outside.length ? { files: outside } : {}) };
   generated.set("manifest.json", JSON.stringify({ ...manifest, sources }, null, 2) + "\n");
   generated.set("ai/guidelines.md", aiGuidelines(manifest, rendered.contracts));
