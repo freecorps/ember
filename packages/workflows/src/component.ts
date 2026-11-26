@@ -19,7 +19,7 @@
 // runAction job continuing after step i runs as the drive job of index i + 1 would (`driving` = i + 1), and its
 // retry resumes the same way.
 
-import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type GenericId, type WithoutSystemFields } from "@freecorps/ember-server";
+import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, paginationOptsValidator, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type GenericId, type WithoutSystemFields } from "@freecorps/ember-server";
 import type { JournalEntry, Outcome, RetryPolicy, StepRequest } from "./replay.ts";
 
 const status = v.union(v.literal("running"), v.literal("completed"), v.literal("failed"), v.literal("canceled"));
@@ -574,9 +574,87 @@ export const functions = {
   },
 };
 
+// ------------------------------------------------------------------------------------------------ dashboard
+
+/** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
+const dashboardFunctions = {
+  /** Workflows in this shard, newest first (optionally one status). */
+  list: internalQuery({
+    args: { status: v.optional(status), paginationOpts: paginationOptsValidator },
+    handler: (ctx, { status: s, paginationOpts }) => {
+      const q = ctx.db.query("workflows").order("desc");
+      const page = (s ? q.filter((f) => f.eq(f.field("status"), s)) : q).paginate(paginationOpts);
+      return {
+        ...page,
+        page: page.page.map((w) => ({ _id: w._id, driver: w.driver.startsWith("&") ? w.driver.slice(1) : w.driver, status: w.status, steps: w.stepCount, error: w.error ?? null, startedAt: w.startedAt, finishedAt: w.finishedAt ?? null })),
+      };
+    },
+  }),
+  /** One workflow with its journal as a timeline; null when unknown. */
+  detail: internalQuery({
+    args: { id: v.string() },
+    handler: (ctx, { id }) => {
+      const w = load(ctx, id);
+      if (!w) return null;
+      const steps = ctx.db
+        .query("steps")
+        .withIndex("by_workflow", (q) => q.eq("workflow", w._id))
+        .collect()
+        .map((x) => ({
+          at: x.startedAt,
+          title: `#${x.index} ${x.kind} ${x.name}`,
+          status: x.status === "pending" ? "running" : x.status,
+          detail: x.error ?? (x.attempts > 1 ? `${x.attempts} attempts` : null),
+        }));
+      return { _id: w._id, driver: w.driver.startsWith("&") ? w.driver.slice(1) : w.driver, status: w.status, stepCount: w.stepCount, startedAt: w.startedAt, finishedAt: w.finishedAt ?? null, args: w.args, result: w.result ?? null, error: w.error ?? null, steps };
+    },
+  }),
+};
+
 export const workflows = defineComponent({
   name: "workflows",
   schema,
-  functions,
+  functions: { ...functions, dashboard: dashboardFunctions },
   config: v.optional(v.object({ maxSteps: v.optional(v.number()) })),
+  // The workflows' screen in the Ember Dashboard (contracts.md "Telas declarativas"): per shard, where each one runs.
+  dashboard: {
+    label: "Workflows",
+    icon: "workflow",
+    description: "Durable workflows in this shard: status, the journal of each one; cancel a running one, delete a finished one.",
+    tabs: [
+      {
+        id: "workflows",
+        label: "Workflows",
+        blocks: [
+          {
+            kind: "table",
+            id: "list",
+            query: dashboardFunctions.list,
+            columns: [
+              { label: "Workflow", path: "driver", format: "code" },
+              { label: "Status", path: "status", format: "badge" },
+              { label: "Steps", path: "steps", format: "number" },
+              { label: "Started", path: "startedAt", format: "ago" },
+              { label: "Error", path: "error" },
+            ],
+            detail: {
+              query: dashboardFunctions.detail,
+              fromRow: { id: "_id" },
+              sections: [
+                { kind: "kv", items: [{ label: "Workflow", path: "driver", format: "code" }, { label: "Status", path: "status", format: "badge" }, { label: "Steps", path: "stepCount", format: "number" }, { label: "Started", path: "startedAt", format: "date" }, { label: "Finished", path: "finishedAt", format: "date" }] },
+                { kind: "timeline", label: "Journal", path: "steps", time: "at", title: "title", status: "status", detail: "detail" },
+                { kind: "stacktrace", label: "Error", path: "error" },
+                { kind: "json", label: "Arguments", path: "args" },
+                { kind: "json", label: "Result", path: "result" },
+              ],
+            },
+            rowActions: [
+              { id: "cancel", label: "Cancel", fn: functions.lib.cancel, fromRow: { id: "_id" }, description: "A running workflow stops; its onComplete gets canceled." },
+              { id: "cleanup", label: "Delete", fn: functions.lib.cleanup, fromRow: { id: "_id" }, destructive: true, description: "Deletes a finished workflow and its journal." },
+            ],
+          },
+        ],
+      },
+    ],
+  },
 });
