@@ -6,7 +6,7 @@
 // ensured by every write, at most one pending) deletes expired rows in batches, so a limiter keyed by user or IP does
 // not grow without bound.
 
-import { componentBuilders, defineComponent, defineErrors, defineSchema, defineTable, EmberError, v, type ComponentCtx, type GenericId } from "@freecorps/ember-server";
+import { componentBuilders, defineComponent, defineErrors, defineSchema, defineTable, EmberError, paginationOptsValidator, v, type ComponentCtx, type GenericId } from "@freecorps/ember-server";
 import { checkChecked, checkConfig, consumeChecked, fullAt, refill, HOUR, type RateLimitConfig, type RateLimitState } from "./algorithms.ts";
 
 const schema = defineSchema({
@@ -87,7 +87,7 @@ export const DEFAULT_GC_INTERVAL_MS = HOUR;
 /** Most rows one GC job deletes (a job stays well under the shard's write limits). */
 export const MAX_GC_BATCH = 4000;
 
-const { query, mutation, internalMutation } = componentBuilders<typeof schema, RateLimitInstallConfig | undefined>();
+const { query, mutation, internalMutation, internalQuery } = componentBuilders<typeof schema, RateLimitInstallConfig | undefined>();
 
 const callArgs = {
   /** Limit name ("sendEmail"). */
@@ -306,10 +306,74 @@ export function edgeBindingsOf(config: RateLimitInstallConfig | undefined): Arra
   return out;
 }
 
+// ------------------------------------------------------------------------------------------------ dashboard
+
+/** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
+const dashboardFunctions = {
+  /** Buckets in this shard (one limit's, or a key's), by limit and key. A row is a bucket not full again yet. */
+  buckets: internalQuery({
+    args: { name: v.optional(v.string()), key: v.optional(v.string()), paginationOpts: paginationOptsValidator },
+    handler: (ctx, { name, key, paginationOpts }) => {
+      const q = name !== undefined ? ctx.db.query("rateLimits").withIndex("by_name_key", (r) => (key !== undefined ? r.eq("name", name).eq("key", key) : r.eq("name", name))) : ctx.db.query("rateLimits").withIndex("by_name_key");
+      const page = (key !== undefined && name === undefined ? q.filter((f) => f.eq(f.field("key"), key)) : q).paginate(paginationOpts);
+      return { ...page, page: page.page.map((r) => ({ _id: r._id, name: r.name, key: r.key, value: r.value, updatedAt: r.ts, expiresAt: r.expiresAt ?? null, named: !!ctx.component.config?.limits?.[r.name] })) };
+    },
+  }),
+  /** The limits named in the install config, and the GC's state. */
+  config: internalQuery({
+    args: {},
+    handler: (ctx) => {
+      const gc = ctx.db.query("gc").first();
+      return {
+        limits: Object.entries(ctx.component.config?.limits ?? {}).map(([name, c]) => ({ name, ...c })),
+        gc: ctx.component.config?.gc === false ? "off" : gc ? "scheduled" : "idle",
+        gcAt: gc?.at ?? null,
+        buckets: ctx.db.query("rateLimits").take(1001).length,
+      };
+    },
+  }),
+};
+
 export const rateLimit = defineComponent({
   name: "rateLimit",
   schema,
-  functions,
+  functions: { ...functions, dashboard: dashboardFunctions },
   config: v.optional(installConfigValidator),
   bindings: (config) => edgeBindingsOf(config),
+  // The limiter's screen in the Ember Dashboard (contracts.md "Telas declarativas"): buckets live per shard.
+  dashboard: {
+    label: "Rate limits",
+    icon: "gauge",
+    description: "Buckets not full again yet in this shard (a missing one is a full bucket); reset one to give its key a full bucket now.",
+    tabs: [
+      {
+        id: "buckets",
+        label: "Buckets",
+        blocks: [
+          {
+            kind: "table",
+            id: "buckets",
+            query: dashboardFunctions.buckets,
+            columns: [
+              { label: "Limit", path: "name", format: "code" },
+              { label: "Key", path: "key", format: "code" },
+              { label: "Tokens", path: "value", format: "number" },
+              { label: "Updated", path: "updatedAt", format: "ago" },
+              { label: "Full again", path: "expiresAt", format: "date" },
+            ],
+            rowActions: [{ id: "reset", label: "Reset", fn: functions.lib.reset, fromRow: { name: "name", key: "key" }, destructive: true, description: "Deletes the bucket: the key gets a full bucket now." }],
+          },
+          { kind: "actions", id: "manual", label: "Reset a key", actions: [{ id: "resetKey", label: "Reset…", fn: functions.lib.reset, destructive: true }] },
+        ],
+      },
+      {
+        id: "config",
+        label: "Configuration",
+        blocks: [
+          { kind: "stats", id: "state", query: dashboardFunctions.config, items: [{ label: "Buckets (up to 1000)", path: "buckets", format: "number" }, { label: "GC", path: "gc", format: "badge" }, { label: "Next GC", path: "gcAt", format: "date" }] },
+          { kind: "table", id: "limits", label: "Limits named in the install config", query: dashboardFunctions.config, rows: "limits", rowKey: "name", columns: [{ label: "Limit", path: "name", format: "code" }, { label: "Kind", path: "kind" }, { label: "Rate", path: "rate", format: "number" }, { label: "Period", path: "period", format: "ms" }, { label: "Capacity", path: "capacity", format: "number" }] },
+        ],
+      },
+    ],
+  },
 });
