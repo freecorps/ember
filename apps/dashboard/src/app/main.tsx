@@ -2,6 +2,7 @@
 //   #/                                       projects of the account
 //   #/audit                                  audit log, all projects
 //   #/p/<project>/<env>/<section>[/<shard>]  health | functions | shards | data | crons | deployments | audit
+//   #/p/<project>/<env>/components[/<shard>/<install>[/<tab>]], #/p/<project>/<env>/app[/<shard>/<tab>]: declarative screens
 // The shard in the route is the one the top bar's picker selected (data, shards and crons use it).
 
 import { StrictMode, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -19,12 +20,15 @@ import { Reactivity } from "./pages/reactivity.tsx";
 import { Settings } from "./pages/settings.tsx";
 import { Users } from "./pages/users.tsx";
 import { Shards } from "./pages/shards.tsx";
+import { Screens } from "./pages/screens.tsx";
 import type { Project, ShardRow } from "./pages/types.ts";
 import { Dialog, Loading, Mono, Problem, Toasts, type ToastItem } from "./ui.tsx";
 
 const SECTIONS = [
   { id: "health", label: "Health", key: "h" },
   { id: "functions", label: "Functions", key: "f" },
+  { id: "app", label: "App screens", key: "x" },
+  { id: "components", label: "Components", key: "k" },
   { id: "shards", label: "Shards", key: "s" },
   { id: "data", label: "Data", key: "d" },
   { id: "reactivity", label: "Reactivity", key: "r" },
@@ -37,7 +41,9 @@ const SECTIONS = [
   { id: "settings", label: "Settings", key: "g" },
 ] as const;
 
-const SHARD_SECTIONS = new Set(["data", "shards", "crons", "reactivity", "files"]);
+const SHARD_SECTIONS = new Set(["data", "shards", "crons", "reactivity", "files", "components", "app"]);
+/** Sections whose route keeps its later segments (component, tab) when another shard is picked. */
+const KEEPS_REST = new Set(["components", "app"]);
 const DEFAULT_SHARD = "global:main";
 
 function Logo() {
@@ -51,7 +57,7 @@ function Logo() {
 
 // ------------------------------------------------------------------------------------------- shard picker
 
-function ShardPicker({ project, env, current, section }: { project: string; env: string; current: string; section: string }) {
+function ShardPicker({ project, env, current, section, rest }: { project: string; env: string; current: string; section: string; rest?: string[] | undefined }) {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -74,7 +80,7 @@ function ShardPicker({ project, env, current, section }: { project: string; env:
     setOpen(false);
     setQ("");
     input.current?.blur();
-    location.hash = href({ project, env, section: SHARD_SECTIONS.has(section) ? section : "data", shard });
+    location.hash = href({ project, env, section: SHARD_SECTIONS.has(section) ? section : "data", shard, ...(KEEPS_REST.has(section) ? { rest } : {}) });
   };
   return (
     <div className="picker" role="combobox" aria-expanded={open} aria-haspopup="listbox" aria-owns="shard-options">
@@ -220,6 +226,8 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
     body =
       section.id === "functions" ? (
         <Functions {...p} fn={route.fn} />
+      ) : section.id === "components" || section.id === "app" ? (
+        <Screens key={`${p.project}/${p.env}/${section.id}`} {...p} shard={shard} kind={section.id} rest={route.rest ?? []} />
       ) : section.id === "users" ? (
         <Users key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "settings" ? (
@@ -270,7 +278,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
             <strong>{route.page === "audit" ? "Audit log" : "Projects"}</strong>
           )}
         </div>
-        {inEnv && SHARD_SECTIONS.has(section.id) && <ShardPicker project={route.project!} env={route.env!} current={shard} section={section.id} />}
+        {inEnv && SHARD_SECTIONS.has(section.id) && <ShardPicker project={route.project!} env={route.env!} current={shard} section={section.id} rest={route.rest} />}
         <span className="spacer" />
         <span className="who" title={`Signed in through ${me.via === "access" ? "Cloudflare Access" : "a dashboard token"}`}>
           {me.actor}

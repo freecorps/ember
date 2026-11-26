@@ -18,6 +18,7 @@ export function Table({
   onRow,
   selected,
   label,
+  rowKeys,
 }: {
   cols: Col[];
   rows: ReactNode[][];
@@ -25,6 +26,8 @@ export function Table({
   onRow?: (i: number) => void;
   selected?: number | null;
   label?: string;
+  /** Stable, unique key of each row (its record's id): state inside a row stays with its record across reloads. */
+  rowKeys?: string[];
 }) {
   if (!rows.length) return <Empty>{empty ?? "Nothing here yet."}</Empty>;
   return (
@@ -42,7 +45,7 @@ export function Table({
         <tbody>
           {rows.map((r, i) => (
             <tr
-              key={i}
+              key={rowKeys?.[i] ?? i}
               className={[onRow ? "clickable" : "", selected === i ? "selected" : ""].join(" ").trim() || undefined}
               {...(onRow
                 ? {

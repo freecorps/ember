@@ -22,7 +22,8 @@ describe("zframe: frames keep the identity they arrived under", () => {
     // The client sends `auth` for bob while the frame decodes; the frames after it arrive as bob.
     tag = "u:bob";
     q.push(JSON.stringify({ t: "snap", qid: 1, value: "bob's" }), tag);
-    await new Promise((r) => setTimeout(r, 20));
+    // The binary frame decodes asynchronously (a slow runner takes longer): wait for both, with a ceiling.
+    for (let i = 0; i < 500 && got.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
     expect(got).toEqual([
       ["snap", "u:ana"],
       ["snap", "u:bob"],
