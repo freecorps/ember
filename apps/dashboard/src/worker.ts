@@ -57,7 +57,7 @@ export interface Assets {
 }
 
 /** Back-compat name: who the caller is, or the refusal. */
-export async function authorize(request: Request, env: DashboardEnv, fetchImpl?: typeof fetch): Promise<{ via: "access" | "token"; who?: string; role: Role } | Response> {
+export async function authorize(request: Request, env: DashboardEnv, fetchImpl?: typeof fetch): Promise<{ via: Principal["via"]; who?: string; role: Role } | Response> {
   const p = await authenticate(request, env, fetchImpl);
   if (p instanceof Response) return p;
   return { via: p.via, role: p.role, ...(p.via === "access" ? { who: p.actor } : {}) };

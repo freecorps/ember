@@ -47,11 +47,13 @@ Commands:
                                           synchronous, imports/validators/ConvexError/crons/convex-helpers triggers are
                                           rewritten, and a report lists what needs a decision. --check fails while
                                           manual items remain (CI); --verify runs codegen + tsc --noEmit on the result
-  dev [--port 8787] [--no-persist] [--remote [--env dev]]
+  dev [--port 8787] [--no-persist] [--remote [--env dev]] [--dashboard [--dashboard-port 8788]]
                                           Run locally (Miniflare/workerd), rebuild on change. --remote binds the
                                           env's real Workers AI, Vectorize, Browser Rendering and Images (AI Search
                                           stays on the local fallback)
-                                          (needs wrangler; billed; dev writes reach those indexes)
+                                          (needs wrangler; billed; dev writes reach those indexes). --dashboard also
+                                          serves the Ember Dashboard on http://127.0.0.1:8788 for this runtime: no
+                                          login (this machine only), a local registry, no account
   deploy --preflight [--env prod | --url URL] [--shard kind:key ...] [--admin-token T] [--allow-schema-rollback]
                                           Upload nothing: ask each live shard (the registry catalog, or --shard)
                                           what its migration planner would do with this schema (steps, staged
@@ -260,13 +262,15 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return migrateCommand(rest);
     }
     case "dev": {
-      const { values } = parseArgs({ args: rest, options: { port: { type: "string" }, "no-persist": { type: "boolean" }, remote: { type: "boolean" }, env: { type: "string" } } });
+      const { values } = parseArgs({ args: rest, options: { port: { type: "string" }, "no-persist": { type: "boolean" }, remote: { type: "boolean" }, env: { type: "string" }, dashboard: { type: "boolean" }, "dashboard-port": { type: "string" } } });
       if (values.env && !values.remote) throw new Error("--env only applies with --remote (ember dev is local otherwise)");
+      if (values["dashboard-port"] && !values.dashboard) throw new Error("--dashboard-port only applies with --dashboard");
       const project = loadProject();
       const server = await dev(project, {
         ...(values.port ? { port: Number(values.port) } : {}),
         persist: !values["no-persist"],
         ...(values.remote ? { remote: { ...(values.env ? { env: values.env } : {}) } } : {}),
+        ...(values.dashboard ? { dashboard: { ...(values["dashboard-port"] ? { port: Number(values["dashboard-port"]) } : {}) } } : {}),
       });
       await new Promise<void>((resolve) => {
         const stop = () => void server.close().then(resolve);

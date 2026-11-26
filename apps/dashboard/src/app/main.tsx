@@ -294,7 +294,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           <span>Go to…</span>
           <kbd>⌘K</kbd>
         </button>
-        <span className="who" title={`Signed in through ${me.via === "access" ? "Cloudflare Access" : "a dashboard token"}`}>
+        <span className="who" title={me.via === "dev" ? "ember dev --dashboard: local, no login (loopback only)" : `Signed in through ${me.via === "access" ? "Cloudflare Access" : "a dashboard token"}`}>
           {me.actor}
           <span className={`role ${me.role}`}>{me.role}</span>
         </span>
