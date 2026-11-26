@@ -24,7 +24,7 @@ Node >= 22. `wrangler` (>= 4.40) is an optional peer: `ember dev --remote` needs
 | `codegen [--check] [--strict]` | writes `ember/_generated` (types + manifest; `claims.d.ts`: the identity's claims from `ember/auth.config.ts`); `--check` fails in CI when it is out of date. In `ember dev` it is incremental: a save re-infers the edited modules and the ones importing them |
 | `types <module:fn>`, `openapi [--out file]` | a function's contract; OpenAPI 3.1 of the public functions and typed HTTP routes (both read `ember/_generated/manifest.json` and `api.d.ts` when they are current, else run codegen in memory) |
 | `deploy [--env prod] [--wait] [--gradual N] [--dry-run] [--preflight] [--allow-schema-rollback] [--allow-missing-env]` | deploys `ember-<project>-<env>` through the Cloudflare API; `--wait` polls until shards have migrated; `--preflight` asks the live shards what the migration would do, uploading nothing. Stops before uploading when the app schema is one this environment already left for a newer one (registry deploy history), says what that rollback costs, and needs `--allow-schema-rollback` to go ahead. When the history cannot be read, the deploy warns and goes ahead unchecked. Also stops when a required var of `defineApp({ env })` is neither a secret on the Worker nor a var in `ember.json`, naming them (`--allow-missing-env` deploys anyway; a first deploy only warns, since secrets need the Worker). A redeploy reads the Worker's state in parallel and skips the workers.dev, R2 CORS and lifecycle writes that would change nothing, and the `limits`/`placement` write when the Worker already has them |
-| `deploy --preview <branch> [--destroy]` | an ephemeral `preview-<slug>` environment (Worker `ember-<project>-preview-<slug>`) derived from `environments.preview`: same vars and settings, its own Durable Objects, bucket and queues; the same branch always maps to the same environment. `--destroy` deletes it (also `ember destroy --preview <branch>`) |
+| `deploy --preview <branch> [--destroy]` | an ephemeral `preview-<slug>` environment (Worker `ember-<project>-preview-<slug>`) derived from `environments.preview`: same vars and settings, its own Durable Objects, bucket and queues; the same branch always maps to the same environment, and branches with the same slug (`feat/x`, `feat-x`) share it. `--destroy` deletes it (also `ember destroy --preview <branch>`, no `--yes` needed): prod is untouched, but a branch sharing the slug loses its preview too |
 | `destroy [--env name] --yes` | deletes the Worker, its Durable Object data and the env's resources |
 | `run <fn> ['<json args>']` | calls a query, mutation or action over HTTP |
 | `env list\|set\|get\|rm` | secrets (Worker secrets) and vars (`ember.json`) of an environment |
@@ -54,7 +54,8 @@ Node >= 22. `wrangler` (>= 4.40) is an optional peer: `ember dev --remote` needs
 ```
 
 Both are script-level settings: they go up with a Script PUT, so a redeploy that would change them deploys at 100% in one
-request, and one whose Worker already has them is a plain code upload. Absent, Ember leaves whatever the Worker has.
+request, and one whose Worker already has them is a plain code upload. Absent, Ember leaves whatever the Worker has
+(removing a key from `ember.json` does not reset it).
 
 ## MCP server
 
@@ -75,7 +76,10 @@ claude mcp add ember -e EMBER_ADMIN_TOKEN=... -- npx ember mcp --allow-env prod
 Live tools act on the running `ember dev` unless the call names a deployed environment, which the server must be
 started with: `--allow-env <env>` for reading, `--allow-run <env>` for running functions there, and every mutation or
 action on it also needs `confirm: "<env>"` in the call. Admin calls use `EMBER_ADMIN_TOKEN` (start `ember dev` with the
-same value).
+same value). Nothing in a call moves it to another environment: requests to a deployed one name it (`x-ember-env`) and
+its Worker refuses them if it serves another; an unconfirmed `run` is sent read-only, so the deployed runtime refuses
+anything that is not a query in its own code; and `"local"` only reaches an `ember dev` on loopback. Deployed
+environments need a runtime with these checks (admin API level 14): redeploy older ones.
 
 ## Secrets
 
