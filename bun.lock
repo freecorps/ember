@@ -439,7 +439,7 @@
         "react-dom": "19",
       },
       "peerDependencies": {
-        "@tanstack/react-query": ">=5.80",
+        "@tanstack/react-query": ">=5.89.0",
         "react": ">=18",
       },
     },
