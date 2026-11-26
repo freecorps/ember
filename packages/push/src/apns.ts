@@ -13,7 +13,7 @@ import {
   MAX_PUSH_CONCURRENCY,
   apnsSound,
   byteLength,
-  createPushLimiter,
+  sharedPushLimiter,
   deadlineSignal,
   fetchWithRetry,
   limitedFetch,
@@ -64,8 +64,9 @@ export interface ApnsOptions extends ApnsCredentials, RetryOptions {
   /** Requests in flight at once (default and most `MAX_PUSH_CONCURRENCY`, 5; `limiter` caps it too). */
   concurrency?: number;
   /**
-   * The slots this send's requests take (default: its own, of `MAX_PUSH_CONCURRENCY`). `sendToDevices` passes one
-   * limiter to APNs, FCM and Expo, so together they never pass 5 requests in flight.
+   * The slots this send's requests take (default `sharedPushLimiter`, the isolate's, of `MAX_PUSH_CONCURRENCY`, shared
+   * by every send without its own). `sendToDevices` passes one limiter to APNs, FCM and Expo, so together they never
+   * pass 5 requests in flight.
    */
   limiter?: PushLimiter;
   fetch?: typeof fetch;
@@ -254,7 +255,7 @@ interface Attempt {
 export async function sendApns(messages: AddressedPushMessage[], o: ApnsOptions): Promise<PushTicket[]> {
   const rawFetch = (o.fetch ?? globalThis.fetch)?.bind(globalThis);
   if (!rawFetch) throw new Error("@freecorps/ember-push: no fetch available; pass options.fetch");
-  const fetchFn = limitedFetch(rawFetch, o.limiter ?? createPushLimiter());
+  const fetchFn = limitedFetch(rawFetch, o.limiter ?? sharedPushLimiter);
   const now = o.now ?? Date.now;
   // This call's signings: its sends share one, other calls (requests) never wait on it.
   const signings: ApnsSignings = new Map();

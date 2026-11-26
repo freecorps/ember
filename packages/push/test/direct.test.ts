@@ -3,11 +3,13 @@ import {
   clearApnsTokenCache,
   clearFcmTokenCache,
   createPushLimiter,
+  limitedFetch,
   generateRecipient,
   MAX_PUSH_CONCURRENCY,
   openPushEnvelope,
   sendApns,
   sendToDevices,
+  sharedPushLimiter,
   toBase64url,
   type PushTransports,
 } from "../src/index.ts";
@@ -92,7 +94,67 @@ describe("outbound concurrency (Workers: 6 open connections per invocation)", ()
     expect(r.tickets.every((t) => t.status === "ok")).toBe(true);
     // 15 APNs + 15 FCM + 1 OAuth exchange + 3 Expo batches of 100.
     expect(m.requests).toBe(34);
-    expect(m.peak).toBe(MAX_PUSH_CONCURRENCY);
+    // Never above the cap (how many overlap at once is up to the scheduler).
+    expect(m.peak).toBeLessThanOrEqual(MAX_PUSH_CONCURRENCY);
+    expect(m.peak).toBeGreaterThan(1);
+    expect(sharedPushLimiter.active).toBe(0);
+  });
+
+  test("two sendToDevices at once without a limiter share the default one: together never above 5", async () => {
+    const w = await world();
+    const { m, fetch } = metered(w.transports.apns!.fetch!);
+    const t: PushTransports = { ...w.transports, apns: { ...w.transports.apns!, fetch, concurrency: 5 } };
+    const batch = (k: number) => Array.from({ length: 10 }, (_, i) => ({ token: hexToken("ok", k * 100 + i), provider: "apns" }));
+    const [a, b] = await Promise.all([sendToDevices(batch(1), { body: "a" }, t), sendToDevices(batch(2), { body: "b" }, t)]);
+    expect([...a.tickets, ...b.tickets].every((x) => x.status === "ok")).toBe(true);
+    expect(m.requests).toBe(20);
+    expect(m.peak).toBeLessThanOrEqual(MAX_PUSH_CONCURRENCY);
+    expect(sharedPushLimiter.active).toBe(0);
+  });
+
+  test("FCM with one slot: the token exchange takes the same slot, once, and nothing deadlocks", async () => {
+    const w = await world();
+    const { m, fetch } = metered(w.transports.apns!.fetch!);
+    const limiter = createPushLimiter(1);
+    const devices = Array.from({ length: 4 }, (_, i) => ({ token: fcmToken(`one${i}`), provider: "fcm" }));
+    const r = await sendToDevices(devices, { body: "x" }, { ...w.transports, fcm: { ...w.transports.fcm!, fetch, concurrency: 5 }, limiter });
+    expect(r.tickets.every((x) => x.status === "ok")).toBe(true);
+    expect(m.requests).toBe(5); // 1 exchange + 4 sends
+    expect(m.peak).toBe(1);
+    expect(limiter.peak).toBe(1);
+    expect(limiter.active).toBe(0);
+  });
+
+  test("a request aborted while its body is unread gives its slot back", async () => {
+    const limiter = createPushLimiter(1);
+    const hang = (async () => new Response(new ReadableStream<Uint8Array>({ pull: () => new Promise(() => {}) }), { status: 200 })) as typeof globalThis.fetch;
+    const f = limitedFetch(hang, limiter);
+    const ac = new AbortController();
+    const res = await f("https://x.test/", { signal: ac.signal });
+    expect(limiter.active).toBe(1);
+    ac.abort(new Error("deadline"));
+    expect(limiter.active).toBe(0);
+    await res.body?.cancel().catch(() => {});
+    // Aborted before the answer: the slot is freed and the call rejects.
+    const ac2 = new AbortController();
+    const slow = (async () => {
+      ac2.abort(new Error("late"));
+      return new Response("{}");
+    }) as typeof globalThis.fetch;
+    await expect(limitedFetch(slow, limiter)("https://x.test/", { signal: ac2.signal })).rejects.toThrow("late");
+    expect(limiter.active).toBe(0);
+  });
+
+  test("a slot held past holdMs (its invocation gone) is taken back", async () => {
+    const limiter = createPushLimiter(1, { holdMs: 20 });
+    const stuck = await limiter.acquire(); // never released
+    const t0 = Date.now();
+    const release = await limiter.acquire();
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(15);
+    expect(limiter.active).toBe(1);
+    release();
+    stuck(); // late: does nothing
+    expect(limiter.active).toBe(0);
   });
 
   test("a limiter passed in is shared by several sends at once; a smaller one caps lower", async () => {

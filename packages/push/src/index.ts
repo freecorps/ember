@@ -71,12 +71,15 @@ export {
   MAX_PUSH_CONCURRENCY,
   PUSH_MAX_TTL_SECONDS,
   PUSH_TTL_DEFAULTS,
+  PUSH_SLOT_HOLD_MS,
   createPushLimiter,
   limitedFetch,
+  sharedPushLimiter,
   resolveInterruptionLevel,
   resolveTtlSeconds,
   resolveUrgency,
   type PushLimiter,
+  type PushLimiterOptions,
 } from "./delivery.ts";
 export {
   APNS_MAX_PAYLOAD,

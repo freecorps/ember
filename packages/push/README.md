@@ -125,11 +125,12 @@ Urgency follows Brigade's relay as its README documents it (Brigade's `low`/`hig
 - Each device token's APNs environment is recorded at registration (development-signed builds get sandbox tokens;
   ad hoc, TestFlight and App Store builds get production). For a device registered without one, the default host is
   tried first, then the other one after `BadDeviceToken`. The one that works is recorded.
-- Outbound requests are capped at **5 in flight** per send, APNs, FCM, Expo and the OAuth exchange together (a
-  Worker keeps at most 6 connections open per invocation): `sendToDevices` shares one `createPushLimiter()` among the
-  three transports, and `sendApns`/`sendFcm`/`sendPush` have their own when called alone. Pass `limiter` to share one
-  between sends that run at once in the same invocation (or a smaller one, `createPushLimiter(2)`); each response is
-  read to the end before its slot is freed.
+- Outbound requests are capped at **5 in flight**, APNs, FCM, Expo and the OAuth exchange together (a Worker keeps
+  at most 6 connections open per invocation): every send without its own `limiter` (`sendToDevices`, `sendApns`,
+  `sendFcm`, `sendExpoMessages` and `sendPush`, `checkPushReceipts`) takes `sharedPushLimiter`, one per isolate, so
+  sends running at once share the 5. Pass `limiter: createPushLimiter(2)` for a smaller cap. A slot is freed when its
+  response body is read to the end, cancelled (retried answers are cancelled unread) or the send's signal aborts;
+  one held past `PUSH_SLOT_HOLD_MS` (60 s) is taken back.
 - The APNs provider token (ES256 over the `.p8`) is reused for 40 minutes. The FCM access token (RS256
   service-account assertion) is kept until 5 minutes before it expires; concurrent sends share one exchange, and a
   401 refetches it once for every send that saw the same token.

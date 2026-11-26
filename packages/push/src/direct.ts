@@ -13,7 +13,7 @@
  *   // r.unregisteredTokens / r.unregisteredVoipTokens → prune; r.environments → record; r.expoTickets → receipts later
  */
 import { sendApns, type ApnsOptions } from "./apns.ts";
-import { DEFAULT_PUSH_FALLBACK, createPushLimiter, type PushLimiter } from "./delivery.ts";
+import { DEFAULT_PUSH_FALLBACK, sharedPushLimiter, type PushLimiter } from "./delivery.ts";
 import { sealPushContent } from "./envelope.ts";
 import { sendExpoMessages, type ExpoPushOptions } from "./expo.ts";
 import { sendFcm, type FcmOptions } from "./fcm.ts";
@@ -49,10 +49,10 @@ export interface PushTransports {
    */
   seal?: (device: PushTarget, message: PushMessage, provider: "apns" | "fcm") => PushPayload | null | Promise<PushPayload | null>;
   /**
-   * The slots every request of this send takes, Expo, APNs, FCM and the OAuth exchange together (default: one
-   * `createPushLimiter()` per call, 5 at once, under the Workers limit of 6 open connections per invocation). Pass
-   * one limiter to several sends running at once in the same invocation to cap them together. A transport's own
-   * `limiter` is replaced by this one.
+   * The slots every request of this send takes, Expo, APNs, FCM and the OAuth exchange together (default:
+   * `sharedPushLimiter`, the isolate's, 5 at once, under the Workers limit of 6 open connections per invocation, so
+   * sends running at once share it). Pass `createPushLimiter(n)` for a smaller cap. A transport's own `limiter` is
+   * replaced by this one.
    */
   limiter?: PushLimiter;
   now?: () => number;
@@ -170,8 +170,8 @@ export async function sendToDevices(targets: Iterable<PushTarget>, message: Push
     const out = await send(g.map((x) => x.m));
     g.forEach(({ i }, k) => (tickets[i] = out[k]!));
   };
-  // One limiter for the three transports: together they never pass its slots (Workers: 6 open connections).
-  const limiter = t.limiter ?? createPushLimiter();
+  // One limiter for the three transports (and other sends at once): together they never pass its slots.
+  const limiter = t.limiter ?? sharedPushLimiter;
   await Promise.all([
     run("expo", t.expo === false ? null : (ms) => sendExpoMessages(ms, { ...(t.expo || {}), limiter })),
     run("apns", t.apns ? (ms) => sendApns(ms, { ...t.apns!, fallback: t.apns!.fallback ?? fallback, limiter }) : null),

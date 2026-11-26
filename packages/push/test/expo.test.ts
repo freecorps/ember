@@ -3,6 +3,7 @@ import {
   EXPO_PUSH_URL,
   EXPO_RECEIPTS_URL,
   checkPushReceipts,
+  createPushLimiter,
   expoPushProvider,
   isExpoPushToken,
   sendPush,
@@ -134,7 +135,7 @@ describe("sendPush", () => {
     expect(r2.unregisteredTokens).toEqual([]);
   });
 
-  it("releases every response: each is read to the end under the push limiter (retried ones too), none is left open", async () => {
+  it("releases every response it does not use: retried ones are cancelled, the last one is read to the end", async () => {
     const bodies: Array<{ status: number; cancelled: boolean; read: boolean }> = [];
     const tracked = (status: number, payload: unknown, headers: Record<string, string> = {}) => {
       const b = { status, cancelled: false, read: false };
@@ -161,10 +162,9 @@ describe("sendPush", () => {
     }) as unknown as typeof globalThis.fetch;
     const r = await sendPush([tok(1)], { body: "hi" }, { fetch, retries: 2, ...noSleep });
     expect(r.tickets[0]).toMatchObject({ status: "ok" });
-    // `limitedFetch` holds a slot until the body is read, so it drains each answer before handing it back.
     expect(bodies).toEqual([
-      { status: 429, cancelled: false, read: true },
-      { status: 503, cancelled: false, read: true },
+      { status: 429, cancelled: true, read: false },
+      { status: 503, cancelled: true, read: false },
       { status: 200, cancelled: false, read: true },
     ]);
 
@@ -174,9 +174,42 @@ describe("sendPush", () => {
     const r2 = await checkPushReceipts([{ token: tok(1), status: "ok", id: "a" }], { fetch: down, retries: 1, ...noSleep });
     expect(r2.pending).toEqual([{ token: tok(1), id: "a" }]);
     expect(bodies).toEqual([
-      { status: 503, cancelled: false, read: true },
+      { status: 503, cancelled: true, read: false },
       { status: 503, cancelled: false, read: true },
     ]);
+  });
+
+  it("a retried answer whose body never ends is cancelled: its slot comes back (one slot, no hang)", async () => {
+    let n = 0;
+    let cancelled = 0;
+    const fetch = (async (_u: unknown, init?: RequestInit) => {
+      n++;
+      if (n === 1) {
+        // 503 headers, then a body that never closes.
+        const open = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => {}), cancel: () => void cancelled++ });
+        return new Response(open, { status: 503 });
+      }
+      return json({ data: JSON.parse(String(init!.body)).map(() => ({ status: "ok", id: "x" })) });
+    }) as unknown as typeof globalThis.fetch;
+    const limiter = createPushLimiter(1);
+    const r = await sendPush([tok(1)], { body: "hi" }, { fetch, limiter, retries: 1, ...noSleep });
+    expect(r.tickets[0]).toMatchObject({ status: "ok" });
+    expect(cancelled).toBe(1);
+    expect(limiter.active).toBe(0);
+  });
+
+  it("an accepted batch whose body fails to download is not sent again", async () => {
+    let n = 0;
+    const fetch = (async () => {
+      n++;
+      const broken = new ReadableStream<Uint8Array>({ pull: (c) => c.error(new Error("stream reset")) });
+      return new Response(broken, { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof globalThis.fetch;
+    const limiter = createPushLimiter(1);
+    const r = await sendPush([tok(1)], { body: "hi" }, { fetch, limiter, retries: 2, ...noSleep });
+    expect(n).toBe(1);
+    expect(r.tickets[0]).toMatchObject({ status: "error", error: "RequestFailed" });
+    expect(limiter.active).toBe(0);
   });
 
   it("turns a request-level error into error tickets for that batch only", async () => {

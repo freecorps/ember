@@ -11,7 +11,7 @@ import {
   DEFAULT_PUSH_FALLBACK,
   MAX_PUSH_CONCURRENCY,
   byteLength,
-  createPushLimiter,
+  sharedPushLimiter,
   deadlineSignal,
   soundName,
   fetchWithRetry,
@@ -60,7 +60,7 @@ export interface FcmOptions extends RetryOptions {
   fallback?: PushFallback;
   /** Requests in flight at once (default and most `MAX_PUSH_CONCURRENCY`, 5; `limiter` caps it too). */
   concurrency?: number;
-  /** The slots this send's requests (and its token exchange) take; default: its own (see `ApnsOptions.limiter`). */
+  /** The slots this send's requests (and its token exchange) take (default `sharedPushLimiter`; see `ApnsOptions.limiter`). */
   limiter?: PushLimiter;
   fetch?: typeof fetch;
   now?: () => number;
@@ -237,8 +237,9 @@ export function fcmMessage(m: AddressedPushMessage, fallback: PushFallback = DEF
 export async function sendFcm(messages: AddressedPushMessage[], o: FcmOptions): Promise<PushTicket[]> {
   const rawFetch = (o.fetch ?? globalThis.fetch)?.bind(globalThis);
   if (!rawFetch) throw new Error("@freecorps/ember-push: no fetch available; pass options.fetch");
-  // Sends and the token exchange share the limiter's slots.
-  const fetchFn = limitedFetch(rawFetch, o.limiter ?? createPushLimiter());
+  // Sends and the token exchange share the limiter's slots. The exchange gets this fetch as is (`parsed.fetch`, never
+  // wrapped again): one slot per request, taken while no send of this call holds one waiting on the token.
+  const fetchFn = limitedFetch(rawFetch, o.limiter ?? sharedPushLimiter);
   let sa: ServiceAccount;
   try {
     sa = parseServiceAccount(o.serviceAccount);
