@@ -12,7 +12,10 @@
 //   - `load_extension` and the file / pointer functions of the SQLite shell (`readfile`, `writefile`, `edit`,
 //     `fts3_tokenizer`), quoted or not;
 //   - names of SQLite's and Cloudflare's internal tables (`sqlite_*`, `_cf_*`), quoted or not, except `sqlite_master`
-//     and `sqlite_schema` (the schema, read-only by nature);
+//     and `sqlite_schema` (the schema, read-only by nature). Any name: a column alias or a CTE called `sqlite_x` too
+//     (deciding which names are tables would need a parser, and `FROM sqlite_stat1 AS s` must not pass);
+//   - what SQLite tokenizes differently from the plain reading: a NUL anywhere, a Tcl-style parameter `$a(...)`
+//     (and a BOM where a token starts is whitespace, as in SQLite, so `\uFEFF_cf_KV` is `_cf_KV`);
 //   - `pragma_*` table-valued functions, except the schema introspection ones (`pragma_table_info`,
 //     `pragma_table_xinfo`, `pragma_index_list`, `pragma_index_info`, `pragma_index_xinfo`, `pragma_foreign_key_list`):
 //     SQLite only exposes side-effect-free pragmas as functions, and those six read the schema, nothing else.
@@ -51,14 +54,26 @@ const isDigit = (c: number) => c >= 48 && c <= 57;
 const isIdStart = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c >= 128;
 const isIdPart = (c: number) => isIdStart(c) || isDigit(c) || c === 36;
 
-/** SQLite's tokens of `sql`, without whitespace and comments. Unterminated strings, names and comments throw. */
+/** U+FEFF: SQLite reads its UTF-8 form (EF BB BF) as whitespace where a token starts (tokenize.c `CC_BOM`). */
+const BOM = 0xfeff;
+
+/**
+ * SQLite's tokens of `sql`, without whitespace and comments. Unterminated strings, names and comments throw.
+ * Where SQLite would read the text differently from a plain tokenizer, it follows SQLite (or throws):
+ *   - a BOM where a token starts is whitespace (`\uFEFFDELETE` is the keyword DELETE), inside a name it is part of it;
+ *   - a NUL ends SQLite's input (what follows is never parsed the same way): refused anywhere;
+ *   - `$name(...)`, `:name(...)`, `@name(...)` are one Tcl-style parameter in SQLite (up to the `)` or a space, quotes
+ *     included), so `$a('x) FROM t --')` hides `FROM t` from a tokenizer that sees a string: refused.
+ */
 export function tokenizeSql(sql: string): SqlToken[] {
   const out: SqlToken[] = [];
   const n = sql.length;
+  const nul = sql.indexOf("\0");
+  if (nul >= 0) throw new SqlTokenizeError("unexpected NUL character", nul);
   let i = 0;
   while (i < n) {
     const c = sql.charCodeAt(i);
-    if (isSpace(c)) {
+    if (isSpace(c) || c === BOM) {
       i++;
       continue;
     }
@@ -142,11 +157,22 @@ export function tokenizeSql(sql: string): SqlToken[] {
       out.push({ kind: "number", text: sql.slice(start, i), value: sql.slice(start, i), at: start });
       continue;
     }
-    // ?, ?NNN, :name, @name, $name
+    // ?, ?NNN, :name, @name, $name (a name as SQLite reads it: identifier characters and `::` pairs)
     if (c === 63 || c === 58 || c === 64 || c === 36) {
       i++;
       if (c === 63) while (i < n && isDigit(sql.charCodeAt(i))) i++;
-      else while (i < n && (isIdPart(sql.charCodeAt(i)) || sql[i] === ":")) i++;
+      else {
+        let named = 0;
+        for (;;) {
+          if (i < n && isIdPart(sql.charCodeAt(i))) {
+            i++;
+            named++;
+          } else if (sql.charCodeAt(i) === 58 && sql.charCodeAt(i + 1) === 58) i += 2;
+          else break;
+        }
+        if (!named) throw new SqlTokenizeError(`a ${sql[start]} parameter needs a name`, start);
+        if (sql.charCodeAt(i) === 40) throw new SqlTokenizeError("Tcl-style parameters ($name(...)) are not supported", start);
+      }
       out.push({ kind: "param", text: sql.slice(start, i), value: sql.slice(start, i), at: start });
       continue;
     }
@@ -276,15 +302,19 @@ export interface SqlPlanNode {
   children: SqlPlanNode[];
 }
 
-/** The plan rows (`[id, parent, notused, detail]`, in order) as a tree; rows whose parent is unknown are roots. */
+/** The plan rows (`[id, parent, notused, detail]`) as a tree, in row order; rows whose parent is unknown are roots. */
 export function planTree(rows: ReadonlyArray<readonly unknown[]>): SqlPlanNode[] {
   const roots: SqlPlanNode[] = [];
   const byId = new Map<number, SqlPlanNode>();
-  for (const r of rows) {
+  const nodes = rows.map((r) => {
     const node: SqlPlanNode = { id: Number(r[0]), detail: String(r[3] ?? ""), children: [] };
-    const parent = byId.get(Number(r[1]));
-    (parent ? parent.children : roots).push(node);
     byId.set(node.id, node);
+    return { node, parent: Number(r[1]) };
+  });
+  // Two passes: a row may come before its parent's. A node is never its own parent.
+  for (const { node, parent } of nodes) {
+    const p = parent !== node.id ? byId.get(parent) : undefined;
+    (p ? p.children : roots).push(node);
   }
   return roots;
 }

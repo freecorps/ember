@@ -33,6 +33,12 @@ describe("checkReadOnlySql: accepted", () => {
     "SELECT name, sql FROM sqlite_master WHERE type = 'table'",
     "SELECT * FROM sqlite_schema",
     "SELECT * FROM main.sqlite_master",
+    "SELECT * FROM temp.sqlite_master",
+    "SELECT * FROM sqlite_temp_master",
+    'SELECT "replace"(body, \'a\', \'b\'), [replace](body, \'a\', \'b\') FROM messages',
+    "\uFEFFSELECT 1",
+    " \uFEFF SELECT 1 \uFEFF",
+    "SELECT :a::b, $c::d",
     "SELECT * FROM pragma_table_info('messages')",
     "SELECT * FROM pragma_index_list('messages')",
     "SELECT json_extract(_json, '$.a') FROM t WHERE _id = :id OR _id = @id OR _id = $id OR _id = ?1",
@@ -121,6 +127,23 @@ describe("checkReadOnlySql: refused (adversarial)", () => {
     [";", /empty statement/],
     ["-- only a comment", /empty statement/],
     ["SELECT 1 \\ 2", /unexpected character/],
+    // Where SQLite tokenizes differently from a plain reading (see "agrees with SQLite" below).
+    ["SELECT * FROM \uFEFFsqlite_sequence", /internal table/],
+    ["SELECT * FROM \uFEFF_cf_KV", /internal table/],
+    ["SELECT * FROM t, \uFEFFpragma_database_list", /only the schema pragmas/],
+    ["WITH x AS (SELECT 1) \uFEFFDELETE FROM t", /DELETE is not allowed/],
+    ["SELECT 1 \uFEFFRETURNING *", /RETURNING is not allowed/],
+    ["SELECT $a('x) , * FROM sqlite_sequence --')", /Tcl-style/],
+    ["SELECT :a('x) , * FROM _cf_KV --')", /Tcl-style/],
+    ["SELECT @a(';) DELETE FROM t --')", /Tcl-style/],
+    ["SELECT $a::b(x)", /Tcl-style/],
+    ["SELECT 1 -- \u0000\nDELETE FROM t", /NUL/],
+    ["SELECT 1 /* \u0000 */", /NUL/],
+    ["SELECT 1\u0000; DELETE FROM t", /NUL/],
+    ["SELECT $ FROM t", /needs a name/],
+    // A name is refused wherever it is: an alias or a CTE called like an internal table too (no parser here).
+    ["SELECT 1 AS sqlite_version", /internal table/],
+    ["WITH sqlite_x AS (SELECT 1) SELECT * FROM sqlite_x", /internal table/],
   ];
   it.each(refused)("%s", (sql, why) => {
     const r = checkReadOnlySql(sql);
@@ -129,6 +152,18 @@ describe("checkReadOnlySql: refused (adversarial)", () => {
       expect(r.message).toMatch(why);
       expect(r.at).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  it("agrees with SQLite where its tokenizer differs from a plain reading: these really read internal tables", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v); INSERT INTO t (v) VALUES (1)");
+    for (const sql of ["SELECT * FROM \uFEFFsqlite_sequence", "SELECT $a('x) , * FROM sqlite_sequence --')", "SELECT :a('x) , * FROM sqlite_sequence --')"]) {
+      expect(db.prepare(sql).all(), sql).toEqual([expect.objectContaining({ name: "t", seq: 1 })]);
+      expect(ok(sql), sql).toBe(false);
+    }
+    // And a BOM before a keyword is that keyword: this DELETE runs in SQLite.
+    db.prepare("WITH x AS (SELECT 1) \uFEFFDELETE FROM t").run();
+    expect(db.prepare("SELECT count(*) AS n FROM t").get()).toEqual({ n: 0 });
   });
 
   it("a non-string is refused, never thrown", () => {
@@ -165,6 +200,19 @@ describe("planTree", () => {
     ).toEqual([
       { id: 2, detail: "SCAN t", children: [] },
       { id: 5, detail: "USE TEMP B-TREE", children: [{ id: 7, detail: "SEARCH u", children: [] }] },
+    ]);
+  });
+
+  it("nests a row that comes before its parent's", () => {
+    expect(
+      planTree([
+        [7, 5, 0, "SEARCH u"],
+        [5, 0, 0, "USE TEMP B-TREE"],
+        [9, 9, 0, "SELF"],
+      ]),
+    ).toEqual([
+      { id: 5, detail: "USE TEMP B-TREE", children: [{ id: 7, detail: "SEARCH u", children: [] }] },
+      { id: 9, detail: "SELF", children: [] },
     ]);
   });
 });

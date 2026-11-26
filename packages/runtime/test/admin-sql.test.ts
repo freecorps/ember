@@ -89,11 +89,18 @@ describe("POST /api/_ember/sql", () => {
       "SELECT * FROM _cf_KV",
       "SELECT * FROM sqlite_sequence",
       "SELECT load_extension('x')",
+      // SQLite reads these differently from a plain tokenizer (BOM = whitespace, Tcl-style parameter, NUL).
+      "SELECT * FROM \uFEFF_cf_KV",
+      "WITH x AS (SELECT 1) \uFEFFDELETE FROM messages",
+      "SELECT $a('x) , * FROM sqlite_sequence --')",
+      "SELECT 1 -- \u0000\nDELETE FROM messages",
     ]) {
       const r = await sql(shard, text);
       expect([text, r.status, r.body.error.code]).toEqual([text, 400, "SqlRefused"]);
     }
     expect((await sql(shard, "SELECT count(*) FROM messages")).body.value.rows).toEqual([[2]]);
+    // A leading BOM is whitespace, as SQLite has it.
+    expect((await sql(shard, "\uFEFFSELECT 7")).body.value.rows).toEqual([[7]]);
     // Strings with ; and DROP are data.
     const s = await sql(shard, "SELECT 'x; DROP TABLE messages' AS s, \"body\" FROM messages LIMIT 1");
     expect(s.body.value.rows[0][0]).toBe("x; DROP TABLE messages");
@@ -121,6 +128,20 @@ describe("POST /api/_ember/sql", () => {
     expect((await admin("sql", { shard: "sql:x", sql: "SELECT ?", params: "x" })).status).toBe(400);
     expect((await admin("sql", { shard: "sql:x", sql: "SELECT 1", explain: "yes" })).status).toBe(400);
     expect((await admin("sql", { shard: "sql:x", sql: `SELECT '${"x".repeat(100_001)}'` })).status).toBe(413);
+    // Without content-length (a chunked body) the cap holds too: the body is bounded while it is read.
+    const big = JSON.stringify({ shard: "sql:x", sql: "SELECT 1", params: ["x".repeat(400_001)] });
+    const chunked = await SELF.fetch("http://ember/api/_ember/sql", {
+      method: "POST",
+      headers: { authorization: "Bearer admin-secret", "content-type": "application/json" },
+      body: new ReadableStream({
+        start(c) {
+          for (let i = 0; i < big.length; i += 65_536) c.enqueue(new TextEncoder().encode(big.slice(i, i + 65_536)));
+          c.close();
+        },
+      }),
+      duplex: "half",
+    } as RequestInit);
+    expect(chunked.status).toBe(413);
     const ok = await admin("sql", { shard: "sql:x", sql: "SELECT ?, ?, ?", params: [true, null, 1.5] });
     expect(ok.body.value.rows).toEqual([[1, null, 1.5]]);
   });
