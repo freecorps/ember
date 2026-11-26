@@ -213,7 +213,7 @@ try {
        c.close();`,
     ]);
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, expo-updates)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
@@ -225,7 +225,9 @@ try {
        const ag = await import("@freecorps/ember-agent");
        if (ag.agent?.name !== "agent" || typeof ag.Agent !== "function" || typeof ag.workersAi !== "function" || typeof ag.aiSdk !== "function") throw new Error("missing agent exports");
        const wp = await import("@freecorps/ember-workpool");
-       if (wp.workpool?.name !== "workpool" || typeof wp.Workpool !== "function") throw new Error("missing workpool exports");`,
+       if (wp.workpool?.name !== "workpool" || typeof wp.Workpool !== "function") throw new Error("missing workpool exports");
+       const eu = await import("@freecorps/ember-expo-updates");
+       if (eu.expoUpdates?.name !== "expoUpdates" || typeof eu.renderResponse !== "function" || typeof eu.resolvePlan !== "function") throw new Error("missing expo-updates exports");`,
     ]);
   });
   await step("auth/session-lookup on node: the origin's side of L14 imports alone and checks Ember's signature", () => {
