@@ -82,6 +82,22 @@ afterAll(async () => {
   if (project) cleanup(project);
 });
 
+/** index.js and the chunks it imports statically (transitively): what every isolate evaluates at startup. */
+function startup(b: WorkerBuild): { code: string; bytes: number } {
+  const outputs = b.metafile!.outputs;
+  const byName = new Map(Object.keys(outputs).map((k) => [k.split("/").at(-1)!, k]));
+  const code = new Map([["index.js", b.code], ...(b.modules ?? []).map((m) => [m.name, m.code] as [string, string])]);
+  const seen = new Set<string>();
+  const walk = (name: string) => {
+    if (seen.has(name)) return;
+    seen.add(name);
+    for (const i of outputs[byName.get(name)!]!.imports) if (i.kind === "import-statement" && !i.external) walk(i.path.split("/").at(-1)!);
+  };
+  walk("index.js");
+  const parts = [...seen].map((n) => code.get(n) ?? "");
+  return { code: parts.join("\n"), bytes: parts.reduce((n, c) => n + Buffer.byteLength(c), 0) };
+}
+
 const post = async (path: string, body: unknown) => {
   const res = await mf.dispatchFetch(new URL(path, url), { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
   return (await res.json()) as { ok: boolean; value?: unknown; error?: { code: string; message: string; data?: unknown } };
@@ -94,12 +110,15 @@ describe("lazy action modules", () => {
     expect(readFileSync(lazy.entry, "utf8")).toMatch(/import \* as \w+ from ".*messages\.ts"/);
   });
 
-  it("the action module and its dependency are not in the main module; with lazyActions: false they are", () => {
-    expect(lazy.code).not.toContain(MARKER);
+  it("the action module and its dependency are not in what an isolate evaluates at startup; with lazyActions: false they are", () => {
+    const lazyStart = startup(lazy);
+    const eagerStart = startup(eager);
+    expect(lazyStart.code).not.toContain(MARKER);
     expect(lazy.modules?.some((m) => m.code.includes(MARKER))).toBe(true);
-    expect(eager.code).toContain(MARKER);
-    console.log(`main module: ${(Buffer.byteLength(eager.code) / 1024).toFixed(1)} KiB (static) → ${(Buffer.byteLength(lazy.code) / 1024).toFixed(1)} KiB (lazy actions)`);
-    expect(Buffer.byteLength(lazy.code)).toBeLessThan(Buffer.byteLength(eager.code) - 150_000);
+    expect(eagerStart.code).toContain(MARKER);
+    const kib = (n: number) => `${(n / 1024).toFixed(1)} KiB`;
+    console.log(`startup modules: ${kib(eagerStart.bytes)} (static) → ${kib(lazyStart.bytes)} (lazy actions); index.js ${kib(Buffer.byteLength(eager.code))} → ${kib(Buffer.byteLength(lazy.code))}`);
+    expect(lazyStart.bytes).toBeLessThan(eagerStart.bytes - 150_000);
   });
 
   it("a lazy action runs: defaults, validation, declared errors and its return validator", async () => {

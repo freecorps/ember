@@ -108,6 +108,8 @@ describe.skipIf(!hasBrowser)("offline storage in Chromium", () => {
     });
     await waitSnap(b.page, "latest", "s.status === 'success' && s.value.length === 2");
     expect(await snap(b.page, "latest")).toMatchObject({ source: "local" });
+    // IndexedDB: this Chromium has getAllRecords, so `latest` (a descending scan) ran as one request, not a cursor.
+    if (k === "indexeddb") expect(await b.page.evaluate(() => typeof (IDBIndex.prototype as unknown as { getAllRecords?: unknown }).getAllRecords)).toBe("function");
     await waitSnap(b.page, "search", "s.status === 'success'");
     expect(await snap(b.page, "search")).toMatchObject({ value: ["Olá, ação!"], source: "local" }); // FTS5 in the Worker
 
