@@ -130,8 +130,46 @@ describe("expo updates component", () => {
     ).rejects.toMatchObject({ code: "AssetNotUploaded" });
     await expect(publish(t, { bundle: "ws", runtimeVersion: "1.0.0 " })).rejects.toThrow(/surrounding whitespace/);
     await expect(publish(t, { bundle: "ws", runtimeVersion: " 1.0.0" })).rejects.toThrow(/surrounding whitespace/);
+    await expect(publish(t, { bundle: "ws", runtimeVersion: "1\n2" })).rejects.toThrow(/control characters/);
+    await expect(publish(t, { bundle: "ws", runtimeVersion: "1\u00002" })).rejects.toThrow(/control characters/);
     expect((await publish(t, { bundle: "ws", runtimeVersion: "1.0.0" })).ids).toHaveLength(1);
   });
+
+  test("two publishers of the same content: the first one's confirmed upload serves, though a second ticket came after", async () => {
+    const t = harness();
+    const body = "console.log('shared')";
+    const prep = async () =>
+      ((await t.mutation(m("prepareAssets"), { assets: [{ sha256: hex(body), size: body.length, contentType: "application/javascript" }] })) as Array<{ upload?: { url: string; headers: Record<string, string>; storageId: string; shard: string; token: string } }>)[0]!.upload!;
+    const first = await prep();
+    const second = await prep(); // before the first confirms
+    expect(second.storageId).not.toBe(first.storageId);
+    expect((await t.fetch(first.url, { method: "PUT", headers: first.headers, body })).status).toBe(200);
+    const c = await t.fetch("/api/storage/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shard: first.shard, storageId: first.storageId, token: first.token }) });
+    expect(c.status).toBe(200);
+    const r = (await t.mutation(m("publish"), { branch: "production", updates: [{ platform: "ios", runtimeVersion: "1.0.0", launchAsset: asset(body, "bundle", "application/javascript"), assets: [] }] })) as { updates: unknown[] };
+    expect(r.updates).toHaveLength(1);
+    const a = await ask(t);
+    expect(a.kind).toBe("update");
+    expect(await (await t.fetch(a.manifest.launchAsset.url)).text()).toBe(body);
+    // The second publisher's upload, still in flight, can still be confirmed (its file stayed referenced).
+    expect((await t.fetch(second.url, { method: "PUT", headers: second.headers, body })).status).toBe(200);
+    const c2 = await t.fetch("/api/storage/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shard: second.shard, storageId: second.storageId, token: second.token }) });
+    expect(c2.status).toBe(200);
+  });
+
+  test("branch-wide commands find every live platform and runtime version, however many rows other ones have", async () => {
+    const t = harness();
+    await publish(t, { bundle: "ios-1", platforms: ["ios"] });
+    await publish(t, { bundle: "ios-2", platforms: ["ios"] });
+    // Many newer rows of another platform and runtime version on the same branch.
+    for (let i = 0; i < 510; i++) await publish(t, { bundle: "android", platforms: ["android"], runtimeVersion: "2.0.0" });
+    const rb = (await t.mutation(m("rollback"), { branch: "production", platform: "ios" })) as Array<{ platform: string; runtimeVersion: string }>;
+    expect(rb.map((x) => [x.platform, x.runtimeVersion])).toEqual([["ios", "1.0.0"]]);
+    expect((await ask(t)).manifest.launchAsset.hash).toBe(createHash("sha256").update("ios-1").digest("base64url"));
+    // Without a platform: one per pair.
+    const all = (await t.mutation(m("rollback"), { branch: "production" })) as Array<{ platform: string; runtimeVersion: string }>;
+    expect(all.map((x) => `${x.platform} ${x.runtimeVersion}`).sort()).toEqual(["android 2.0.0", "ios 1.0.0"]);
+  }, 60_000);
 
   test("assetsUrl with its own query string: key joins it", async () => {
     const cdn = defineApp().use(expoUpdates, { config: { assetsUrl: "https://cdn.test/expoUpdates/assets?region=eu" } });

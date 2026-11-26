@@ -69,7 +69,15 @@ const schema = defineSchema({
       .index("by_head", ["branch", "platform", "runtimeVersion", "rolledBack", "createdAt"])
       .index("by_branch", ["branch", "createdAt"])
       .index("by_created", ["createdAt"]),
-    assets: defineTable({ sha256: v.string(), file: v.file(), contentType: v.string(), size: v.number(), createdAt: v.number() }).index("by_sha", ["sha256"]),
+    assets: defineTable({
+      sha256: v.string(),
+      file: v.file(),
+      /** Uploads of the same content still in flight besides `file` (concurrent publishers): any confirmed one serves. */
+      pending: v.optional(v.array(v.file())),
+      contentType: v.string(),
+      size: v.number(),
+      createdAt: v.number(),
+    }).index("by_sha", ["sha256"]),
   },
 });
 
@@ -187,16 +195,32 @@ function ensureBranch(ctx: Ctx["mutation"], name: string) {
   return ctx.db.get(id)!;
 }
 
-/** The (platform, runtime version) pairs a branch-wide command acts on: given, or those of its newest 500 rows. */
+/** The most distinct runtime versions per platform a branch-wide command walks (beyond it: name `runtimeVersion`). */
+const MAX_PAIRS_PER_PLATFORM = 500;
+
+/**
+ * The (platform, runtime version) pairs a branch-wide command acts on: given, or every pair the branch has rows for,
+ * found by skipping through `by_head` one runtime version at a time (one read each, however many rows each has).
+ */
 function pairsOf(ctx: ReadCtx, branch: string, platform: Platform | undefined, runtimeVersion: string | undefined): Array<{ platform: Platform; runtimeVersion: string }> {
-  if (platform && runtimeVersion !== undefined) return [{ platform, runtimeVersion }];
-  const out = new Map<string, { platform: Platform; runtimeVersion: string }>();
-  for (const r of ctx.db.query("updates").withIndex("by_branch", (q) => q.eq("branch", branch)).order("desc").take(500)) {
-    if (platform && r.platform !== platform) continue;
-    if (runtimeVersion !== undefined && r.runtimeVersion !== runtimeVersion) continue;
-    out.set(`${r.platform}\u0000${r.runtimeVersion}`, { platform: r.platform, runtimeVersion: r.runtimeVersion });
+  const platforms: Platform[] = platform ? [platform] : ["ios", "android"];
+  if (runtimeVersion !== undefined) return platforms.map((p) => ({ platform: p, runtimeVersion }));
+  const out: Array<{ platform: Platform; runtimeVersion: string }> = [];
+  for (const p of platforms) {
+    let last: string | undefined;
+    for (let n = 0; ; n++) {
+      const after = last;
+      const r = ctx.db
+        .query("updates")
+        .withIndex("by_head", (q) => (after === undefined ? q.eq("branch", branch).eq("platform", p) : q.eq("branch", branch).eq("platform", p).gt("runtimeVersion", after)))
+        .first();
+      if (!r) break;
+      if (n >= MAX_PAIRS_PER_PLATFORM) throw new EmberError("ValidationError", `branch ${branch} has more than ${MAX_PAIRS_PER_PLATFORM} ${p} runtime versions: name the runtimeVersion`);
+      out.push({ platform: p, runtimeVersion: r.runtimeVersion });
+      last = r.runtimeVersion;
+    }
   }
-  return [...out.values()];
+  return out;
 }
 
 const publishedUpdate = v.object({
@@ -217,11 +241,33 @@ function checkAsset(ctx: Ctx["mutation"], a: StoredAsset, ready: Map<string, boo
   let ok = ready.get(a.sha256);
   if (ok === undefined) {
     const row = ctx.db.query("assets").withIndex("by_sha", (q) => q.eq("sha256", a.sha256)).unique();
-    ok = !!row && ctx.storage.getMetadata(row.file)?.state === "ready";
+    ok = !!row && promoteReady(ctx, row);
     ready.set(a.sha256, ok);
   }
   if (!ok) throw expoUpdatesErrors.AssetNotUploaded({ sha256: a.sha256 });
 }
+
+const assetBySha = (ctx: ReadCtx, sha256: string) => ctx.db.query("assets").withIndex("by_sha", (q) => q.eq("sha256", sha256)).unique();
+type AssetRow = NonNullable<ReturnType<typeof assetBySha>>;
+const fileState = (ctx: ReadCtx, id: string) => ctx.storage.getMetadata(id)?.state;
+
+/**
+ * Whether the asset row has a ready file: its own, or one of the uploads in flight beside it (another `prepareAssets`
+ * for the same content ran before this publisher's confirm), which then becomes the row's file. The uploads still
+ * in flight stay referenced (their publishers confirm them); the others (finished duplicates, failed) are let go.
+ */
+function promoteReady(ctx: Ctx["mutation"], row: AssetRow): boolean {
+  if (fileState(ctx, row.file) === "ready") return true;
+  const candidates = [row.file, ...(row.pending ?? [])];
+  const file = candidates.find((f) => fileState(ctx, f) === "ready");
+  if (!file) return false;
+  const pending = candidates.filter((f) => f !== file && fileState(ctx, f) === "pending");
+  ctx.db.patch(row._id, { file, pending: pending.length ? pending : undefined });
+  return true;
+}
+
+/** At most this many uploads of one content in flight at once (each keeps its file referenced until it is used). */
+const MAX_PENDING_UPLOADS = 16;
 
 /** Inserts a new head row (createdAt strictly after the current head, so clients see it as newer). */
 type UpdateRow = Omit<ReturnType<typeof liveRows>[number], "_id" | "_creationTime" | "createdAt">;
@@ -253,9 +299,16 @@ export const functions = {
             out.push({ sha256: a.sha256, exists: true });
             continue;
           }
+          if (row && promoteReady(ctx, row)) {
+            out.push({ sha256: a.sha256, exists: true });
+            continue;
+          }
           const ticket = ctx.storage.generateUploadUrl({ sha256: a.sha256, size: a.size, contentType: a.contentType });
-          // The row references the file from now on (refcount): a pending upload is not collected while it is here.
-          if (row) ctx.db.patch(row._id, { file: ticket.storageId as never, contentType: a.contentType, size: a.size });
+          // The row references the file from now on (refcount): a pending upload is not collected while it is here. An
+          // upload of the same content already in flight keeps its place (its publisher confirms it, and either serves).
+          const inFlight = row ? [row.file, ...(row.pending ?? [])].filter((f) => f !== ticket.storageId && fileState(ctx, f) === "pending") : [];
+          if (inFlight.length >= MAX_PENDING_UPLOADS) throw new EmberError("ValidationError", `asset ${a.sha256}: ${MAX_PENDING_UPLOADS} uploads of it are already in flight`);
+          if (row) ctx.db.patch(row._id, { file: ticket.storageId as never, pending: inFlight.length ? inFlight : undefined, contentType: a.contentType, size: a.size });
           else ctx.db.insert("assets", { sha256: a.sha256, file: ticket.storageId as never, contentType: a.contentType, size: a.size, createdAt: ctx.now });
           if (ticket.exists || !ticket.url) out.push({ sha256: a.sha256, exists: true });
           else out.push({ sha256: a.sha256, exists: false, upload: { storageId: ticket.storageId, shard: ticket.shard, token: ticket.token, url: ticket.url, method: ticket.method ?? "PUT", headers: ticket.headers ?? {} } });
@@ -301,6 +354,8 @@ export const functions = {
           if (!u.runtimeVersion || u.runtimeVersion.length > 256) throw new EmberError("ValidationError", "runtimeVersion must be 1..256 characters");
           // Clients send it as a header, whose value has no surrounding whitespace: such an update could never be asked for.
           if (u.runtimeVersion.trim() !== u.runtimeVersion) throw new EmberError("ValidationError", `runtimeVersion ${JSON.stringify(u.runtimeVersion)} has surrounding whitespace`);
+          // Nor NUL, CR, LF or other controls (a header value cannot carry them).
+          if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(u.runtimeVersion)) throw new EmberError("ValidationError", `runtimeVersion ${JSON.stringify(u.runtimeVersion)} has control characters`);
           for (const x of [u.launchAsset, ...u.assets]) checkAsset(ctx, x, ready);
           if (u.assets.length > 2000) throw new EmberError("ValidationError", "at most 2000 assets per update");
           const [head] = liveRows(ctx, a.branch, u.platform, u.runtimeVersion, 1);
@@ -388,7 +443,11 @@ export const functions = {
       },
     }),
 
-    /** Creates or updates a channel: its branch, and optionally a branch rollout (`rolloutBranch` null clears it). */
+    /**
+     * Creates or updates a channel: its branch, and optionally a branch rollout (`rolloutBranch` null clears it). The
+     * channel then serves the target branch's head as it is: an install only moves to a newer `createdAt`, so one that
+     * runs a newer update of the previous branch keeps it until something newer is published where it now points.
+     */
     setChannel: mutation({
       args: { name: v.string(), branch: v.string(), rolloutBranch: v.optional(v.union(v.string(), v.null())), rolloutPercent: v.optional(v.number()) },
       handler: (ctx, a) => {

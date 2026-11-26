@@ -137,6 +137,10 @@ ember expo list
   falls below `p`, so raising `p` only adds installs, and installs on the other side get the previous update.
   Publishing on top of an unfinished rollout is refused (`RolloutInProgress`). A channel can also send a share of
   its installs to a second branch.
+- **Pointing a channel elsewhere** (`setChannel`, or clearing its branch rollout) serves the other branch's current
+  head as it is: installs only move to a newer `createdAt`, so one already running a newer update from the previous
+  branch keeps it. To bring those back, republish the target update after the switch (`ember expo publish` of the
+  same export, or a `rollback` on the previous branch), which gives it a newer `createdAt`.
 - **Rollback** takes the head out (`rolledBack`) and republishes the previous update as a new one (clients only move
   to a newer `createdAt`), or publishes `rollBackToEmbedded` with `--to-embedded` or when there is no previous update.
 - **Kill switch**: a paused channel answers `noUpdateAvailable` to all its installs; a paused branch, to the installs
