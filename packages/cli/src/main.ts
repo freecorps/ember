@@ -28,6 +28,7 @@ import { exportEmber, importEmber } from "./export.ts";
 import { rotateKeys, type RotateKind } from "./keys.ts";
 import { filesOrphans, parseDuration } from "./files.ts";
 import { destroy } from "./destroy.ts";
+import { formatShardList, formatShardReport, inspectShard, listShards } from "./shards.ts";
 import { checkEnvArgs, DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
 
 const HELP = `ember <command> [options]
@@ -79,6 +80,13 @@ Commands:
                                           Stream the Worker's logs (tail API). --fn/--shard filter per execution
                                           (needs the Worker var EMBER_TRACE=1; else they match log text)
   projects ls [--json]                    Projects and environments in the account registry (D1 ember-registry)
+  shards ls [--env name] [--kind k] [--json]
+                                          The environment's shards from the registry catalog: size, schema version,
+                                          last write (what each shard last reported)
+  shards inspect <kind:key> [--env name | --url URL] [--json] [--admin-token T]
+                                          One shard, live (admin endpoints): size, schema and commit version,
+                                          tables with row counts, open jobs, subscriptions, files, outbox. Without
+                                          --env/--url: the running \`ember dev\`
   domains add <host> [--env name] [--dry-run]
                                           Attach a Custom Domain after checking the zone's routes, custom domains and
                                           the registry for conflicts
@@ -454,6 +462,31 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           console.log(`${p.name}${p.repo ? `  (${p.repo})` : ""}  fingerprint ${p.fingerprint.slice(0, 8)}…`);
           for (const e of p.envs) console.log(`  ${e.env.padEnd(10)} ${e.worker.padEnd(36)} ${e.url ?? "-"}  schema ${e.schemaVersion?.slice(0, 12) ?? "-"}  ${e.lastDeploy ? new Date(e.lastDeploy).toISOString() : ""}`);
         }
+      return 0;
+    }
+    case "shards": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: { env: { type: "string" }, url: { type: "string" }, "admin-token": { type: "string" }, kind: { type: "string" }, json: { type: "boolean" }, registry: { type: "string" } },
+      });
+      const [sub, shard] = positionals;
+      const project = loadProject();
+      if ((sub ?? "ls") === "ls") {
+        if (values.url) throw new Error("shards ls reads the registry catalog of an environment: pass --env, not --url");
+        const env = resolveEnv(project, values.env);
+        const reg = await D1Registry.open(accountClient(project, undefined, env.name), registryName(values.registry), { create: false, ddl: false });
+        const shards = await listShards((sql, ...p) => reg.exec(sql, ...p), project.config.project, env.name, values.kind ? { kind: values.kind } : {});
+        console.log(values.json ? JSON.stringify(shards, null, 2) : formatShardList(shards));
+        return 0;
+      }
+      if (sub !== "inspect" || !shard || positionals.length > 2) throw new Error("usage: ember shards ls [--env name] [--kind k] [--json] | ember shards inspect <kind:key> [--env name | --url URL] [--json]");
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("shards inspect reads the shard through the admin endpoints: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
+      // Without --env and --url: the local `ember dev`.
+      const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(values.env ? { env: resolveEnv(project, values.env).name } : {}) });
+      const r = await inspectShard({ url, adminToken }, shard);
+      console.log(values.json ? JSON.stringify(r, null, 2) : formatShardReport(r));
       return 0;
     }
     case "domains": {
