@@ -89,7 +89,11 @@ export function EmbedBlock({ c, b, tab }: { c: EmbedHost; b: EmbedSpec; tab: str
     if (own.current === c.version) return;
     setGen((g) => g + 1);
   }, [c.version]);
-  const generation = `${c.shard}#${gen}`;
+  // A generation never comes back: a counter moved by every new `gen` and every shard change (A → B → A is a third
+  // generation, not the first again), so a write answered after its page was replaced never passes for current.
+  const seq = useRef({ shard: c.shard, gen, n: 0 });
+  if (seq.current.shard !== c.shard || seq.current.gen !== gen) seq.current = { shard: c.shard, gen, n: seq.current.n + 1 };
+  const generation = `${c.shard}#${seq.current.n}`;
   const current = useRef(generation);
   current.current = generation;
   // The exemption only for the page that is still the current one: a write answered after the page was replaced (by
