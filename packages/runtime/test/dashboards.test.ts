@@ -121,4 +121,19 @@ describe("dashboards (admin API)", () => {
     expect((await embed("tally", "/dashboard/page", "wrong")).status).toBe(401);
     expect((await SELF.fetch("http://ember/api/_ember/dashboards/embed?dashboard=tally&route=%2Fdashboard%2Fpage", { method: "POST", headers: { authorization: "Bearer admin-secret" } })).status).toBe(405);
   });
+
+  it("an embed page over 1 MiB is refused even when the route streams it without content-length", async () => {
+    const big = await SELF.fetch(`http://ember/api/_ember/dashboards/embed?${new URLSearchParams({ dashboard: "tally", route: "/dashboard/big" })}`, { headers: { authorization: "Bearer admin-secret" } });
+    expect(big.status).toBe(413);
+    expect(((await big.json()) as { error: { code: string } }).error.code).toBe("too_large");
+  });
+
+  it("an embed page is served by its own install's route, never by another scope's route at the same path", async () => {
+    // The app serves a route at /tally/dashboard/shadowed, the mounted path of tally's embed: ingress picks the app's,
+    // the embed always tally's own.
+    expect(await (await SELF.fetch("http://ember/tally/dashboard/shadowed")).text()).toBe("<p>the app's page</p>");
+    const res = await SELF.fetch(`http://ember/api/_ember/dashboards/embed?${new URLSearchParams({ dashboard: "tally", route: "/dashboard/shadowed" })}`, { headers: { authorization: "Bearer admin-secret" } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("<p>tally's own page</p>");
+  });
 });

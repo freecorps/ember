@@ -508,12 +508,14 @@ async function handleEmbed(request: Request, url: URL, deps: AdminDeps): Promise
   if (!deps.embedRoute) return deps.error(501, "not_supported", "this runtime cannot serve embed routes");
   const res = await deps.embedRoute(block.path ?? block.route, spec.key ? spec.key.split("/") : []);
   if (!res) return deps.error(404, "unknown_route", `no GET route serves ${block.path ?? block.route} (was it removed from the http router?)`);
+  // The real size, not `content-length` (a route may stream without one): read up to the limit, then cancel.
   const len = Number(res.headers.get("content-length") ?? "0");
-  if (len > DASHBOARD_EMBED_MAX) {
+  const bytes = len > DASHBOARD_EMBED_MAX ? null : await readLimited(res.body, DASHBOARD_EMBED_MAX);
+  if (!bytes) {
     await res.body?.cancel().catch(() => undefined);
     return deps.error(413, "too_large", `the embed page is over ${DASHBOARD_EMBED_MAX} bytes`);
   }
-  return new Response(res.body, {
+  return new Response(bytes as Uint8Array<ArrayBuffer>, {
     status: res.status,
     headers: {
       "content-type": res.headers.get("content-type") ?? "application/octet-stream",
