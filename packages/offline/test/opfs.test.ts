@@ -55,6 +55,8 @@ function fakeOpfs() {
         reserveMinimumCapacity: async (n) => (fs.capacity = Math.max(fs.capacity, n)),
         getCapacity: () => fs.capacity,
         getFileCount: () => fs.files.size,
+        // The wasm file stays (empty): reopened under the same name, as a new OPFS file would be.
+        unlink: (file) => fs.files.delete(file),
         isPaused: () => paused,
         pauseVfs() {
           paused = true;
@@ -264,6 +266,32 @@ describe("opfs storage (Node wiring over SQLite-Wasm)", () => {
     await again.load();
     for (const sh of shards) expect((await again.runQueryLocally({ ...at(sh), identity: null }))!.value).toEqual(list);
     for (const sh of ["new:1", "new:2", "new:3"]) await again.applyPatch({ ...at(sh), value: list, version: 1 });
+    await again.close();
+  });
+
+  it("a shard left empty gives its file back to the pool; a cold start opens the main database only", async () => {
+    const opfs = fakeOpfs();
+    const srv = engineServer();
+    srv.m("messages:send", { channel: "a", body: "hi" });
+    const list = srv.q("messages:list", { channel: "a" });
+    const args = { channel: "a" };
+    const at = (shard: string) => ({ shard, fn: "messages:list", args, argsJson: stableStringify(args) });
+    const name = `e-${Math.random().toString(36).slice(2)}`;
+    const options = { name, schema, queries: offlineQueries, sqlite3: async () => opfs.module() };
+    const s = await openOpfsStore(options);
+    await s.load();
+    for (const sh of ["org:1", "org:2", "org:3"]) await s.applyPatch({ ...at(sh), value: list, version: 1 });
+    expect(opfs.dir(name)!.files.size).toBe(4);
+    await s.close();
+    const again = await openOpfsStore(options);
+    await again.load();
+    expect((await again.runQueryLocally({ ...at("org:2"), identity: null }))!.value).toEqual(list);
+    await again.clear();
+    expect(opfs.dir(name)!.files.size).toBe(1);
+    // Written again: a new file.
+    await again.applyPatch({ ...at("org:2"), value: list, version: 2 });
+    expect(opfs.dir(name)!.files.size).toBe(2);
+    expect((await again.runQueryLocally({ ...at("org:2"), identity: null }))!.value).toEqual(list);
     await again.close();
   });
 

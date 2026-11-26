@@ -85,6 +85,38 @@ describe("tinybase storage", () => {
     await s.close();
   });
 
+  it("a failed batch of the queue: a mutation queued after it still sorts after one written while it was saving", async () => {
+    const store = createStore();
+    let gate: Promise<void> | null = null;
+    let open!: () => void;
+    const persister = {
+      load: async () => {},
+      save: async () => {
+        if (!gate) return;
+        const g = gate;
+        gate = null;
+        await g;
+        throw new Error("quota exceeded");
+      },
+    };
+    const s = tinybaseStorage({ store: store as unknown as TinyStore, persister, schema, queries: offlineQueries });
+    await s.load();
+    type Be = { putPending(r: unknown): Promise<void>; batchPending(ops: unknown[]): Promise<void>; loadPending(): Promise<Array<{ mid: string }>> };
+    const be = (s as unknown as { backend: Be }).backend;
+    const rec = (mid: string) => ({ mid, shard: SHARD, fn: "messages:send", args: {}, createdAt: 1, identity: null });
+    await be.putPending(rec("first"));
+    gate = new Promise<void>((r) => (open = r));
+    const failed = be.batchPending([{ mid: "lost", record: rec("lost") }]);
+    // Written while the batch is still saving (its save waits for the batch's): it stays.
+    const kept = be.putPending(rec("kept"));
+    open();
+    await expect(failed).rejects.toThrow("quota exceeded");
+    await kept;
+    await be.putPending(rec("after"));
+    expect((await be.loadPending()).map((r) => r.mid)).toEqual(["first", "kept", "after"]);
+    await s.close();
+  });
+
   it("keeps values JSON cannot carry (int64, bytes, NaN, nested objects, null)", async () => {
     const odd = defineSchema({
       tables: { blobs: defineTable({ n: v.int64(), data: v.bytes(), f: v.float64(), meta: v.object({ tags: v.array(v.string()), x: v.null() }) }) },
