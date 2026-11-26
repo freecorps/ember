@@ -200,30 +200,37 @@ type RangeOp = { op: "eq" | "gt" | "gte" | "lt" | "lte"; field: string; value: u
 
 /**
  * The `q` of `withIndex(name, q => ...)`: records the bounds in order (`withIndex` checks them against the index). One
- * object per call with its methods on the prototype, not five closures per call (they are called on `q`, chained).
+ * object per call with its methods on the prototype, not five closures per call. They are called on `q`, chained, or
+ * detached (`({ eq }) => eq("userId", id)`): without a builder as `this`, a method records on the one `withIndex` is
+ * building (`active`), as the closures it replaces did.
  */
 class RangeBuilder {
   readonly ops: RangeOp[] = [];
-  eq(field: string, value: unknown): this {
-    this.ops.push({ op: "eq", field, value });
-    return this;
+  eq(field: string, value: unknown): RangeBuilder {
+    return rangeOp(this, "eq", field, value);
   }
-  gt(field: string, value: unknown): this {
-    this.ops.push({ op: "gt", field, value });
-    return this;
+  gt(field: string, value: unknown): RangeBuilder {
+    return rangeOp(this, "gt", field, value);
   }
-  gte(field: string, value: unknown): this {
-    this.ops.push({ op: "gte", field, value });
-    return this;
+  gte(field: string, value: unknown): RangeBuilder {
+    return rangeOp(this, "gte", field, value);
   }
-  lt(field: string, value: unknown): this {
-    this.ops.push({ op: "lt", field, value });
-    return this;
+  lt(field: string, value: unknown): RangeBuilder {
+    return rangeOp(this, "lt", field, value);
   }
-  lte(field: string, value: unknown): this {
-    this.ops.push({ op: "lte", field, value });
-    return this;
+  lte(field: string, value: unknown): RangeBuilder {
+    return rangeOp(this, "lte", field, value);
   }
+}
+
+/** The builder of the `withIndex` callback running now (a callback is synchronous: one at a time, nested at most). */
+let active: RangeBuilder | undefined;
+
+function rangeOp(self: unknown, op: RangeOp["op"], field: string, value: unknown): RangeBuilder {
+  const b = self instanceof RangeBuilder ? self : active;
+  if (!b) throw new EmberError("QueryError", `withIndex(): ${op}() called outside the index range callback`);
+  b.ops.push({ op, field, value });
+  return b;
 }
 
 export class QueryImpl {
@@ -298,7 +305,15 @@ export class QueryImpl {
       throw new EmberError("IndexNotReady", `Index ${this.t.name}.${name} is still backfilling and cannot be queried yet`);
     }
     const b = new RangeBuilder();
-    build?.(b);
+    if (build) {
+      const outer = active;
+      active = b;
+      try {
+        build(b);
+      } finally {
+        active = outer;
+      }
+    }
     this.index = name;
     let i = 0;
     for (const o of b.ops) {

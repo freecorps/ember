@@ -185,4 +185,22 @@ describe("withIndex range builder", () => {
     expect(run((q) => q.eq("n", 1))).toBe("withIndex(by_a): eq(n) must be on a");
     expect(run((q) => q.gt("a", "a").eq("a", "b"))).toBe("withIndex(by_a): eq() after a range bound");
   });
+
+  it("detached methods (`({ eq }) => eq(...)`) record on the builder, as the closures they replace did", () => {
+    const { engine } = counted();
+    engine.runMutation(insert("b"), {});
+    engine.runMutation(insert("d"), {});
+    const run = (build: (q: any) => unknown) =>
+      (engine.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.query("t").withIndex("by_a", build).collect().map((d: any) => d.a) }) as any, {}) as { value: unknown }).value;
+    expect(run(({ eq }) => eq("a", "b"))).toEqual(["b"]);
+    expect(run(({ gte, lt }) => (gte("a", "a"), lt("a", "c")))).toEqual(["b"]);
+    expect(run(({ gt }) => gt("a", "b").lte("a", "d"))).toEqual(["d"]);
+    const { lt } = (() => {
+      let kept: any;
+      run((q) => ((kept = q), q));
+      return kept;
+    })();
+    // Outside its callback a detached method has no builder to record on.
+    expect(() => lt("a", "c")).toThrow("called outside the index range callback");
+  });
 });
