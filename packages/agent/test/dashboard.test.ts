@@ -25,4 +25,24 @@ describe("agent dashboard", () => {
     expect(engine.runMutation("@agent/lib:deleteThread", { threadId: a }).value).toBe(true);
     expect(engine.runQuery("@agent/dashboard:thread", { threadId: a }).value).toBeNull();
   });
+
+  test("threads by activity through an index (no scan for a status), prompts counted from 0", () => {
+    const composed = composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(agent, { config: { workersAi: false } }) });
+    let now = 1_700_000_000_000;
+    const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver: createNodeSqliteDriver(), now: () => now++ });
+    engine.migrate();
+    const ids = Array.from({ length: 40 }, (_, i) => engine.runMutation("@agent/lib:createThread", { userId: `u${i}`, title: `t${i}` }).value as string);
+    engine.runMutation("@agent/lib:updateThread", { threadId: ids[3]!, patch: { status: "archived" } });
+    // The oldest thread, touched last, comes first: by activity (updatedAt), not by creation.
+    engine.runMutation("@agent/lib:updateThread", { threadId: ids[0]!, patch: { title: "renamed" } });
+    const run = (args: object) => engine.runQuery("@agent/dashboard:threads", { paginationOpts: { numItems: 5, cursor: null }, ...args });
+    const all = run({}).value as { page: Array<{ _id: string; prompts: number }> };
+    expect(all.page.map((t) => t._id).slice(0, 2)).toEqual([ids[0], ids[3]]);
+    // No prompt yet: 0 (lastOrder is -1).
+    expect(all.page[0]!.prompts).toBe(0);
+    const archived = run({ status: "archived" });
+    expect((archived.value as { page: Array<{ _id: string }> }).page.map((t) => t._id)).toEqual([ids[3]]);
+    // One status is a range of by_status: it never reads the other 39 threads.
+    expect(archived.usage!.rowsRead).toBeLessThan(10);
+  });
 });

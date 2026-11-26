@@ -65,7 +65,11 @@ const schema = defineSchema({
       /** `order` of the last prompt (the next one gets +1). */
       lastOrder: v.number(),
       updatedAt: v.number(),
-    }).index("by_user", ["userId", "updatedAt"]),
+    })
+      .index("by_user", ["userId", "updatedAt"])
+      // The dashboard's thread list (`dashboard:threads`): every thread by activity, and one status by activity.
+      .index("by_updated", ["updatedAt"])
+      .index("by_status", ["status", "updatedAt"]),
     messages: defineTable({
       thread: v.id("threads"),
       userId: v.optional(v.string()),
@@ -725,15 +729,24 @@ export const functions = {
 
 /** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
 const dashboardFunctions = {
-  /** Threads in this shard (one user's, by their activity; else newest first), optionally by status. */
+  /**
+   * Threads in this shard by activity, most recent first: one user's (`by_user`; a status filters that user's), one
+   * status's (`by_status`) or all (`by_updated`). Each page is a range of an index, never a scan of the table.
+   */
   threads: internalQuery({
     args: { userId: v.optional(v.string()), status: v.optional(v.union(v.literal("active"), v.literal("archived"))), paginationOpts: paginationOptsValidator },
     handler: (ctx, a) => {
-      const base = a.userId !== undefined ? ctx.db.query("threads").withIndex("by_user", (q) => q.eq("userId", a.userId)).order("desc") : ctx.db.query("threads").order("desc");
-      const page = (a.status !== undefined ? base.filter((f) => f.eq(f.field("status"), a.status!)) : base).paginate(a.paginationOpts);
+      const q =
+        a.userId !== undefined
+          ? ctx.db.query("threads").withIndex("by_user", (r) => r.eq("userId", a.userId)).order("desc")
+          : a.status !== undefined
+            ? ctx.db.query("threads").withIndex("by_status", (r) => r.eq("status", a.status!)).order("desc")
+            : ctx.db.query("threads").withIndex("by_updated").order("desc");
+      const page = (a.userId !== undefined && a.status !== undefined ? q.filter((f) => f.eq(f.field("status"), a.status!)) : q).paginate(a.paginationOpts);
       return {
         ...page,
-        page: page.page.map((t) => ({ _id: t._id, userId: t.userId ?? null, title: t.title ?? null, status: t.status, prompts: t.lastOrder, tokens: t.usage.totalTokens ?? null, updatedAt: t.updatedAt })),
+        // `lastOrder` is the order of the last prompt, -1 before the first one.
+        page: page.page.map((t) => ({ _id: t._id, userId: t.userId ?? null, title: t.title ?? null, status: t.status, prompts: t.lastOrder + 1, tokens: t.usage.totalTokens ?? null, updatedAt: t.updatedAt })),
       };
     },
   }),
