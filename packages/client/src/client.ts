@@ -760,6 +760,12 @@ export class EmberClient {
   private readonly identityListeners = new Set<() => void>();
   /** Inside `setAuth` (which tells `onIdentityChange` listeners once, at the end). */
   private settingAuth = false;
+  /**
+   * Whom the current token source has answered for (`"anon"` or `identityCacheKey`): undefined until its first answer
+   * (or, with no source, until a request goes out anonymously). An answer for someone else than this one is an identity
+   * change (`onIdentityChange`); the first one is not (`setAuth` already told, if it replaced a source in use).
+   */
+  private answeredAs: string | undefined;
 
   private filesApi: FilesApi | undefined;
 
@@ -991,7 +997,10 @@ export class EmberClient {
     const inUse = this.authFetcher !== undefined || this.tokenSeen;
     const replaced = !!fetcher && inUse;
     if (inUse) this.serializedOwner = null;
+    // An anonymous session that already sent requests (no source yet) and now signs in also changes identity.
+    const announce = inUse || this.answeredAs !== undefined;
     this.authFetcher = fetcher;
+    this.answeredAs = undefined;
     this.authGen++;
     if (replaced) this.storedCurrent = false;
     // Listener-free subscriptions waiting out `unsubscribeGraceMs` hold the previous identity's value: a listener of
@@ -1024,7 +1033,7 @@ export class EmberClient {
     // Local values read for the previous identity leave the screen; read again once the new one is known.
     if (replaced) this.rereadLocal();
     void this.reauthAll(true);
-    if (inUse) this.emitIdentityChange();
+    if (announce) this.emitIdentityChange();
   }
 
   /** Same as `setAuth(undefined)`: open sockets send `{t:"auth", token:null}` and get fresh anonymous snapshots. */
@@ -1033,7 +1042,11 @@ export class EmberClient {
   }
 
   private fetchToken(): Promise<string | null> {
-    if (!this.authFetcher) return Promise.resolve(null);
+    if (!this.authFetcher) {
+      // A request goes out anonymously: signing in later is an identity change.
+      this.answeredAs ??= "anon";
+      return Promise.resolve(null);
+    }
     if (this.tokenInFlight) return this.tokenInFlight;
     const gen = this.authGen;
     const fetcher = this.authFetcher;
@@ -1205,6 +1218,11 @@ export class EmberClient {
     // Hydrated values are the first identity's the client learns (the one the server rendered for, normally), and
     // nobody else's: a fetcher that now answers for someone else does not hand them over (nor `dehydrate()`).
     const owner = id ? identityCacheKey(id) : "anon";
+    // The source answered before for someone else (anonymous included: it answered null, now a user's token): caches
+    // outside the client hold the previous one's. Its first answer is not a change (setAuth told already, if it was).
+    const switched = this.answeredAs !== undefined && this.answeredAs !== owner;
+    this.answeredAs = owner;
+    if (switched && !this.settingAuth) this.emitIdentityChange(); // setAuth emits once, at its end
     if (this.serializedOwner === undefined) this.serializedOwner = owner;
     else if (this.serializedOwner !== owner) this.serializedOwner = null;
     for (const [key, h] of this.hydrated) {
@@ -1225,7 +1243,6 @@ export class EmberClient {
     this.storedIdentity = id;
     // The same fetcher now answers for someone else (or for nobody): what waits out its grace was not theirs.
     this.identityChanged(!!prev);
-    if (prev && !this.settingAuth) this.emitIdentityChange(); // setAuth emits once, at its end
     // A local value read for the previous identity is not this one's: read again (or nothing) under the new one.
     this.rereadLocal();
     const offline = this.offline;
@@ -2517,9 +2534,11 @@ export class EmberClient {
 
   /**
    * Called when whoever the client runs as changes: `setAuth` replaced or removed a token source in use (sign-out,
-   * account switch), or the fetcher answered for someone else. Not on the first sign-in of a client built without one,
-   * nor on a renewed token of the same user. For caches outside the client (`@freecorps/ember-react-query`): what they
-   * hold was read for the previous identity.
+   * account switch) or signed in a session that already ran anonymously, or the fetcher answered for someone else
+   * than before (anonymous included: `null`, then a user's token). Not on the first sign-in of a client that has not
+   * sent anything yet, nor on the first answer of a new source (`setAuth` told already), nor on a renewed token of the
+   * same user. For caches outside the client (`@freecorps/ember-react-query`): what they hold was read for the
+   * previous identity.
    */
   onIdentityChange(cb: () => void): () => void {
     this.identityListeners.add(cb);

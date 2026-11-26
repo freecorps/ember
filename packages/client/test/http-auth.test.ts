@@ -313,4 +313,45 @@ describe("hydrate and whose read it is", () => {
     expect(n).toBe(2);
     c.close();
   });
+
+  it("onIdentityChange: a known anonymous session that signs in (fetcher null → JWT, or no source → setAuth); once per change", async () => {
+    // The same fetcher answers null (anonymous queries went out), then Ana's token.
+    const base = { url: "https://ember.test", WebSocket: null, connectivity: null, heartbeat: false, defaultShard: "global:main" } as const;
+    let token: string | null = null;
+    const a = new EmberClient({ ...base, fetch: worker().fetch, auth: () => token });
+    let n = 0;
+    a.onIdentityChange(() => n++);
+    await a.query(q, { a: 1 }); // anonymous
+    expect(n).toBe(0);
+    token = jwt("ana", 3600);
+    // The next fetch (a refresh, a reconnect) gets Ana's token from the same fetcher.
+    await (a as unknown as { fetchToken(): Promise<string | null> }).fetchToken();
+    expect(n).toBe(1);
+    await a.query(q, { a: 3 }); // still ana
+    expect(n).toBe(1);
+    a.close();
+    // No source: anonymous requests went out, then setAuth signs in.
+    const b = new EmberClient({ ...base, fetch: worker().fetch });
+    let m = 0;
+    b.onIdentityChange(() => m++);
+    await b.query(q, { a: 1 });
+    b.setAuth(() => jwt("ana", 3600));
+    expect(m).toBe(1);
+    // The new source's first answer (ana) is not another change: setAuth told already.
+    await b.query(q, { a: 2 });
+    expect(m).toBe(1);
+    // A switch: told at setAuth, not again when bob's token arrives.
+    b.setAuth(() => jwt("bob", 3600));
+    await b.query(q, { a: 3 });
+    expect(m).toBe(2);
+    b.close();
+    // No source and nothing sent yet: the first sign-in is not a change.
+    const c = new EmberClient({ ...base, fetch: worker().fetch });
+    let k = 0;
+    c.onIdentityChange(() => k++);
+    c.setAuth(() => jwt("ana", 3600));
+    await c.query(q, { a: 1 });
+    expect(k).toBe(0);
+    c.close();
+  });
 });
