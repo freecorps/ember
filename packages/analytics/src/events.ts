@@ -15,7 +15,7 @@ export const MAX_PROPS = 20;
 export const MAX_PROP_LENGTH = 256;
 /** Characters of `userId` (when it is taken from the batch, `trustClientUserId`) and of an identity subject kept. */
 export const MAX_USER_ID_LENGTH = 128;
-/** Bytes of the JSON of the props that no dimension or measure takes (blob7). */
+/** Bytes (UTF-8) of the JSON of the props that no dimension or measure takes (blob7). */
 export const MAX_EXTRA_BYTES = 2048;
 /** A client `ts` this far in the past (or `MAX_FUTURE_MS` in the future) is replaced by the time the server got it. */
 export const MAX_PAST_MS = 7 * 24 * 3600 * 1000;
@@ -29,8 +29,11 @@ export const MAX_MEASURES = 19;
  * and no backslash can ever be part of one, so a name is safe inside an SQL string literal (sql.ts still escapes).
  */
 export const EVENT_NAME = /^[A-Za-z](?:[A-Za-z0-9 _.:/-]{0,62}[A-Za-z0-9_.:/-])?$/;
-/** Prop keys (also dimension and measure names): identifiers up to 40 characters. */
-export const PROP_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/;
+/**
+ * Prop keys (also dimension and measure names): identifiers up to 40 characters, except `__proto__` (assigning it to a
+ * plain object sets the prototype or is ignored: the prop would be lost, or worse).
+ */
+export const PROP_KEY = /^(?!__proto__$)[A-Za-z_][A-Za-z0-9_]{0,39}$/;
 /** Anonymous ids: what the client generates (a UUID) or any opaque token of the same alphabet. */
 export const ANONYMOUS_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -137,7 +140,13 @@ export function checkBatch(body: unknown, o: CheckOptions): TrackedEvent[] {
   const max = o.maxEvents ?? MAX_EVENTS;
   if (events.length === 0) throw new BatchError("events is empty");
   if (events.length > max) throw new BatchError(`events has ${events.length} items (at most ${max})`);
-  return events.map((e, i) => checkEvent(e, `events[${i}]`, o));
+  // An index loop, not `map`: a sparse array (`new Array(3)` from server code) has holes `map` would skip.
+  const out: TrackedEvent[] = [];
+  for (let i = 0; i < events.length; i++) {
+    if (!(i in events)) throw new BatchError(`events[${i}] is missing`);
+    out.push(checkEvent(events[i], `events[${i}]`, o));
+  }
+  return out;
 }
 
 /** Parses and checks a batch body (JSON text, as `text/plain` beacons send it). */
@@ -194,6 +203,10 @@ export interface PointContext extends PointLayout {
  */
 export const BLOB = { name: 1, userId: 2, anonymousId: 3, source: 4, country: 5, install: 6, extra: 7, firstDimension: 8 } as const;
 
+const encoder = new TextEncoder();
+/** UTF-8 bytes of a string (what Analytics Engine counts for blobs). */
+const utf8Length = (s: string) => encoder.encode(s).length;
+
 export function toDataPoint(e: TrackedEvent, c: PointContext): DataPoint {
   const dims = c.dimensions ?? [];
   const meas = c.measures ?? [];
@@ -214,13 +227,13 @@ export function toDataPoint(e: TrackedEvent, c: PointContext): DataPoint {
     extra[k] = v;
   }
   let extraJson = Object.keys(extra).length ? JSON.stringify(extra) : "";
-  if (extraJson.length > MAX_EXTRA_BYTES) {
-    // Keep whole props, in order, while they fit (never a cut JSON). The size is counted as it grows: the JSON of a
-    // flat object is `{` + the `"key":value` entries joined by `,` + `}`, so this is exactly its length.
+  if (utf8Length(extraJson) > MAX_EXTRA_BYTES) {
+    // Keep whole props, in order, while they fit (never a cut JSON). The size is counted as it grows, in UTF-8 bytes:
+    // the JSON of a flat object is `{` + the `"key":value` entries joined by `,` + `}`, so this is exactly its size.
     const kept: Props = {};
     let size = 2;
     for (const [k, v] of Object.entries(extra)) {
-      const entry = (size > 2 ? 1 : 0) + JSON.stringify(k).length + 1 + JSON.stringify(v).length;
+      const entry = (size > 2 ? 1 : 0) + utf8Length(JSON.stringify(k)) + 1 + utf8Length(JSON.stringify(v));
       if (size + entry > MAX_EXTRA_BYTES) break;
       kept[k] = v;
       size += entry;

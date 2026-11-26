@@ -9,6 +9,8 @@ const refused = (body: unknown, re: RegExp) => {
   expect(() => checkBatch(body, { now })).toThrow(re);
 };
 
+const bytes = (s: string) => new TextEncoder().encode(s).length;
+
 describe("batch validation", () => {
   test("a valid batch: defaults filled, server time for a missing ts", () => {
     const [e] = ok([{ name: "signed_up", props: { plan: "pro", seats: 3, trial: true }, anonymousId: "a-1" }]);
@@ -97,21 +99,42 @@ describe("data points", () => {
     expect(toDataPoint({ ...e, props: {} }, { install: "a", source: "client" }).blobs[6]).toBe("");
     const big = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`k${i}`, "v".repeat(200)]));
     const json = toDataPoint({ ...e, props: big }, { install: "a", source: "client" }).blobs[6]!;
-    expect(json.length).toBeLessThanOrEqual(MAX_EXTRA_BYTES);
+    expect(bytes(json)).toBeLessThanOrEqual(MAX_EXTRA_BYTES);
     const kept = JSON.parse(json) as Record<string, string>;
     expect(Object.keys(kept).length).toBeGreaterThan(5);
     expect(Object.keys(kept)).toEqual(Object.keys(big).slice(0, Object.keys(kept).length));
     // The size counted as it grows is the JSON's: a prop that ends exactly at the cap is kept, one byte more is not.
-    const sizeOf = (p: Record<string, unknown>) => JSON.stringify(p).length;
+    const sizeOf = (p: Record<string, unknown>) => bytes(JSON.stringify(p));
     const base = Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, "v".repeat(200)]));
     for (const extra of [0, 1]) {
       const room = MAX_EXTRA_BYTES - sizeOf(base) - ',"last":""'.length;
       const props = { ...base, n: 1.5, t: true, last: "w".repeat(room - ',"n":1.5,"t":true'.length + extra) };
       const out = toDataPoint({ ...e, props }, { install: "a", source: "client" }).blobs[6]!;
-      expect(out.length).toBeLessThanOrEqual(MAX_EXTRA_BYTES);
+      expect(bytes(out)).toBeLessThanOrEqual(MAX_EXTRA_BYTES);
       expect(Object.keys(JSON.parse(out) as object).includes("last")).toBe(extra === 0);
-      if (extra === 0) expect(out.length).toBe(MAX_EXTRA_BYTES);
+      if (extra === 0) expect(bytes(out)).toBe(MAX_EXTRA_BYTES);
     }
+    // In UTF-8 bytes, not UTF-16 code units: 3 props of 256 CJK characters are ~800 code units but ~2300 bytes.
+    const cjk = { a: "語".repeat(256), b: "語".repeat(256), c: "語".repeat(256) };
+    expect(JSON.stringify(cjk).length).toBeLessThan(MAX_EXTRA_BYTES);
+    const cut = toDataPoint({ ...e, props: cjk }, { install: "a", source: "client" }).blobs[6]!;
+    expect(bytes(cut)).toBeLessThanOrEqual(MAX_EXTRA_BYTES);
+    expect(Object.keys(JSON.parse(cut) as object)).toEqual(["a", "b"]);
+    // The exact-limit rule holds in bytes too: a multi-byte prop that ends exactly at the cap is kept.
+    const two = { a: "語".repeat(256), b: "語".repeat(256) };
+    const room = MAX_EXTRA_BYTES - bytes(JSON.stringify(two)) - bytes(',"z":""');
+    expect(Object.keys(JSON.parse(toDataPoint({ ...e, props: { ...two, z: "x".repeat(room) } }, { install: "a", source: "client" }).blobs[6]!) as object)).toEqual(["a", "b", "z"]);
+    expect(Object.keys(JSON.parse(toDataPoint({ ...e, props: { ...two, z: "x".repeat(room + 1) } }, { install: "a", source: "client" }).blobs[6]!) as object)).toEqual(["a", "b"]);
+  });
+
+  test("__proto__ is not a prop key (a plain object would lose it); sparse batches are refused", () => {
+    const body = JSON.parse('{"events":[{"name":"a","props":{"__proto__":"x"}}]}') as unknown;
+    expect(() => checkBatch(body, { now: 1 })).toThrow(/invalid key/);
+    expect(() => checkLayout({ dimensions: ["__proto__"] })).toThrow(/invalid prop/);
+    expect(() => checkBatch({ events: new Array(2) }, { now: 1 })).toThrow(/events\[0\] is missing/);
+    const holey: unknown[] = [{ name: "a" }];
+    holey[2] = { name: "b" };
+    expect(() => checkBatch({ events: holey }, { now: 1 })).toThrow(/events\[1\] is missing/);
   });
 
   test("layouts: identifiers, no repeats, within the column counts", () => {
