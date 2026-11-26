@@ -192,6 +192,16 @@ describe("measure / lastStats", () => {
     expect(t.lastStats()?.rowsWritten).toBe(3);
   });
 
+  it("convexTest: a job its (real) timer starts is a call of its own, not part of the call that scheduled it", async () => {
+    using c = convexTest(schema, { items });
+    await c.mutation(api.items.later, {});
+    const base = await c.ember();
+    expect(base.lastStats()?.rowsWritten).toBe(0);
+    await new Promise((r) => setTimeout(r, 40));
+    await c.finishInProgressScheduledFunctions();
+    expect(base.lastStats()?.rowsWritten).toBe(3);
+  });
+
   it("concurrent calls do not mix", async () => {
     using t = emberTest({ schema, modules: { items } });
     await t.mutation(api.items.seed, { count: 5 });

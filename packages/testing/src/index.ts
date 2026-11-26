@@ -235,12 +235,18 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     }
   };
   const statsOf = (c: Collector): ExecutionStats => ({ rowsRead: c.rowsRead, rowsWritten: c.rowsWritten, documentsRead: c.documentsRead });
-  const collector = (call: boolean): Collector => ({ rowsRead: 0, rowsWritten: 0, documentsRead: 0, call, parent: usageScope.getStore() });
-  /** A call from the test (not one nested in a running action): its own collector, `lastStats` when it settles. */
-  const tracked = <R>(fn: () => Promise<R>): Promise<R> => {
+  const collector = (call: boolean, parent = usageScope.getStore()): Collector => ({ rowsRead: 0, rowsWritten: 0, documentsRead: 0, call, parent });
+  /**
+   * A call from the test (not one nested in a running action): its own collector, `lastStats` when it settles.
+   * `job`: a scheduled job, always a call of its own, even when its timer (convexTest) carries the async context of the
+   * call that scheduled it; only the `measure`s around count it too.
+   */
+  const tracked = <R>(fn: () => Promise<R>, job = false): Promise<R> => {
     if (closed) return Promise.reject(new Error("emberTest: this harness is closed (t.close())"));
-    for (let c = usageScope.getStore(); c; c = c.parent) if (c.call) return fn();
-    const c = collector(true);
+    let parent = usageScope.getStore();
+    if (job) while (parent?.call) parent = parent.parent;
+    else for (let c = parent; c; c = c.parent) if (c.call) return fn();
+    const c = collector(true, parent);
     const p = usageScope.run(c, fn).finally(() => {
       last = statsOf(c);
       inFlight.delete(p);
@@ -540,7 +546,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         await tracked(async () => {
           if (j.kind === "mutation") await system.mutation(namedRef<"mutation">(j.fn), j.args as Record<string, unknown>, { shard: j.shard });
           else await (system as unknown as { _action(name: string, args: unknown, shard: string): Promise<unknown> })._action(j.fn, j.args, j.shard);
-        });
+        }, true);
       } catch (e) {
         setState(j.id, { kind: "failed", error: `${(e as { code?: string }).code ?? "Error"}: ${(e as Error)?.message ?? String(e)}` });
         throw e;
