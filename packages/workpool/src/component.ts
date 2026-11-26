@@ -729,11 +729,19 @@ export const functions = {
 
     // ------------------------------------------------------------------------------------------- dashboard
 
-    /** Items of this pool in this shard, newest first (by status: in queue order). The dashboard's "Items" table. */
+    /**
+     * Items of this pool in this shard, newest first. One status: pending and running in queue order (`by_queue`),
+     * finished ones newest finished first (`by_finished`). Every page is a range of an index (no scan of the table).
+     * The dashboard's "Items" table.
+     */
     list: internalQuery({
       args: { status: v.optional(status), paginationOpts: paginationOptsValidator },
       handler: (ctx, { status: s, paginationOpts }) => {
-        const q = s ? ctx.db.query("work").withIndex("by_queue", (r) => r.eq("status", s)) : ctx.db.query("work").order("desc");
+        const q = !s
+          ? ctx.db.query("work").order("desc")
+          : s === "pending" || s === "running"
+            ? ctx.db.query("work").withIndex("by_queue", (r) => r.eq("status", s))
+            : ctx.db.query("work").withIndex("by_finished", (r) => r.eq("status", s)).order("desc");
         const page = q.paginate(paginationOpts);
         return { ...page, page: page.page.map(itemView) };
       },
@@ -747,7 +755,8 @@ export const functions = {
         if (!w) return null;
         const events: Array<{ at: number; event: string; status?: string }> = [{ at: w.enqueuedAt, event: "enqueued" }];
         if (w.startedAt !== undefined) events.push({ at: w.startedAt, event: `attempt ${w.attempts} started` });
-        if (w.attemptAt !== undefined && w.attempts > 1 && w.status === "running") events.push({ at: w.attemptAt, event: `attempt ${w.attempts} due`, status: "retrying" });
+        // A retry waiting for its backoff (finishing clears `attemptAt`).
+        if (w.attemptAt !== undefined && w.attempts > 1) events.push({ at: w.attemptAt, event: `attempt ${w.attempts} due`, status: "retrying" });
         if (w.finishedAt !== undefined) events.push({ at: w.finishedAt, event: "finished", status: w.status });
         return { ...itemView(w), args: w.args, context: w.context ?? null, retry: w.retry ?? null, result: w.result ?? null, onCompleteError: w.onCompleteError ?? null, events };
       },

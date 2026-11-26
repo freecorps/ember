@@ -46,4 +46,17 @@ describe("workpool dashboard", () => {
     const after = (await t.query(fn("list"), { status: "canceled", paginationOpts: { numItems: 10, cursor: null } })) as { page: unknown[] };
     expect(after.page.length).toBeGreaterThanOrEqual(2);
   });
+
+  test("a finished status lists newest finished first through by_finished; no status reads more than its page", async () => {
+    const t = emberTest({ schema, modules: { jobs }, app });
+    const ids = (await t.mutation(unsafeRef<"mutation">("jobs:add"), { n: 30 })) as string[];
+    // Every item canceled at once (the running one's job had not started yet).
+    expect(await t.mutation(fn("cancelAll"), {})).toBe(30);
+    const { value, stats } = await t.measure(() => t.query(fn("list"), { status: "canceled", paginationOpts: { numItems: 5, cursor: null } }));
+    const page = (value as { page: Array<{ _id: string; status: string }> }).page;
+    expect(page.map((w) => w.status)).toEqual(Array(5).fill("canceled"));
+    // Newest finished first (queue order would show the first one enqueued).
+    expect(page[0]!._id).toBe(ids[29]);
+    expect(stats.rowsRead).toBeLessThan(20);
+  });
 });
