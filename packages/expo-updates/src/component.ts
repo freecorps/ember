@@ -21,7 +21,7 @@
  *   uploaded once, whatever the number of updates that use them.
  */
 import { componentBuilders, defineComponent, defineErrors, defineSchema, defineTable, EmberError, httpRouter, paginationOptsValidator, unsafeRef, v, type ComponentCtx } from "@freecorps/ember-server";
-import { assetHash, buildManifest, finalOutcome, isSha256Hex, isUuid, parseUpdateRequest, ProtocolError, renderResponse, rsaSigner, SigningKeyMissing, type Platform, type RenderedResponse, type StoredAsset, type UpdateRequest } from "./protocol.ts";
+import { buildManifest, finalOutcome, isSha256Hex, isUuid, parseUpdateRequest, ProtocolError, renderResponse, rsaSigner, SigningKeyMissing, type Platform, type RenderedResponse, type StoredAsset, type UpdateRequest } from "./protocol.ts";
 import { resolvePlan, type BranchPlan, type Plan, type PlanEntry } from "./rollout.ts";
 
 const vPlatform = v.union(v.literal("ios"), v.literal("android"));
@@ -599,7 +599,7 @@ const assetsAction = httpAction(async (ctx, request) => {
   if (!a || !file) return text(404, "unknown asset");
   const bytes = await file.arrayBuffer();
   // Content-addressed (the URL is the SHA-256): never changes, cached for a year at the edge and on the device.
-  const headers = { "content-type": a.contentType, "cache-control": "public, max-age=31536000, immutable", etag: `"${key}"`, "x-ember-asset-hash": assetHash(key) };
+  const headers = { "content-type": a.contentType, "cache-control": "public, max-age=31536000, immutable", etag: `"${key}"` };
   if (edge) await edge.put(cacheKey, new Response(bytes, { headers })).catch(() => undefined);
   return new Response(bytes, { headers: { ...headers, "x-ember-cache": "MISS" } });
 });
