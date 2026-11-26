@@ -24,7 +24,7 @@ const feedByClaim = routed<FunctionReference<"query", "public", { paginationOpts
 const shoutByOrg = routed<FunctionReference<"action", "public", { orgId: string; text: string }, string>>("ai:shoutByOrg", { kind: "org", fromArg: "orgId" });
 const jwt = (payload: object) => `x.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.y`;
 
-function setup(opts: { defaultShard?: string } = {}) {
+function setup(opts: { defaultShard?: string; auth?: () => string } = {}) {
   // Newest first, `cursor` = the last `n` of the previous page.
   const feed = (db: { where<T>(t: string, f: string, v: unknown): T[] }, tag: string, o: { numItems: number; cursor: string | null }) => {
     const all = db.where<Note>("notes", "tag", tag).sort((a, b) => b.n - a.n);
@@ -60,7 +60,7 @@ function setup(opts: { defaultShard?: string } = {}) {
     fetch,
     connectivity: null,
     heartbeat: false,
-    ...(opts.defaultShard ? { defaultShard: opts.defaultShard } : { auth: () => jwt({ sub: "ana", org: "beta" }) }),
+    ...(opts.defaultShard ? { defaultShard: opts.defaultShard } : { auth: opts.auth ?? (() => jwt({ sub: "ana", org: "beta" })) }),
   });
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   new EmberQueryClient(ember).connect(queryClient);
@@ -168,6 +168,47 @@ describe("emberPaginatedQuery", () => {
     const key = emberPaginatedQuery(feedByClaim, {}, { numItems: 2 }).queryKey;
     expect(queryClient.getQueryData(key)).toBeDefined();
     await act(async () => ember.setAuth(() => jwt({ sub: "ana", org: "beta" })));
+    expect(queryClient.getQueryData(key)).toBeUndefined();
+    ember.close();
+  });
+
+  it("a fromAuth claim moving to another shard (same user, active org switched) resets the pages; a renewal keeps them", async () => {
+    let token = jwt({ sub: "ana", org: "beta" });
+    const { server, ember, queryClient, wrap } = setup({ auth: () => token });
+    for (let n = 1; n <= 5; n++) server.mutateDirect("org:beta", "notes:add", { tag: "org:beta", n });
+    for (let n = 1; n <= 3; n++) server.mutateDirect("org:gamma", "notes:add", { tag: "org:gamma", n: n * 100 });
+    let q!: UseInfiniteQueryResult<InfiniteData<Page<Note>, string | null>, unknown>;
+    const shown: string[] = [];
+    function Feed() {
+      q = useInfiniteQuery(emberPaginatedQuery(feedByClaim, {}, { numItems: 2 }));
+      const text = q.status === "success" ? q.data.pages.flatMap((p) => p.page.map((d) => d.n)).join(",") : q.status;
+      shown.push(text);
+      return <div data-testid="f">{text}</div>;
+    }
+    const view = wrap(<Feed />);
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("5,4"));
+    await act(async () => void (await q.fetchNextPage()));
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("5,4,3,2"));
+    const refetchToken = () => (ember as unknown as { fetchToken(): Promise<string | null> }).fetchToken();
+    // A renewed token, same claim: the pages stay (no refetch from page 1).
+    token = jwt({ sub: "ana", org: "beta", exp: 4_000_000_000 });
+    await act(async () => void (await refetchToken()));
+    expect(q.data!.pageParams).toEqual([null, "4"]);
+    shown.length = 0;
+    // Same user, active org gamma: beta's pages are not shown nor extended with beta's cursor on gamma's shard.
+    token = jwt({ sub: "ana", org: "gamma" });
+    await act(async () => void (await refetchToken()));
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("300,200"));
+    expect(shown.filter((t) => /\b[1-5]\b/.test(t))).toEqual([]);
+    expect(q.data!.pageParams).toEqual([null]);
+    await act(async () => void (await q.fetchNextPage()));
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("300,200,100"));
+    // Unobserved: dropped when the claim moves again.
+    view.unmount();
+    const key = emberPaginatedQuery(feedByClaim, {}, { numItems: 2 }).queryKey;
+    expect(queryClient.getQueryData(key)).toBeDefined();
+    token = jwt({ sub: "ana", org: "beta" });
+    await act(async () => void (await refetchToken()));
     expect(queryClient.getQueryData(key)).toBeUndefined();
     ember.close();
   });

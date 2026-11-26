@@ -685,3 +685,81 @@ describe("functions routed by their own shard spec", () => {
     ember.close();
   });
 });
+
+describe("identity change (CWE-524): observed queries keep nothing of the previous identity", () => {
+  const secret = unsafeRef<"query">("me:secret");
+  const jwt = (sub: string) => `x.${Buffer.from(JSON.stringify({ sub })).toString("base64url")}.y`;
+  function identitySetup() {
+    const server = new FakeEmberServer({
+      verify: (token) => ({ subject: (JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString()) as { sub: string }).sub }),
+      queries: {
+        "me:secret": (_db, _args, ctx) => {
+          if (!ctx.identity) throw new FakeFunctionError("Unauthenticated", "sign in");
+          return `secret of ${ctx.identity.subject}`;
+        },
+      },
+    });
+    let failHttp = false;
+    const fetch: typeof globalThis.fetch = (input, init) => (failHttp ? Promise.reject(new TypeError("offline")) : server.fetch(input, init));
+    const ember = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch, connectivity: null, heartbeat: false, defaultShard: SHARD, auth: () => jwt("ana") });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    new EmberQueryClient(ember).connect(queryClient);
+    const shown: string[] = [];
+    function Secret() {
+      const { data, status, error } = useQuery(emberQuery(secret, {}));
+      const text = status === "success" ? String(data) : status === "error" ? `error:${(error as { code?: string }).code}${data ? `+${String(data)}` : ""}` : status;
+      shown.push(text);
+      return <div data-testid="secret">{text}</div>;
+    }
+    const wrap = () => render(<QueryClientProvider client={queryClient}>{<Secret />}</QueryClientProvider>);
+    const key = emberQuery(secret, {}).queryKey;
+    return { server, ember, queryClient, wrap, shown, key, offline: () => (failHttp = true) };
+  }
+
+  it("sign-out whose anonymous refresh fails: the previous identity's value is gone, not kept next to the error", async () => {
+    const { ember, queryClient, wrap, shown, key } = identitySetup();
+    wrap();
+    await waitFor(() => expect(screen.getByTestId("secret").textContent).toBe("secret of ana"));
+    shown.length = 0;
+    act(() => ember.clearAuth());
+    expect(queryClient.getQueryData(key)).toBeUndefined();
+    await waitFor(() => expect(screen.getByTestId("secret").textContent).toBe("error:Unauthenticated"));
+    expect(queryClient.getQueryData(key)).toBeUndefined();
+    expect(shown.filter((t) => t.includes("ana"))).toEqual([]);
+    // A refetch does not bring the previous identity's snapshot back either.
+    await act(async () => void (await queryClient.refetchQueries({ queryKey: key }).catch(() => undefined)));
+    expect(queryClient.getQueryData(key)).toBeUndefined();
+    ember.close();
+  });
+
+  it("an account switch with no refresh arriving (offline): nothing of the previous identity, then the new one's value", async () => {
+    const { server, ember, queryClient, wrap, shown, key, offline } = identitySetup();
+    wrap();
+    await waitFor(() => expect(screen.getByTestId("secret").textContent).toBe("secret of ana"));
+    shown.length = 0;
+    // The socket's answers wait, and HTTP fails: no value for Bob arrives.
+    for (const s of server.sockets) s.hold();
+    offline();
+    await act(async () => ember.setAuth(() => jwt("bob")));
+    await act(async () => void (await queryClient.refetchQueries({ queryKey: key }).catch(() => undefined)));
+    expect(queryClient.getQueryData(key)).toBeUndefined();
+    expect(shown.filter((t) => t.includes("ana"))).toEqual([]);
+    // Bob's snapshot reaches the cache through the subscription that stayed.
+    for (const s of server.sockets) s.release();
+    await waitFor(() => expect(screen.getByTestId("secret").textContent).toBe("secret of bob"));
+    expect(shown.filter((t) => t.includes("ana"))).toEqual([]);
+    ember.close();
+  });
+
+  it("a new source for the same user (no new snapshot: the shard sees a renewal): the value comes back over HTTP", async () => {
+    const { server, ember, queryClient, wrap, key } = identitySetup();
+    wrap();
+    await waitFor(() => expect(screen.getByTestId("secret").textContent).toBe("secret of ana"));
+    const before = server.httpRequests.length;
+    act(() => ember.setAuth(() => jwt("ana")));
+    expect(queryClient.getQueryData(key)).toBeUndefined();
+    await waitFor(() => expect(screen.getByTestId("secret").textContent).toBe("secret of ana"));
+    expect(server.httpRequests.slice(before).map((r) => r.authorization)).toContain(`Bearer ${jwt("ana")}`);
+    ember.close();
+  });
+});

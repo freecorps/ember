@@ -244,11 +244,12 @@ export function emberPaginatedQuery<Q extends PaginatedQueryReference>(ref: Q, a
       args === "skip"
         ? skipToken
         : (ctx) =>
-            (connected(ctx.client).client.query as (r: Q, a: unknown, x: unknown) => Promise<Page>)(
+            connected(ctx.client).fetchPage(
+              ctx.queryKey,
               ref,
               { ...(args as Record<string, unknown>), paginationOpts: { numItems: o.numItems, cursor: ctx.pageParam } },
-              shard === undefined ? undefined : { shard },
-            ),
+              shard,
+            ) as Promise<Page>,
     initialPageParam: null,
     getNextPageParam: (last) => (last.isDone ? undefined : last.continueCursor),
     queryKeyHashFn: emberQueryKeyHashFn,
@@ -278,7 +279,22 @@ interface Live {
    * `setQueryData` and then the fetch's: one render on a cold load).
    */
   fetching?: Array<{ key: EmberQueryKey; resolve: (v: unknown) => void; reject: (e: unknown) => void }> | undefined;
+  /** The last snapshot the subscription handed over. */
+  last?: QuerySnapshot | undefined;
+  /**
+   * The snapshot it held when the identity changed (the previous identity's value or error): never written to the
+   * cache nor answered to a `queryFn` again. Cleared by the next one the subscription hands over (a value read for the
+   * new identity); until then a `queryFn` reads over HTTP, as whoever is signed in now.
+   */
+  stale?: QuerySnapshot | undefined;
 }
+
+/** Where a `fromAuth` paginated query's pages were read: the shard of the token's claim then. */
+interface PageRoute {
+  route: ClaimRoute;
+  shard: string;
+}
+type ClaimRoute = NonNullable<ReturnType<EmberClient["claimRoute"]>>;
 
 /** `emberQueryKeyHashFn` of an ember key's hydration entry, from the key's own hash: no second encoding of the args. */
 const HASH_PREFIX = 'ember:["ember",';
@@ -289,6 +305,10 @@ export class EmberQueryClient {
   private queryClient: QueryClient | null = null;
   private stopCache: (() => void) | null = null;
   private stopIdentity: (() => void) | null = null;
+  /** Following the token's claims (`fromAuth` paginated queries): started by the first such query read. */
+  private stopClaims: (() => void) | null = null;
+  /** By the query's key array (what its `queryFn` gets): the shard its pages were read from. */
+  private readonly pageRoutes = new WeakMap<QueryKey, PageRoute>();
   private readonly live = new Map<string, Live>();
   /** The same, by the query's key array (the very one its `queryFn` gets): found without hashing it again. */
   private readonly liveByKey = new WeakMap<QueryKey, Live>();
@@ -323,6 +343,8 @@ export class EmberQueryClient {
     this.stopCache = null;
     this.stopIdentity?.();
     this.stopIdentity = null;
+    this.stopClaims?.();
+    this.stopClaims = null;
     for (const t of this.idle.values()) clearTimeout(t);
     this.idle.clear();
     const live = [...this.live.values()];
@@ -337,9 +359,11 @@ export class EmberQueryClient {
 
   /**
    * Sign-out or account switch (`client.onIdentityChange`): what the TanStack cache holds was read for the previous
-   * identity. Paginated queries (not live) are reset: no page of theirs is shown, nor extended with its cursor, under
-   * the new one (observed ones refetch from page 1). Ember queries nobody observes are removed (a live one gets the
-   * new identity's value from its subscription), with the hydration entries of a server render.
+   * identity, and none of it stays. Ember queries nobody observes are removed, with the hydration entries of a server
+   * render. Observed ones are reset (no data, no error): their subscription stays, but what it holds now is the
+   * previous identity's (`Live.stale`), so they read again over HTTP as the new one, and take the subscription's values
+   * again from the first new one. Paginated queries (not live) are reset too: no page of theirs is shown, nor extended
+   * with its cursor (observed ones refetch from page 1).
    */
   private identityChanged(): void {
     const qc = this.queryClient;
@@ -349,7 +373,55 @@ export class EmberQueryClient {
       return k === "ember" || k === "ember:paginated" || k === "ember:hydration";
     };
     qc.removeQueries({ predicate: (q) => ours(q) && q.getObserversCount() === 0 });
-    qc.resetQueries({ predicate: (q) => q.queryKey[0] === "ember:paginated" }).catch(() => {});
+    for (const l of this.live.values()) {
+      const held = l.last;
+      if (held && held.status !== "loading") l.stale = held;
+    }
+    qc.resetQueries({ predicate: (q) => q.queryKey[0] === "ember:paginated" || (isEmberQueryKey(q.queryKey) && this.live.has(q.queryHash)) }).catch(() => {});
+  }
+
+  /**
+   * @internal One page of an `emberPaginatedQuery` (`client.query`). A `fromAuth` one remembers the shard of the
+   * token's claim its first page was read from: when the claim moves to another shard (an org switch), its pages are
+   * another shard's and its cursor means nothing there (`claimsChanged`).
+   */
+  fetchPage(key: QueryKey, ref: QueryReference, args: Record<string, unknown>, shard: string | undefined): Promise<unknown> {
+    const opts = shard === undefined ? undefined : { shard };
+    const read = (r: QueryReference, a: unknown, o: unknown) => (this.client.query as (r: QueryReference, a: unknown, o: unknown) => Promise<unknown>)(r, a, o);
+    const route = this.client.claimRoute(ref, opts);
+    if (!route) return read(ref, args, opts);
+    this.stopClaims ??= route.onChange(() => this.claimsChanged());
+    const first = (args.paginationOpts as { cursor?: unknown } | undefined)?.cursor === null;
+    // Where the pages are: the claim's shard when page 1 is asked for (or, with the token not known yet, once read).
+    const keep = () => {
+      const now = route.current();
+      if (typeof now === "string" && (first || !this.pageRoutes.has(key))) this.pageRoutes.set(key, { route, shard: now });
+    };
+    keep();
+    return read(ref, args, opts).then((page) => {
+      if (!this.pageRoutes.has(key)) keep();
+      return page;
+    });
+  }
+
+  /** The token changed: paginated `fromAuth` queries whose claim now points to another shard start over. */
+  private claimsChanged(): void {
+    const qc = this.queryClient;
+    if (!qc) return;
+    const moved = new Set<Query>();
+    for (const q of qc.getQueryCache().getAll()) {
+      if (q.queryKey[0] !== "ember:paginated") continue;
+      const r = this.pageRoutes.get(q.queryKey);
+      if (!r) continue;
+      const now = r.route.current();
+      // Not known yet (the token is being fetched): decided when it is.
+      if (now === undefined || now === r.shard) continue;
+      this.pageRoutes.delete(q.queryKey);
+      moved.add(q);
+    }
+    if (!moved.size) return;
+    qc.removeQueries({ predicate: (q) => moved.has(q) && q.getObserversCount() === 0 });
+    qc.resetQueries({ predicate: (q) => moved.has(q) }).catch(() => {});
   }
 
   /** Number of live subscriptions held for the TanStack cache. */
@@ -378,11 +450,16 @@ export class EmberQueryClient {
       return this.client.fetchForHydration(ref, args, opts).then((h) => (qc ? keepMeta(qc, key, h) : h.value));
     }
     const now = this.client.localQueryResult(ref, args, opts);
+    const l = byKey && this.live.get(byKey.query.queryHash) === byKey ? byKey : this.live.get(hashOf());
+    // After an identity change, until the subscription hands over a new snapshot: what it holds (or is about to show
+    // again, while the token is fetched) is the previous identity's. Read over HTTP, as whoever is signed in now.
+    if (l?.stale && (now === l.stale || now.status === "loading")) {
+      return (this.client.query as (r: QueryReference, a: unknown, o: unknown) => Promise<unknown>)(ref, args, { ...opts, transport: "http" });
+    }
     if (now.status === "success") return Promise.resolve(now.value);
     // An error already there is not sent again: waiting for the next snapshot would never settle.
     if (now.status === "error") return Promise.reject(now.error);
     // Observed: its live subscription (`watch`) brings the value.
-    const l = byKey && this.live.get(byKey.query.queryHash) === byKey ? byKey : this.live.get(hashOf());
     if (l) return new Promise((resolve, reject) => (l.fetching ??= []).push({ key, resolve, reject }));
     return this.fetchOnce(ref, args, opts);
   }
@@ -495,6 +572,12 @@ export class EmberQueryClient {
     const l = this.live.get(hash);
     const qc = this.queryClient;
     if (!l || !qc) return;
+    l.last = s;
+    if (l.stale) {
+      // The previous identity's snapshot is never written again; the first new one is the new identity's.
+      if (s === l.stale) return;
+      if (s.status !== "loading") l.stale = undefined;
+    }
     const waiting = l.fetching;
     if (waiting && s.status !== "loading") {
       l.fetching = undefined;
