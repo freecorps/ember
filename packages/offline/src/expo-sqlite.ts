@@ -121,11 +121,27 @@ export function loadExpoSqlite(): OpenDatabaseSync | null {
   }
 }
 
+/** expo-sqlite's `deleteDatabaseSync` (database file, WAL and shm), when installed. */
+export function loadExpoSqliteDelete(): ((name: string) => void) | null {
+  try {
+    const m = require("expo-sqlite");
+    const del = m?.deleteDatabaseSync ?? m?.default?.deleteDatabaseSync;
+    return typeof del === "function" ? del : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface ExpoSqliteStorageOptions extends OfflineOptions {
   /** Database name prefix (files `<name>.db`, `<name>-<hash>.db`). Default `"ember"`. */
   name?: string;
   /** expo-sqlite's `openDatabaseSync` (default: required lazily). */
   openDatabaseSync?: OpenDatabaseSync;
+  /**
+   * expo-sqlite's `deleteDatabaseSync`, which deletes the database of a shard left empty (default: required lazily
+   * along with `openDatabaseSync`; with an injected `openDatabaseSync` only when given; `null`: never delete).
+   */
+  deleteDatabaseSync?: ((name: string) => void) | null;
   /** Shard databases kept open at once (least recently used closed first). Default 8. */
   maxOpenShards?: number;
 }
@@ -156,5 +172,6 @@ export function expoSqliteStorage(options: ExpoSqliteStorageOptions): OfflineSto
     if (name !== main) pragma("PRAGMA synchronous = NORMAL");
     return expoSqliteDriver(d);
   };
-  return createOfflineStorage(new SqliteBackend(options.schema, db, main, options), options);
+  const del = options.deleteDatabaseSync !== undefined ? options.deleteDatabaseSync : options.openDatabaseSync ? null : loadExpoSqliteDelete();
+  return createOfflineStorage(new SqliteBackend(options.schema, db, main, { ...options, ...(del ? { remove: (name: string) => del(`${name}.db`) } : {}) }), options);
 }

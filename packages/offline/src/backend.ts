@@ -96,8 +96,14 @@ export interface BackendReader extends LocalReader {
 export type ExternalChange = { shard: string; tables: string[] };
 
 export interface OfflineBackend {
-  /** Open / migrate (a schema change the planner refuses resets the replica; pending survives). */
-  open(): Promise<{ meta: Record<string, string>; queries: QueryRecord[]; log?: QueryLogEntry[] }>;
+  /**
+   * Open / migrate (a schema change the planner refuses resets the replica; pending survives). `lazy`: shards whose
+   * records were left out (read with `openShard` when the store first needs one of them), so opening — what the
+   * client's `hello` waits for — does not read every shard.
+   */
+  open(): Promise<{ meta: Record<string, string>; queries: QueryRecord[]; log?: QueryLogEntry[]; lazy?: string[] }>;
+  /** With `lazy` from `open()`: the records and log of one of those shards. */
+  openShard?(shard: string): Promise<{ queries: QueryRecord[]; log?: QueryLogEntry[] }> | { queries: QueryRecord[]; log?: QueryLogEntry[] };
   setMeta(key: string, value: string | null): Promise<void> | void;
   loadPending(): Promise<PendingMutationRecord[]> | PendingMutationRecord[];
   putPending(record: PendingMutationRecord): Promise<void> | void;

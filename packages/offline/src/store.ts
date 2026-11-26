@@ -211,6 +211,8 @@ export class OfflineStore implements StorageAdapter {
   private readonly registry: Map<string, AnyRegisteredFunction>;
   private readonly replicated: Set<string>;
   private readonly records = new Map<string, Rec>();
+  /** Shards whose records the backend has not read yet (`OfflineBackend.openShard`). */
+  private readonly unloaded = new Set<string>();
   /** `${shard}\0${id}` → number of records owning the row. */
   private readonly refs = new Map<string, number>();
   /** `${shard}\0${id}` → the row as last written / read (unknown after a restart until needed). */
@@ -272,30 +274,48 @@ export class OfflineStore implements StorageAdapter {
   private open(): Promise<void> {
     if (!this.opened) {
       this.opened = (async () => {
-        const { meta, queries, log = [] } = await this.backend.open();
+        const { meta, queries, log = [], lazy } = await this.backend.open();
         this.meta = { ...meta };
-        const logs = new Map<string, QueryLogEntry[]>();
-        for (const e of log) {
-          const list = logs.get(e.key);
-          if (list) list.push(e);
-          else logs.set(e.key, [e]);
-        }
-        const broken: Rec[] = [];
-        for (const r of queries) {
-          const rec = this.replay(r, (logs.get(r.key) ?? []).sort((a, b) => a.seq - b.seq));
-          this.records.set(rec.key, rec);
-          for (const id of rec.ids) this.ref(rec.shard, id, +1);
-          if (rec.skel === BROKEN) broken.push(rec);
-        }
-        // Retention: what the server has not refreshed for too long goes, with the rows only it owned.
-        const cutoff = this.now() - (this.options.retentionMs ?? 30 * DAY);
-        const stale = [...this.records.values()].filter((r) => r.updatedAt < cutoff || r.skel === BROKEN);
-        if (stale.length) await this.dropRecords(stale);
+        // Shards the backend did not read yet: their records load on first use (`ensureShard`).
+        if (lazy && this.backend.openShard) for (const shard of lazy) this.unloaded.add(shard);
+        await this.addRecords(queries, log);
         this.stopExternal = this.backend.onExternalChange?.((c) => this.onExternal(c)) ?? null;
       })();
       this.chain = this.opened.catch(() => undefined);
     }
     return this.opened;
+  }
+
+  /** Stored records (and their log) into memory; then retention drops what the server has not refreshed for too long. */
+  private async addRecords(queries: QueryRecord[], log: QueryLogEntry[]): Promise<void> {
+    const logs = new Map<string, QueryLogEntry[]>();
+    for (const e of log) {
+      const list = logs.get(e.key);
+      if (list) list.push(e);
+      else logs.set(e.key, [e]);
+    }
+    const cutoff = this.now() - (this.options.retentionMs ?? 30 * DAY);
+    const stale: Rec[] = [];
+    for (const r of queries) {
+      const rec = this.replay(r, (logs.get(r.key) ?? []).sort((a, b) => a.seq - b.seq));
+      this.records.set(rec.key, rec);
+      for (const id of rec.ids) this.ref(rec.shard, id, +1);
+      // Retention: with the rows only it owned. A log that does not apply: the same.
+      if (rec.updatedAt < cutoff || rec.skel === BROKEN) stale.push(rec);
+    }
+    if (stale.length) await this.dropRecords(stale);
+  }
+
+  /**
+   * A shard's records in memory before anything reads or writes it (a backend that opens shards lazily: only the
+   * first use of each reads them). In the write queue, like every caller. A failed read leaves it unloaded (retried by
+   * the next use) and fails this one.
+   */
+  private async ensureShard(shard: string): Promise<void> {
+    if (!this.unloaded.has(shard)) return;
+    const { queries, log = [] } = await this.backend.openShard!(shard);
+    this.unloaded.delete(shard);
+    await this.addRecords(queries, log);
   }
 
   /** A stored record with its log applied. A log that does not apply marks the record broken (dropped on open). */
@@ -492,7 +512,19 @@ export class OfflineStore implements StorageAdapter {
   private async applyBurst(items: Pending[]): Promise<void> {
     if (this.burst === items) this.burst = null;
     const txs = new Map<string, { tx: ShardTx; items: Pending[] }>();
+    const failed = new Map<string, unknown>();
+    for (const shard of new Set(items.map((it) => it.u.shard))) {
+      try {
+        await this.ensureShard(shard);
+      } catch (e) {
+        failed.set(shard, e);
+      }
+    }
     for (const it of items) {
+      if (failed.has(it.u.shard)) {
+        it.reject(failed.get(it.u.shard));
+        continue;
+      }
       let t = txs.get(it.u.shard);
       if (!t) txs.set(it.u.shard, (t = { tx: newTx(), items: [] }));
       try {
@@ -912,6 +944,7 @@ export class OfflineStore implements StorageAdapter {
    * value at that version, so the client may `resume` from it.
    */
   private async evaluate(req: LocalQueryRequest, fn: AnyRegisteredFunction | undefined): Promise<{ result: LocalQueryResult | undefined; readSet: ReadSet | null }> {
+    await this.ensureShard(req.shard);
     const cached = this.records.get(recordKey(req.shard, req.fn, req.argsJson));
     // Only its owner's (an unknown owner is nobody's); one stored before owners were recorded is shown, never resumed.
     const mine = cached !== undefined && cached.owner !== undefined && cached.owner === ownerKey(req.identity);
@@ -1089,7 +1122,11 @@ export class OfflineStore implements StorageAdapter {
 
   /** Forget every cached result and replicated row (e.g. on sign-out on a shared device). Pending mutations stay. */
   async clear(): Promise<void> {
-    await this.enqueue(() => this.dropRecords([...this.records.values()]));
+    await this.enqueue(async () => {
+      // Every shard, read or not yet.
+      for (const shard of [...this.unloaded]) await this.ensureShard(shard);
+      await this.dropRecords([...this.records.values()]);
+    });
   }
 
   async close(): Promise<void> {

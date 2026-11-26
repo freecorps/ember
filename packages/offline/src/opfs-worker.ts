@@ -33,6 +33,8 @@ export interface SahPool {
   /** Files the pool can hold / holds now (every database stored, open or not, and live journals). */
   getCapacity?(): number;
   getFileCount?(): number;
+  /** Deletes a (closed) database file of the pool (its slot goes back to the pool). */
+  unlink?(filename: string): boolean;
   pauseVfs(): unknown;
   unpauseVfs(): Promise<unknown>;
   isPaused(): boolean;
@@ -124,6 +126,8 @@ export async function openOpfsStore(options: OpfsWorkerOptions, loaded?: { pool?
       grow();
       return db;
     },
+    // A shard left empty gives its file back to the pool.
+    ...(p.unlink ? { remove: (n: string) => void p.unlink!(`/${n}.db`) } : {}),
   });
   const close = store.close.bind(store);
   store.close = async () => {
