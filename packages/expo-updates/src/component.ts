@@ -177,7 +177,7 @@ const ROLLBACK_SCAN_MAX = 1000;
  * `ROLLBACK_WINDOW` until another release shows up; past `ROLLBACK_SCAN_MAX` copies of the head's release it refuses
  * (a rollback there must say `toEmbedded`, or the copies be rolled back first) rather than guess.
  */
-function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runtimeVersion: string) {
+function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runtimeVersion: string, toEmbedded = false) {
   const rows: ReturnType<typeof liveRows> = [];
   for (;;) {
     const last = rows[rows.length - 1];
@@ -194,6 +194,9 @@ function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runti
     if (!head) return null;
     const prev = rows.find((r) => releaseOf(r) !== releaseOf(head)) ?? null;
     if (prev || step.length < ROLLBACK_WINDOW) return { head, prev, rows: prev ? rows.slice(0, rows.indexOf(prev)) : rows };
+    // Past the bound: to the embedded update the copies read so far go (a later rollback takes the rest);
+    // otherwise no previous release can be told, and the rollback refuses rather than guess.
+    if (rows.length >= ROLLBACK_SCAN_MAX && toEmbedded) return { head, prev: null, rows };
     if (rows.length >= ROLLBACK_SCAN_MAX) throw new EmberError("ValidationError", `${branch} ${platform} ${runtimeVersion}: more than ${ROLLBACK_SCAN_MAX} live copies of ${releaseOf(head)}; roll back with toEmbedded`);
   }
 }
@@ -479,7 +482,8 @@ export const functions = {
         for (const p of pairsOf(ctx, a.branch, a.platform, a.runtimeVersion)) {
           // A rollback takes out the head's release (the head and the live copies of it a rollback republished) and
           // goes back to the newest live row of another release: rolling back B' (a republish of B) reaches A, not B.
-          const scan = previousRelease(ctx, a.branch, p.platform, p.runtimeVersion);
+          // To the embedded update no previous release is needed: the search stops at its bound instead of refusing.
+          const scan = previousRelease(ctx, a.branch, p.platform, p.runtimeVersion, !!a.toEmbedded);
           if (!scan) continue;
           const { head, prev, rows } = scan;
           const bad = releaseOf(head);

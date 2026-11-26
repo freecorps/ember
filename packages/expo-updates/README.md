@@ -142,8 +142,10 @@ ember expo list
   head as it is: installs only move to a newer `createdAt`, so one already running a newer update from the previous
   branch keeps it. To bring those back, republish the target update on the target branch after the switch
   (`ember expo publish` of the same export there), which gives it a newer `createdAt`. If the target branch has an
-  unfinished rollout, that publish is refused (`RolloutInProgress`): finish it first (`ember expo rollout` to 100,
-  which serves its update to every install) or roll it back, then publish. A rollback on the previous
+  unfinished rollout, that publish is refused (`RolloutInProgress`, which names the platform and runtime version):
+  finish it first, `ember expo rollout 100 --branch <target> --platform <p> --runtime-version <v>` (its update goes
+  to every install), or take it out with `ember expo rollback --branch <target> --platform <p> --runtime-version <v>`,
+  then publish. Without `--platform`/`--runtime-version` both commands act on every pair of the branch. A rollback on the previous
   branch does not help: it changes that branch (and the other channels still on it), not the target's head.
 - **Rollback** takes the head out (`rolledBack`) and republishes the previous update as a new one (clients only move
   to a newer `createdAt`), or publishes `rollBackToEmbedded` with `--to-embedded` or when there is no previous update.

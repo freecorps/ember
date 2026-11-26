@@ -250,6 +250,19 @@ describe("expo updates component", () => {
     expect(((await t.mutation(m("rollback"), { branch: "production" })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
   }, 60_000);
 
+  test("past the copies a rollback can tell apart, it refuses; to the embedded update it still runs", async () => {
+    const t = harness();
+    await publish(t, { bundle: "A" });
+    await publish(t, { bundle: "B" });
+    for (let i = 0; i < 1001; i++) {
+      await publish(t, { bundle: `tmp-${i}` });
+      await t.mutation(m("rollback"), { branch: "production" });
+    }
+    await expect(t.mutation(m("rollback"), { branch: "production" })).rejects.toThrow(/live copies.*toEmbedded/);
+    expect(((await t.mutation(m("rollback"), { branch: "production", toEmbedded: true })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
+    expect((await ask(t)).kind).toBe("rollBackToEmbedded");
+  }, 180_000);
+
   test("branch-wide commands find every live platform and runtime version, however many rows other ones have", async () => {
     const t = harness();
     await publish(t, { bundle: "ios-1", platforms: ["ios"] });
