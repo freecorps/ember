@@ -536,21 +536,28 @@ function Toggle({ c, value, loaded, label, mutation, args, arg, disabled }: { c:
   const [busy, setBusy] = useState(false);
   const [flipped, setFlipped] = useState<boolean | null>(null);
   const [expected, setExpected] = useState<string | null>(null);
+  /** The value the confirmation asks about: the retry sends exactly it, whatever a reload showed meanwhile. */
+  const [pending, setPending] = useState<boolean | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
   useEffect(() => setFlipped(null), [loaded]);
   const shown = flipped ?? value;
+  const target = pending ?? !shown;
   const run = async (typed: string | null) => {
-    const next = !shown;
+    const next = typed !== null && pending !== null ? pending : !shown;
     setBusy(true);
     setError(null);
     try {
       await runWrite(c, mutation, { ...args, [arg]: next }, typed);
       setExpected(null);
+      setPending(null);
       setFlipped(next);
       c.changed();
     } catch (x) {
       const e = x instanceof ApiError ? x : new ApiError(0, "error", String(x));
-      if (e.code === "confirmation_required" && typeof e.data?.expected === "string") setExpected(e.data.expected);
+      if (e.code === "confirmation_required" && typeof e.data?.expected === "string") {
+        setPending(next);
+        setExpected(e.data.expected);
+      }
       else if (expected !== null) setError(e);
       else s.toast({ kind: "bad", text: `${label}: ${e.message}`, detail: e.code });
     } finally {
@@ -574,14 +581,15 @@ function Toggle({ c, value, loaded, label, mutation, args, arg, disabled }: { c:
       </button>
       <ConfirmDialog
         open={expected !== null}
-        title={`${label}: turn ${shown ? "off" : "on"} on ${c.env}?`}
-        confirmLabel={shown ? "Turn off" : "Turn on"}
+        title={`${label}: turn ${target ? "on" : "off"} on ${c.env}?`}
+        confirmLabel={target ? "Turn on" : "Turn off"}
         danger
         expected={expected}
         busy={busy}
         error={error}
         onCancel={() => {
           setExpected(null);
+          setPending(null);
           setError(null);
         }}
         onConfirm={(typed) => void run(typed)}
