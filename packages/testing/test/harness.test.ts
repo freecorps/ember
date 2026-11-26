@@ -89,6 +89,15 @@ describe("ctx.storage in actions and HTTP actions", () => {
     await expect(none.fetch("/missing")).rejects.toThrow(/http router/);
   });
 
+  it("fetch: a route added to the router after emberTest() matches (routes are read at each request)", async () => {
+    const http = httpRouter();
+    using t = emberTest({ schema, modules: { files }, http });
+    expect((await t.fetch("/late")).status).toBe(404);
+    http.route({ path: "/late", method: "GET", handler: httpAction(async () => new Response("late")) });
+    const res = await t.fetch("/late");
+    expect([res.status, await res.text()]).toEqual([200, "late"]);
+  });
+
   it("a Buffer is copied: changing it after store() leaves the file, and the file reads back as exactly its bytes", async () => {
     using t = emberTest({ schema, modules: { files } });
     expect(await t.action(api.files.storeBuffer, {})).toEqual({ text: "hello", byteLength: 5, pooled: true });

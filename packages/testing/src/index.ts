@@ -206,8 +206,12 @@ export function emberTest(options: EmberTestOptions): EmberTest {
   const defaultShard = options.defaultShard ?? "global:main";
   const engines = new Map<string, Engine>();
   const composed = options.app ? composeApp({ schema: options.schema, functions: options.modules, app: options.app, http: options.http ?? null }) : null;
-  /** App routes, then the components' under their mounts (each runs in its own scope), as the Worker matches them. */
-  const routes = composed ? composed.routes : (options.http?.routes ?? []).map((r) => ({ ...r, scope: [] as string[] }));
+  /**
+   * App routes, then the components' under their mounts (each runs in its own scope), as the Worker matches them. Read
+   * at each request: a route added to the app's router after `emberTest()` still matches, as before.
+   */
+  const componentRoutes = composed ? composed.routes.filter((r) => r.scope.length > 0) : [];
+  const routesNow = () => [...(options.http?.routes ?? []).map((r) => ({ ...r, scope: [] as string[] })), ...componentRoutes];
   // Components first (their tables join the app's), then the replica tables, as the Worker builds it.
   const schema = withReplicas(composed?.schema ?? options.schema, options.replicas);
   const applier = replicaApplyFunction(() => schema.manifest);
@@ -619,6 +623,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       const stored = await serveStorage(request, url, { bucket, driverOf: (s) => drivers.get(s) ?? null, now });
       if (stored) return stored;
       // An explicit router with no routes still answers (404); only no router at all is a setup error.
+      const routes = routesNow();
       if (!options.http && !routes.length) throw new Error("fetch(): pass the app's http router (emberTest({ http }) / convexTest's `http` module), or an app whose components have routes");
       const hit = matchRoute(routes, request.method, url.pathname);
       if (!hit) return new Response(JSON.stringify({ ok: false, error: { code: "not_found", message: "not found" } }), { status: 404, headers: { "content-type": "application/json" } });
