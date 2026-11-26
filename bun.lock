@@ -256,6 +256,10 @@
         "wrangler": "^4.157.0",
       },
     },
+    "packages/dashboard-sdk": {
+      "name": "@freecorps/ember-dashboard-sdk",
+      "version": "0.9.0",
+    },
     "packages/email": {
       "name": "@freecorps/ember-email",
       "version": "0.9.0",
@@ -853,6 +857,8 @@
     "@freecorps/ember-client": ["@freecorps/ember-client@workspace:packages/client"],
 
     "@freecorps/ember-dashboard": ["@freecorps/ember-dashboard@workspace:apps/dashboard"],
+
+    "@freecorps/ember-dashboard-sdk": ["@freecorps/ember-dashboard-sdk@workspace:packages/dashboard-sdk"],
 
     "@freecorps/ember-email": ["@freecorps/ember-email@workspace:packages/email"],
 
