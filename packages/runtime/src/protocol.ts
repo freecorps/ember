@@ -34,9 +34,11 @@ export const MAX_BATCH_MESSAGES = 512;
  * - "zframe" (v1.5): after `ready`, a server frame larger than 2 KiB (ZFRAME_MIN_CHARS) may go as a binary message: the
  *   frame's UTF-8 text compressed with raw DEFLATE (`DecompressionStream("deflate-raw")` decodes it). Server → client
  *   only; frames keep their order. A client announces it only where it can decode it.
+ * - "ephemeral" (v1.6): channels (`join`/`leave`/`pub` → `joined`/`members`/`msg`/`left`): rooms of sockets on the
+ *   shard, broadcast in memory (no row, no version), authorized by the app's `defineApp({ channels })` (ephemeral.ts).
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "zframe", "rum"] as const;
+export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "zframe", "ephemeral", "rum"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
@@ -50,7 +52,22 @@ export type ClientMessage =
   | { t: "ack"; mids: Id[] }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated. */
-  | { t: "auth"; token: string | null };
+  | { t: "auth"; token: string | null }
+  /**
+   * Feature "ephemeral": join a channel (again: update the member state; without `state`, keep it). `ref` (a
+   * non-negative integer the sender picks): the answer to this frame (`joined`, `left` or `err`) carries it.
+   */
+  | { t: "join"; ch: string; state?: unknown; ref?: number }
+  | { t: "leave"; ch: string }
+  /**
+   * Feature "ephemeral": broadcast `data` to the channel's other members. With `ref`, the sender hears how it went:
+   * `published {ch, ref}` once it went out, or the refusal (`err`) with that `ref` (the `multiTab` leader relays it to
+   * the other tabs only then).
+   */
+  | { t: "pub"; ch: string; data: unknown; ref?: number };
+
+/** A channel member (feature "ephemeral"): one per socket; `user` is its identity's subject (null: anonymous). */
+export type ChannelMember = { id: string; user: string | null; state?: unknown };
 
 export type ServerMessage =
   /** `features`: the subset of the hello's features this server speaks (omitted when none). */
@@ -67,8 +84,18 @@ export type ServerMessage =
   | { t: "qres"; qid: Id; ok: false; error: WireError }
   | { t: "mres"; mid: Id; ok: true; value: unknown; version: number }
   | { t: "mres"; mid: Id; ok: false; error: WireError }
-  | { t: "err"; code: string; message: string; data?: unknown; kind?: "app"; qid?: Id }
-  | { t: "authExpired" };
+  /** `ch` (feature "ephemeral"): a refused `pub`, or an update of a channel the socket stays in (`ref`: the frame's). */
+  | { t: "err"; code: string; message: string; data?: unknown; kind?: "app"; qid?: Id; ch?: string; ref?: number }
+  | { t: "authExpired" }
+  /** Feature "ephemeral": the answer to `join` (every member, the socket's own `self` included). */
+  | { t: "joined"; ch: string; self: string; members: ChannelMember[]; ref?: number }
+  /** Feature "ephemeral": members that joined (or changed state or user) and members that left. */
+  | { t: "members"; ch: string; join?: ChannelMember[]; leave?: string[] }
+  | { t: "msg"; ch: string; from: string; user: string | null; data: unknown }
+  /** Feature "ephemeral": the socket is not in the channel (a refused join, or taken out: authorization). */
+  | { t: "left"; ch: string; code: string; message: string; ref?: number }
+  /** Feature "ephemeral": a `pub` with `ref` went out to the other members. */
+  | { t: "published"; ch: string; ref: number };
 
 /**
  * A query's new value, or (feature "rowdiff") the per-row diff from the value the socket last received, or (feature
@@ -115,6 +142,11 @@ function id(v: unknown, field: string): Id {
     return v;
   }
   return str(v, field, 128);
+}
+
+function ref(v: unknown): number {
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) bad(`"ref" must be a non-negative integer`);
+  return v as number;
 }
 
 function args(v: unknown): Record<string, unknown> {
@@ -198,6 +230,22 @@ function decodeClientValue(m: unknown): ClientMessage {
     case "auth":
       onlyKeys(m, ["t", "token"]);
       return { t: "auth", token: m.token === null ? null : str(m.token, "token", 16384) };
+    case "join": {
+      onlyKeys(m, ["t", "ch"], ["state", "ref"]);
+      const out: ClientMessage = { t: "join", ch: str(m.ch, "ch", 128) };
+      if ("state" in m) out.state = m.state;
+      if (m.ref !== undefined) out.ref = ref(m.ref);
+      return out;
+    }
+    case "leave":
+      onlyKeys(m, ["t", "ch"]);
+      return { t: "leave", ch: str(m.ch, "ch", 128) };
+    case "pub": {
+      onlyKeys(m, ["t", "ch", "data"], ["ref"]);
+      const out: ClientMessage = { t: "pub", ch: str(m.ch, "ch", 128), data: m.data };
+      if (m.ref !== undefined) out.ref = ref(m.ref);
+      return out;
+    }
     default:
       return bad(`unknown frame type ${JSON.stringify(m.t)}`);
   }

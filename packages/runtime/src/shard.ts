@@ -111,6 +111,7 @@ import { REPLICA_APPLY_FN } from "./replication.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, sampleExecution, share, usageMetrics, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 import { deflateFrame, ZFRAME_MIN_CHARS, zframeSupported } from "./zframe.ts";
+import { EphemeralChannels, memberId, type EphemeralAttachment } from "./ephemeral.ts";
 import { queryAdvice, ReactivityLog, reactivityReport, returnedOf, type ProfileResult, type ReactivityReport } from "./reactivity.ts";
 import { AHEAD_MARKER_KEY, aheadFinishDecision, isAheadMarker, type AheadMarker, type BookmarkRow, type RestoreFinishInfo, type RestoreOutcome, type RestorePrepared, type RestoreRpc } from "./restore.ts";
 
@@ -440,6 +441,11 @@ export interface Attachment {
    * do, as before.
    */
   ack?: true;
+  /**
+   * The client negotiated `features: ["ephemeral"]`: its member id and the channels it is in, with its member state
+   * (ephemeral.ts). Rebuilt into the shard's rooms on wake; no row.
+   */
+  eph?: EphemeralAttachment;
 }
 
 /** Options of the `mutation` RPC. */
@@ -600,6 +606,8 @@ export interface ShardInspection {
   alarm: number | null;
   /** SQLite rows read / written by this object instance since it started (`cursor.rowsRead/rowsWritten`, billed). */
   rows: { read: number; written: number };
+  /** Ephemeral channels (feature "ephemeral"): held now, and counters since this object instance started. */
+  ephemeral: { channels: number; members: number; joins: number; messages: number; delivered: number; refused: number; timedOut: number };
   /** Statements and rows by kind since this object instance started (`DoSqlDriver.counters`). */
   sql: SqlCounters;
 }
@@ -886,6 +894,30 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly tableSubs = new Map<string, Set<string>>();
   /** Sockets already told `authExpired` for their current (expired) identity. */
   private readonly expiredNotified = new Set<string>();
+  /** Ephemeral channels (feature "ephemeral"): in memory, rebuilt from the attachments on wake. */
+  private readonly eph = new EphemeralChannels({
+    socket: (sid) => this.sockets.get(sid),
+    attachment: (sid) => this.attachments.get(sid),
+    saveEph: (ws, eph) => {
+      const att = this.attachmentOf(ws);
+      const next: Attachment = { ...att, eph };
+      // A channel never writes a row: a larger `eph` that would push the subscriptions out to `_ember_subs` (or drop the
+      // identity's claims or token) is refused instead. Smaller (a leave) always fits.
+      if (JSON.stringify(eph).length > JSON.stringify(att.eph ?? null).length && JSON.stringify(next).length > MAX_ATTACHMENT_BYTES) return false;
+      this.saveAttachment(ws, next);
+      return true;
+    },
+    send: (ws, frame) => this.send(ws, frame),
+    blocked: (sid) => this.expiredSocket(sid),
+    close: (ws, code, reason) => {
+      const sid = this.attachmentOf(ws)?.sid;
+      this.closeNow(ws, code, reason);
+      if (sid) this.dropSocket(sid);
+    },
+    autoResponseAt: (ws) => this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0,
+    shard: () => this.shardName ?? "",
+    channels: () => this.cfg.app?.channels,
+  });
   /** The latest migration attempt was refused: everything fails with this error until a fixed deploy. */
   private refused: { code: string; message: string } | null = null;
   /**
@@ -1185,6 +1217,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (att.acks?.length) this.ackedSockets.add(sid);
       if (att.batch) this.batching.add(ws);
       if (att.zframe) this.zframes.add(ws);
+      // Channel memberships (feature "ephemeral"): the rooms come back from the attachments.
+      this.eph.restore(sid, att.eph);
       // Acks received before a hibernation, not yet in a ring row.
       for (const mid of att.acks ?? []) this.pendingAcks.add(outcomeKey(identityKey(att.identity), att.clientId ?? "", mid));
     }
@@ -2269,6 +2303,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.expiredNotified.delete(sid);
     this.chains.delete(sid);
     this.tableSubs.delete(sid);
+    // Out of its channels: the other members are told.
+    this.eph.drop(sid);
     // A shard refused by RuntimeSchemaTooNew rebuilt no subscription: nothing of this socket is in `_ember_subs`.
     if (!this.runtimeAhead && hadRows) this.driver.exec("DELETE FROM _ember_subs WHERE sock = ?", sid);
   }
@@ -3856,6 +3892,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   override async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
     const att = this.attachmentOf(ws);
+    this.eph.touch(att.sid);
     // Serialize handling per socket: `hello` may await token verification.
     const prev = this.chains.get(att.sid) ?? Promise.resolve();
     const next = prev.then(() => this.handleMessage(ws, data)).catch((e) => {
@@ -3938,9 +3975,10 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const batch = msg.features?.includes("batch") === true;
         const zframe = msg.features?.includes("zframe") === true && zframeSupported();
         const rum = msg.features?.includes("rum") === true;
-        att = { ...prevAtt, ...(rum ? { rum: true as const } : {}), identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}), ...(zframe ? { zframe: true as const } : {}) };
+        const ephemeral = msg.features?.includes("ephemeral") === true;
+        att = { ...prevAtt, ...(rum ? { rum: true as const } : {}), identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}), ...(zframe ? { zframe: true as const } : {}), ...(ephemeral ? { eph: prevAtt.eph ?? { m: memberId(), ch: [] } } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : []), ...(msg.features?.includes("qbatch") ? ["qbatch" as const] : []), ...(zframe ? ["zframe" as const] : []), ...(rum ? ["rum" as const] : [])];
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : []), ...(msg.features?.includes("qbatch") ? ["qbatch" as const] : []), ...(zframe ? ["zframe" as const] : []), ...(ephemeral ? ["ephemeral" as const] : []), ...(rum ? ["rum" as const] : [])];
         const colo = rum ? this.coloFor() : null;
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}), ...(colo ? { colo } : {}) });
         // `ready` goes out alone (the client reads it before it knows the server batches), and as text (before it knows
@@ -3981,6 +4019,16 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return;
       case "ack":
         this.acknowledge(ws, att, msg.mids);
+        return;
+      // Feature "ephemeral": channels in memory, no row and no version (ephemeral.ts).
+      case "join":
+        this.eph.join(ws, att.sid, msg.ch, msg.state, "state" in msg, msg.ref);
+        return;
+      case "leave":
+        this.eph.leave(ws, att.sid, msg.ch);
+        return;
+      case "pub":
+        this.eph.publish(ws, att.sid, msg.ch, msg.data, msg.ref);
         return;
       case "mut": {
         const ctx: AuthCtx = { identity: att.identity };
@@ -4031,6 +4079,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           this.stats.authRenewals++;
           return;
         }
+        // Its channels are authorized again under the new identity (feature "ephemeral").
+        this.eph.reauth(ws, att.sid);
         // Not a renewal: a frame still being compressed for this socket (feature "zframe") holds values of the identity
         // before; its `snap`/`patch` are dropped unsent (as on a revocation), and the fresh snaps below replace them.
         if (this.zsending.has(ws)) this.zcut.set(ws, (this.zcut.get(ws) ?? 0) + 1);
@@ -4639,6 +4689,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       outbox: ahead ? { pending: 0, inFlight: 0, parked: 0 } : outboxStats(this.driver),
       rows: { read: this.driver.rowsRead, written: this.driver.rowsWritten },
       sql,
+      ephemeral: { ...this.eph.counts(), ...this.eph.stats },
     };
   }
 

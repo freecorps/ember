@@ -1151,3 +1151,109 @@ describe("multiTab: the leader's frames to the shard", () => {
     }
   });
 });
+
+describe("multiTab: channels (feature ephemeral)", () => {
+  const F = { features: ["batch", "ident", "ephemeral"] };
+  const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null;
+  const pubsOut = (server: FakeEmberServer) => shardSockets(server).flatMap((ws) => ws.sent.filter((m) => m !== "ping" && m.t === "pub"));
+  const refused = { payload: (d: unknown) => (isObj(d) && d.bad ? "invalid_payload" : undefined), state: (s: unknown) => (isObj(s) && s.bad ? "invalid_state" : undefined) };
+
+  it("a pub reaches the other tabs only once the shard took it; a tab not in the channel cannot publish through the shared member", async () => {
+    const server = messagesServer({ batch: true, ident: true, ephemeral: refused });
+    const raw = rawLeader(server);
+    try {
+      await until(() => raw.hub.role === "leader");
+      const a = await raw.member(F);
+      const b = await raw.member(F);
+      const other = await raw.member({ ...F, token: "user:bia" });
+      a.send([{ t: "join", ch: "r" }]);
+      other.send([{ t: "join", ch: "r" }]);
+      await until(() => a.got.some((m) => m.t === "joined") && other.got.some((m) => m.t === "joined"));
+      // `b` never joined: refused by the leader, as the shard would; nothing goes out under the shared member.
+      b.send([{ t: "pub", ch: "r", data: { n: 0 } }]);
+      await until(() => b.got.some((m) => m.t === "err" && m.code === "not_joined"));
+      expect(pubsOut(server)).toEqual([]);
+      b.send([{ t: "join", ch: "r" }]);
+      await until(() => b.got.some((m) => m.t === "joined"));
+      // A payload the shard refuses: no tab gets it, only the sender hears the refusal.
+      a.send([{ t: "pub", ch: "r", data: { bad: true } }]);
+      await until(() => a.got.some((m) => m.t === "err" && m.code === "invalid_payload"));
+      a.send([{ t: "pub", ch: "r", data: { n: 1 } }]);
+      await until(() => b.got.some((m) => m.t === "msg") && other.got.some((m) => m.t === "msg"));
+      expect(b.got.filter((m) => m.t === "msg").map((m) => m.data)).toEqual([{ n: 1 }]);
+      expect(other.got.filter((m) => m.t === "msg").map((m) => m.data)).toEqual([{ n: 1 }]);
+      expect(b.got.filter((m) => m.t === "err" && m.code === "invalid_payload")).toEqual([]);
+      // The leader's refs stay between it and the shard.
+      expect([...a.got, ...b.got].some((m) => "ref" in m)).toBe(false);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("a refused state update keeps the tab in; the leader caches only the state the shard accepted", async () => {
+    const server = messagesServer({ batch: true, ident: true, ephemeral: refused });
+    const raw = rawLeader(server);
+    try {
+      await until(() => raw.hub.role === "leader");
+      const a = await raw.member(F);
+      const b = await raw.member(F);
+      a.send([{ t: "join", ch: "r", state: { name: "A" } }]);
+      await until(() => a.got.some((m) => m.t === "joined"));
+      b.send([{ t: "join", ch: "r" }]);
+      await until(() => b.got.some((m) => m.t === "joined"));
+      const joinsOut = () => shardSockets(server).flatMap((ws) => ws.sent.filter((m) => m !== "ping" && m.t === "join")).length;
+      expect(joinsOut()).toBe(1);
+      a.send([{ t: "join", ch: "r", state: { bad: true } }]);
+      await until(() => a.got.some((m) => m.t === "err" && m.code === "invalid_state"));
+      expect(b.got.some((m) => m.t === "err")).toBe(false);
+      // Still in: what the other tab publishes reaches it.
+      b.send([{ t: "pub", ch: "r", data: "to a" }]);
+      await until(() => a.got.some((m) => m.t === "msg"));
+      // The same refused state again goes to the shard (it was never the member's): refused again.
+      a.send([{ t: "join", ch: "r", state: { bad: true } }]);
+      await until(() => a.got.filter((m) => m.t === "err" && m.code === "invalid_state").length === 2);
+      expect(joinsOut()).toBe(3);
+      // The accepted one: a tab joining with it is answered by the leader.
+      const c = await raw.member(F);
+      c.send([{ t: "join", ch: "r", state: { name: "A" } }]);
+      await until(() => c.got.some((m) => m.t === "joined"));
+      expect(joinsOut()).toBe(3);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("a tab whose token expired is told; its renewal brings the member list it missed", async () => {
+    const realNow = Date.now.bind(Date);
+    let shiftMs = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + shiftMs);
+    const server = messagesServer({ batch: true, ident: true, verify: verifyJwt, ephemeral: true });
+    const raw = rawLeader(server);
+    try {
+      await until(() => raw.hub.role === "leader");
+      const now = Math.floor(realNow() / 1000);
+      const a = await raw.member({ ...F, token: jwt({ sub: "ana", exp: now + 100_000 }) });
+      const b = await raw.member({ ...F, token: jwt({ sub: "ana", exp: now + 60 }) });
+      const other = await raw.member({ ...F, token: jwt({ sub: "bia", exp: now + 100_000 }) });
+      a.send([{ t: "join", ch: "r" }]);
+      await until(() => a.got.some((m) => m.t === "joined"));
+      b.send([{ t: "join", ch: "r" }]);
+      other.send([{ t: "join", ch: "r" }]);
+      await until(() => b.got.some((m) => m.t === "joined") && a.got.some((m) => m.t === "members"));
+      await until(() => b.got.some((m) => m.t === "members"));
+      shiftMs = 120_000; // b's own token has expired; the shared socket's (a's) has not
+      other.send([{ t: "leave", ch: "r" }]);
+      await until(() => a.got.filter((m) => m.t === "members").length === 2);
+      await until(() => b.got.some((m) => m.t === "authExpired"));
+      expect(b.got.filter((m) => m.t === "members")).toHaveLength(1);
+      // A renewal that does not go to the shard (the shared socket's token is later): the leader sends the list.
+      b.send([{ t: "auth", token: jwt({ sub: "ana", exp: now + 90_000 }) }]);
+      await until(() => b.got.filter((m) => m.t === "joined").length === 2);
+      const last = b.got.filter((m) => m.t === "joined").at(-1)!;
+      expect((last.members as Array<{ user: string }>).map((m) => m.user)).toEqual(["ana"]);
+    } finally {
+      raw.close();
+      clock.mockRestore();
+    }
+  });
+});

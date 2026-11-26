@@ -78,6 +78,19 @@ export interface FakeServerOptions {
    * is a 404 there).
    */
   queryBatch?: boolean;
+  /**
+   * Speak feature "ephemeral" (channels, broadcast in memory): `true` lets every socket into every channel, or an
+   * `authorize(identity, name)` decides (as the app's `defineApp({ channels })` does). `payload` / `state` stand for its
+   * validators: an error code refuses that `pub` (`err`) or member state (`err` for a member, else `left`). Default
+   * false: an older runtime.
+   */
+  ephemeral?:
+    | boolean
+    | {
+        authorize?: (identity: FakeIdentity | null, name: string) => boolean;
+        payload?: (data: unknown, name: string) => string | undefined;
+        state?: (state: unknown, name: string) => string | undefined;
+      };
   now?: () => number;
   /** Sockets open after this many ms (a real upgrade takes a round trip). Default: at once (next microtask). */
   openDelayMs?: number;
@@ -149,6 +162,10 @@ export class FakeSocket implements WebSocketLike {
   held: string[] | null = null;
   /** When true, "ping" gets no "pong" (half-open socket). */
   silent = false;
+  /** Feature "ephemeral" was confirmed: its member id and channels (name → member state). */
+  ephemeral = false;
+  readonly memberId = `m${this.id}`;
+  readonly chans = new Map<string, unknown>();
 
   constructor(
     readonly url: string,
@@ -386,6 +403,87 @@ export class FakeEmberServer {
   detach(ws: FakeSocket): void {
     this.sockets.delete(ws);
     ws.subs.clear();
+    for (const name of [...ws.chans.keys()]) this.chanLeave(ws, name);
+  }
+
+  // ------------------------------------------------------------------ channels (feature "ephemeral")
+
+  private chanMembers(shard: string, name: string): FakeSocket[] {
+    return [...this.sockets].filter((x) => x.shard === shard && x.chans.has(name));
+  }
+
+  private memberOf(ws: FakeSocket, name: string) {
+    const state = ws.chans.get(name);
+    return { id: ws.memberId, user: ws.identity?.subject ?? null, ...(state !== undefined ? { state } : {}) };
+  }
+
+  private chanAllowed(ws: FakeSocket, name: string): boolean {
+    const e = this.opts.ephemeral;
+    return typeof e === "object" && e.authorize ? e.authorize(ws.identity, name) === true : true;
+  }
+
+  private chanJoined(ws: FakeSocket, name: string, ref?: number): void {
+    const members = this.chanMembers(ws.shard, name).map((x) => this.memberOf(x, name));
+    this.send(ws, ref === undefined ? { t: "joined", ch: name, self: ws.memberId, members } : { t: "joined", ch: name, self: ws.memberId, members, ref });
+  }
+
+  private chanBroadcast(ws: FakeSocket, name: string, m: ServerMessage): void {
+    for (const x of this.chanMembers(ws.shard, name)) if (x !== ws && !this.expired(x.identity)) this.send(x, m);
+  }
+
+  private chanLeave(ws: FakeSocket, name: string): void {
+    if (!ws.chans.has(name)) return;
+    ws.chans.delete(name);
+    this.chanBroadcast(ws, name, { t: "members", ch: name, leave: [ws.memberId] });
+  }
+
+  private chanFrame(ws: FakeSocket, msg: Extract<ClientMessage, { t: "join" | "leave" | "pub" }>): void {
+    // `ref` (join, pub): the answer carries it; a pub with one that went out is answered `published`.
+    const ref = msg.t !== "leave" && typeof msg.ref === "number" ? { ref: msg.ref } : {};
+    if (!ws.ephemeral) return this.send(ws, { t: "err", code: "bad_frame", message: "channels need feature ephemeral", ch: msg.ch, ...ref });
+    const expired = { code: "auth_expired", message: 'the token expired; send {t:"auth"} with a fresh one' };
+    if (msg.t === "leave") return this.chanLeave(ws, msg.ch);
+    if (this.expired(ws.identity)) {
+      this.send(ws, { t: "authExpired" });
+      return this.send(ws, msg.t === "join" ? { t: "left", ch: msg.ch, ...expired, ...ref } : { t: "err", ...expired, ch: msg.ch, ...ref });
+    }
+    if (msg.t === "pub") {
+      if (!ws.chans.has(msg.ch)) return this.send(ws, { t: "err", code: "not_joined", message: `join ${msg.ch} first`, ch: msg.ch, ...ref });
+      const refuse = this.opts.ephemeral && typeof this.opts.ephemeral === "object" ? this.opts.ephemeral.payload?.(msg.data, msg.ch) : undefined;
+      if (refuse) return this.send(ws, { t: "err", code: refuse, message: `refused ${msg.ch} payload`, ch: msg.ch, ...ref });
+      this.chanBroadcast(ws, msg.ch, { t: "msg", ch: msg.ch, from: ws.memberId, user: ws.identity?.subject ?? null, data: msg.data });
+      if (msg.ref !== undefined) this.send(ws, { t: "published", ch: msg.ch, ref: msg.ref });
+      return;
+    }
+    if (!this.chanAllowed(ws, msg.ch)) {
+      this.chanLeave(ws, msg.ch); // a member denied now is out (the others told)
+      return this.send(ws, { t: "left", ch: msg.ch, code: "channel_denied", message: `not allowed to join ${msg.ch}`, ...ref });
+    }
+    const was = ws.chans.has(msg.ch);
+    const refuseState = "state" in msg && this.opts.ephemeral && typeof this.opts.ephemeral === "object" ? this.opts.ephemeral.state?.(msg.state, msg.ch) : undefined;
+    if (refuseState) {
+      // As the shard: a member stays in with its state (`err`); one that was not in is not (`left`).
+      const refusal = { code: refuseState, message: `refused ${msg.ch} state`, ...ref };
+      return this.send(ws, was ? { t: "err", ...refusal, ch: msg.ch } : { t: "left", ch: msg.ch, ...refusal });
+    }
+    const before = JSON.stringify(ws.chans.get(msg.ch));
+    if ("state" in msg) ws.chans.set(msg.ch, msg.state);
+    else if (!was) ws.chans.set(msg.ch, undefined);
+    this.chanJoined(ws, msg.ch, msg.ref);
+    if (!was || JSON.stringify(ws.chans.get(msg.ch)) !== before) this.chanBroadcast(ws, msg.ch, { t: "members", ch: msg.ch, join: [this.memberOf(ws, msg.ch)] });
+  }
+
+  /** The socket's identity changed: its channels are authorized again (as the shard does). */
+  private chanReauth(ws: FakeSocket): void {
+    for (const name of [...ws.chans.keys()]) {
+      if (!this.chanAllowed(ws, name)) {
+        this.chanLeave(ws, name);
+        this.send(ws, { t: "left", ch: name, code: "channel_denied", message: `not allowed to join ${name}` });
+        continue;
+      }
+      this.chanJoined(ws, name);
+      this.chanBroadcast(ws, name, { t: "members", ch: name, join: [this.memberOf(ws, name)] });
+    }
   }
 
   private send(ws: FakeSocket, m: ServerMessage | "pong"): void {
@@ -468,7 +566,8 @@ export class FakeEmberServer {
         ws.vdiff = this.opts.vdiff !== false && msg.features?.includes("vdiff") === true;
         ws.ident = this.opts.ident === true && msg.features?.includes("ident") === true;
         const batch = this.opts.batch === true && msg.features?.includes("batch") === true;
-        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.vdiff ? ["vdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(this.opts.ack && msg.features?.includes("ack") ? ["ack"] : []), ...(batch ? ["batch"] : []), ...(this.opts.queryBatch && msg.features?.includes("qbatch") ? ["qbatch"] : []), ...(this.opts.colo && msg.features?.includes("rum") ? ["rum"] : [])];
+        ws.ephemeral = !!this.opts.ephemeral && msg.features?.includes("ephemeral") === true;
+        const features = [...(ws.rowdiff ? ["rowdiff"] : []), ...(ws.vdiff ? ["vdiff"] : []), ...(ws.ident ? ["ident"] : []), ...(this.opts.query && msg.features?.includes("query") ? ["query"] : []), ...(this.opts.ack && msg.features?.includes("ack") ? ["ack"] : []), ...(batch ? ["batch"] : []), ...(this.opts.queryBatch && msg.features?.includes("qbatch") ? ["qbatch"] : []), ...(ws.ephemeral ? ["ephemeral"] : []), ...(this.opts.colo && msg.features?.includes("rum") ? ["rum"] : [])];
         const colo = this.opts.colo && msg.features?.includes("rum") ? this.opts.colo : undefined;
         this.send(ws, { t: "ready", shard: shard.name, version: shard.version, epoch: shard.epoch, ...(features.length ? { features } : {}), ...(colo ? { colo } : {}) });
         ws.batch = batch;
@@ -530,8 +629,13 @@ export class FakeEmberServer {
           this.evaluate(shard, ws, sub);
           this.sendSnap(shard, ws, sub);
         }
+        this.chanReauth(ws);
         return;
       }
+      case "join":
+      case "leave":
+      case "pub":
+        return this.chanFrame(ws, msg);
     }
   }
 
@@ -716,11 +820,15 @@ function strictDecode(raw: string): ClientMessage {
     ack: [["t", "mids"], []],
     mut: [["t", "mid", "fn", "args"], []],
     auth: [["t", "token"], []],
+    join: [["t", "ch"], ["state", "ref"]],
+    leave: [["t", "ch"], []],
+    pub: [["t", "ch", "data"], ["ref"]],
   };
   const spec = allowed[m.t as string] ?? bad(`unknown frame type ${JSON.stringify(m.t)}`);
   for (const k of spec[0]) if (!(k in m)) bad(`missing field "${k}"`);
   for (const k of Object.keys(m)) if (!spec[0].includes(k) && !spec[1].includes(k)) bad(`unknown field "${k}"`);
   if (m.t === "hello" && m.protocol !== 1) bad("protocol must be 1");
+  if ("ref" in m && !(typeof m.ref === "number" && Number.isSafeInteger(m.ref) && m.ref >= 0)) bad(`"ref" must be a non-negative integer`);
   if ("args" in m && (!m.args || typeof m.args !== "object" || Array.isArray(m.args))) bad(`"args" must be an object`);
   return m as unknown as ClientMessage;
 }
