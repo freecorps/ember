@@ -25,6 +25,7 @@ import {
 import { parse, stableStringify, stringify } from "./wire.ts";
 import type { PageHost } from "./paginate.ts";
 import { RoutedStore, type ClaimRoute } from "./route.ts";
+import { FrameQueue, zframeSupported } from "./zframe.ts";
 import type { CachedSnapshot, SnapshotCache } from "./snapshot-cache.ts";
 // Type-only: the multi-tab hub and the upload helpers are subpaths (`@freecorps/ember-client/multitab`, `/files`), or a
 // lazy `import()` for the old options, never in the static graph of an app that does not use them.
@@ -84,6 +85,14 @@ export interface EmberClientOptions {
    * holding arrays of docs (`paginate()`'s `{page, ...}`) with a value diff. Default true.
    */
   rowDiff?: boolean;
+  /**
+   * Feature "zframe" (protocol v1.5): ask the shard to send frames above 2 KiB compressed (raw DEFLATE, binary
+   * messages), decoded here with `DecompressionStream`. A large `snap` or `patch` is typically 5–10× smaller on the
+   * wire (a 120-row list: 21.6 KB → 2.5 KB), at the cost of the shard's CPU to compress it (billed) and the client's to
+   * decompress. Worth it on slow or metered links (mobile web); off by default. Announced only where the platform
+   * decodes it (not React Native/Hermes); a runtime without the feature keeps sending text.
+   */
+  zframe?: boolean;
   /** How long a shard socket stays open without subscriptions or pending mutations. Default 10 s. */
   idleTimeoutMs?: number;
   /**
@@ -2594,6 +2603,17 @@ export class EmberClient {
       return;
     }
     conn.ws = ws;
+    // Feature "zframe": binary frames as bytes, not a Blob to read first (a socket that has the property). Its frames
+    // are handled in order: a binary one is decoded before what follows it.
+    if ("binaryType" in ws) (ws as { binaryType: string }).binaryType = "arraybuffer";
+    const inbox = new FrameQueue(
+      (text) => {
+        if (conn.ws === ws) this.onFrame(conn, text);
+      },
+      (e) => {
+        if (conn.ws === ws) this.report(new EmberError("bad_frame", `could not decode a compressed frame: ${(e as Error)?.message ?? String(e)}`), { shard: conn.shard });
+      },
+    );
     const authGen = this.authGen;
     let opened = false;
     let token: { value: string | null } | null = null;
@@ -2608,6 +2628,7 @@ export class EmberClient {
       conn.identity = t ? jwtIdentity(t) : null;
       conn.opaque = !!t && !conn.identity;
       m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch"] : ["ident", "query", "ack", "batch", "qbatch"];
+      if (this.options.zframe && zframeSupported()) m.features.push("zframe");
       this.send(conn, m);
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot); one whose
@@ -2638,7 +2659,7 @@ export class EmberClient {
     };
     ws.onmessage = (ev) => {
       if (conn.ws !== ws) return;
-      this.onFrame(conn, ev.data);
+      inbox.push(ev.data);
     };
     ws.onclose = () => {
       if (conn.ws !== ws) return;

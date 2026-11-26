@@ -73,6 +73,7 @@
 import type { WebSocketConstructor, WebSocketLike } from "./client.ts";
 import { jwtPayload } from "./jwt.ts";
 import { PING, PONG } from "./protocol.ts";
+import { FrameQueue } from "./zframe.ts";
 
 /** The part of `navigator.locks` (Web Locks API) used here. */
 export interface LockManagerLike {
@@ -715,6 +716,7 @@ class VirtualSocket implements WebSocketLike {
       return;
     }
     this.direct = ws;
+    if ("binaryType" in ws) (ws as { binaryType: string }).binaryType = "arraybuffer";
     ws.onopen = (ev) => this.onopen?.(ev);
     ws.onmessage = (ev) => this.onmessage?.(ev);
     ws.onclose = (ev) => this.onclose?.(ev);
@@ -1191,6 +1193,15 @@ class Leader {
       return g;
     }
     g.ws = ws;
+    // Feature "zframe" (the members' hello asked for it): the leader decodes compressed frames, in order, and routes
+    // their text (tabs get text over the channel).
+    if ("binaryType" in ws) (ws as { binaryType: string }).binaryType = "arraybuffer";
+    const inbox = new FrameQueue(
+      (text) => {
+        if (!g.closed) this.onReal(g, text);
+      },
+      () => this.end(g, CLOSE_PROTOCOL, "bad compressed frame"),
+    );
     ws.onopen = () => {
       if (g.closed) return;
       this.real(g, JSON.stringify(hello));
@@ -1200,7 +1211,7 @@ class Leader {
       if (g.closed) return;
       g.heardAt = Date.now();
       g.pingAt = undefined;
-      if (typeof ev.data === "string") this.onReal(g, ev.data);
+      inbox.push(ev.data);
     };
     ws.onclose = (ev) => {
       const code = (ev as { code?: unknown } | null)?.code;

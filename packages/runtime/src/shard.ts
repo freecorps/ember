@@ -109,6 +109,7 @@ import {
 import { REPLICA_APPLY_FN } from "./replication.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, sampleExecution, share, usageMetrics, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
+import { deflateFrame, ZFRAME_MIN_CHARS, zframeSupported } from "./zframe.ts";
 import { queryAdvice, ReactivityLog, reactivityReport, returnedOf, type ProfileResult, type ReactivityReport } from "./reactivity.ts";
 import { AHEAD_MARKER_KEY, aheadFinishDecision, isAheadMarker, type AheadMarker, type BookmarkRow, type RestoreFinishInfo, type RestoreOutcome, type RestorePrepared, type RestoreRpc } from "./restore.ts";
 
@@ -407,6 +408,8 @@ export interface Attachment {
   acks?: string[];
   /** The client negotiated `features: ["batch"]`: frames to it may be JSON arrays of messages. */
   batch?: true;
+  /** The client negotiated `features: ["zframe"]`: frames to it above ZFRAME_MIN_CHARS go compressed (binary). */
+  zframe?: true;
   /**
    * The client negotiated `features: ["ack"]`: it acknowledges settled outcomes, so the effect-free ones need not stay
    * in the dedup generations (`Pending.acks`). Missing (a client without it, or a socket from an older runtime): they
@@ -544,6 +547,10 @@ export interface ShardInspection {
     authRenewals: number;
     /** Socket mutation outcomes with no effect (no write, or an error) kept in memory instead of a dedup row. */
     volatileOutcomes: number;
+    /** Feature "zframe": frames sent compressed, and their size before (UTF-16 units) and after (bytes), since boot. */
+    zframes: number;
+    zframeBytesIn: number;
+    zframeBytesOut: number;
   };
   /** External-index outbox (Vectorize / AI Search). */
   outbox: OutboxStats;
@@ -844,7 +851,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private lastArmed: number | null | undefined = undefined;
   /** Last commit with changes (shard catalog `lastWrite`; persisted at report time). */
   private lastWrite: number | null = null;
-  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0, prefetchHits: 0 };
+  private readonly stats = { batches: 0, batchSizes: [] as number[], booted: 0, migrated: 0, rebuiltSubs: 0, backfillSteps: 0, reruns: 0, debouncedReruns: 0, filesCollected: 0, outboxSent: 0, outboxFailed: 0, identityRuns: 0, splits: 0, gateRuns: 0, warmed: 0, nestedReused: 0, authRenewals: 0, volatileOutcomes: 0, prefetchHits: 0, zframes: 0, zframeBytesIn: 0, zframeBytesOut: 0 };
   /** The schema has external indexes (Vectorize / AI Search): commits feed the outbox. */
   private readonly hasExternal: boolean;
   /** Tables with an external index (Vectorize, AI Search): only a commit touching one may have written the outbox. */
@@ -1124,6 +1131,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.attachments.set(sid, att);
       if (att.acks?.length) this.ackedSockets.add(sid);
       if (att.batch) this.batching.add(ws);
+      if (att.zframe) this.zframes.add(ws);
       // Acks received before a hibernation, not yet in a ring row.
       for (const mid of att.acks ?? []) this.pendingAcks.add(outcomeKey(identityKey(att.identity), att.clientId ?? "", mid));
     }
@@ -2435,11 +2443,61 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   }
 
   private sendFrame(ws: WebSocket, frame: string): void {
+    // Feature "zframe": a large frame goes compressed; one behind a compression still running waits for it (in order).
+    if (this.zframes.has(ws) && (frame.length > ZFRAME_MIN_CHARS || this.zsending.has(ws))) return this.sendCompressed(ws, frame);
     try {
       ws.send(frame);
     } catch {
       // socket already closed
     }
+  }
+
+  /** Sockets that negotiated feature "zframe" (from `hello`, or their attachment after a wake). */
+  private readonly zframes = new WeakSet<WebSocket>();
+  /** Per "zframe" socket, the last frame still being compressed (or waiting behind one): what comes after waits. */
+  private readonly zsending = new Map<WebSocket, Promise<void>>();
+
+  /**
+   * Feature "zframe": `frame` as a binary message of its raw-DEFLATE bytes when it is large (as text when that is not
+   * smaller), sent after every frame queued before it. The compression runs at once; the event is kept alive until the
+   * frame went out (`waitUntil`), so a hibernation never drops it.
+   */
+  private sendCompressed(ws: WebSocket, frame: string): void {
+    const bytes = frame.length > ZFRAME_MIN_CHARS ? deflateFrame(frame).catch(() => null) : null;
+    const before = this.zsending.get(ws);
+    const sent = (before ?? Promise.resolve()).then(async () => {
+      const z = bytes && (await bytes);
+      try {
+        if (z && z.byteLength < frame.length) {
+          ws.send(z);
+          this.stats.zframes++;
+          this.stats.zframeBytesIn += frame.length;
+          this.stats.zframeBytesOut += z.byteLength;
+        } else ws.send(frame);
+      } catch {
+        // socket already closed
+      }
+    });
+    this.zsending.set(ws, sent);
+    void sent.finally(() => {
+      if (this.zsending.get(ws) === sent) this.zsending.delete(ws);
+    });
+    this.ctx.waitUntil(sent);
+  }
+
+  /** Closes `ws` once the frames queued for it went out (compressed ones included: feature "zframe"). */
+  private closeAfterSends(ws: WebSocket, code: number, reason: string): void {
+    this.flushSocket(ws);
+    const close = () => {
+      try {
+        ws.close(code, reason);
+      } catch {
+        // already closing
+      }
+    };
+    const pending = this.zsending.get(ws);
+    if (!pending) return close();
+    this.ctx.waitUntil(pending.then(close));
   }
 
   /** Frames waiting for the end of the turn, per batching socket. */
@@ -3671,12 +3729,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const ident = msg.features?.includes("ident") === true;
         const acks = msg.features?.includes("ack") === true;
         const batch = msg.features?.includes("batch") === true;
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}) };
+        const zframe = msg.features?.includes("zframe") === true && zframeSupported();
+        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}), ...(zframe ? { zframe: true as const } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : []), ...(msg.features?.includes("qbatch") ? ["qbatch" as const] : [])];
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : []), ...(msg.features?.includes("qbatch") ? ["qbatch" as const] : []), ...(zframe ? ["zframe" as const] : [])];
         this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
-        // `ready` goes out alone (the client reads it before it knows the server batches); everything after may batch.
+        // `ready` goes out alone (the client reads it before it knows the server batches), and as text (before it knows
+        // the server compresses); everything after may batch, and go compressed.
         if (batch) this.batching.add(ws);
+        if (zframe) this.zframes.add(ws);
         return;
       }
       case "q": {
@@ -4046,6 +4107,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     if (att?.sid) this.dropSocket(att.sid);
     this.outbox.delete(ws);
     this.unflushed.delete(ws);
+    this.zsending.delete(ws);
     try {
       ws.close(code, reason);
     } catch {
@@ -4059,6 +4121,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // Frames queued for a broken socket are never sent: as on close, nothing of it is kept.
     this.outbox.delete(ws);
     this.unflushed.delete(ws);
+    this.zsending.delete(ws);
   }
 
   // ------------------------------------------------------------------ RPC (Worker / System)
@@ -4192,12 +4255,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!att?.sid || !att.identity || !revokeMatches(match, att.identity)) continue;
       reached++;
       if (opts.close) {
-        this.flushSocket(ws);
-        try {
-          ws.close(4401, "ember: access revoked");
-        } catch {
-          // already closing
-        }
+        this.closeAfterSends(ws, 4401, "ember: access revoked");
         this.dropSocket(att.sid);
         continue;
       }
@@ -4621,12 +4679,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.sid) this.dropSocket(att.sid);
-      this.flushSocket(ws);
-      try {
-        ws.close(1012, "ember restore");
-      } catch {
-        // already closed
-      }
+      this.closeAfterSends(ws, 1012, "ember restore");
     }
     // `.replicated()` tables: a restored global:main resends everything (its log went back in time); a restored target
     // asks for a fresh copy (its marks went back).
@@ -4686,12 +4739,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.sid) this.dropSocket(att.sid);
-      this.flushSocket(ws);
-      try {
-        ws.close(1012, "ember import");
-      } catch {
-        // already closed
-      }
+      this.closeAfterSends(ws, 1012, "ember import");
     }
   }
 
