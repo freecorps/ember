@@ -21,7 +21,7 @@
  * - `assets(sha256, file, contentType, size)`: content-addressed (hex SHA-256) over Ember's files (R2, PLAN §7):
  *   uploaded once, whatever the number of updates that use them.
  */
-import { componentBuilders, defineComponent, defineErrors, defineSchema, defineTable, EmberError, httpRouter, paginationOptsValidator, unsafeRef, v, type ComponentCtx } from "@freecorps/ember-server";
+import { componentBuilders, cronJobs, defineComponent, defineErrors, defineSchema, defineTable, EmberError, httpRouter, paginationOptsValidator, unsafeRef, v, type ComponentCtx } from "@freecorps/ember-server";
 import { buildManifest, finalOutcome, isSha256Hex, isUuid, parseUpdateRequest, ProtocolError, renderResponse, rsaSigner, SigningKeyMissing, type Platform, type RenderedResponse, type StoredAsset, type UpdateRequest } from "./protocol.ts";
 import { resolvePlan, type BranchPlan, type Plan, type PlanEntry } from "./rollout.ts";
 
@@ -83,10 +83,14 @@ const schema = defineSchema({
       fileExpiresAt: v.optional(v.number()),
       /** Uploads of the same content still in flight besides `file` (concurrent publishers): any confirmed one serves. */
       pending: v.optional(v.array(v.object({ file: v.file(), expiresAt: v.number() }))),
+      /** When the last upload listed here leaves its grace (`CONFIRM_GRACE_MS`): the daily sweep looks at it then. */
+      pendingUntil: v.optional(v.number()),
       contentType: v.string(),
       size: v.number(),
       createdAt: v.number(),
-    }).index("by_sha", ["sha256"]),
+    })
+      .index("by_sha", ["sha256"])
+      .index("by_pending_until", ["pendingUntil"], { sparse: true }),
   },
 });
 
@@ -129,7 +133,7 @@ export const expoUpdatesErrors = defineErrors({
   UnknownBranch: { data: v.object({ name: v.string() }), status: 404, message: (d: { name: string }) => `no branch named ${d.name}` },
 });
 
-const { query, mutation, internalQuery, httpAction } = componentBuilders<typeof schema, ExpoUpdatesConfig | undefined>();
+const { query, mutation, internalQuery, internalMutation, httpAction } = componentBuilders<typeof schema, ExpoUpdatesConfig | undefined>();
 type Ctx = ComponentCtx<typeof schema, ExpoUpdatesConfig | undefined>;
 type ReadCtx = Ctx["query"] | Ctx["mutation"];
 
@@ -300,19 +304,21 @@ const publishedUpdate = v.object({
   extra: v.optional(v.any()),
 });
 
-function checkAsset(ctx: Ctx["mutation"], a: StoredAsset, ready: Map<string, boolean>): void {
+function checkAsset(ctx: Ctx["mutation"], a: StoredAsset, ready: Map<string, { ok: boolean; contentType: string | null }>): void {
   if (!isSha256Hex(a.sha256)) throw new EmberError("ValidationError", `asset sha256 must be lowercase hex (got ${JSON.stringify(a.sha256)})`);
   if (!a.key || a.key.length > 200) throw new EmberError("ValidationError", "asset key must be 1..200 characters");
   if (a.fileExtension !== undefined && !/^\.[A-Za-z0-9]{1,16}$/.test(a.fileExtension)) throw new EmberError("ValidationError", `fileExtension must start with "." (got ${JSON.stringify(a.fileExtension)})`);
-  let ok = ready.get(a.sha256);
-  const row = assetBySha(ctx, a.sha256);
-  if (ok === undefined) {
-    ok = !!row && promoteReady(ctx, row);
-    ready.set(a.sha256, ok);
+  // One read of the asset row per hash in a publish (a hash repeated across updates is read once).
+  let seen = ready.get(a.sha256);
+  if (seen === undefined) {
+    const row = assetBySha(ctx, a.sha256);
+    seen = { ok: !!row && promoteReady(ctx, row), contentType: row?.contentType ?? null };
+    ready.set(a.sha256, seen);
   }
-  if (!ok) throw expoUpdatesErrors.AssetNotUploaded({ sha256: a.sha256 });
+  if (!seen.ok) throw expoUpdatesErrors.AssetNotUploaded({ sha256: a.sha256 });
   // One media type per content: the manifest says what the asset route serves.
-  if (row && row.contentType !== a.contentType) throw new EmberError("ValidationError", `asset ${a.sha256} is stored as ${row.contentType}, not ${a.contentType}`);
+  const row = { contentType: seen.contentType };
+  if (row.contentType !== null && row.contentType !== a.contentType) throw new EmberError("ValidationError", `asset ${a.sha256} is stored as ${row.contentType}, not ${a.contentType}`);
 }
 
 const assetBySha = (ctx: ReadCtx, sha256: string) => ctx.db.query("assets").withIndex("by_sha", (q) => q.eq("sha256", sha256)).unique();
@@ -327,17 +333,18 @@ const fileState = (ctx: ReadCtx, id: string) => ctx.storage.getMetadata(id)?.sta
 function promoteReady(ctx: Ctx["mutation"], row: AssetRow): boolean {
   if (fileState(ctx, row.file) === "ready") {
     // Ready already: the uploads still listed beside it go once out of their grace (or finished, or failed).
-    if (row.pending?.length || row.fileExpiresAt !== undefined) {
+    if (row.pending?.length || row.fileExpiresAt !== undefined || row.pendingUntil !== undefined) {
       const { fileExpiresAt: _own, ...beside } = row; // the row's own file is the ready one: only the others
       const pending = pendingUploads(ctx, beside).filter((u) => u.file !== row.file);
-      if (pending.length !== (row.pending?.length ?? 0) || row.fileExpiresAt !== undefined) ctx.db.patch(row._id, { fileExpiresAt: undefined, pending: pending.length ? pending : undefined });
+      const pendingUntil = pendingUntilOf(undefined, pending);
+      if (pending.length !== (row.pending?.length ?? 0) || row.fileExpiresAt !== undefined || pendingUntil !== row.pendingUntil) ctx.db.patch(row._id, { fileExpiresAt: undefined, pending: pending.length ? pending : undefined, pendingUntil });
     }
     return true;
   }
   const file = [row.file, ...(row.pending ?? []).map((u) => u.file)].find((f) => fileState(ctx, f) === "ready");
   if (!file) return false;
   const pending = pendingUploads(ctx, row).filter((u) => u.file !== file);
-  ctx.db.patch(row._id, { file, fileExpiresAt: undefined, pending: pending.length ? pending : undefined });
+  ctx.db.patch(row._id, { file, fileExpiresAt: undefined, pending: pending.length ? pending : undefined, pendingUntil: pendingUntilOf(undefined, pending) });
   return true;
 }
 
@@ -359,6 +366,31 @@ const CONFIRM_GRACE_MS = 24 * 3600_000;
 /** At most this many expired uploads kept referenced in their grace period (the oldest go first). */
 const MAX_GRACED_UPLOADS = 64;
 
+/** When the last of these uploads leaves its grace (undefined: none listed). */
+function pendingUntilOf(fileExpiresAt: number | undefined, pending: ReadonlyArray<{ expiresAt: number }> | undefined): number | undefined {
+  const xs = [...(fileExpiresAt !== undefined ? [fileExpiresAt] : []), ...(pending ?? []).map((u) => u.expiresAt)];
+  return xs.length ? Math.max(...xs) + CONFIRM_GRACE_MS : undefined;
+}
+
+/** Rows one daily sweep looks at (it goes on the next day for the rest). */
+const SWEEP_BATCH = 500;
+
+/**
+ * The daily sweep of abandoned uploads (a hash nobody prepares or publishes again): a row whose uploads all left their
+ * grace either has a ready file (the stale ones go from it) or nothing stored and nothing in flight — then the row
+ * goes, and with it the reference, so storage collects the file. A published asset always has a ready file.
+ */
+function sweepAbandonedUploads(ctx: Ctx["mutation"]): number {
+  const rows = ctx.db.query("assets").withIndex("by_pending_until", (q) => q.lt("pendingUntil", ctx.now)).take(SWEEP_BATCH);
+  for (const row of rows) {
+    if (promoteReady(ctx, row)) continue;
+    const kept = pendingUploads(ctx, row);
+    if (!kept.length) ctx.db.delete(row._id);
+    else ctx.db.patch(row._id, { pendingUntil: pendingUntilOf(undefined, kept) });
+  }
+  return rows.length;
+}
+
 /** The row's pending uploads still referenced: in flight, or expired within `CONFIRM_GRACE_MS`. */
 function pendingUploads(ctx: ReadCtx, row: AssetRow): Array<{ file: AssetRow["file"]; expiresAt: number }> {
   const all = [...(row.fileExpiresAt !== undefined ? [{ file: row.file, expiresAt: row.fileExpiresAt }] : []), ...(row.pending ?? [])];
@@ -367,6 +399,9 @@ function pendingUploads(ctx: ReadCtx, row: AssetRow): Array<{ file: AssetRow["fi
   const graced = kept.filter((u) => u.expiresAt <= ctx.now).sort((x, y) => y.expiresAt - x.expiresAt).slice(0, MAX_GRACED_UPLOADS);
   return [...live, ...graced];
 }
+
+/** Distinct assets one publish may name: with the channel bump (up to 1000 rows), below the 16 384 reads of a mutation. */
+const MAX_PUBLISH_ASSETS = 12_000;
 
 /** At most this many uploads of one content in flight at once (each keeps its file referenced until it is used). */
 const MAX_PENDING_UPLOADS = 16;
@@ -414,8 +449,9 @@ export const functions = {
           // Kept: the uploads in flight and those in their grace period (their PUT may have finished in time).
           const pending = (row ? pendingUploads(ctx, row) : []).filter((u) => u.file !== ticket.storageId);
           const fileExpiresAt = ticket.exists ? undefined : ticket.expiresAt;
-          if (row) ctx.db.patch(row._id, { file: ticket.storageId as never, fileExpiresAt, pending: pending.length ? pending : undefined, contentType: a.contentType, size: a.size });
-          else ctx.db.insert("assets", { sha256: a.sha256, file: ticket.storageId as never, ...(fileExpiresAt !== undefined ? { fileExpiresAt } : {}), contentType: a.contentType, size: a.size, createdAt: ctx.now });
+          const pendingUntil = pendingUntilOf(fileExpiresAt, pending);
+          if (row) ctx.db.patch(row._id, { file: ticket.storageId as never, fileExpiresAt, pending: pending.length ? pending : undefined, pendingUntil, contentType: a.contentType, size: a.size });
+          else ctx.db.insert("assets", { sha256: a.sha256, file: ticket.storageId as never, ...(fileExpiresAt !== undefined ? { fileExpiresAt } : {}), ...(pendingUntil !== undefined ? { pendingUntil } : {}), contentType: a.contentType, size: a.size, createdAt: ctx.now });
           if (ticket.exists || !ticket.url) out.push({ sha256: a.sha256, exists: true });
           else out.push({ sha256: a.sha256, exists: false, upload: { storageId: ticket.storageId, shard: ticket.shard, token: ticket.token, url: ticket.url, method: ticket.method ?? "PUT", headers: ticket.headers ?? {} } });
         }
@@ -440,6 +476,10 @@ export const functions = {
       errors: [expoUpdatesErrors.RolloutInProgress, expoUpdatesErrors.AssetNotUploaded],
       handler: (ctx, a) => {
         if (!a.updates.length || a.updates.length > 8) throw new EmberError("ValidationError", "publish 1..8 updates (one per platform and runtime version)");
+        // Reads in the worst case: one asset row per distinct hash, plus every channel the bump re-versions. Kept under
+        // the mutation's default `documentsRead` (16 384), refused before anything is written.
+        const hashes = new Set(a.updates.flatMap((u) => [u.launchAsset.sha256, ...u.assets.map((x) => x.sha256)]));
+        if (hashes.size > MAX_PUBLISH_ASSETS) throw new EmberError("ValidationError", `a publish names at most ${MAX_PUBLISH_ASSETS} distinct assets (got ${hashes.size}): publish fewer platforms at once`);
         const percent = a.rolloutPercent ?? 100;
         checkPercent(percent);
         if (a.message !== undefined && a.message.length > 1000) throw new EmberError("ValidationError", "message is at most 1000 characters");
@@ -450,7 +490,7 @@ export const functions = {
         }
         const group = a.group ?? uuidOf(ctx.random);
         if (!isUuid(group)) throw new EmberError("ValidationError", "group must be a UUID");
-        const ready = new Map<string, boolean>();
+        const ready = new Map<string, { ok: boolean; contentType: string | null }>();
         const pairs = new Set<string>();
         const created: Array<{ id: string; platform: Platform; runtimeVersion: string }> = [];
         for (const u of a.updates) {
@@ -657,6 +697,9 @@ export const functions = {
       }),
     }),
 
+    /** Daily (component cron): lets go of upload references nobody will confirm any more (see `sweepAbandonedUploads`). */
+    sweepUploads: internalMutation({ args: {}, handler: (ctx) => sweepAbandonedUploads(ctx) }),
+
     /** The newest updates of a branch (all platforms), newest first. */
     updates: query({
       args: { branch: v.optional(v.string()), paginationOpts: paginationOptsValidator },
@@ -838,7 +881,8 @@ const assetsAction = httpAction(async (ctx, request) => {
   const url = new URL(request.url);
   const key = (url.searchParams.get("key") ?? "").toLowerCase();
   if (!isSha256Hex(key)) return text(400, "key must be the asset's hex SHA-256");
-  const edge = edgeCache();
+  // `cache: false` turns the edge cache off for assets too (straight from storage, never stored at the edge).
+  const edge = (ctx.component.config ?? {}).cache === false ? null : edgeCache();
   const cacheKey = new Request(`${url.origin}/__ember/expo-updates${url.pathname}/${key}`);
   if (edge) {
     const hit = await edge.match(cacheKey).catch(() => undefined);
@@ -940,6 +984,8 @@ export const expoUpdates = defineComponent({
   functions: { ...functions, dashboard: dashboardFunctions },
   config: configValidator,
   http,
+  // Assets live on global:main with the rest of the component's tables.
+  crons: () => cronJobs({ shard: "global:main" }).daily("sweepUploads", { hour: 5 }, "lib:sweepUploads"),
   dashboard: {
     label: "Expo updates",
     icon: "flag",

@@ -256,6 +256,14 @@ describe("expo-updates in workerd", () => {
     const renders = probes.renders;
     for (let i = 0; i < 2; i++) expect(await ask(host, "nocache")).toMatchObject({ status: 200, cache: "MISS", plan: "MISS", id: v1.id });
     expect(probes.renders - renders).toBe(2);
+    // The assets too: from storage every time, never an edge entry.
+    const url = (await ask(host, "nocache")).manifest.launchAsset.url as string;
+    const fetches = probes.assetFetches;
+    for (let i = 0; i < 2; i++) {
+      const a = await call(url);
+      expect([a.status, a.headers.get("x-ember-cache"), await a.text()]).toEqual([200, "MISS", "nc-1"]);
+    }
+    expect(probes.assetFetches - fetches).toBe(2);
   });
 
   it("the JSON form through the Worker: the manifest alone, the signature as a header, 204 and 406", async () => {

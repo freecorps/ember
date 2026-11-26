@@ -144,8 +144,8 @@ ember expo list
   branch keeps it. To bring those back, republish the target update on the target branch after the switch
   (`ember expo publish` of the same export there), which gives it a newer `createdAt`: the later of the publish time
   and the target branch's head plus 1 ms. Installs move only if it is also later than the update they run: compare
-  the two in the Updates tab of the component's dashboard screen, or with `components.expoUpdates.lib.updates({ branch,
-  paginationOpts })` (id and `createdAt`, newest first) for each branch; if it is not later (the same millisecond, or
+  the two in the Updates tab of the component's dashboard screen, or from an action with `await ctx.runQuery(components.expoUpdates.lib.updates,
+  { branch, paginationOpts })` (id and `createdAt`, newest first) for each branch; if it is not later (the same millisecond, or
   a clock behind), publish again. If the target branch has an
   unfinished rollout, that publish is refused (`RolloutInProgress`, which names the platform and runtime version):
   finish it first, `ember expo rollout 100 --branch <target> --platform <p> --runtime-version <v>` (its update then

@@ -271,19 +271,57 @@ describe("expo updates component", () => {
     const t = harness();
     await publish(t, { bundle: "A" });
     await publish(t, { bundle: "B" });
-    for (let i = 0; i < 1001; i++) {
-      await publish(t, { bundle: `tmp-${i}` });
+    const b = (await t.query(unsafeRef<"query">("@expoUpdates/lib:updates"), { branch: "production", paginationOpts: { numItems: 1, cursor: null } })) as { page: Array<{ id: string }> };
+    const bId = b.page[0]!.id;
+    await upload(t, { bundle: "tmp" });
+    for (let i = 0; i < 1100; i++) {
+      await t.mutation(m("publish"), { branch: "production", updates: [{ id: crypto.randomUUID(), platform: "ios", runtimeVersion: "1.0.0", launchAsset: asset("tmp", "bundle-ios", "application/javascript"), assets: [] }] });
       await t.mutation(m("rollback"), { branch: "production" });
     }
+    const liveB = async () => {
+      const all = (await t.query(unsafeRef<"query">("@expoUpdates/lib:updates"), { branch: "production", paginationOpts: { numItems: 5000, cursor: null } })) as { page: Array<{ id: string; republishOf: string | null; rolledBack: boolean }> };
+      return all.page.filter((u) => !u.rolledBack && (u.id === bId || u.republishOf === bId)).length;
+    };
     await expect(t.mutation(m("rollback"), { branch: "production" })).rejects.toThrow(/live copies.*toEmbedded/);
     expect(((await t.mutation(m("rollback"), { branch: "production", toEmbedded: true })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
     expect((await ask(t)).kind).toBe("rollBackToEmbedded");
+    // The bounded rollback left copies of B live below the directive (the case the exclusion is for).
+    expect(await liveB()).toBeGreaterThan(0);
     // Copies of B the bounded rollback left behind are never served again: another to-embedded changes nothing, and
     // rolling the directive back reaches A, not a leftover B.
     expect(await t.mutation(m("rollback"), { branch: "production", toEmbedded: true })).toEqual([]);
     await t.mutation(m("rollback"), { branch: "production" });
     expect((await ask(t)).manifest.launchAsset.hash).toBe(createHash("sha256").update("A").digest("base64url"));
   }, 180_000);
+
+  test("a publish naming more distinct assets than a mutation can read is refused before anything is written", async () => {
+    const t = harness();
+    const fake = (n: number, at: number) => Array.from({ length: n }, (_, i) => ({ sha256: createHash("sha256").update(`a-${at}-${i}`).digest("hex"), key: `k${at}-${i}`, contentType: "image/png" }));
+    const updates = (["ios", "android"] as const).flatMap((platform) =>
+      Array.from({ length: 4 }, (_, j) => ({ platform, runtimeVersion: `${j}.0.0`, launchAsset: fake(1, j * 10 + (platform === "ios" ? 0 : 5))[0]!, assets: fake(1600, j * 10 + (platform === "ios" ? 1 : 6)) })),
+    );
+    await expect(t.mutation(m("publish"), { branch: "production", updates })).rejects.toThrow(/at most 12000 distinct assets/);
+    expect((await t.query(unsafeRef<"query">("@expoUpdates/lib:updates"), { branch: "production", paginationOpts: { numItems: 5, cursor: null } })) as { page: unknown[] }).toMatchObject({ page: [] });
+  });
+
+  test("the daily sweep lets go of upload references for a hash nobody touches again; storage then collects the file", async () => {
+    const t = harness();
+    const body = "abandoned";
+    const prepared = (await t.mutation(m("prepareAssets"), { assets: [{ sha256: hex(body), size: body.length, contentType: "application/javascript" }] })) as Array<{ upload?: { storageId: string } }>;
+    const id = prepared[0]!.upload!.storageId;
+    const stateOf = () => t.run((ctx) => ctx.storage.getMetadata(id as never)?.state ?? "gone");
+    const sweep = () => t.mutation(unsafeRef<"mutation">("@expoUpdates/lib:sweepUploads"), {}) as Promise<number>;
+    expect(await sweep()).toBe(0); // still in flight
+    await t.advance(26 * 3600_000); // past the ticket and its grace
+    expect(await stateOf()).toBe("pending"); // still referenced: nothing touched the hash
+    expect(await sweep()).toBe(1);
+    await t.advance(26 * 3600_000);
+    expect(await stateOf()).toBe("gone");
+    // A published asset is never swept: its file is ready.
+    await publish(t, { bundle: "kept" });
+    await t.advance(26 * 3600_000);
+    expect(await sweep()).toBe(0);
+  });
 
   test("repeated rollbacks to the embedded update retire the copies left below the directive, until A is reachable", async () => {
     const t = harness();
