@@ -544,9 +544,18 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await detail.locator("pre.stacktrace", { hasText: "SMTP down" }).waitFor();
     await shot(page, "screens-detail");
     await page.keyboard.press("Escape");
-    // Inline toggle: the declared mutation with the row's id and the new value.
-    await t.getByRole("switch", { name: "Paused" }).click();
+    // `k` on a focused row moves between rows: it is not the Components shortcut.
+    await t.locator("tbody tr").first().focus();
+    await page.keyboard.press("k");
+    await page.keyboard.press("j");
+    expect(page.url()).toContain("/components/org%3Aacme/pool");
+    await page.getByRole("heading", { name: "Work pool" }).waitFor();
+    // Inline toggle (Enter on the switch: it flips, the row's detail stays closed): the declared mutation with the
+    // row's id and the new value.
+    await t.getByRole("switch", { name: "Paused" }).focus();
+    await page.keyboard.press("Enter");
     await expect.poll(() => prod.posts.filter((x) => x.path === "dashboards/run").length).toBe(1);
+    expect(await page.getByRole("dialog").count()).toBe(0);
     expect(prod.posts.at(-1)!.body).toMatchObject({ dashboard: "pool", fn: "@pool/lib:pause", args: { id: "work_2", paused: false }, shard: "org:acme" });
     // A row action on prod: a plain confirmation (not destructive).
     await t.getByRole("button", { name: "Cancel" }).click();
@@ -562,7 +571,7 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await go.click();
     await page.getByText("Cancel all: done").waitFor();
     // The Worker checked the typed text (it answers 428 without it); the project only gets the call.
-    expect(prod.posts.at(-1)!.body).toEqual({ shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", args: {} });
+    expect(prod.posts.at(-1)!.body).toEqual({ shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", args: {}, destructive: true });
     // An action form generated from the action's args.
     await page.getByRole("button", { name: "Enqueue" }).click();
     await page.getByRole("dialog").getByLabel("label").fill("nightly");
@@ -585,6 +594,13 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await expect.poll(() => t.locator("tbody tr").count()).toBe(2);
     expect(await page.getByRole("button", { name: "Cancel all" }).isDisabled()).toBe(true);
     expect(await t.getByRole("switch").first().isDisabled()).toBe(true);
+    // Paging is a read; another shard starts on its first page (the cursor is the other shard's position).
+    await page.getByRole("button", { name: "Next →" }).click();
+    await expect.poll(() => prod.dashQueries.filter((q) => q.fn === "@pool/lib:listWork").at(-1)?.args).toMatchObject({ paginationOpts: { cursor: "2" } });
+    await page.goto(`${origin}/#/p/chat/prod/components/org%3Abeta/pool`);
+    await expect.poll(() => prod.dashQueries.filter((q) => q.fn === "@pool/lib:listWork").at(-1)).toMatchObject({ shard: "org:beta", args: { paginationOpts: { cursor: null } } });
+    expect(prod.dashQueries.filter((q) => q.fn === "@pool/lib:listWork" && q.shard === "org:beta").map((q) => (q.args as { paginationOpts: { cursor: unknown } }).paginationOpts.cursor)).toEqual([null]);
+    await page.getByText("page 1").waitFor();
     // The app has no screens of its own: the section says how to add them.
     await page.goto(`${origin}/#/p/chat/prod/app`);
     await page.getByText(/This app has no screens yet/).waitFor();

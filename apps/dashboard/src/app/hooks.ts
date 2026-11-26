@@ -97,7 +97,8 @@ export function useShortcuts(map: Record<string, () => void>): void {
   ref.current = map;
   useEffect(() => {
     const f = (e: KeyboardEvent) => {
-      if (e.metaKey || e.ctrlKey || e.altKey || typing(e.target) || document.querySelector("dialog[open]")) return;
+      // A key something on the page already handled (a focused table row's j/k) is not a shortcut.
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || typing(e.target) || document.querySelector("dialog[open]")) return;
       const fn = ref.current[e.key];
       if (fn) {
         e.preventDefault();

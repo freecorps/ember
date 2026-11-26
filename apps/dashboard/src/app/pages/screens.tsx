@@ -264,7 +264,12 @@ function TableBlock({ c, b }: { c: ScreenCtx; b: Extract<Block, { kind: "table" 
   const [raw, setRaw] = useState<Record<string, string>>({});
   const [applied, setApplied] = useState<Record<string, unknown>>({});
   const [filterError, setFilterError] = useState<string | null>(null);
-  const [cursors, setCursors] = useState<Array<string | null>>([null]);
+  // The pages walked, for one shard: a cursor of another shard's table would seek a wrong position there, so another
+  // shard starts on the first page (in this same render, before any request). Filters stay.
+  const [pager, setPager] = useState<{ shard: string; cursors: Array<string | null> }>({ shard: c.shard, cursors: [null] });
+  const cursors = pager.shard === c.shard ? pager.cursors : [null];
+  const setCursors = (f: Array<string | null> | ((x: Array<string | null>) => Array<string | null>)) =>
+    setPager((p) => ({ shard: c.shard, cursors: typeof f === "function" ? f(p.shard === c.shard ? p.cursors : [null]) : f }));
   const [open, setOpen] = useState<unknown>(null);
   const cursor = cursors[cursors.length - 1] ?? null;
   const args = { ...(b.args ?? {}), ...applied, ...(b.pageSize ? { paginationOpts: { numItems: b.pageSize, cursor } } : {}) };
@@ -274,6 +279,17 @@ function TableBlock({ c, b }: { c: ScreenCtx; b: Extract<Block, { kind: "table" 
   const rows = at(b.rows ? value : page ? page.page : value, b.rows);
   const list = Array.isArray(rows) ? rows : null;
   const hasActions = !!b.rowActions?.length;
+  // Each row by its record (`rowKey`), so an open action or a switch never moves to another record on a reload.
+  const rowKeys = useMemo(() => {
+    const seen = new Set<string>();
+    return (list ?? []).map((row, i) => {
+      const k = at(row, b.rowKey);
+      let key = typeof k === "string" || typeof k === "number" ? `k:${k}` : `i:${i}`;
+      if (seen.has(key)) key = `${key}#${i}`;
+      seen.add(key);
+      return key;
+    });
+  }, [list, b.rowKey]);
   return (
     <>
       {filterFields.length > 0 && (
@@ -318,6 +334,7 @@ function TableBlock({ c, b }: { c: ScreenCtx; b: Extract<Block, { kind: "table" 
         <Table
           label={b.label ?? b.id}
           empty={Object.keys(applied).length ? "Nothing matches these filters." : "Nothing here yet."}
+          rowKeys={rowKeys}
           {...(b.detail ? { onRow: (i: number) => setOpen(list[i]) } : {})}
           cols={[...b.columns.map((col) => ({ h: col.label, ...(col.format === "number" || col.format === "bytes" || col.format === "ms" ? { num: true } : {}) })), ...(hasActions ? [{ h: "" }] : [])]}
           rows={list.map((row) => [
@@ -523,6 +540,8 @@ function Toggle({ c, value, label, mutation, args, arg, disabled }: { c: ScreenC
       className={`switch${shown ? " on" : ""}`}
       disabled={disabled || busy}
       title={disabled ? "Needs the admin role" : undefined}
+      // Enter/Space on the switch flips it, never the row under it (a table row with a detail opens on those keys).
+      onKeyDown={(e) => e.stopPropagation()}
       onClick={async (e) => {
         e.stopPropagation();
         setBusy(true);
