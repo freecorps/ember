@@ -6,7 +6,8 @@
 // its own (or a batch refused with another 4xx) is dropped. On `pagehide` the beacons stay within the
 // browser's keepalive budget (64 KiB in flight per page, shared with the pending fetch): what does not fit stays
 // queued (a page restored from the back/forward cache sends it). The anonymous id lives in localStorage when there is
-// one.
+// one; `reset()` (sign-out) is an identity boundary: what was queued before it never goes with the next user's token.
+// A send that hangs (token or fetch) gives up after `timeoutMs` and is retried; redirects are never followed.
 //
 //   const analytics = createAnalytics({ url: "https://my-app.example.com" });
 //   analytics.track("viewed_pricing", { plan: "pro" });
@@ -31,6 +32,8 @@ export interface AnalyticsClientOptions {
   getToken?: () => string | null | undefined | Promise<string | null | undefined>;
   /** Default `globalThis.fetch`. */
   fetch?: typeof fetch;
+  /** How long one send (token + request) may take before it is given up and retried (default 15 s). */
+  timeoutMs?: number;
   /** Where the anonymous id is kept (default `localStorage`, when available; otherwise memory). */
   storage?: Pick<Storage, "getItem" | "setItem"> | null;
 }
@@ -51,6 +54,13 @@ const MAX_PROPS = 20;
  * pending keepalive bodies pass 64 KiB (Fetch "keepalive" quota); a little under it, for the headers.
  */
 export const BEACON_BUDGET_BYTES = 60 * 1024;
+
+const finite = (x: unknown, d: number) => (typeof x === "number" && Number.isFinite(x) ? x : d);
+const LOOPBACK = (host: string) => host === "localhost" || host === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+type Outcome = "ok" | "retry" | "split";
+/** Delivered: 2xx. Refused whole (400 bad_batch, 413 too_large): "split". Another 4xx but 429: dropped for good. */
+const outcomeOf = (status: number): Outcome =>
+  status >= 200 && status < 300 ? "ok" : status === 400 || status === 413 ? "split" : status >= 400 && status < 500 && status !== 429 ? "ok" : "retry";
 
 const byteLength = (s: string) => (typeof TextEncoder !== "undefined" ? new TextEncoder().encode(s).length : s.length * 3);
 
@@ -74,6 +84,8 @@ export class AnalyticsClient {
   private readonly endpoint: string;
   private readonly batchSize: number;
   private readonly maxQueue: number;
+  private readonly timeoutMs: number;
+  private closed = false;
   private readonly timer: ReturnType<typeof setInterval>;
   private readonly onHide: (() => void) | null = null;
   private readonly storage: Pick<Storage, "getItem" | "setItem"> | null;
@@ -87,11 +99,25 @@ export class AnalyticsClient {
 
   constructor(private readonly o: AnalyticsClientOptions) {
     this.endpoint = `${o.url.replace(/\/+$/, "")}${o.path ?? "/analytics/track"}`;
-    this.batchSize = Math.max(1, Math.min(50, Math.floor(o.batchSize ?? 20)));
-    this.maxQueue = Math.max(this.batchSize, Math.floor(o.maxQueue ?? 500));
+    if (o.getToken) {
+      // A bearer token never crosses the network in the clear: https, or plain http to the loopback (local dev).
+      let u: URL | null = null;
+      try {
+        u = new URL(this.endpoint);
+      } catch {
+        // a relative URL: the page's own origin, which the browser already chose
+      }
+      if (u && u.protocol !== "https:" && !(u.protocol === "http:" && LOOPBACK(u.hostname))) {
+        throw new Error(`ember-analytics: getToken needs an https url (got ${u.protocol}//${u.host}): the token would go in the clear`);
+      }
+    }
+    // Non-finite options (NaN, Infinity) fall back to the defaults before clamping.
+    this.batchSize = Math.max(1, Math.min(50, Math.floor(finite(o.batchSize, 20))));
+    this.maxQueue = Math.max(this.batchSize, Math.floor(finite(o.maxQueue, 500)));
+    this.timeoutMs = Math.max(1000, finite(o.timeoutMs, 15_000));
     this.storage = o.storage === undefined ? defaultStorage() : o.storage;
     this.aid = this.loadId();
-    this.timer = setInterval(() => void this.flush(), o.flushIntervalMs ?? 10_000);
+    this.timer = setInterval(() => void this.flush(), Math.max(100, finite(o.flushIntervalMs, 10_000)));
     (this.timer as { unref?: () => void }).unref?.();
     // A page (a document to hide and a navigator to beacon with): not a worker, not Node/SSR with a stubbed document.
     const g = globalThis as { addEventListener?: (t: string, f: () => void) => void; removeEventListener?: unknown; document?: unknown; navigator?: unknown };
@@ -122,7 +148,10 @@ export class AnalyticsClient {
     return this.aid;
   }
 
-  /** A new anonymous id (after sign-out, so the next visitor is not linked to the last). */
+  /**
+   * A new anonymous id (after sign-out, so the next visitor is not linked to the last). Events already queued keep the
+   * old id and are sent without a token (anonymous): never as the user who signs in next.
+   */
   reset(): void {
     this.aid = newId();
     try {
@@ -142,7 +171,7 @@ export class AnalyticsClient {
       // The cap counts the props kept, not the keys looked at (an invalid one does not use a slot).
       for (const [k, v] of Object.entries(props)) {
         if (kept >= MAX_PROPS) break;
-        if (!/^[A-Za-z_][A-Za-z0-9_]{0,39}$/.test(k)) continue;
+        if (!/^(?!__proto__$)[A-Za-z_][A-Za-z0-9_]{0,39}$/.test(k)) continue;
         if (typeof v === "string") p[k] = v.slice(0, 256);
         else if ((typeof v === "number" && Number.isFinite(v)) || typeof v === "boolean") p[k] = v;
         else continue;
@@ -161,8 +190,26 @@ export class AnalyticsClient {
 
   /** Posts what is queued, a batch at a time. Never throws. While one runs, a call waits for it (no second request). */
   flush(): Promise<void> {
-    if (!this.flushing) this.flushing = this.drain().finally(() => (this.flushing = null));
+    if (!this.flushing) {
+      // The promise is in place before any user code runs (a `getToken` that tracks, say): the drain starts a tick later.
+      this.flushing = Promise.resolve()
+        .then(() => this.drain())
+        .finally(() => (this.flushing = null));
+    }
     return this.flushing;
+  }
+
+  /** How many of the first `n` queued events go together: one anonymous id per batch (an identity boundary). */
+  private run(n: number): number {
+    const aid = this.queue[0]?.anonymousId;
+    let k = 0;
+    while (k < n && k < this.queue.length && this.queue[k]!.anonymousId === aid) k++;
+    return k;
+  }
+
+  private requeue(batch: QueuedEvent[]): void {
+    this.queue.unshift(...batch);
+    if (this.queue.length > this.maxQueue) this.queue.splice(0, this.queue.length - this.maxQueue);
   }
 
   private async drain(): Promise<void> {
@@ -170,7 +217,7 @@ export class AnalyticsClient {
     // 32 KiB) goes back in halves, for the rest of this flush: only an event refused on its own is dropped.
     let size = this.batchSize;
     while (this.queue.length) {
-      const batch = this.queue.splice(0, size);
+      const batch = this.queue.splice(0, this.run(size));
       const r = await this.post(batch);
       if (r === "split" && batch.length > 1) {
         this.queue.unshift(...batch);
@@ -178,39 +225,57 @@ export class AnalyticsClient {
         continue;
       }
       if (r === "retry") {
-        // Back to the front, for the next flush (keeping the cap).
-        this.queue.unshift(...batch);
-        if (this.queue.length > this.maxQueue) this.queue.splice(0, this.queue.length - this.maxQueue);
+        // Back to the front, for the next flush (keeping the cap). Closed: no timer will come, so beacon it now.
+        this.requeue(batch);
+        if (this.closed) this.flushBeacon();
         return;
       }
     }
   }
 
   /** "ok": delivered or dropped for good; "retry": later, as is; "split": refused whole, smaller batches may pass. */
-  private async post(batch: QueuedEvent[]): Promise<"ok" | "retry" | "split"> {
+  private async post(batch: QueuedEvent[]): Promise<Outcome> {
     const f = this.o.fetch ?? (globalThis as { fetch?: typeof fetch }).fetch;
     if (!f) return "ok";
     this.sent++;
     const body = JSON.stringify({ events: batch });
     const bytes = byteLength(body);
+    // One deadline for the token and the request: a send that hangs is given up (aborted) and retried, so the flush
+    // never stays held. A late answer of a given-up send changes nothing (the batch is already back in the queue).
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), this.timeoutMs);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
     try {
       const headers: Record<string, string> = { "content-type": "text/plain" };
-      const token = this.o.getToken ? await this.o.getToken() : null;
-      if (token) headers.authorization = `Bearer ${token}`;
+      // The token only for events queued under the current anonymous id: after `reset()` (sign-out), older events go
+      // anonymous, never as the next user.
+      if (this.o.getToken && batch[0]?.anonymousId === this.aid) {
+        const token = await Promise.race([Promise.resolve().then(() => this.o.getToken!()), timeout]);
+        if (token === "timeout") return "retry";
+        if (token) headers.authorization = `Bearer ${token}`;
+      }
       this.inFlightBytes += bytes;
       try {
-        const r = await f(this.endpoint, { method: "POST", headers, body, keepalive: true });
-        // Delivered: 2xx. Refused whole (400 bad_batch, 413 too_large): smaller batches. Another 4xx (but 429):
-        // dropped, sending it again would not change the answer. Anything else (a redirect not followed, 429, 5xx)
-        // was not taken: retried.
-        if (r.status >= 200 && r.status < 300) return "ok";
-        if (r.status === 400 || r.status === 413) return "split";
-        return r.status >= 400 && r.status < 500 && r.status !== 429 ? "ok" : "retry";
+        // `redirect: "manual"`: a redirect is never followed (a 301 to a landing page would turn the POST into a GET
+        // and answer 200): it comes back as a 3xx or an opaque redirect (status 0), retried.
+        const sending = f(this.endpoint, { method: "POST", headers, body, keepalive: true, redirect: "manual", ...(ctrl ? { signal: ctrl.signal } : {}) });
+        sending.catch(() => undefined);
+        const r = await Promise.race([sending, timeout]);
+        if (r === "timeout") {
+          ctrl?.abort();
+          return "retry";
+        }
+        return outcomeOf(r.status);
       } finally {
         this.inFlightBytes -= bytes;
       }
     } catch {
       return "retry";
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -224,29 +289,46 @@ export class AnalyticsClient {
     const nav = (globalThis as { navigator?: { sendBeacon?: (url: string, data: Blob | string) => boolean } }).navigator;
     let budget = BEACON_BUDGET_BYTES - this.inFlightBytes;
     while (this.queue.length) {
-      const batch = this.queue.slice(0, this.batchSize);
+      const batch = this.queue.slice(0, this.run(this.batchSize));
       const body = JSON.stringify({ events: batch });
       const bytes = byteLength(body);
       if (bytes > budget) return;
       try {
         if (typeof nav?.sendBeacon === "function" && typeof Blob !== "undefined") {
           if (!nav.sendBeacon(this.endpoint, new Blob([body], { type: "text/plain" }))) return; // over the browser's quota
+          this.queue.splice(0, batch.length);
         } else {
           const f = this.o.fetch ?? (globalThis as { fetch?: typeof fetch }).fetch;
           if (!f) return;
-          void f(this.endpoint, { method: "POST", headers: { "content-type": "text/plain" }, body, keepalive: true }).catch(() => undefined);
+          // Out of the queue while the keepalive fetch is pending (never sent twice); back in front if it is not
+          // delivered (network, 3xx, 429, 5xx), for a page restored from the back/forward cache.
+          this.queue.splice(0, batch.length);
+          let sending: Promise<Response>;
+          try {
+            sending = f(this.endpoint, { method: "POST", headers: { "content-type": "text/plain" }, body, keepalive: true, redirect: "manual" });
+          } catch (e) {
+            this.queue.unshift(...batch);
+            throw e;
+          }
+          sending.then(
+            (r) => void (outcomeOf(r.status) === "retry" && this.requeue(batch)),
+            () => this.requeue(batch),
+          );
         }
       } catch {
         return; // tracking must never break the app
       }
-      this.queue.splice(0, batch.length);
       this.sent++;
       budget -= bytes;
     }
   }
 
-  /** Sends what is left (as beacons) and stops the timer. */
+  /**
+   * Sends what is left (as beacons) and stops the timer. A fetch still in flight is not waited for; if it then fails,
+   * its batch is beaconed as soon as it is back in the queue (no timer is left to send it).
+   */
   close(): void {
+    this.closed = true;
     this.flushBeacon();
     clearInterval(this.timer);
     if (this.onHide) (globalThis as { removeEventListener?: (t: string, f: () => void) => void }).removeEventListener?.("pagehide", this.onHide);

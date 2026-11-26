@@ -176,6 +176,28 @@ describe("analytics client", () => {
     a.track("e", props as never);
     await a.flush();
     expect(Object.keys(sent[0]!.body.events[0]!.props as object)).toEqual(Array.from({ length: 20 }, (_, i) => `k${i}`));
+    // __proto__ is never kept (the server refuses it as a key: the whole batch would be lost).
+    a.track("p", JSON.parse('{"__proto__":"x","ok":1}') as never);
+    await a.flush();
+    expect(sent[1]!.body.events[0]!.props).toEqual({ ok: 1 });
+  });
+
+  test("over maxQueue, the oldest events go first (while a request is held open)", async () => {
+    let release!: () => void;
+    const bodies: number[][] = [];
+    const fetch = (async (_url: string, init: RequestInit) => {
+      bodies.push((JSON.parse(String(init.body)) as Sent["body"]).events.map((e) => (e.props as { i: number }).i));
+      if (bodies.length === 1) await new Promise<void>((r) => (release = r));
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 5, maxQueue: 10, flushIntervalMs: 60_000 });
+    for (let i = 0; i < 5; i++) a.track("e", { i });
+    await vi.advanceTimersByTimeAsync(0); // 0..4 out, held
+    for (let i = 5; i < 30; i++) a.track("e", { i });
+    expect(a.pending).toBe(10);
+    release();
+    await a.flush();
+    expect(bodies).toEqual([[0, 1, 2, 3, 4], [20, 21, 22, 23, 24], [25, 26, 27, 28, 29]]);
   });
 
   test("the queue is capped (oldest dropped); invalid names and props never leave the client", async () => {
@@ -267,6 +289,135 @@ describe("analytics client", () => {
     const { fetch } = fakeFetch();
     make({ url: "https://app.test", fetch, storage: null }).close();
     expect(added).toEqual([]);
+  });
+
+  test("reset() is an identity boundary: events queued before it never go with the next user's token", async () => {
+    const sent: Array<{ auth?: string; names: string[]; aids: string[] }> = [];
+    const fetch = (async (_url: string, init: RequestInit) => {
+      const b = JSON.parse(String(init.body)) as Sent["body"];
+      sent.push({ ...((init.headers as Record<string, string>).authorization ? { auth: (init.headers as Record<string, string>).authorization } : {}), names: b.events.map((e) => e.name), aids: [...new Set(b.events.map((e) => e.anonymousId))] });
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof globalThis.fetch;
+    let token = "token-of-a";
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000, getToken: () => token });
+    a.track("a1");
+    a.track("a2");
+    a.reset(); // A signs out
+    token = "token-of-b"; // B signs in
+    a.track("b1");
+    await a.flush();
+    expect(sent).toEqual([
+      { names: ["a1", "a2"], aids: [sent[0]!.aids[0]] },
+      { auth: "Bearer token-of-b", names: ["b1"], aids: [a.anonymousId] },
+    ]);
+    expect(sent[0]!.aids[0]).not.toBe(a.anonymousId);
+  });
+
+  test("non-finite options fall back to the defaults (NaN batchSize never posts empty batches)", async () => {
+    const { sent, fetch } = fakeFetch();
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: Number.NaN, maxQueue: Number.NaN, flushIntervalMs: Number.NaN });
+    for (let i = 0; i < 25; i++) a.track("e");
+    await a.flush();
+    expect(sent.map((x) => x.body.events.length)).toEqual([20, 5]);
+    expect(a.pending).toBe(0);
+  });
+
+  test("the flush guard is set before user code: a getToken that tracks does not start a second drain", async () => {
+    let inFlight = 0;
+    let most = 0;
+    const fetch = (async () => {
+      inFlight++;
+      most = Math.max(most, inFlight);
+      await Promise.resolve();
+      inFlight--;
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof globalThis.fetch;
+    let calls = 0;
+    const a: AnalyticsClient = make({ url: "https://app.test", fetch, storage: null, batchSize: 1, flushIntervalMs: 60_000, getToken: () => (calls++ < 3 && a.track("from-token"), "t") });
+    a.track("first");
+    await vi.advanceTimersByTimeAsync(0);
+    await a.flush();
+    expect(most).toBe(1);
+    expect(a.pending).toBe(0);
+  });
+
+  test("a send that hangs (token or fetch) is given up after timeoutMs, aborted and retried", async () => {
+    let signal: AbortSignal | undefined;
+    let hang = true;
+    const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      signal = init.signal ?? undefined;
+      expect(init.redirect).toBe("manual");
+      return hang ? new Promise<Response>(() => {}) : new Response(null, { status: 204 });
+    }) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000, timeoutMs: 2000 });
+    a.track("x");
+    const first = a.flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await first;
+    expect(signal?.aborted).toBe(true);
+    expect(a.pending).toBe(1);
+    hang = false;
+    await a.flush();
+    expect(a.pending).toBe(0);
+    // A token that never comes: the same deadline.
+    const b = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000, timeoutMs: 2000, getToken: () => new Promise<string>(() => {}) });
+    b.track("y");
+    const p = b.flush();
+    await vi.advanceTimersByTimeAsync(2000);
+    await p;
+    expect(b.pending).toBe(1);
+  });
+
+  test("a token is never sent to a plain http endpoint (only the loopback, for local dev)", () => {
+    const { fetch } = fakeFetch();
+    expect(() => make({ url: "http://app.test", fetch, storage: null, getToken: () => "t" })).toThrow(/https/);
+    for (const url of ["http://localhost:8787", "http://127.0.0.1:3000", "http://[::1]:3000", "https://app.test"]) make({ url, fetch, storage: null, getToken: () => "t" });
+    make({ url: "http://app.test", fetch, storage: null }); // no token: anonymous events over http are the app's choice
+  });
+
+  test("without sendBeacon, a keepalive fetch on pagehide that fails puts its batch back (bfcache restore)", async () => {
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    let answer: () => Promise<Response> = async () => new Response(null, { status: 503 });
+    const fetch = vi.fn(() => answer()) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    a.track("one");
+    a.track("two");
+    listeners.get("pagehide")!();
+    expect(a.pending).toBe(0); // out of the queue while the fetch is pending
+    await vi.advanceTimersByTimeAsync(0);
+    expect(a.pending).toBe(2);
+    answer = async () => Promise.reject(new TypeError("offline"));
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(a.pending).toBe(2);
+    answer = async () => new Response(null, { status: 204 });
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(a.pending).toBe(0);
+  });
+
+  test("close(): a fetch in flight that then fails is beaconed (no timer is left to send it)", async () => {
+    const beacons: string[][] = [];
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("addEventListener", () => {});
+    vi.stubGlobal("removeEventListener", () => {});
+    vi.stubGlobal("navigator", { sendBeacon: (_u: string, d: Blob) => (void d.text().then((t) => beacons.push((JSON.parse(t) as Sent["body"]).events.map((e) => e.name))), true) });
+    let fail!: (r: Response) => void;
+    const fetch = (async () => new Promise<Response>((resolve) => (fail = resolve))) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    a.track("in-flight");
+    const p = a.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    a.close();
+    fail(new Response(null, { status: 503 }));
+    await p;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(beacons).toEqual([["in-flight"]]);
+    expect(a.pending).toBe(0);
   });
 
   test("the anonymous id: kept in storage across clients, a new one after reset", () => {
