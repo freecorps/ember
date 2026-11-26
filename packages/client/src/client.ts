@@ -478,13 +478,19 @@ type HttpAnswer = { status: number; body: unknown; owner: string; authGen: numbe
 /** One query of `query()` / `fetchForHydration` waiting for the end of its turn (`flushQueries`). */
 interface QueuedQuery {
   fn: string;
-  args: Record<string, unknown>;
+  /** The arguments encoded when the query was asked (`stringify`): a caller changing its object later changes nothing. */
+  args: string;
   resolve: (r: HttpAnswer) => void;
   reject: (e: unknown) => void;
 }
 
 /** Most queries one `POST /api/query/batch` carries (the runtime's `MAX_QUERY_BATCH`). */
 const MAX_QUERY_BATCH = 32;
+
+/** `{fn, args, shard?}` as JSON text, `args` already encoded (the canonical JSON composes: a value's text is its parts'). */
+function queryEntry(fn: string, args: string, shard?: string): string {
+  return `{"fn":${JSON.stringify(fn)},"args":${args}${shard === undefined ? "" : `,"shard":${JSON.stringify(shard)}`}}`;
+}
 
 /** An HTTP query answer as `httpFirst` uses it: a value with version, epoch and `ik` (an older runtime: null). */
 function httpFirstValue(r: unknown): HttpFirstValue | null {
@@ -2186,41 +2192,50 @@ export class EmberClient {
    * without the batch, goes on its own.
    */
   private postQuery(fn: string, args: Record<string, unknown>, shard: string): Promise<HttpAnswer> {
-    if (this.queryBatch === false) return this.post("query", stringify({ fn, args, shard }));
     return new Promise((resolve, reject) => {
+      // Encoded now, as the call was made (an argument that cannot be encoded, a cycle, rejects this query alone).
+      const encoded = stringify(args);
+      if (this.queryBatch === false) return void this.post("query", queryEntry(fn, encoded, shard)).then(resolve, reject);
       let q = this.queryQueue.get(shard);
       if (!q) {
         this.queryQueue.set(shard, (q = []));
         queueMicrotask(() => this.flushQueries(shard));
       }
-      q.push({ fn, args, resolve, reject });
+      q.push({ fn, args: encoded, resolve, reject });
     });
   }
 
   /**
    * The turn's HTTP queries of one shard: one `POST /api/query/batch` per `MAX_QUERY_BATCH`, each query answered with
-   * its own entry. A refusal of the whole request (an invalid token, 429, a server error) is every query's answer, as
-   * it would have been one by one; a runtime that does not serve the batch gets them one by one (and no batch again).
+   * its own entry. A refusal of the whole request (an invalid token after the one renewal `post` tries, 429, a server
+   * error) is every query's answer, as `{ok: false, error}` with the request's status, as it would have been one by
+   * one; a batch too large (413) goes one by one; a runtime that does not serve the batch gets them one by one (and
+   * no batch again).
    */
   private flushQueries(shard: string): void {
     const items = this.queryQueue.get(shard) ?? [];
     this.queryQueue.delete(shard);
     const alone = (list: QueuedQuery[]) => {
-      for (const i of list) this.post("query", stringify({ fn: i.fn, args: i.args, shard })).then(i.resolve, i.reject);
+      for (const i of list) this.post("query", queryEntry(i.fn, i.args, shard)).then(i.resolve, i.reject);
     };
     if (items.length < 2 || this.queryBatch === false) return alone(items);
     for (let k = 0; k < items.length; k += MAX_QUERY_BATCH) {
       const chunk = items.slice(k, k + MAX_QUERY_BATCH);
-      const payload = stringify({ shard, queries: chunk.map((i) => ({ fn: i.fn, args: i.args })) });
+      const payload = `{"shard":${JSON.stringify(shard)},"queries":[${chunk.map((i) => queryEntry(i.fn, i.args)).join(",")}]}`;
       this.post("query", payload, `query/batch?shard=${encodeURIComponent(shard)}`).then(
         (r) => {
-          const b = r.body as { ok?: unknown; results?: unknown } | null;
+          const b = r.body as { ok?: unknown; results?: unknown; error?: unknown } | null;
           if (b?.ok === true && Array.isArray(b.results) && b.results.length === chunk.length) {
             const results = b.results as unknown[];
             chunk.forEach((i, n) => i.resolve({ ...r, body: results[n] }));
             return;
           }
-          if (r.status === 401 || r.status === 429 || r.status >= 500) return chunk.forEach((i) => i.resolve(r));
+          if (r.status === 401 || r.status === 429 || r.status >= 500) {
+            // Each query's own answer, shaped as `POST /api/query` refuses one (never the batch's other fields).
+            const body = b && typeof b.error === "object" && b.error !== null ? { ok: false, error: b.error } : { ok: false };
+            return chunk.forEach((i) => i.resolve({ ...r, body }));
+          }
+          if (r.status === 413) return alone(chunk);
           this.queryBatch = false;
           alone(chunk);
         },
