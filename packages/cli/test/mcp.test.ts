@@ -245,11 +245,12 @@ describe("MCP tools", () => {
     // A query needs only the flag.
     expect((await call(on.s, "run", { fn: "messages:list", env: "prod" })).structuredContent.env).toBe("prod");
     expect(on.rt.calls.at(-1)!.url).toBe("https://ember-chat-prod.acme.workers.dev/api/_ember/run");
-    // A mutation unconfirmed goes with readOnly: the deployed runtime refuses it (403), nothing ran.
+    // A mutation (by the local manifest) unconfirmed is refused before anything is sent.
+    const before = on.rt.calls.length;
     const unconfirmed = await call(on.s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" } });
     expect(unconfirmed.isError).toBe(true);
-    expect(unconfirmed.content[0]!.text).toMatch(/changes real data there\. Ask the user, then call again with confirm: "prod"/);
-    expect(on.rt.calls.at(-1)!.body).toMatchObject({ fn: "messages:send", readOnly: true });
+    expect(unconfirmed.content[0]!.text).toMatch(/messages:send is a mutation on "prod" and changes real data there\. Ask the user, then call again with confirm: "prod"/);
+    expect(on.rt.calls).toHaveLength(before);
     const n = on.rt.calls.length;
     const wrong = await call(on.s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" }, confirm: "dev" });
     expect([wrong.isError, wrong.content[0]!.text]).toEqual([true, 'confirm must be the environment\'s name, "prod" (got "dev").']);
@@ -273,7 +274,7 @@ describe("MCP tools", () => {
     expect((await call(noToken, "run", { fn: "messages:list" })).content[0]!.text).toMatch(/EMBER_ADMIN_TOKEN/);
   }, 120_000);
 
-  it("run: an unconfirmed call goes with readOnly, so the deployed code's type decides, not the local one", async () => {
+  it("run: an unconfirmed call goes with readOnly, so a write in the deployed code is refused even if it is a query here", async () => {
     // messages:list is a query here but a mutation in what prod runs (a change not deployed yet, or the reverse).
     const { s, rt } = server({ allowRun: ["prod"] }, { deployed: { "messages:list": "mutation" } });
     const r = await call(s, "run", { fn: "messages:list", env: "prod", args: { channel: "c" } });
@@ -283,10 +284,11 @@ describe("MCP tools", () => {
     // Confirmed: it runs.
     expect((await call(s, "run", { fn: "messages:list", env: "prod", args: { channel: "c" }, confirm: "prod" })).isError).toBe(false);
     expect(rt.calls.at(-1)!.body).not.toHaveProperty("readOnly");
-    // The reverse: a mutation here, still a query in what prod runs: unconfirmed, the runtime runs it.
+    // The reverse: a mutation here, still a query in what prod runs: refused here all the same (asking for confirm on a
+    // read is harmless; sending a write unconfirmed is not), nothing sent.
     const back = server({ allowRun: ["prod"] }, { deployed: { "messages:send": "query" } });
     const sent = await call(back.s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" } });
-    expect([sent.isError, back.rt.calls.at(-1)!.body.readOnly]).toEqual([false, true]);
+    expect([sent.isError, back.rt.calls.length]).toEqual([true, 0]);
     // A real query stays a one-step call, readOnly on the wire.
     const q = server({ allowRun: ["prod"] });
     expect((await call(q.s, "run", { fn: "messages:list", env: "prod" })).isError).toBe(false);
@@ -329,11 +331,12 @@ describe("MCP tools", () => {
   }, 120_000);
 
   it("a gradual deployment: the check and the run reach the same (checked) version, so the old one never runs an unconfirmed write", async () => {
-    const { s, rt } = server({ allowRun: ["prod"] }, { split: true });
+    // messages:list is a query here (so it goes unconfirmed, with readOnly) and a write in what prod runs.
+    const { s, rt } = server({ allowRun: ["prod"] }, { split: true, deployed: { "messages:list": "mutation" } });
     // Each call's check reaches either version: the old one is refused there (nothing else sent); after the new one
     // answered, the run is pinned to it and its guard refuses the unconfirmed write. It never runs.
     for (let i = 0; i < 6; i++) {
-      const r = await call(s, "run", { fn: "messages:send", env: "prod", args: { channel: "c", body: "x" } });
+      const r = await call(s, "run", { fn: "messages:list", env: "prod", args: { channel: "c" } });
       expect([i, r.isError, r.content[0]!.text]).toEqual([i, true, expect.stringMatching(/not a query in what "prod" runs|older than this `ember mcp`/)]);
     }
     const runs = rt.calls.filter((c) => c.url.endsWith("/run"));

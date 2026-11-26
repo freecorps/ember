@@ -315,10 +315,13 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
         // Grants and the confirm checked on the resolved name, before anything is sent.
         const envName = access(a.env as string | undefined, "run");
         if (envName !== LOCAL && a.confirm !== undefined && a.confirm !== envName) throw new ToolError(`confirm must be the environment's name, "${envName}" (got ${JSON.stringify(a.confirm)}).`);
-        // Outside the local ember dev a write runs only when the call names the environment again (confirm). The
-        // local manifest's type decides nothing: unconfirmed, the call goes with readOnly, and the deployed runtime
-        // refuses anything that is not a query in its own code (a function may be a query here and a mutation there).
+        // Outside the local ember dev a write runs only when the call names the environment again (confirm). Two checks:
+        // a function that is a mutation or action here is refused at once (an actionable error, nothing sent); one that
+        // is a query here still goes with readOnly, so the deployed runtime refuses it if its own code made it a write.
         const confirmed = envName === LOCAL || a.confirm === envName;
+        if (!confirmed && fn.type !== "query") {
+          throw new ToolError(`${fn.name} is a ${fn.type} on "${envName}" and changes real data there. Ask the user, then call again with confirm: "${envName}".`);
+        }
         const args = (a.args ?? {}) as Record<string, unknown>;
         let shard = a.shard as string | undefined;
         if (!shard && fn.shard && fn.shard.kind !== "global") {
