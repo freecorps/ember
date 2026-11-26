@@ -51,16 +51,19 @@ import {
 } from "@freecorps/ember-server";
 import { applyAnyDiff, isPlainObject, rowDiff, valueDiff } from "@freecorps/ember-values";
 import {
-  fingerprintOfJson,
   NeedData,
   ownerKey,
   recordKey,
+  hasFingerprint,
+  sameValue,
   UNKNOWN_OWNER,
   updateOwner,
+  valueFingerprint,
   type BackendReader,
   type Commit,
   type ExternalChange,
   type OfflineBackend,
+  type PendingOp as PendingWrite,
   type QueryLogEntry,
   type QueryRecord,
   type SavedNotice,
@@ -98,6 +101,13 @@ export interface OfflineOptions {
    * data pass the map.
    */
   foreignIds?: ForeignIds;
+  /**
+   * Replicated rows kept decoded in memory (least recently written or read first out; default 50 000): written ones
+   * and read ones, so a re-run reads them without a backend round trip (IndexedDB) or a decode, gets the very objects
+   * it got before (cheap to fingerprint and diff), and an unchanged row the server sends again is not rewritten. A row
+   * out of it is read from the backend again when needed, and rewritten if the server sends it again.
+   */
+  maxCachedRows?: number;
   now?: () => number;
 }
 
@@ -145,14 +155,15 @@ interface ShardTx {
 type Pending = { u: QueryUpdate; resolve(): void; reject(e: unknown): void };
 
 /** A pending-queue write (`persistPending.put` with `record`, `.remove` without) waiting in a batch. */
-type PendingOp = { mid: string; record?: PendingMutationRecord; resolve(): void; reject(e: unknown): void };
+type PendingOp = PendingWrite & { resolve(): void; reject(e: unknown): void };
 
 interface Watch {
   req: LocalQueryRequest;
   key: string;
   fn: AnyRegisteredFunction | undefined;
   readSet: ReadSet | null;
-  last: string | null;
+  /** The last result sent (null: none yet). */
+  last: LocalQueryResult | undefined | null;
   dirty: boolean;
   closed: boolean;
   failed: boolean;
@@ -200,11 +211,12 @@ export class OfflineStore implements StorageAdapter {
   private readonly registry: Map<string, AnyRegisteredFunction>;
   private readonly replicated: Set<string>;
   private readonly records = new Map<string, Rec>();
+  /** Shards whose records the backend has not read yet (`OfflineBackend.openShard`). */
+  private readonly unloaded = new Set<string>();
   /** `${shard}\0${id}` → number of records owning the row. */
   private readonly refs = new Map<string, number>();
   /** `${shard}\0${id}` → the row as last written / read (unknown after a restart until needed). */
-  private readonly rowDoc = new Map<string, Doc>();
-  private readonly rowSig = new Map<string, string>();
+  private readonly rows: RowCache;
   private readonly watches = new Set<Watch>();
   private rerunQueued = false;
   /** The burst of `applyPatch` calls still accepting more (closed by any other queued operation). */
@@ -225,6 +237,7 @@ export class OfflineStore implements StorageAdapter {
     this.registry = localQueryRegistry(options.queries ?? {});
     this.sync = options.sync ?? [];
     this.now = options.now ?? Date.now;
+    this.rows = new RowCache(Math.max(1, options.maxCachedRows ?? 50_000));
     this.replicated = new Set([...this.registry.keys(), ...this.sync.map((s) => getFunctionName(s.query))]);
     // Through the same write queue as results, so `flush()` covers the pending queue too.
     this.persistPending = {
@@ -261,30 +274,59 @@ export class OfflineStore implements StorageAdapter {
   private open(): Promise<void> {
     if (!this.opened) {
       this.opened = (async () => {
-        const { meta, queries, log = [] } = await this.backend.open();
+        const { meta, queries, log = [], lazy } = await this.backend.open();
         this.meta = { ...meta };
-        const logs = new Map<string, QueryLogEntry[]>();
-        for (const e of log) {
-          const list = logs.get(e.key);
-          if (list) list.push(e);
-          else logs.set(e.key, [e]);
-        }
-        const broken: Rec[] = [];
-        for (const r of queries) {
-          const rec = this.replay(r, (logs.get(r.key) ?? []).sort((a, b) => a.seq - b.seq));
-          this.records.set(rec.key, rec);
-          for (const id of rec.ids) this.ref(rec.shard, id, +1);
-          if (rec.skel === BROKEN) broken.push(rec);
-        }
-        // Retention: what the server has not refreshed for too long goes, with the rows only it owned.
-        const cutoff = this.now() - (this.options.retentionMs ?? 30 * DAY);
-        const stale = [...this.records.values()].filter((r) => r.updatedAt < cutoff || r.skel === BROKEN);
-        if (stale.length) await this.dropRecords(stale);
+        // Shards the backend did not read yet: their records load on first use (`ensureShard`).
+        if (lazy && this.backend.openShard) for (const shard of lazy) this.unloaded.add(shard);
+        await this.addRecords(queries, log);
         this.stopExternal = this.backend.onExternalChange?.((c) => this.onExternal(c)) ?? null;
       })();
       this.chain = this.opened.catch(() => undefined);
     }
     return this.opened;
+  }
+
+  /** Stored records (and their log) into memory; then retention drops what the server has not refreshed for too long. */
+  private async addRecords(queries: QueryRecord[], log: QueryLogEntry[], added?: Set<Rec>): Promise<void> {
+    const logs = new Map<string, QueryLogEntry[]>();
+    for (const e of log) {
+      const list = logs.get(e.key);
+      if (list) list.push(e);
+      else logs.set(e.key, [e]);
+    }
+    const cutoff = this.now() - (this.options.retentionMs ?? 30 * DAY);
+    const stale: Rec[] = [];
+    for (const r of queries) {
+      const rec = this.replay(r, (logs.get(r.key) ?? []).sort((a, b) => a.seq - b.seq));
+      this.records.set(rec.key, rec);
+      added?.add(rec);
+      for (const id of rec.ids) this.ref(rec.shard, id, +1);
+      // Retention: with the rows only it owned. A log that does not apply: the same.
+      if (rec.updatedAt < cutoff || rec.skel === BROKEN) stale.push(rec);
+    }
+    if (stale.length) await this.dropRecords(stale);
+  }
+
+  /**
+   * A shard's records in memory before anything reads or writes it (a backend that opens shards lazily: only the
+   * first use of each reads them). In the write queue, like every caller. A failed read leaves it unloaded (retried by
+   * the next use) and fails this one.
+   */
+  private async ensureShard(shard: string): Promise<void> {
+    if (!this.unloaded.has(shard)) return;
+    const { queries, log = [] } = await this.backend.openShard!(shard);
+    const added = new Set<Rec>();
+    try {
+      await this.addRecords(queries, log, added);
+    } catch (e) {
+      // Retention's drop failed: the shard stays unloaded, as it was (the next use reads it again and retries).
+      for (const rec of added) {
+        if (this.records.get(rec.key) === rec) this.records.delete(rec.key);
+        for (const id of rec.ids) if (this.ref(shard, id, -1) <= 0) this.rows.delete(`${shard}\u0000${id}`);
+      }
+      throw e;
+    }
+    this.unloaded.delete(shard);
   }
 
   /** A stored record with its log applied. A log that does not apply marks the record broken (dropped on open). */
@@ -420,6 +462,21 @@ export class OfflineStore implements StorageAdapter {
       if (list) list.push(it);
       else byMid.set(it.mid, [it]);
     }
+    if (this.backend.batchPending) {
+      // One transaction for the whole batch: every write lands, or none (they all reject).
+      const writes = [...byMid].map(([mid, ops]) => {
+        const last = ops[ops.length - 1]!;
+        return last.record ? { mid, record: last.record } : { mid };
+      });
+      try {
+        await this.backend.batchPending(writes);
+      } catch (e) {
+        for (const it of batch) it.reject(e);
+        return;
+      }
+      for (const it of batch) it.resolve();
+      return;
+    }
     for (const [mid, ops] of byMid) {
       const last = ops[ops.length - 1]!;
       try {
@@ -465,8 +522,29 @@ export class OfflineStore implements StorageAdapter {
   /** Applies a burst of updates in order, then commits once per shard (all of a shard's updates, or none of them). */
   private async applyBurst(items: Pending[]): Promise<void> {
     if (this.burst === items) this.burst = null;
+    try {
+      await this.applyBurstInner(items);
+    } finally {
+      // Whatever the burst staged and did not undo is what storage holds now (or it failed to stage: nothing).
+      this.rows.release();
+    }
+  }
+
+  private async applyBurstInner(items: Pending[]): Promise<void> {
     const txs = new Map<string, { tx: ShardTx; items: Pending[] }>();
+    const failed = new Map<string, unknown>();
+    for (const shard of new Set(items.map((it) => it.u.shard))) {
+      try {
+        await this.ensureShard(shard);
+      } catch (e) {
+        failed.set(shard, e);
+      }
+    }
     for (const it of items) {
+      if (failed.has(it.u.shard)) {
+        it.reject(failed.get(it.u.shard));
+        continue;
+      }
       let t = txs.get(it.u.shard);
       if (!t) txs.set(it.u.shard, (t = { tx: newTx(), items: [] }));
       try {
@@ -487,10 +565,12 @@ export class OfflineStore implements StorageAdapter {
           await this.backend.commit(shard, c);
         } catch (e) {
           for (let i = tx.undo.length - 1; i >= 0; i--) tx.undo[i]!();
+          this.rows.release(`${shard}\u0000`);
           for (const it of mine) it.reject(e);
           continue;
         }
       }
+      this.rows.release(`${shard}\u0000`);
       for (const k of tx.keys) {
         keep.add(k);
         const r = this.records.get(k);
@@ -510,21 +590,40 @@ export class OfflineStore implements StorageAdapter {
   }
 
   /**
-   * The backend's reader for `shard`, answering `get` from the rows this store already knows (written or read since
-   * open): an async backend (IndexedDB) needs no round trip for them, a SQLite one no decode.
+   * The backend's reader for `shard` through the rows this store already knows (written or read since open): `get` is
+   * answered from them (an async backend, IndexedDB, needs no round trip; a SQLite one no decode), a scanned row known
+   * already comes back as the known object (a re-run returns the objects of the previous one: identity diffs and
+   * memoized fingerprints), and what the backend reads is remembered. The known rows always hold what storage holds:
+   * every write goes through `setRow`, every drop forgets them, an external writer's change forgets its shard's.
    */
   private reader(shard: string): BackendReader {
     const inner = this.backend.reader(shard);
     const m = this.options.schema.manifest;
+    const rows = this.rows;
+    const known = (table: string, doc: Doc): Doc => {
+      const k = `${shard}\u0000${doc._id}`;
+      const cached = rows.get(k);
+      if (cached) return cached;
+      if (localTableOfId(m, doc._id, this.options.foreignIds) === table) rows.set(k, doc);
+      return doc;
+    };
     const out: BackendReader = {
       get misses() {
         return inner.misses ?? 0;
       },
-      scan: (...a) => inner.scan(...a),
+      scan: (table, index, lo, hi, asc, limit) => {
+        const r = inner.scan(table, index, lo, hi, asc, limit);
+        for (let i = 0; i < r.length; i++) {
+          const doc = known(table, r[i]!.doc);
+          if (doc !== r[i]!.doc) r[i] = { key: r[i]!.key, doc };
+        }
+        return r;
+      },
       get: (table, id) => {
-        const doc = this.rowDoc.get(`${shard}\u0000${id}`);
+        const doc = rows.get(`${shard}\u0000${id}`);
         if (doc && localTableOfId(m, id, this.options.foreignIds) === table) return doc;
-        return inner.get(table, id);
+        const got = inner.get(table, id);
+        return got ? known(table, got) : got;
       },
     };
     if (inner.pluginQuery) out.pluginQuery = (...a) => inner.pluginQuery!(...a);
@@ -563,14 +662,22 @@ export class OfflineStore implements StorageAdapter {
   /** The full value of a record (resolving its row references from the replica). */
   private async valueOf(rec: Rec): Promise<unknown> {
     if (rec.materialized) return rec.value;
-    const missing = [...new Set(refsIn(rec.skel))].filter((id) => !this.rowDoc.has(`${rec.shard}\u0000${id}`));
+    // Resolved from a map of its own: the known rows may drop some of these meanwhile (their LRU).
+    const got = new Map<string, Doc>();
+    const missing: string[] = [];
+    for (const id of new Set(refsIn(rec.skel))) {
+      const doc = this.rows.get(`${rec.shard}\u0000${id}`);
+      if (doc) got.set(id, doc);
+      else missing.push(id);
+    }
     if (missing.length) {
       for (const [id, doc] of await this.readRows(rec.shard, missing)) {
         if (!doc) throw new Error(`offline store: replicated row ${id} of ${rec.fn} is missing`);
         this.know(rec.shard, doc);
+        got.set(id, doc);
       }
     }
-    rec.value = resolveRefs(rec.skel, (id) => this.rowDoc.get(`${rec.shard}\u0000${id}`)!);
+    rec.value = resolveRefs(rec.skel, (id) => got.get(id)!);
     rec.materialized = true;
     rec.json = undefined;
     return rec.value;
@@ -584,28 +691,18 @@ export class OfflineStore implements StorageAdapter {
 
   /** Knows / forgets a row inside a burst, recording how to put the previous state back. */
   private setRow(tx: ShardTx, k: string, doc: Doc | null, sig?: string): void {
-    const had = this.rowDoc.has(k);
-    const prevDoc = this.rowDoc.get(k);
-    const prevSig = this.rowSig.get(k);
+    const prev = this.rows.entry(k);
     tx.undo.push(() => {
-      if (had) this.rowDoc.set(k, prevDoc!);
-      else this.rowDoc.delete(k);
-      if (prevSig !== undefined) this.rowSig.set(k, prevSig);
-      else this.rowSig.delete(k);
+      if (prev) this.rows.set(k, prev.doc, prev.sig);
+      else this.rows.delete(k);
     });
-    if (doc) {
-      this.rowDoc.set(k, doc);
-      this.rowSig.set(k, sig ?? stableStringify(doc));
-    } else {
-      this.rowDoc.delete(k);
-      this.rowSig.delete(k);
-    }
+    // Pinned until the burst's commit: see `RowCache`.
+    if (doc) this.rows.set(k, doc, sig, true);
+    else this.rows.delete(k);
   }
 
   private know(shard: string, doc: Doc, sig?: string): void {
-    const k = `${shard}\u0000${doc._id}`;
-    this.rowDoc.set(k, doc);
-    this.rowSig.set(k, sig ?? stableStringify(doc));
+    this.rows.set(`${shard}\u0000${doc._id}`, doc, sig);
   }
 
   /**
@@ -635,19 +732,20 @@ export class OfflineStore implements StorageAdapter {
     // the retry of a write that failed). No owner or an unknown one, or a record without a fingerprint (written
     // before it): taken, the value may be another identity's. Coalesced, not dropped: past `refreshAfter()` it is
     // written again, so `updatedAt` keeps the record from expiring while the server keeps refreshing it.
-    const json = encodeJson(u.value);
-    const fp = fingerprintOfJson(json);
-    if (
+    // The fingerprint is a structural hash memoized per object (`valueFingerprint`): the rows the client kept from the
+    // previous value cost nothing. A match is confirmed by comparing the values in full (`sameValue`, identity first),
+    // so a collision never skips a write.
+    const fp = valueFingerprint(u.value);
+    const coalesce =
       sameEpoch &&
       u.version === prev.version &&
       prev.fp === fp &&
       owner !== undefined &&
       owner !== UNKNOWN_OWNER &&
       prev.owner === owner &&
-      this.now() - prev.updatedAt < this.refreshAfter()
-    )
-      return;
-    // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved.
+      this.now() - prev.updatedAt < this.refreshAfter();
+    // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved (and, to
+    // coalesce, whether the value is the same).
     if (prev && !prev.materialized) {
       // Resolved against memory as this burst left it (rows an earlier update of it wrote): undone with the burst,
       // or the record would keep rows its storage never got.
@@ -660,12 +758,13 @@ export class OfflineStore implements StorageAdapter {
         });
       }
     }
+    if (coalesce && prev.materialized && sameValue(prev.value, u.value)) return;
     const found = this.replicated.has(u.fn) ? documentsIn(m, u.value, undefined, this.options.foreignIds) : [];
     const prevIds = new Set(prev?.ids ?? []);
     const newIds = new Set<string>();
     const c: Commit = { upsert: [], delete: [] };
     const changes: LocalRowChange[] = [];
-    const written: Array<{ doc: Doc; sig: string }> = [];
+    const written: Array<{ doc: Doc; sig: string | undefined }> = [];
     const removed: string[] = [];
     // Refcount changes are applied as computed and undone if the commit fails, so memory never runs ahead of storage.
     const deltas: Array<[string, number]> = [];
@@ -673,21 +772,29 @@ export class OfflineStore implements StorageAdapter {
       deltas.push([id, d]);
       return this.ref(u.shard, id, d);
     };
-    const before = (k: string): Doc | null | undefined => (this.rowDoc.has(k) ? this.rowDoc.get(k)! : this.refs.has(k) ? undefined : null);
+    // Known: its doc; referenced but not read yet: unknown (undefined); neither: absent (null).
+    const before = (k: string): Doc | null | undefined => {
+      const e = this.rows.entry(k);
+      return e ? e.doc : this.refs.has(k) ? undefined : null;
+    };
     const docSet = new Set<object>(found.map((f) => f.doc));
     const diffs = this.options.persistDiffs !== false;
     const now = this.now();
     let skel: unknown;
     let entry: QueryLogEntry | null = null;
     let entryBytes = 0;
+    /** `encodeJson` of the persisted base, when written whole. */
+    let json: string | undefined;
     try {
       for (const { table, doc } of found) {
         const k = `${u.shard}\u0000${doc._id}`;
         newIds.add(doc._id);
-        // The very object already stored (an unchanged row the client reused): no signature to compute.
-        const same = this.rowDoc.get(k) === doc && this.rowSig.has(k);
-        const sig = same ? this.rowSig.get(k)! : stableStringify(doc);
-        if (!same && this.rowSig.get(k) !== sig) {
+        // The very object already stored (an unchanged row the client reused, or one read back): unchanged. Else its
+        // signature against the known row's (computed now for a row only read so far: not rewritten after a restart).
+        const known = this.rows.entry(k);
+        const same = known !== undefined && known.doc === doc;
+        const sig = same ? undefined : stableStringify(doc);
+        if (!same && (known === undefined || this.rows.sigOf(k, known) !== sig)) {
           c.upsert!.push({ table, doc });
           changes.push({ table, id: doc._id, before: before(k), after: doc });
           written.push({ doc, sig });
@@ -750,7 +857,8 @@ export class OfflineStore implements StorageAdapter {
           ...(docSet.size && diffs ? { refs: true as const } : {}),
           fp,
         };
-        record.size = skel === u.value ? json.length : encodeJson(skel).length;
+        json = encodeJson(skel);
+        record.size = json.length;
         c.put = [record];
       }
     } catch (e) {
@@ -788,7 +896,8 @@ export class OfflineStore implements StorageAdapter {
       logCount: entry ? prev!.logCount + 1 : 0,
       logBytes: entry ? prev!.logBytes + entryBytes : 0,
       baseBytes,
-      json,
+      // The full value's encoding, when that is what went to storage (no row references).
+      json: skel === u.value ? json : undefined,
       fp,
     });
   }
@@ -836,15 +945,14 @@ export class OfflineStore implements StorageAdapter {
         const table = localTableOfId(m, id, this.options.foreignIds);
         if (table) {
           c.delete!.push({ table, id });
-          changes.push({ table, id, before: this.rowDoc.has(k) ? this.rowDoc.get(k)! : undefined, after: null });
+          changes.push({ table, id, before: this.rows.get(k), after: null });
         }
       }
       await this.backend.commit(shard, c);
       for (const r of records) this.records.delete(r.key);
       for (const [id, n] of dec) {
         if (this.ref(shard, id, -n) > 0) continue;
-        this.rowDoc.delete(`${shard}\u0000${id}`);
-        this.rowSig.delete(`${shard}\u0000${id}`);
+        this.rows.delete(`${shard}\u0000${id}`);
       }
       this.notify(shard, changes, records.map((r) => r.key));
       this.emitSaved({ put: [], drop: records.map((r) => r.key) });
@@ -858,26 +966,22 @@ export class OfflineStore implements StorageAdapter {
   }
 
   /**
-   * The local result of a request (registered: run over the replica; else / on failure: the cached value), and its
-   * `encodeJson` when computed. A local run that is exactly the value cached for its owner carries that value's
-   * `version`/`epoch`/`ik`: it is the server's value at that version, so the client may `resume` from it.
+   * The local result of a request (registered: run over the replica; else / on failure: the cached value). A local run
+   * that is exactly the value cached for its owner carries that value's `version`/`epoch`/`ik`: it is the server's
+   * value at that version, so the client may `resume` from it.
    */
-  private async evaluate(
-    req: LocalQueryRequest,
-    fn: AnyRegisteredFunction | undefined,
-  ): Promise<{ result: LocalQueryResult | undefined; readSet: ReadSet | null; json?: string }> {
+  private async evaluate(req: LocalQueryRequest, fn: AnyRegisteredFunction | undefined): Promise<{ result: LocalQueryResult | undefined; readSet: ReadSet | null }> {
+    await this.ensureShard(req.shard);
     const cached = this.records.get(recordKey(req.shard, req.fn, req.argsJson));
     // Only its owner's (an unknown owner is nobody's); one stored before owners were recorded is shown, never resumed.
     const mine = cached !== undefined && cached.owner !== undefined && cached.owner === ownerKey(req.identity);
     const resumable = mine && cached.epoch !== undefined && cached.ik !== undefined;
-    // The cached value's `encodeJson` comes along when known (a watch compares it with what it sent last).
-    const fromCache = async (): Promise<{ result: LocalQueryResult | undefined; json?: string }> => {
+    const fromCache = async (): Promise<{ result: LocalQueryResult | undefined }> => {
       if (!cached) return { result: undefined };
       if (cached.owner !== undefined && !mine) return { result: undefined };
       try {
         const value = await this.valueOf(cached);
-        const result: LocalQueryResult = resumable ? { value, source: "cache", version: cached.version, epoch: cached.epoch!, ik: cached.ik! } : { value, source: "cache" };
-        return cached.json !== undefined ? { result, json: cached.json } : { result };
+        return { result: resumable ? { value, source: "cache", version: cached.version, epoch: cached.epoch!, ik: cached.ik! } : { value, source: "cache" } };
       } catch {
         return { result: undefined };
       }
@@ -891,7 +995,6 @@ export class OfflineStore implements StorageAdapter {
       if (c.result) return { ...c, readSet: null };
       throw e;
     }
-    const json = encodeJson(local.value);
     if (resumable) {
       // Is the local run the value the server sent at `cached.version`? Its fingerprint says so without resolving
       // the record's row references (a cold record: no backend reads) — and against the value as it was stored, not
@@ -899,14 +1002,14 @@ export class OfflineStore implements StorageAdapter {
       // fingerprints existed is compared by its encoding, as before.
       const same =
         cached.fp !== undefined
-          ? fingerprintOfJson(json) === cached.fp
+          ? hasFingerprint(local.value, cached.fp)
           : await this.jsonOf(cached).then(
-              (j) => j === json,
+              (j) => j === encodeJson(local.value),
               () => false,
             );
-      if (same) return { result: { value: local.value, source: "local", version: cached.version, epoch: cached.epoch!, ik: cached.ik! }, readSet: local.readSet, json };
+      if (same) return { result: { value: local.value, source: "local", version: cached.version, epoch: cached.epoch!, ik: cached.ik! }, readSet: local.readSet };
     }
-    return { result: { value: local.value, source: "local" }, readSet: local.readSet, json };
+    return { result: { value: local.value, source: "local" }, readSet: local.readSet };
   }
 
   /** Runs a registered query over a shard's replica (re-running after async fetches until nothing is missing). */
@@ -979,11 +1082,9 @@ export class OfflineStore implements StorageAdapter {
   private async rerun(w: Watch): Promise<void> {
     w.dirty = false;
     let result: LocalQueryResult | undefined;
-    let json: string | undefined;
     try {
       const r = await this.evaluate(w.req, w.fn);
       result = r.result;
-      json = r.json;
       w.readSet = r.readSet;
       w.failed = false;
     } catch (e) {
@@ -993,10 +1094,11 @@ export class OfflineStore implements StorageAdapter {
       return;
     }
     if (w.closed) return;
-    // The version too: a local value that becomes resumable (its record caught up) is sent again with it.
-    const sig = result ? `${result.source}\u0000${result.version ?? ""}\u0000${json ?? encodeJson(result.value)}` : "";
-    if (sig === w.last) return;
-    w.last = sig;
+    // The version too: a local value that becomes resumable (its record caught up) is sent again with it. Values are
+    // compared in full (a re-run reuses the rows it read before by identity: `reader`), not encoded.
+    const last = w.last;
+    if (last !== null && (last === undefined ? result === undefined : result !== undefined && last.source === result.source && last.version === result.version && sameValue(last.value, result.value))) return;
+    w.last = result;
     try {
       w.onResult(result);
     } catch {
@@ -1020,12 +1122,7 @@ export class OfflineStore implements StorageAdapter {
   /** Someone else wrote rows (a shared TinyBase store): what we knew about them is stale; re-run what reads them. */
   private onExternal(c: ExternalChange): void {
     const prefix = `${c.shard}\u0000`;
-    // Deleting the entry just visited while iterating a Map is safe: no copy of every key.
-    for (const k of this.rowDoc.keys()) {
-      if (!k.startsWith(prefix)) continue;
-      this.rowDoc.delete(k);
-      this.rowSig.delete(k);
-    }
+    this.rows.forgetPrefix(prefix);
     for (const r of this.records.values()) {
       if (r.shard === c.shard && r.refs) {
         r.materialized = false;
@@ -1052,7 +1149,11 @@ export class OfflineStore implements StorageAdapter {
 
   /** Forget every cached result and replicated row (e.g. on sign-out on a shared device). Pending mutations stay. */
   async clear(): Promise<void> {
-    await this.enqueue(() => this.dropRecords([...this.records.values()]));
+    await this.enqueue(async () => {
+      // Every shard, read or not yet.
+      for (const shard of [...this.unloaded]) await this.ensureShard(shard);
+      await this.dropRecords([...this.records.values()]);
+    });
   }
 
   async close(): Promise<void> {
@@ -1062,6 +1163,56 @@ export class OfflineStore implements StorageAdapter {
     this.stopExternal?.();
     this.stopExternal = null;
     await this.backend.close();
+  }
+}
+
+/**
+ * Replicated rows known decoded, by `${shard}\0${id}`, least recently set first; their `stableStringify` once computed
+ * (a row read back has none until a server value compares against it). Rows a burst staged (`set(..., pin)`: written
+ * to memory, their commit still pending) are held apart from the LRU until `release`: evicting one mid-burst would
+ * send a later read of it to storage, which still has the previous row, and that read would stay cached after the
+ * commit.
+ */
+class RowCache {
+  private readonly m = new Map<string, { doc: Doc; sig: string | undefined }>();
+  private readonly staged = new Map<string, { doc: Doc; sig: string | undefined }>();
+  constructor(private readonly max: number) {}
+  entry(k: string): { doc: Doc; sig: string | undefined } | undefined {
+    return this.staged.get(k) ?? this.m.get(k);
+  }
+  get(k: string): Doc | undefined {
+    return this.entry(k)?.doc;
+  }
+  /** The row's signature (computed now from the known doc if it has none yet). */
+  sigOf(_k: string, e: { doc: Doc; sig: string | undefined }): string {
+    return (e.sig ??= stableStringify(e.doc));
+  }
+  set(k: string, doc: Doc, sig?: string, pin = false): void {
+    this.m.delete(k);
+    this.staged.delete(k);
+    if (pin) this.staged.set(k, { doc, sig });
+    else this.lru(k, { doc, sig });
+  }
+  delete(k: string): void {
+    this.m.delete(k);
+    this.staged.delete(k);
+  }
+  /** Staged rows of keys starting with `prefix` (all: "") back into the LRU (their burst committed or was undone). */
+  release(prefix = ""): void {
+    for (const [k, e] of this.staged) {
+      if (!k.startsWith(prefix)) continue;
+      this.staged.delete(k);
+      this.lru(k, e);
+    }
+  }
+  forgetPrefix(prefix: string): void {
+    // Deleting the entry just visited while iterating a Map is safe: no copy of every key.
+    for (const k of this.m.keys()) if (k.startsWith(prefix)) this.m.delete(k);
+    for (const k of this.staged.keys()) if (k.startsWith(prefix)) this.staged.delete(k);
+  }
+  private lru(k: string, e: { doc: Doc; sig: string | undefined }): void {
+    this.m.set(k, e);
+    if (this.m.size > this.max) this.m.delete(this.m.keys().next().value!);
   }
 }
 

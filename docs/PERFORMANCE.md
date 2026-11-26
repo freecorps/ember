@@ -91,6 +91,47 @@ para o índice esparso, as linhas cobradas pelo DO no workerd (`spikes/rows-writ
   sem índice FTS5 (busca opt-in, `{ search: true }`): nenhuma linha de FTS por mensagem.
 - **Migrations:** `start` 2 → 1 linha escrita. **Workpool:** item sem `key` sem entrada no `by_key`.
 
+## Offline e actions fora do cold start do Shard (PR 4b da 0.10)
+
+`packages/offline/bench/cold.ts` (node:sqlite, fake-indexeddb, TinyBase em memória; antes = `main` em 268a7f63, na
+mesma máquina) e o teste `packages/cli/test/lazy-actions.test.ts`:
+
+| | antes | depois |
+| --- | --- | --- |
+| boot com 20 shards (5 queries × 50 linhas): bancos abertos antes do `hello` | 21 | **1** |
+| idem: ms até o `hello` poder sair / até o 1º resultado local de um shard | 4,9 / 5,0 | **0,5 / 1,3** |
+| `clear()`: bancos no disco (principal + shards) | 21 | **1** |
+| rajada de 40 puts + 40 removes da fila: transações de escrita (SQLite, IndexedDB, TinyBase) | 80 | **2** |
+| idem, SQLite em arquivo | 18,5 ms | **0,8 ms** |
+| mesmo valor de novo (200 linhas, N abas), objetos do cliente / clone estruturado | 57 / 98 µs | **4,3** / 111 µs |
+| ponte: rajada de 20 updates, mensagens página→Worker / Worker→página | 20 / 21 | **1 / 2** |
+| ponte: resultado observado (500 linhas, 1 mudou), bytes Worker→página | 102 KB | **404 B** |
+| Worker com um módulo só de actions que importa ~195 KiB: módulos avaliados no startup | 896 KiB | **702 KiB** |
+
+- **Cold start lazy por shard:** `SqliteBackend.open()` lê só o banco principal (meta, fila, lista de shards) e
+  `openShard()` lê os registros de um shard no primeiro uso. O `hello` espera load + clientId + fila: só o principal.
+- **Shards vazios:** o banco de um shard sem registros, linhas, log nem pendência é apagado (`remove`; `unlink` do
+  `opfs-sahpool`; `deleteDatabaseSync` do expo-sqlite). Bancos novos com `auto_vacuum = INCREMENTAL` e um
+  `incremental_vacuum(256)` a cada 32 commits que liberam páginas; os existentes só mudam de modo com `VACUUM`
+  (contracts.md, "Offline").
+- **Fingerprint estrutural:** hash de 53 bits memoizado por objeto (`WeakMap`) em vez de `encodeJson` + hash; um
+  fingerprint igual só pula a escrita depois de `sameValue` (comparação completa, identidade primeiro). O caso de um
+  clone estruturado (valor de outra aba) fica ~13% mais caro: são os ~16 µs da comparação completa, o preço de uma
+  colisão nunca pular uma escrita; o caso comum (o cliente reusa as linhas que não mudaram) cai 13×.
+- **`batchPending`:** o lote da fila (a última escrita de cada mutation) numa transação no SQLite, IndexedDB e TinyBase
+  (um `save()` do persister).
+- **Ponte:** lotes por microtask nos dois sentidos (feature `batch`) e diff nas streams `watch` (a reexecução do store
+  devolve os mesmos objetos das linhas que já leu, então o diff sai por identidade).
+- **Linhas lidas no LRU do store** (`maxCachedRows`, 50 000): `get` sem ida ao IndexedDB, mesmos objetos entre
+  reexecuções, e depois de reabrir o primeiro valor do servidor regrava só as linhas que mudaram (antes, todas: a
+  assinatura das linhas só existia para as escritas na sessão). Varredura descendente do IndexedDB numa requisição com
+  `getAllRecords({ direction: "prev" })` (Chrome 141+), cursor como fallback.
+- **Actions fora do cold start:** um módulo `ember/*.ts` só com actions entra por `import()` (`lazyActions`); o
+  `examples/chat` não tem um (Worker igual); no fixture, o módulo e o SDK saem do index.js (241 → 45 KiB) e do
+  conjunto que todo isolate avalia no startup (896 → 702 KiB, sem minificar).
+- Iguais (ruído da máquina à parte): rajada de 20 queries mudadas, 10,1 → 2,6 ms (SQLite) e 2,0 → 1,4 ms (IndexedDB),
+  como na 3B-1; bytes por patch na ponte, ~300 B.
+
 ## Depois da 0.9.0: PR 3c (v0.10)
 
 Medido nos testes de contador (workerd), antes → depois:
@@ -111,6 +152,9 @@ BACKENDS=ember ROUND=x bun --conditions=@freecorps/ember-source run docs/spikes/
 # motor
 node --conditions=@freecorps/ember-source --experimental-transform-types --no-warnings scripts/bench-hot-path.ts
 # cliente/offline: ver o cabeçalho de cada arquivo em packages/client/bench e packages/offline/bench
+bun --conditions=@freecorps/ember-source packages/offline/bench/cold.ts
+# actions fora do startup (imprime os tamanhos)
+bun run --cwd packages/cli vitest run test/lazy-actions.test.ts --disableConsoleIntercept
 ```
 
 O `bench.ts` precisa do cliente do Convex em `docs/spikes/remote/convex-bench/node_modules` mesmo com

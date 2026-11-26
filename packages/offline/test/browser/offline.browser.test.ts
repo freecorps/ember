@@ -99,8 +99,25 @@ describe.skipIf(!hasBrowser)("offline storage in Chromium", () => {
     await a.page.waitForFunction(() => (globalThis as any).t.roles.includes("leader"));
     await a.page.evaluate(() => (globalThis as any).t.flush());
 
+    // Counts the calls of what indexeddb.ts uses for a descending scan (`IDBIndex.prototype.getAllRecords`), in this tab.
+    const countGetAllRecords = (p: Page) =>
+      p.evaluate(() => {
+        const proto = IDBIndex.prototype as unknown as { getAllRecords?: (...a: unknown[]) => unknown };
+        const orig = proto.getAllRecords;
+        (globalThis as any).getAllRecordsCalls = 0;
+        if (typeof orig === "function") {
+          proto.getAllRecords = function (this: unknown, ...a: unknown[]) {
+            (globalThis as any).getAllRecordsCalls++;
+            return orig.apply(this, a);
+          };
+        }
+      });
+    const getAllRecordsCalls = (p: Page) => p.evaluate(() => (globalThis as any).getAllRecordsCalls as number);
+    if (k === "indexeddb") await countGetAllRecords(a.page);
+
     const b = await open(ctx, name, false);
     await b.page.waitForFunction(() => (globalThis as any).t.roles.includes("follower"));
+    if (k === "indexeddb") await countGetAllRecords(b.page);
     await b.page.evaluate(() => {
       const t = (globalThis as any).t;
       t.sub("latest", "messages:latest", { channel: "a", n: 5 });
@@ -108,6 +125,9 @@ describe.skipIf(!hasBrowser)("offline storage in Chromium", () => {
     });
     await waitSnap(b.page, "latest", "s.status === 'success' && s.value.length === 2");
     expect(await snap(b.page, "latest")).toMatchObject({ source: "local" });
+    // IndexedDB: this Chromium has getAllRecords, so `latest` (a descending scan) ran as one request, not a cursor.
+    // The leader's IndexedDB runs it (whichever tab reads): counted in both.
+    if (k === "indexeddb") expect((await getAllRecordsCalls(a.page)) + (await getAllRecordsCalls(b.page))).toBeGreaterThan(0);
     await waitSnap(b.page, "search", "s.status === 'success'");
     expect(await snap(b.page, "search")).toMatchObject({ value: ["Olá, ação!"], source: "local" }); // FTS5 in the Worker
 

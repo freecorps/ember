@@ -3,9 +3,11 @@
  * Object classes and `authOutbox`, and nothing else. The package root re-exports every module (admin API, browser,
  * files, …), and a bundler splits code by file: through the root, those modules are statically reachable from the entry
  * and land in the chunks every isolate loads at startup, even when the Worker only reaches them through `import()`
- * (worker.ts, actions.ts). Through this entry they stay in chunks of their own.
+ * (worker.ts, actions.ts). Through this entry they stay in chunks of their own. `lazyActions`: the stand-ins of a module
+ * that exports only actions, imported on first use (build.ts `lazyActionModules`).
  */
 export { createEmberWorker } from "./worker.ts";
 export { Shard } from "./shard.ts";
 export { System } from "./system.ts";
 export { authOutbox } from "./auth-outbox.ts";
+export { lazyActions } from "@freecorps/ember-server";
