@@ -244,17 +244,18 @@ export function workersAi(model: string, opts: WorkersAiOptions = {}): AgentMode
         // `response` (Workers AI format) or `choices[0].delta.content` (OpenAI format): a chunk with both carries the
         // same text twice, so `response` is taken and the delta's content skipped.
         const response = typeof c.response === "string" && c.response ? c.response : null;
-        if (response) yield* content(response);
-        if (Array.isArray(c.tool_calls)) flat.push(...toolCallsOf(c.tool_calls));
         const choice = rec(Array.isArray(c.choices) ? c.choices[0] : undefined);
-        if (!choice) continue;
-        if (typeof choice.finish_reason === "string") finishReason = choice.finish_reason;
-        const delta = rec(choice.delta);
+        const delta = rec(choice?.delta);
+        // The chunk's reasoning field first: a `<think>` block in this very chunk's content is the same reasoning.
         const thought = reasoningField(delta);
         if (thought) {
           fieldSeen = true;
           yield { type: "reasoning-delta", text: thought };
         }
+        if (response) yield* content(response);
+        if (Array.isArray(c.tool_calls)) flat.push(...toolCallsOf(c.tool_calls));
+        if (!choice) continue;
+        if (typeof choice.finish_reason === "string") finishReason = choice.finish_reason;
         if (!response && typeof delta?.content === "string" && delta.content) yield* content(delta.content);
         // OpenAI-style tool call fragments, merged by index.
         for (const t of Array.isArray(delta?.tool_calls) ? delta.tool_calls : []) {

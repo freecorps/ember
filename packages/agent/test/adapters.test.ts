@@ -161,6 +161,13 @@ describe("workersAi", () => {
     const ev2 = await collect(workersAi("@cf/m", { ai: streamed, stream: true }).stream(request({ tools: [] })));
     expect(texts(ev2, "reasoning-delta")).toBe("Thought");
     expect(texts(ev2, "text-delta")).toBe("Answer");
+    // Both in one chunk (`response` with the <think> block, the delta with the field): the field is read first.
+    const combined = { run: async () => sseStream([{ response: "<think>x</think>Answer", choices: [{ delta: { reasoning_content: "x" } }] }, "[DONE]"]) };
+    const ev3 = await collect(workersAi("@cf/m", { ai: combined, stream: true }).stream(request({ tools: [] })));
+    expect(ev3.filter((e) => e.type !== "finish")).toEqual([
+      { type: "reasoning-delta", text: "x" },
+      { type: "text-delta", text: "Answer" },
+    ]);
   });
 
   test("generateObject: response_format json_schema", async () => {
