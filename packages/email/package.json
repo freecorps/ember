@@ -58,6 +58,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@freecorps/ember-dashboard-sdk": "workspace:*",
     "@freecorps/ember-rate-limit": "workspace:*",
     "@freecorps/ember-server": "workspace:*",
     "@freecorps/ember-values": "workspace:*",
