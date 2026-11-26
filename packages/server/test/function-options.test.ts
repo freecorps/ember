@@ -15,6 +15,7 @@ describe("query({ cache })", () => {
     const bad = [{ maxAge: 0 }, { maxAge: 1.5 }, { maxAge: -1 }, { maxAge: 40_000_000 }, { maxAge: 1, swr: -1 }, { maxAge: 1, swr: 0.5 }, { maxAge: 1, other: 1 }, {}, null, 5];
     for (const cache of bad) expect(() => query({ cache: cache as never, handler: () => 1 }), JSON.stringify(cache)).toThrow(/cache must be/);
     expect(() => (mutation as (d: unknown) => unknown)({ cache: { maxAge: 1 }, handler: () => 1 })).toThrow(/queries only/);
+    // @ts-expect-error cache is for public queries only (a type error too, not just at load)
     expect(() => internalQuery({ cache: { maxAge: 1 }, handler: () => 1 })).toThrow(/public queries/);
     expect(() => query({ shard: { org: fromAuth("org") }, cache: { maxAge: 1 }, handler: () => 1 })).toThrow(/fromAuth/);
   });

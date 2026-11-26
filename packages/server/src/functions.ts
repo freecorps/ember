@@ -469,7 +469,8 @@ type RetainDef = { retainMs?: 0 };
  * seconds (1 to 1 year), then served stale for `swr` seconds more (default 0) while it is refreshed.
  */
 export type QueryCache = { readonly maxAge: number; readonly swr?: number };
-type QueryCacheDef = { cache?: QueryCache };
+/** `cache` only on public queries (an internal one throws at definition too, for JavaScript callers). */
+type QueryCacheDef<Vis extends Visibility> = Vis extends "public" ? { cache?: QueryCache } : { cache?: never };
 /** Most seconds `cache.maxAge` / `cache.swr` take (one year). */
 export const MAX_QUERY_CACHE_SECONDS = 31_536_000;
 
@@ -500,10 +501,10 @@ type Merged<XE extends readonly AnyErrorFactory[], E extends readonly AnyErrorFa
 /** `X`: extra ctx fields (middlewares, component builders); `XA` / `XE`: arguments and errors the middlewares add. */
 export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: AuthorizedDef<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & QueryCacheDef & SyncOnly<R>,
+    def: AuthorizedDef<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & QueryCacheDef<Vis> & SyncOnly<R>,
   ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & QueryCacheDef & SyncOnly<R>,
+    def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & QueryCacheDef<Vis> & SyncOnly<R>,
   ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <R = unknown>(handler: ((ctx: QueryCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredQuery<Vis, XA, R, Merged<XE, readonly []>>;
   /** A builder whose functions run `mw` first (see `Middleware`). */
