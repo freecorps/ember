@@ -292,6 +292,21 @@ describe("hydrate and whose read it is", () => {
     c3.close();
   });
 
+  it("an anonymous session that already sent requests and signs in: a serialized entry is nobody's while the token is on its way", async () => {
+    const server = { fn: "notes:list", args: {}, shard: "global:main", value: ["anon"], version: 1, epoch: "e", ik: "k" };
+    // No auth source: anonymous, and it already read (the answer names nobody).
+    const c = new EmberClient({ url: "https://ember.test", WebSocket: null, fetch: worker().fetch, connectivity: null, heartbeat: false, defaultShard: "global:main" });
+    await c.query(q, { other: 1 });
+    let release!: (t: string) => void;
+    c.setAuth(() => new Promise<string>((r) => (release = r)));
+    // The old (anonymous) preload handed over again while ana's token is pending: not shown.
+    c.hydrate(server);
+    expect(c.dehydrate()).toEqual([]);
+    expect(c.watchQuery(q, {}).getSnapshot().status).toBe("loading");
+    release(jwt("ana", 3600));
+    c.close();
+  });
+
   it("onIdentityChange: on a switch and a sign-out; not on the first sign-in nor on a renewed token", async () => {
     const c = new EmberClient({ url: "https://ember.test", WebSocket: null, fetch: worker().fetch, connectivity: null, heartbeat: false, defaultShard: "global:main" });
     let n = 0;

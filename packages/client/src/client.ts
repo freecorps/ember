@@ -996,9 +996,11 @@ export class EmberClient {
     // who local queries run as. (The first source of a client built without one keeps the last session's, as `auth`.)
     const inUse = this.authFetcher !== undefined || this.tokenSeen;
     const replaced = !!fetcher && inUse;
-    if (inUse) this.serializedOwner = null;
     // An anonymous session that already sent requests (no source yet) and now signs in also changes identity.
     const announce = inUse || this.answeredAs !== undefined;
+    // From then on no serialized (server-rendered) entry is anyone's: not the anonymous session's either, while the
+    // new token is on its way. Only a client that never established a session keeps them unbound.
+    if (announce) this.serializedOwner = null;
     this.authFetcher = fetcher;
     this.answeredAs = undefined;
     this.authGen++;
