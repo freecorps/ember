@@ -5,11 +5,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { buildWorker, runtimeVersion, type WorkerBuild, type WorkerModule } from "../build.ts";
 import { codegen } from "../codegen/index.ts";
-import { authSettings, resolveEnv, SESSION_LOOKUP_SECRET_DEFAULT, workerName, type Project } from "../config.ts";
+import { authSettings, resolveEnv, SESSION_LOOKUP_SECRET_DEFAULT, workerName, workerSettings, type Project } from "../config.ts";
 import { CfClient, CloudflareApiError, resolveToken } from "./cf.ts";
 import { createR2Credentials, ensureFilesResources, filesBucketName, filesQueueName, wireFilesQueue, type FilesState } from "./files.ts";
 import { componentQueues, deleteComponentQueues, ensureComponentQueues, loadComponentQueueState, queueBindings, saveComponentQueueState, wireComponentQueues } from "./queues.ts";
-import { buildMetadata, componentBindings, workerObservability, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
+import { buildMetadata, componentBindings, workerObservability, DEFAULT_METRICS_DATASET, NEW_VERSION, planDeploy, type MetadataInput, redactMetadata, versionMetadata, type CurrentState, type DeployPlan, type WorkerMetadata } from "./plan.ts";
 import { waitForShards, type WaitOptions } from "./wait.ts";
 import { ensureAiResources, namespaceWarnings, planAiResources, pruneAiResources, wireIndexingQueue, type AiResources, type AiState, type SchemaManifestLike } from "./ai.ts";
 import { D1Registry, ensureFingerprint, findDatabase, gitRemote, noopRegistry, registryName, type ProjectRegistry } from "../registry.ts";
@@ -165,9 +165,10 @@ async function activeVersion(client: CfClient, worker: string): Promise<string |
 /**
  * The Worker as it is now. `versionsOnly`: existence and active versions only (one GET; a dry run reads nothing else).
  * Otherwise the deployments, DO namespaces, secrets and workers.dev route are read at once (they do not depend on each
- * other); a Worker that turns out not to exist ignores the other three.
+ * other); a Worker that turns out not to exist ignores the other three. `settings`: also its `limits` / `placement`
+ * (`GET .../settings`, best effort), when ember.json manages one of them.
  */
-export async function fetchCurrentState(client: CfClient, worker: string, o: { versionsOnly?: boolean } = {}): Promise<CurrentState> {
+export async function fetchCurrentState(client: CfClient, worker: string, o: { versionsOnly?: boolean; settings?: boolean } = {}): Promise<CurrentState> {
   const deployments = client.request<{ deployments: Array<{ versions: Array<{ version_id: string; percentage: number }> }> }>("GET", `/workers/scripts/${worker}/deployments`);
   if (o.versionsOnly) {
     const d = await deployments;
@@ -175,12 +176,14 @@ export async function fetchCurrentState(client: CfClient, worker: string, o: { v
     if (!d.success) throw new CloudflareApiError(`GET /workers/scripts/${worker}/deployments`, d.status, d.errors);
     return { exists: true, provisionedClasses: [], activeVersions: d.result?.deployments?.[0]?.versions ?? [] };
   }
-  const [d, ns, secrets, sub] = await Promise.all([
+  const [d, ns, secrets, sub, set] = await Promise.all([
     deployments,
     client.request<Array<{ script?: string; class?: string }>>("GET", "/workers/durable_objects/namespaces?per_page=1000"),
     client.request<Array<{ name: string; type: string }>>("GET", `/workers/scripts/${worker}/secrets`),
     // Best effort: unreadable → the deploy sets the route as always.
     client.request<{ enabled?: boolean; previews_enabled?: boolean }>("GET", `/workers/scripts/${worker}/subdomain`).catch(() => null),
+    // Best effort too: unreadable → the settings count as changed and go up with a Script PUT.
+    o.settings ? client.request<{ limits?: { cpu_ms?: number } | null; placement?: { mode?: string } | null }>("GET", `/workers/scripts/${worker}/settings`).catch(() => null) : null,
   ]);
   if (d.status === 404 || d.errors.some((e) => e.code === 10007)) return { exists: false, provisionedClasses: [], activeVersions: [] };
   if (!d.success) throw new CloudflareApiError(`GET /workers/scripts/${worker}/deployments`, d.status, d.errors);
@@ -188,12 +191,14 @@ export async function fetchCurrentState(client: CfClient, worker: string, o: { v
   if (!secrets.success) throw new CloudflareApiError(`GET /workers/scripts/${worker}/secrets`, secrets.status, secrets.errors);
   const provisionedClasses = (ns.result ?? []).filter((n) => n.script === worker && n.class).map((n) => n.class!);
   const s = sub?.success ? sub.result : null;
+  const st = set?.success ? set.result : null;
   return {
     exists: true,
     provisionedClasses,
     activeVersions: d.result?.deployments?.[0]?.versions ?? [],
     secrets: (secrets.result ?? []).map((x) => x.name),
     ...(s && typeof s.enabled === "boolean" ? { subdomain: { enabled: s.enabled, previews_enabled: s.previews_enabled === true } } : {}),
+    ...(st ? { settings: { cpuMs: typeof st.limits?.cpu_ms === "number" ? st.limits.cpu_ms : null, placement: typeof st.placement?.mode === "string" ? st.placement.mode : null } } : {}),
   };
 }
 
@@ -258,6 +263,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   const compBindings = [...plainBindings, ...queueBindings(compQueues, plainBindings)];
   const queuePlan = compQueues.length || staleQueues.length ? { componentQueues: { current: compQueues.map((q) => q.queue), stale: staleQueues } } : {};
   const filesNames = filesOn ? { bucket: filesBucketName(c.project, env.name), queue: filesQueueName(c.project, env.name) } : undefined;
+  // ember.json `limits` / `placement`: script-level, so a redeploy reads the Worker's to skip a write that changes nothing.
+  const settings = workerSettings(project, env.name);
+  const managesSettings = Object.keys(settings).length > 0;
   const metaInput = {
     ...(accountId ? { accountId } : {}),
     project: c.project,
@@ -278,6 +286,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     ...(localAuth ? { auth: true } : {}),
     ...(metrics ? { metrics } : {}),
     observability: workerObservability(c.observability),
+    ...settings,
     ...(build.modules?.length ? { splitModules: true } : {}),
     ...(hasAi ? { aiIndexes: ai } : {}),
     ...(compBindings.length ? { componentBindings: compBindings } : {}),
@@ -428,7 +437,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     for (const n of replicatedDeployNotes({ tables: schemaTables }, byKind)) log(`  ${n.warning ? "warning" : "note"}: ${n.text}`);
   }
 
-  const current = await fetchCurrentState(client, worker);
+  const current = await fetchCurrentState(client, worker, managesSettings ? { settings: true } : {});
   // `ember env`: a name is a secret (on the Worker) or a var (ember.json), never both.
   const clash = Object.keys(env.config.vars ?? {}).filter((n) => (current.secrets ?? []).includes(n));
   if (clash.length) throw new Error(`${clash.join(", ")}: set both as a secret on ${worker} and as a var in ember.json (environments.${env.name}.vars); remove one (\`ember env rm <name>\` or \`ember env rm <name> --var\`)`);
@@ -496,8 +505,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
       switch (step.kind) {
         case "upload-script": {
           await client.call(step.method, step.path, workerForm(metadata, build.code, build.map, build.modules));
-          log(`  uploaded ${worker} (created ${createdClasses.join(", ") || "no classes"})`);
-          if (plan.strategy === "exports-change") {
+          log(`  uploaded ${worker} (${plan.strategy === "settings-change" ? plan.settings.join(", ") : `created ${createdClasses.join(", ") || "no classes"}`})`);
+          if (plan.strategy === "exports-change" || plan.strategy === "settings-change") {
             // The Script PUT already deployed it at 100%. Its version is the active one, recorded like a version
             // upload's; best effort: a failed lookup leaves the id unknown, never fails a deploy that went out.
             versionId = await activeVersion(client, worker).catch(() => null);
@@ -509,7 +518,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
         }
         case "upload-version": {
           // Annotations are proven on version uploads (R2); the Script PUT path does not send them.
-          const meta = { ...metadata, annotations: { "workers/message": message.slice(0, 100) } };
+          // limits / placement are not version fields: the Worker keeps the ones it has (same as ember.json here).
+          const meta = { ...versionMetadata(metadata), annotations: { "workers/message": message.slice(0, 100) } };
           const r = await client.call<{ id: string; number?: number }>(step.method, step.path, workerForm(meta, build.code, build.map, build.modules));
           versionId = r.id;
           log(`  uploaded version ${r.id}${r.number !== undefined ? ` (#${r.number})` : ""}`);
@@ -663,6 +673,11 @@ function printPlan(plan: DeployPlan, build: WorkerBuild, log: (l: string) => voi
   const chunks = build.modules?.length ?? 0;
   log(`  bundle ${(build.bytes / 1024).toFixed(1)} KiB${chunks ? ` (main module ${(Buffer.byteLength(build.code) / 1024).toFixed(1)} KiB + ${chunks} chunk${chunks === 1 ? "" : "s"})` : ""} sha256 ${build.sha256.slice(0, 12)}`);
   for (const w of plan.warnings) log(`  warning: ${w}`);
+  const m = plan.metadata;
+  if (m.limits || m.placement) {
+    const what = [...(m.limits ? [`limits.cpu_ms ${m.limits.cpu_ms}`] : []), ...(m.placement ? [`placement ${m.placement.mode}`] : [])].join(", ");
+    log(`  worker settings: ${what}${dry ? "" : plan.settings.length ? ` (changed: ${plan.settings.join(", ")})` : plan.strategy === "create" ? "" : " (unchanged)"}`);
+  }
   if (dry) {
     log(`  (dry run uploads nothing and plans as for a first deploy; a real run fetches the current deployment and DO namespaces)`);
     log(`  metadata: ${JSON.stringify(redactMetadata(plan.metadata), null, 2).split("\n").join("\n  ")}`);

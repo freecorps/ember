@@ -63,6 +63,8 @@ function fakeCloudflare() {
     if (m === `GET ${W}/deployments`) return state.workerExists ? ok({ deployments: [{ versions: [{ version_id: "v1", percentage: 100 }] }] }) : no(404, 10007, "no worker");
     if (m.startsWith("GET /workers/durable_objects/namespaces")) return ok(state.workerExists ? [{ script: "ember-mail-prod", class: "Shard" }, { script: "ember-mail-prod", class: "System" }] : []);
     if (m === `GET ${W}/secrets`) return ok([]);
+    // The Worker's own marks (EMBER_PROJECT/EMBER_ENV of the last Script PUT): what `ember destroy` checks the owner by.
+    if (m === `GET ${W}/settings`) return state.workerExists ? ok({ bindings: (calls.findLast((c) => c.method === "PUT" && c.path === W)?.metadata?.bindings ?? []).filter((b: { type: string }) => b.type !== "secret_text") }) : no(404, 10007, "no worker");
     if (m === `PUT ${W}` || m === `POST ${W}/versions`) {
       state.workerExists = true;
       return ok({ id: "v2" });
