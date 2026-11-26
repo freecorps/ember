@@ -407,4 +407,40 @@ describe("ctx.db.insert(table, (id) => doc)", () => {
     // ids stay unique and readable in creation order
     expect((s.run((db: any) => db.query("tasks").collect()).value as any[]).map((d) => d.label)).toEqual(["p"]);
   });
+
+  test("a callback that throws, or a refused document, leaves none of its writes or jobs, even when caught", () => {
+    const s = fresh({ schema, functions: { tasks: { run } } });
+    const r = s.engine.runMutation(
+      mutationGeneric((ctx: any) => {
+        const caught: string[] = [];
+        const attempt = (build: (id: string) => unknown) => {
+          try {
+            ctx.db.insert("tasks", build);
+          } catch (e) {
+            caught.push((e as { code?: string }).code ?? (e as Error).message);
+          }
+        };
+        // the document it returns is refused after it wrote and scheduled
+        attempt((id) => {
+          ctx.db.insert("notes", { task: id });
+          ctx.scheduler.runAfter(0, makeFunctionReference("tasks:run"), { id });
+          return { label: 1 };
+        });
+        // the callback itself throws after writing
+        attempt((id) => {
+          ctx.db.insert("notes", { task: id });
+          ctx.scheduler.runAfter(0, makeFunctionReference("tasks:run"), { id });
+          throw new Error("boom");
+        });
+        // what the mutation wrote before stays
+        ctx.db.insert("tasks", (id: string) => ({ label: "kept", job: ctx.scheduler.runAfter(0, makeFunctionReference("tasks:run"), { id }) }));
+        return caught;
+      }) as any,
+    );
+    expect(r.value).toEqual(["ValidationError", "boom"]);
+    expect(s.sql(`SELECT count(*) AS n FROM notes`)[0]!.n).toBe(0);
+    expect(s.sql(`SELECT label FROM tasks`).map((x) => x.label)).toEqual(["kept"]);
+    expect(r.scheduled.length).toBe(1);
+    expect(r.changes.map((c: { table: string }) => c.table)).toEqual(["tasks"]);
+  });
 });

@@ -1082,6 +1082,7 @@ class EngineImpl implements Engine {
     filesExec: Tx["exec"] = tx.exec,
     hooks?: TriggerHooks,
     replica = false,
+    atomic: <T>(op: () => T) => T = (op) => op(),
   ) {
     const { db, getRaw: read } = this.reader(tx, undefined, scope);
     // Replica tables (replica.ts) are written only by the replication applier.
@@ -1367,11 +1368,13 @@ class EngineImpl implements Engine {
     };
     const write = {
       ...db,
-      insert: (logical: string, value: unknown): string => fire(this.phys(scope, logical), () => {
+      // `insert(table, (id) => doc)`: the document is built from its id (fields that need it, such as a job
+      // scheduled for the document), so it is written once instead of an insert and a patch. What the callback
+      // writes (a job, a row pointing back at the id) and the row go in one savepoint (`atomic`): a callback that
+      // throws, or a document it returns that is refused, leaves none of them, even when the caller catches.
+      insert: (logical: string, value: unknown): string => (typeof value === "function" ? atomic : (op: () => string) => op())(() => fire(this.phys(scope, logical), () => {
         const table = this.phys(scope, logical);
         const t = writable(this.table(table));
-        // `insert(table, (id) => doc)`: the document is built from its id (fields that need it, such as a job
-        // scheduled for the document), so it is written once instead of an insert and a patch.
         const build = typeof value === "function" ? (value as (id: string) => unknown) : undefined;
         const fieldsOf = (x: unknown) => {
           const f = checkFields(x);
@@ -1404,7 +1407,7 @@ class EngineImpl implements Engine {
         if (values.length > CHUNK) update(table, rowid, values.slice(CHUNK));
         record(table, id, null, doc, rowid, writtenRow(t, { _rowid: rowid }, values));
         return id;
-      }),
+      })),
       patch: (id: string, value: unknown) => fire(typeof id === "string" ? this.tableOfId(id) : undefined, () => {
         const cur = getRaw(id);
         if (!cur) throw new EmberError("NotFound", `Document ${id} not found`);
@@ -1834,7 +1837,7 @@ class EngineImpl implements Engine {
     };
     // Components never reach the app's tables, and only app tables have triggers (replica tables too: their changes
     // fire the app's triggers when the applier writes them).
-    const db = this.writer(tx, now, random, changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier);
+    const db = this.writer(tx, now, random, changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
     let fileStore: FileStore | undefined;
     const files = () => (fileStore ??= new FileStore(filesExec, this.storageOpts));
     const storage: StorageWriter = {

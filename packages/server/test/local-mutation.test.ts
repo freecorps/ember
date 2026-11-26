@@ -46,6 +46,31 @@ describe("runLocalMutation", () => {
     expect(() => runLocalMutation(mutation((ctx) => ctx.db.insert("users", () => ({ name: 1 }))), {}, { schema, reader: r })).toThrow(/invalid/);
   });
 
+  it("insert(table, (id) => doc): a refused document undoes what the callback wrote and scheduled, even when caught", () => {
+    const r = overlayReader(EMPTY, schema);
+    const out = runLocalMutation(
+      mutation((ctx: any) => {
+        const kept = ctx.db.insert("users", { name: "kept", email: "k@x.dev", admin: false });
+        try {
+          ctx.db.insert("users", (id: string) => {
+            ctx.db.insert("users", { name: `child of ${id}`, email: "c@x.dev", admin: false });
+            ctx.db.patch(kept, { name: "overwritten" });
+            ctx.scheduler.runAfter(0, "users:noop", {});
+            return { name: 1 };
+          });
+        } catch {
+          // swallowed: the mutation goes on
+        }
+        return kept;
+      }),
+      {},
+      { schema, reader: r },
+    );
+    expect(out.changes.map((c) => c.after?.name)).toEqual(["kept"]);
+    expect(out.jobs).toEqual([]);
+    expect(r.get("users", out.value as string)).toMatchObject({ name: "kept" });
+  });
+
   it("validates like the engine: arguments, system fields, the document shape, missing documents", () => {
     const r = overlayReader(EMPTY, schema);
     const write = (fn: any, args: unknown = {}) => () => runLocalMutation(fn, args, { schema, reader: r });

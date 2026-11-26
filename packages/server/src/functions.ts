@@ -102,7 +102,9 @@ export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseRea
   /**
    * Inserts a document and returns its id. `value` may be a function of the new id, called once before the row is
    * written: for fields that need the id (a job scheduled for the document, a row pointing back at it), so the
-   * document is written once instead of an insert and then a patch.
+   * document is written once instead of an insert and then a patch. The callback may schedule and write (those writes
+   * precede the row: the new document cannot be read yet); it and the row are one savepoint, so a callback that
+   * throws, or a document it returns that is refused, leaves none of its writes or jobs, even when the caller catches.
    */
   insert<T extends TableNamesIn<DM>>(
     table: T,

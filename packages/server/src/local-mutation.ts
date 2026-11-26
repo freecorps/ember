@@ -33,11 +33,16 @@ export interface OverlayReader extends LocalReader {
   changes(): LocalRowChange[];
 }
 
-export function overlayReader(base: LocalReader, schema: LocalSchema): OverlayReader {
+export function overlayReader(base: LocalReader, schema: LocalSchema): OverlayReader & { savepoint<T>(op: () => T): T } {
   const m = schema.manifest;
   // table → id → doc (null: deleted)
   const writes = new Map<string, Map<string, Doc | null>>();
   const before = new Map<string, { table: string; id: string; before: Doc | null }>();
+  // While a savepoint is open: what each write replaced (`own` absent: undefined), undone when it throws.
+  let journal: Array<{ table: string; id: string; prev: Doc | null | undefined; remembered: boolean }> | null = null;
+  const journaled = (table: string, id: string) => {
+    if (journal) journal.push({ table, id, prev: writes.get(table)?.get(id), remembered: before.has(`${table}\u0000${id}`) });
+  };
   const own = (table: string) => {
     let t = writes.get(table);
     if (!t) writes.set(table, (t = new Map()));
@@ -55,12 +60,34 @@ export function overlayReader(base: LocalReader, schema: LocalSchema): OverlayRe
   return {
     get,
     put(table, doc) {
+      journaled(table, doc._id as string);
       remember(table, doc._id as string);
       own(table).set(doc._id as string, doc);
     },
     remove(table, id) {
+      journaled(table, id);
       remember(table, id);
       own(table).set(id, null);
+    },
+    savepoint<T>(op: () => T): T {
+      const outer = journal;
+      const mine: NonNullable<typeof journal> = (journal = []);
+      try {
+        return op();
+      } catch (e) {
+        for (let i = mine.length - 1; i >= 0; i--) {
+          const { table, id, prev, remembered } = mine[i]!;
+          if (prev === undefined) writes.get(table)?.delete(id);
+          else own(table).set(id, prev);
+          if (!remembered) before.delete(`${table}\u0000${id}`);
+        }
+        mine.length = 0;
+        throw e;
+      } finally {
+        // A nested savepoint's writes belong to the outer one too (undone if it throws later).
+        journal = outer;
+        if (outer) outer.push(...mine);
+      }
     },
     changes() {
       return [...before.values()].map((b) => ({ table: b.table, id: b.id, before: b.before, after: get(b.table, b.id) }));
@@ -218,12 +245,27 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
         checkDoc(name, f);
         return f;
       };
-      // `insert(table, (id) => doc)`: built from its id, as on the server.
-      const given = typeof value === "function" ? undefined : fieldsOf(value);
+      if (typeof value !== "function") {
+        const fields = fieldsOf(value);
+        const ct = (lastCreationTime = Math.max(now, lastCreationTime + 0.001));
+        const id = makeId(table(name).manifest.idPrefix, ct, random);
+        layer.put(name, normalize(name, id, ct, fields));
+        return id;
+      }
+      // `insert(table, (id) => doc)`: built from its id, as on the server; what the callback writes or schedules is
+      // undone with the insert when either throws.
+      const queued = [...jobs];
       const ct = (lastCreationTime = Math.max(now, lastCreationTime + 0.001));
       const id = makeId(table(name).manifest.idPrefix, ct, random);
-      layer.put(name, normalize(name, id, ct, given ?? fieldsOf((value as (id: string) => unknown)(id))));
-      return id;
+      try {
+        return layer.savepoint(() => {
+          layer.put(name, normalize(name, id, ct, fieldsOf((value as (id: string) => unknown)(id))));
+          return id;
+        });
+      } catch (e) {
+        jobs.splice(0, jobs.length, ...queued);
+        throw e;
+      }
     },
     patch: (id: string, value: unknown) => {
       const cur = current(id);

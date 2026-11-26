@@ -95,7 +95,8 @@ export const send = mutation({
   scan without bounds leaves the documents without the field out. Turning it on or off rebuilds the index (staged
   backfill).
 - `ctx.db.insert(table, (id) => doc)` builds the document from its new id (a job scheduled for it, a row that points
-  back at it): one write instead of an insert and a patch.
+  back at it): one write instead of an insert and a patch. The callback and the row are one savepoint: if it throws,
+  or the document it returns is refused, none of what it wrote or scheduled stays, even when the caller catches.
 - `defineApp({ storage: { compactFormat: 2 } })` makes migrations create format 2 compact tables from then on (the
   rollback lever for format 3, the default); existing tables keep their format.
 
