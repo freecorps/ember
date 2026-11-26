@@ -6,6 +6,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useInsertionEffect,
   useMemo,
   useRef,
   useState,
@@ -395,9 +396,14 @@ export function useMutation<M extends MutationReference>(ref: M, ...options: Hoo
   const client = useEmberClient();
   const name = getFunctionName(ref);
   const shard = opts?.shard;
-  // The latest optimistic update, read at call time: an inline one does not make a new mutation function per render.
-  const update = useRef(opts?.optimisticUpdate);
-  update.current = opts?.optimisticUpdate;
+  // The latest committed optimistic update, read at call time: an inline one does not make a new mutation function per
+  // render. Published at commit (a render that suspends or is discarded never hands its callback to the UI on screen);
+  // an insertion effect runs before layout effects and event handlers, and on the server never.
+  const latest = opts?.optimisticUpdate;
+  const update = useRef(latest);
+  useInsertionEffect(() => {
+    update.current = latest;
+  }, [latest]);
   const optimistic = opts?.optimisticUpdate !== undefined;
   return useMemo(
     () => makeMutation<M>(client, ref, shard === undefined ? undefined : { shard }, optimistic ? (store, args, m) => update.current?.(store, args, m) : undefined),

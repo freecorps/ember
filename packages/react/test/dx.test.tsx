@@ -1,6 +1,6 @@
 // Selectors, useActionState, useMutationState with optimisticUpdate, EmberHydrate / usePreloadedQuery.
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
-import { Suspense, useActionState as useReactActionState, type ReactNode } from "react";
+import { Suspense, startTransition, use, useActionState as useReactActionState, useState, type ReactNode } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { EmberClient, anyApi, encodeJson, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
@@ -11,6 +11,7 @@ import {
   shallowEqual,
   useActionState,
   useConnectionState,
+  useMutation,
   useMutationState,
   usePreloadedQuery,
   useQuery,
@@ -259,6 +260,52 @@ describe("useMutationState({ optimisticUpdate })", () => {
     expect(st.error).toMatchObject({ code: "invalid" });
     expect(screen.getByTestId("todos").textContent).toBe("milk");
     expect(seen.size).toBe(1);
+    client.close();
+  });
+});
+
+describe("useMutation({ optimisticUpdate }) and transitions", () => {
+  it("a render that suspends does not hand its optimistic update to the UI on screen; the committed one does", async () => {
+    const { client, wrap } = setup();
+    const used: string[] = [];
+    let mutate!: ReturnType<typeof useMutation<typeof api.todos.add>>;
+    let resume!: () => void;
+    const data = new Promise<void>((r) => (resume = r));
+    let show!: (s: { tag: string; wait: Promise<unknown> | null }) => void;
+    function Gate({ wait }: { wait: Promise<unknown> | null }) {
+      if (wait) use(wait);
+      return null;
+    }
+    function App() {
+      const [s, set] = useState<{ tag: string; wait: Promise<unknown> | null }>({ tag: "A", wait: null });
+      show = set;
+      mutate = useMutation(api.todos.add, { optimisticUpdate: () => void used.push(s.tag) });
+      return (
+        <>
+          <div data-testid="tag">{s.tag}</div>
+          <Suspense fallback={<div data-testid="fallback" />}>
+            <Gate wait={s.wait} />
+          </Suspense>
+        </>
+      );
+    }
+    wrap(<App />);
+    const shown = mutate;
+    // A transition renders B, which suspends: React keeps A on screen.
+    await act(async () => startTransition(() => show({ tag: "B", wait: data })));
+    expect(screen.getByTestId("tag").textContent).toBe("A");
+    expect(screen.queryByTestId("fallback")).toBeNull();
+    await act(async () => void (await shown({ list: "t", title: "x" })));
+    expect(used).toEqual(["A"]);
+    // B's data comes: it commits, and its optimistic update is the one calls use from then on.
+    await act(async () => {
+      resume();
+      await data;
+    });
+    await waitFor(() => expect(screen.getByTestId("tag").textContent).toBe("B"));
+    expect(mutate).toBe(shown);
+    await act(async () => void (await mutate({ list: "t", title: "y" })));
+    expect(used).toEqual(["A", "B"]);
     client.close();
   });
 });
