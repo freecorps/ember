@@ -1,4 +1,4 @@
-import { claimShardOf, componentQueueName, composeApp, cronList, flattenFunctions, hookShard, matchRoute, replicaApplyFunction, replicatedTablesOf, REPLICATED_SOURCE, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
+import { claimShardOf, componentQueueName, type AnyRegisteredFunction, type QueryCache, composeApp, cronList, flattenFunctions, hookShard, matchRoute, replicaApplyFunction, replicatedTablesOf, REPLICATED_SOURCE, resolveTriggers, withReplicas, type ComposedQueue, type InboundEmailMessage } from "@freecorps/ember-server";
 import { unverifiedJwtPayload, type ShardSpec } from "@freecorps/ember-values";
 import { ActionRunner, type ShardApi } from "./actions.ts";
 import type { AdminShardRpc } from "./admin-api.ts";
@@ -98,6 +98,12 @@ function knownShardKinds(config: EmberConfig): Set<string> | null {
   const s = config.schema.manifest.shards;
   if (!s) return null;
   return new Set(Array.isArray(s) ? s : Object.keys(s));
+}
+
+/** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`). */
+function deployVersion(env: EmberEnv): string | null {
+  const v = env.EMBER_VERSION as { id?: unknown } | undefined;
+  return v && typeof v.id === "string" && v.id ? v.id : null;
 }
 
 /** Constant-time string comparison (admin token). */
@@ -376,6 +382,104 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     return json({ ok: true, results });
   };
 
+  /** Edge copies being refreshed from this isolate (a stale hit starts one refresh per key, not one per hit). */
+  const refreshing = new Set<string>();
+
+  /**
+   * `GET /api/query/<module:fn>?args=<JSON>&shard=<shard>` (contracts.md "Queries HTTP cacheáveis"): only for public
+   * queries declared with `cache: { maxAge, swr? }` (any other function: 405, as before). `args`: the arguments as
+   * wire JSON (int64/bytes tagged), URL-encoded; absent = `{}`. The shard as in `POST /api/query/<fn>`.
+   *
+   * Anonymous calls (no bearer token, no session cookie) get `Cache-Control: public, max-age, stale-while-revalidate`
+   * and go through `caches.default`: the key is the function, the shard, the canonical args (keys sorted) and the
+   * Worker version (`EMBER_VERSION.id`, else the schema version), so a deploy starts from an empty cache. A copy
+   * younger than `maxAge` answers without waking the shard; one younger than `maxAge + swr` answers stale while one
+   * refresh runs in the background (`waitUntil`). Only `ok: true` answers are stored. Signed-in calls are never cached
+   * (`Cache-Control: private, no-store`) and run exactly as `POST /api/query/<fn>` does.
+   */
+  const getQuery = async (request: Request, url: URL, env: EmberEnv, ctx: ExecutionContext, rawFn: string): Promise<Response> => {
+    let fnName: string;
+    try {
+      fnName = decodeURIComponent(rawFn);
+    } catch {
+      return error(400, "bad_request", "malformed percent-encoding in the function name");
+    }
+    fns ??= flattenFunctions(config.functions);
+    const f = fns.get(fnName) as AnyRegisteredFunction | undefined;
+    const cache = f && f.type === "query" && f.visibility === "public" ? f.cache : undefined;
+    // Not revealing whether the function exists: the same answer as any GET before this route.
+    if (!cache) return error(405, "method_not_allowed", "use POST (GET is only for queries declared with cache)");
+    const raw = url.searchParams.get("args");
+    if (raw !== null && raw.length > MAX_GET_ARGS_CHARS) return error(414, "too_large", `args in the URL are at most ${MAX_GET_ARGS_CHARS} characters: use POST`);
+    let args: unknown = {};
+    try {
+      if (raw !== null && raw !== "") args = parse(raw);
+    } catch {
+      return error(400, "bad_request", "args must be URL-encoded JSON (an object)");
+    }
+    if (typeof args !== "object" || args === null || Array.isArray(args)) return error(400, "bad_request", "args must be an object");
+    const spec = f!.shard;
+    const fromArg = spec?.fromArg !== undefined ? (args as Record<string, unknown>)[spec.fromArg] : undefined;
+    const routed = spec?.fromArg !== undefined && fromArg !== undefined ? `${spec.kind}:${String(fromArg)}` : undefined;
+    const shard = checkShard(url.searchParams.get("shard") ?? request.headers.get("x-ember-shard") ?? routed ?? "global:main");
+    if (!shard) return error(400, "bad_shard", "shard must be <kind>:<key>");
+    const s = stub(env, shard);
+    const tok = bearer(request, url);
+    const run = async (identity: Identity | null) => {
+      reached(shard);
+      const t0 = performance.now();
+      const out = await s.query(shard, fnName, args, identity, false, { caller: true });
+      recordCall(env, "query", fnName, shard, out, performance.now() - t0);
+      const { metrics: _m, ...reply } = out;
+      return { ok: out.ok, body: stringify(reply) };
+    };
+    const send = (body: string, ok: boolean, headers: Record<string, string>) => new Response(body, { status: ok ? 200 : 400, headers: { "content-type": "application/json", ...headers } });
+
+    if (tok || SESSION_COOKIE.test(request.headers.get("cookie") ?? "")) {
+      // Signed in (or claiming to be): never cached, anywhere; the same checks as POST (revocation in the shard).
+      prewarm(env, ctx, shard, tok, false);
+      const identity = await verify(tok, false, ctx);
+      if (identity === null) return new Response(stringify({ ok: false, error: { code: "unauthenticated", message: "invalid token" } }), { status: 401, headers: { "content-type": "application/json", "cache-control": "private, no-store" } });
+      const r = await run(identity ?? null);
+      return send(r.body, r.ok, { "cache-control": "private, no-store" });
+    }
+
+    const edge = (globalThis as { caches?: { default?: Cache } }).caches?.default;
+    const version = deployVersion(env) ?? manifest.version;
+    const key = new Request(`${url.origin}/__ember/query-cache/${encodeURIComponent(fnName)}?shard=${encodeURIComponent(shard)}&args=${encodeURIComponent(stringify(canonical(args)))}&v=${encodeURIComponent(version)}`);
+    const swr = cache.swr ?? 0;
+    const store = (body: string) => {
+      if (!edge) return;
+      const copy = new Response(body, { headers: { "content-type": "application/json", "cache-control": `public, max-age=${cache.maxAge + swr}`, [CACHED_AT]: String(Date.now()) } });
+      ctx.waitUntil(edge.put(key, copy).catch(() => undefined));
+    };
+    const answer = (body: string, state: "HIT" | "STALE" | "MISS", ageS: number) =>
+      send(body, true, { "cache-control": publicCacheControl(cache), vary: "authorization, cookie", "x-ember-cache": state, age: String(Math.max(0, Math.floor(ageS))) });
+    if (edge) {
+      const hit = await edge.match(key).catch(() => undefined);
+      if (hit) {
+        const age = (Date.now() - Number(hit.headers.get(CACHED_AT) ?? 0)) / 1000;
+        if (age < cache.maxAge) return answer(await hit.text(), "HIT", age);
+        if (age < cache.maxAge + swr) {
+          if (!refreshing.has(key.url)) {
+            refreshing.add(key.url);
+            ctx.waitUntil(
+              run(null)
+                .then((r) => (r.ok ? store(r.body) : undefined))
+                .catch(() => undefined)
+                .finally(() => refreshing.delete(key.url)),
+            );
+          }
+          return answer(await hit.text(), "STALE", age);
+        }
+      }
+    }
+    const r = await run(null);
+    if (!r.ok) return send(r.body, false, { "cache-control": "no-store" });
+    store(r.body);
+    return answer(r.body, "MISS", 0);
+  };
+
   return {
     handles(request) {
       return mounted(new URL(request.url).pathname);
@@ -529,6 +633,8 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
       // shard from `?shard=`, the function's routing argument, or global:main): the form OpenAPI describes.
       const perFn = /^\/api\/(query|mutation|action)\/(.+)$/.exec(url.pathname);
       if (url.pathname === "/api/query" || url.pathname === "/api/mutation" || url.pathname === "/api/action" || perFn) {
+        // `GET /api/query/<fn>?args=`: queries declared with `cache` (edge-cached when anonymous); POST for the rest.
+        if (request.method === "GET" && perFn?.[1] === "query") return getQuery(request, url, env, ctx, perFn[2]!);
         if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
         let body: Record<string, unknown>;
         try {
@@ -830,6 +936,29 @@ export const MAX_HTTP_BODY_BYTES = MAX_FRAME_BYTES;
 export const MAX_QUERY_BATCH_BYTES = MAX_FRAME_BYTES;
 
 const tooLarge = () => error(413, "too_large", `the request body is at most ${MAX_HTTP_BODY_BYTES} bytes`);
+
+/** Longest `args` (characters of the URL-decoded JSON) of `GET /api/query/<fn>`: past it, 414 (use POST). */
+export const MAX_GET_ARGS_CHARS = 8 * 1024;
+
+/**
+ * A cookie whose name says it is a session (`<prefix>.session_token`, `session_data`, `__Secure-…`): the call is not
+ * anonymous for the edge cache of `GET /api/query/<fn>`, even though queries authenticate by bearer token only.
+ */
+const SESSION_COOKIE = /(?:^|;)\s*[^=;]*session[^=;]*=/i;
+
+/** `v` with every plain object's keys sorted: two spellings of the same args share one cache entry. */
+function canonical(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonical);
+  if (v === null || typeof v !== "object" || Object.getPrototypeOf(v) !== Object.prototype) return v;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(v).sort()) out[k] = canonical((v as Record<string, unknown>)[k]);
+  return out;
+}
+
+/** The `Cache-Control` a cacheable query's anonymous answer carries (`swr` only when set). */
+const publicCacheControl = (c: QueryCache) => `public, max-age=${c.maxAge}${c.swr ? `, stale-while-revalidate=${c.swr}` : ""}`;
+/** Header of the edge copy: when it was computed (ms), for its age (the Cache API keeps it `maxAge + swr`). */
+const CACHED_AT = "x-ember-cached-at";
 
 /** `resume` of a `POST /api/query` body (the value the caller holds): `{ version, epoch, ik }`, else ignored. */
 function resumeOf(r: unknown): { resume: { version: number; epoch: string; ik: string } } | undefined {

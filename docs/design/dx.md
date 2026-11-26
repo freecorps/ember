@@ -368,6 +368,13 @@ http.route({
 - `httpAction` cru continua existindo para webhooks.
 - As rotas declaradas entram no manifest e geram `_generated/http.d.ts` (cliente fetch tipado) e o OpenAPI.
 - O `email-lite/ember/http.ts` (`await r.json() as any` nos testes) é o primeiro a migrar.
+- Queries públicas podem ser cacheadas na borda para chamadas anônimas: `query({ cache: { maxAge: 60, swr: 300 }, … })`
+  (segundos inteiros; `maxAge` 1 s a 1 ano, `swr` opcional) responde `GET /api/query/<fn>?args=<JSON URL-encoded>` com
+  `Cache-Control: public, max-age=60, stale-while-revalidate=300` e guarda em `caches.default` por versão do Worker.
+  Chamadas com token ou cookie de sessão nunca são cacheadas. Use para dados públicos (catálogo, página de status, feed):
+  o valor fica até `maxAge + swr` atrás das escritas. Sem `cache`, GET continua 405. O OpenAPI ganha o `get` dessas.
+- Jobs efêmeros: `mutation/action({ retainMs: 0 })` apaga a linha de `_jobs` de uma execução agendada assim que ela termina
+  bem (ou é cancelada), em vez de guardar 7 dias para `ctx.scheduler.get` — para jobs frequentes cujo histórico ninguém lê.
 
 ### 3.12 Ferramentas (DX12)
 

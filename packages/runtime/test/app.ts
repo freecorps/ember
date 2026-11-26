@@ -593,7 +593,21 @@ const tenant = {
   }),
 };
 
-export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared, tallies, tenant };
+/** Queries declared with `cache` (anonymous `GET /api/query/<fn>` is edge-cached). */
+const byChannel = (ctx: Q, channel: string) => ctx.db.query("messages").withIndex("by_channel", (q: any) => q.eq("channel", channel)).collect().map((m: { body: string }) => m.body);
+const cached = {
+  list: query({ args: { channel: v.string() }, cache: { maxAge: 60 }, handler: (ctx: Q, { channel }: { channel: string }) => byChannel(ctx, channel) }),
+  /** Fresh for 1 s, then served stale for 60 s while it is refreshed. */
+  swr: query({ args: { channel: v.string() }, cache: { maxAge: 1, swr: 60 }, handler: (ctx: Q, { channel }: { channel: string }) => byChannel(ctx, channel) }),
+  /** Per signed-in user: anonymous and signed-in answers differ. */
+  who: query({ cache: { maxAge: 60 }, handler: (ctx: Q) => ctx.auth.getUserIdentity()?.subject ?? "anonymous" }),
+  /** Fails for anonymous callers: an error is never stored. */
+  members: query({ cache: { maxAge: 60 }, handler: (ctx: Q) => ctx.auth.require().subject }),
+  /** Routed by its argument (`room:<room>`). */
+  room: query({ args: { room: v.string() }, shard: { room: "room" }, cache: { maxAge: 60 }, handler: (ctx: Q, { room }: { room: string }) => byChannel(ctx, room) }),
+};
+
+export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared, tallies, tenant, cached };
 
 export const functionsV2 = {
   ...functionsV1,

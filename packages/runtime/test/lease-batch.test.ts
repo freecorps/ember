@@ -27,7 +27,7 @@ const LEASE_RPCS = ["claimActionJob", "settleActionJob", "claimActionJobs", "set
  */
 function countingEnv(missing: string[] = []) {
   const calls: string[] = [];
-  const ns = env.SHARD as DurableObjectNamespace;
+  const ns = env.SHARD;
   const SHARD = {
     idFromName: (n: string) => ns.idFromName(n),
     get: (id: DurableObjectId, o?: DurableObjectNamespaceGetDurableObjectOptions) => {
