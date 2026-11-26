@@ -179,8 +179,10 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
   // reloaded ember.json names another directory.
   let watcher: ReturnType<typeof watch> | null = null;
   let watched = "";
+  // Set once close() starts: a config reload still queued then must not open a watcher close() never closes.
+  let closing = false;
   function watchSources(dir: string) {
-    if (dir === watched) return;
+    if (closing || dir === watched) return;
     const w = watch(dir, { recursive: true }, (_event, file) => {
       const f = String(file ?? "");
       if (f.split(/[\\/]/).some((part) => part === "_generated" || part.startsWith("."))) return;
@@ -213,6 +215,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
       await running;
     },
     async close() {
+      closing = true;
       for (const t of timers.values()) clearTimeout(t);
       watcher?.close();
       rootWatcher.close();
