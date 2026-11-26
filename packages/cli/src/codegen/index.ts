@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { ObjectShape, Shape } from "@freecorps/ember-values";
 import type { AuthTableDescriptor } from "@freecorps/ember-auth";
-import { composeApp, isAppDefinition, isTriggersDefinition, resolveTriggers, splitFunctionName, type HttpRouter, type SchemaDefinition, type SchemaManifest, type TypedRouteSpec } from "@freecorps/ember-server";
+import { composeApp, isAppDefinition, isTriggersDefinition, resolveTriggers, splitFunctionName, type DashboardManifest, type HttpRouter, type SchemaDefinition, type SchemaManifest, type TypedRouteSpec } from "@freecorps/ember-server";
 import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
@@ -71,6 +71,11 @@ export interface EmberManifest {
   routes?: TypedRouteSpec[];
   /** `local`: this project's Auth DO (read-only `auth:*` tables); `remote`: SSO against another project. */
   auth?: { mode: "local"; tables: AuthTableDescriptor[]; replicas?: ReplicaTableManifest[] } | { mode: "remote"; from: string };
+  /**
+   * Dashboard screens (`defineApp({ dashboard })` and each installed component's `defineComponent({ dashboard })`),
+   * with absolute function names (contracts.md "Telas declarativas"). Not part of the schema hash.
+   */
+  dashboards?: DashboardManifest[];
 }
 
 /** A replica table (`ember.replicate` in auth.config.ts, PLAN §22 L3) as codegen types it. */
@@ -361,7 +366,15 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
   });
   const env = Object.entries(((loaded.app as { env?: Record<string, { isOptional: string }> } | undefined)?.env ?? {})).map(([name, val]) => ({ name, optional: val.isOptional === "optional" }));
   const routes = ((loaded.http as HttpRouter | undefined)?.routes ?? []).flatMap((r) => (r.typed ? [r.typed] : []));
-  return { formatVersion: 1, schema: composed.schema.manifest as unknown as EmberManifest["schema"], functions, crons, ...(env.length ? { env } : {}), ...(routes.length ? { routes } : {}) };
+  return {
+    formatVersion: 1,
+    schema: composed.schema.manifest as unknown as EmberManifest["schema"],
+    functions,
+    crons,
+    ...(env.length ? { env } : {}),
+    ...(routes.length ? { routes } : {}),
+    ...(composed.dashboards.length ? { dashboards: composed.dashboards } : {}),
+  };
 }
 
 /**

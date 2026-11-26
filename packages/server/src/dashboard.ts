@@ -40,7 +40,7 @@ export type DashboardFromRow = Readonly<Record<string, string>>;
 
 export interface DashboardField {
   label: string;
-  /** Dot path into the value (`totals.enqueued`, `items.0.name`). */
+  /** Dot path into the value (`totals.enqueued`, `items.0.name`; `""`: the value itself). */
   path: string;
   format?: DashboardFormat;
 }
@@ -221,7 +221,8 @@ export interface DashboardManifest extends DashboardSpec {
 // ------------------------------------------------------------------------------------------------ validation
 
 const ID = /^[a-z][A-Za-z0-9_-]{0,39}$/;
-const PATH = /^[A-Za-z0-9_$-]+(\.[A-Za-z0-9_$-]+)*$/;
+/** A dot path into a value; `""` is the value itself (a query that returns a number). */
+const PATH = /^(?:[A-Za-z0-9_$-]+(\.[A-Za-z0-9_$-]+)*)?$/;
 const MAX_TABS = 20;
 const MAX_BLOCKS = 30;
 const MAX_ITEMS = 50;
