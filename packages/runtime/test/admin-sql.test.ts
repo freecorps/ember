@@ -131,6 +131,12 @@ describe("POST /api/_ember/sql", () => {
     expect((await admin("sql", { shard: "sql:x", sql: "SELECT ?", params: "x" })).status).toBe(400);
     expect((await admin("sql", { shard: "sql:x", sql: "SELECT 1", explain: "yes" })).status).toBe(400);
     expect((await admin("sql", { shard: "sql:x", sql: `SELECT '${"x".repeat(100_001)}'` })).status).toBe(413);
+    // The statement SQLite runs is measured in UTF-8 bytes: 50 000 CJK characters are 150 000 bytes; the explain prefix
+    // counts too (once).
+    expect((await admin("sql", { shard: "sql:x", sql: `SELECT '${"漢".repeat(50_000)}'` })).status).toBe(413);
+    const nearly = `SELECT '${"x".repeat(99_985)}'`;
+    expect((await admin("sql", { shard: "sql:x", sql: nearly, explain: true })).status).toBe(413);
+    expect((await admin("sql", { shard: "sql:x", sql: `EXPLAIN QUERY PLAN SELECT '${"x".repeat(99_966)}'`, explain: true })).status).not.toBe(413);
     // Without content-length (a chunked body) the cap holds too: the body is bounded while it is read.
     const big = JSON.stringify({ shard: "sql:x", sql: "SELECT 1", params: ["x".repeat(400_001)] });
     const chunked = await SELF.fetch("http://ember/api/_ember/sql", {
@@ -183,6 +189,28 @@ describe("runReadOnlySql (defense in depth)", () => {
       throw new Error("must not run");
     };
     expect(runReadOnlySql(storage, { sql: "DELETE FROM t" })).toMatchObject({ ok: false, code: "SqlRefused" });
+  });
+
+  const fakeStorage = (rows: unknown[][]) =>
+    ({
+      transactionSync: <T>(fn: () => T): T => fn(),
+      sql: { exec: () => ({ columnNames: ["v"], raw: () => rows[Symbol.iterator](), rowsRead: rows.length, rowsWritten: 0 }) },
+    }) as unknown as Parameters<typeof runReadOnlySql>[0];
+
+  it("the byte budget is checked before a row is added: one that would pass it is left out", () => {
+    const mib = () => [new Uint8Array(1024 * 1024)];
+    const five = runReadOnlySql(fakeStorage([mib(), mib(), mib(), mib(), mib()]), { sql: "SELECT v FROM t" });
+    expect(five.ok && [five.value.rows.length, five.value.truncated]).toEqual([4, true]);
+    // Four rows fill it exactly: all kept, not truncated.
+    const four = runReadOnlySql(fakeStorage([mib(), mib(), mib(), mib()]), { sql: "SELECT v FROM t" });
+    expect(four.ok && [four.value.rows.length, four.value.truncated]).toEqual([4, false]);
+  });
+
+  it("an integer past 2^53 comes with a warning (read rounded); safe numbers do not", () => {
+    const big = runReadOnlySql(fakeStorage([[9007199254740993], [1]]), { sql: "SELECT v FROM t" });
+    expect(big.ok && big.value.warnings?.[0]).toMatch(/CAST\(col AS TEXT\)/);
+    const small = runReadOnlySql(fakeStorage([[Number.MAX_SAFE_INTEGER], [1.5]]), { sql: "SELECT v FROM t" });
+    expect(small.ok && small.value.warnings).toBeUndefined();
   });
 
   it("a statement that fails midway reports what it read (billed, counted in the shard's metrics)", () => {

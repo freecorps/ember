@@ -5077,8 +5077,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * a transaction that is always aborted. Also on a refused shard (it reads the tables as they are, nothing decodes
    * them). Its rows read count in the shard's metrics like any other statement's.
    */
-  async sqlQuery(shard: string, input: SqlQueryInput): Promise<SqlQueryOutcome> {
-    this.setShardName(shard);
+  async sqlQuery(_shard: string, input: SqlQueryInput): Promise<SqlQueryOutcome> {
+    // Nothing is persisted for it (not even the shard's name, as `preflight`): the caller picked the shard, and the
+    // runner does not use the name.
     const r = runReadOnlySql(this.ctx.storage, input);
     // A statement that ran counts, failed or not (its reads are billed); a refused text never ran.
     if (r.ok || r.code !== "SqlRefused") {

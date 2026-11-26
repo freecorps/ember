@@ -430,6 +430,8 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
  */
 /** Largest body of `POST sql`: the text (up to SQL_TEXT_MAX characters, up to 4 bytes each in UTF-8) and its parameters. */
 const SQL_BODY_MAX = SQL_TEXT_MAX * 4;
+/** The Durable Object's largest SQL statement, in UTF-8 bytes (Cloudflare's limit: 100 KB). */
+const SQL_STATEMENT_MAX_BYTES = 100_000;
 
 async function handleSql(request: Request, deps: AdminDeps): Promise<Response> {
   if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
@@ -461,6 +463,10 @@ async function handleSql(request: Request, deps: AdminDeps): Promise<Response> {
   }
   const check = checkReadOnlySql(b.sql);
   if (!check.ok) return deps.json({ ok: false, error: { code: "SqlRefused", message: check.message, data: { at: check.at } } }, 400);
+  // What SQLite runs, in bytes (CJK text is 3 per character; an explain adds its prefix once).
+  const statement = b.explain === true && !check.explain ? `EXPLAIN QUERY PLAN ${b.sql}` : b.sql;
+  const statementBytes = new TextEncoder().encode(statement).byteLength;
+  if (statementBytes > SQL_STATEMENT_MAX_BYTES) return deps.error(413, "too_large", `the statement is ${statementBytes} bytes in UTF-8 (at most ${SQL_STATEMENT_MAX_BYTES})`);
   const t0 = performance.now();
   const out = await deps.stub(shard).sqlQuery(shard, { sql: b.sql, params, ...(b.explain === true ? { explain: true } : {}), ...(b.limit !== undefined ? { limit: b.limit as number } : {}) });
   // workerd's clock only moves on I/O, so the shard's own reading is often 0: the round trip to it is the honest one.

@@ -36,6 +36,8 @@ export interface SqlQueryResult {
   explain: boolean;
   /** With `explain`: the plan as a tree. */
   plan?: SqlPlanNode[];
+  /** Things the rows do not show (an integer past 2^53 came back rounded: select `CAST(col AS TEXT)` for it). */
+  warnings?: string[];
 }
 
 /** `rowsRead` on a failure: what the statement read before it failed (billed all the same); 0 when it never ran. */
@@ -68,18 +70,30 @@ export function runReadOnlySql(storage: Pick<DurableObjectStorage, "sql" | "tran
       const rows: SqlCell[][] = [];
       let truncated = false;
       let bytes = 0;
+      let unsafeInt = false;
       if (columns.length) {
         for (const raw of cur.raw()) {
-          if (rows.length >= limit || bytes > SQL_BYTES_MAX) {
+          if (rows.length >= limit) {
             truncated = true;
             break;
           }
           const row = raw.map((v) => (v instanceof ArrayBuffer ? new Uint8Array(v) : (v as SqlCell)));
-          for (const v of row) bytes += sizeOf(v);
+          // The budget is checked with the row: one that would pass it is left out (a row that fits exactly stays).
+          let size = 0;
+          for (const v of row) {
+            size += sizeOf(v);
+            if (typeof v === "number" && Number.isInteger(v) && !Number.isSafeInteger(v)) unsafeInt = true;
+          }
+          if (bytes + size > SQL_BYTES_MAX) {
+            truncated = true;
+            break;
+          }
+          bytes += size;
           rows.push(row);
         }
       }
       result = { columns, rows, rowsRead: cur.rowsRead, rowsWritten: cur.rowsWritten, truncated, ms: 0, explain };
+      if (unsafeInt) result.warnings = ["an integer past 2^53 came back rounded (SQLite integers are read as JavaScript numbers): select it as CAST(col AS TEXT) for the exact value"];
       throw abort;
     });
   } catch (e) {
