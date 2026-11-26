@@ -6,7 +6,7 @@
  * `@freecorps/ember-auth/lazy` is the same with Better Auth loaded on first use (what the generated Worker uses).
  */
 export { DEFAULT_FETCH_TIMEOUT_MS, defineAuth, isEmberAuthConfig, INJECTED_OPTIONS, resolveAuthConfig } from "./define.ts";
-export type { AuthEnv, AuthSession, DefineAuthInput, EmberAuthConfig, EmberAuthExtras, EmberAuthFactory } from "./define.ts";
+export type { AuthEnv, AuthSession, ClaimsOf, ClaimsOfOptions, DefineAuthInput, EmberAuthConfig, EmberAuthExtras, EmberAuthFactory, OrganizationClaims, SessionClaims } from "./define.ts";
 export {
   assertProjectName,
   DEFAULT_BASE_PATH,

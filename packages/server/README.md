@@ -80,6 +80,11 @@ export const send = mutation({
   have `ctx.sql` (private SQL tables) and `ctx.random()`.
 - Actions: `ctx.runQuery` / `runMutation` / `runAction`, `ctx.onShard(shard)`, `ctx.shards` (`list`, `fanOut`),
   `ctx.env`, `ctx.storage` (bytes and URLs), `ctx.images`, `ctx.browser`, vector and AI search.
+- `ctx.auth.getUserIdentity()` / `ctx.auth.require()` return an `Identity<Claims>`. With `ember/auth.config.ts`,
+  `ember codegen` prints the claims it signs in (`ember/_generated/claims.d.ts`: Better Auth's `sid`, `email`, `name`,
+  `emailVerified`, `org?` with the organization plugin, and what `ember.claims` returns, optional) and the builders of
+  `./_generated/server` use them: `claims.role` is typed, `claims.nope` and `fromAuth("nope")` are type errors. Without
+  one (or the generic builders of this package) the claims are `Record<string, unknown>`.
 
 ## Limits worth knowing
 

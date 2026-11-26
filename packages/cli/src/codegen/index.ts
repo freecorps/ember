@@ -1,4 +1,4 @@
-// `ember codegen`: ember/_generated/{api,dataModel,server,errors,types}.{js,d.ts} + api.d.ts.map + manifest.json
+// `ember codegen`: ember/_generated/{api,dataModel,server,errors,types}.{js,d.ts}, claims.d.ts, api.d.ts.map, manifest.json
 // (docs/design/dx.md §3.5).
 //
 // - api.d.ts, dataModel.d.ts, errors.d.ts and types.d.ts are static (PLAN §11): args come from the `args` validators,
@@ -6,7 +6,8 @@
 //   They import only each other, so a client type-checks without loading server code. The return types are computed
 //   to a fixed point (a function returning another's result needs that one's type first), JSDoc and `@throws` /
 //   `@source` tags go on every function, and api.d.ts.map sends Go to Definition to the handler.
-// - server.d.ts is for server code only: typed builders over `DataModelFromSchema<typeof schema>`.
+// - server.d.ts is for server code only: typed builders over `DataModelFromSchema<typeof schema>`, with the identity's
+//   claims of claims.d.ts (printed from ember/auth.config.ts: `ClaimsOf` of @freecorps/ember-auth).
 // - manifest.json: schema manifest + function list (name, type, visibility, arg/return shapes, errors) + crons.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -18,6 +19,7 @@ import { authModeOf, loadProjectCode, type LoadedProject } from "../build.ts";
 import type { Project } from "../config.ts";
 import { discover } from "../modules.ts";
 import { aiGuidelines } from "./ai.ts";
+import { outsideFiles, sourcesHash, type SourcesStamp } from "./current.ts";
 import { relativeTo, TypeOracle, type FunctionTypeInfo, type NamedType } from "./returnTypes.ts";
 import { propKey, shapeToTs } from "./shapeToTs.ts";
 
@@ -71,6 +73,11 @@ export interface EmberManifest {
   routes?: TypedRouteSpec[];
   /** `local`: this project's Auth DO (read-only `auth:*` tables); `remote`: SSO against another project. */
   auth?: { mode: "local"; tables: AuthTableDescriptor[]; replicas?: ReplicaTableManifest[] } | { mode: "remote"; from: string };
+  /**
+   * manifest.json only: what it was generated from (a hash of the sources), so `ember types` and `ember openapi`
+   * reuse a current one without evaluating the project (codegen/current.ts).
+   */
+  sources?: SourcesStamp;
 }
 
 /** A replica table (`ember.replicate` in auth.config.ts, PLAN §22 L3) as codegen types it. */
@@ -173,6 +180,15 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   checkTriggers(loaded, { ...manifest.schema.tables, ...Object.fromEntries(replicaNames.map((n) => [n, {}])) });
   // Replica tables join the server's DataModel (ctx.db.query("auth:member")): server.d.ts says so.
   if (auth?.mode === "local" && auth.replicas?.length) generated.set("server.d.ts", serverDts(!!files.appConfig, true));
+  // The identity's claims, from ember/auth.config.ts (its own program: Better Auth's types stay out of the modules').
+  const oracle = opts.oracle ?? new TypeOracle();
+  let claims: string | null = null;
+  if (auth?.mode === "local" && files.authConfig) {
+    const r = oracle.claims({ authConfig: files.authConfig, generatedDir: out, projectDir: project.dir, cacheFile: join(project.stateDir, "codegen", "claims.json") });
+    if ("text" in r) claims = r.text;
+    else warnings.push(`ember/auth.config.ts: the identity's claims stay untyped (${r.problem})`);
+  }
+  generated.set("claims.d.ts", claimsDts(claims));
 
   // 3. Static data model and errors.
   generated.set("dataModel.d.ts", dataModelDts(manifest));
@@ -190,19 +206,17 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   generated.set("offline.d.ts", offlineDts(manifest.functions));
 
   // 4. Function types to a fixed point: each iteration type-checks the modules against the previous api.d.ts.
-  const oracle = opts.oracle ?? new TypeOracle();
   const wanted = new Set(manifest.functions.filter((f) => f.type !== "httpAction" && f.component === undefined && !f.name.startsWith("@")).map((f) => f.name));
   const inferReturns = new Set(manifest.functions.filter((f) => wanted.has(f.name) && !f.returns).map((f) => f.name));
   const onDisk = (name: string) => (existsSync(join(out, name)) ? readFileSync(join(out, name), "utf8") : undefined);
   const known = new Set(errorCodes.map((e) => e.code));
   const disk = onDisk("api.d.ts");
-  // The api on disk is usually current (one pass converges): only then is the first pass worth its diagnostics.
+  // The api on disk is usually current: then one pass converges.
   const fromDisk = !!disk && disk.includes("export type Mutation<Args, Returns, Errors extends ErrorSpec>");
   let api = fromDisk ? disk! : apiDts(manifest, new Map(), known, out).text;
   let types = onDisk("types.d.ts") ?? typesDts([]);
   let infos = new Map<string, FunctionTypeInfo>();
   let named: NamedType[] = [];
-  let diagnostics: string[] = [];
   let converged = false;
   for (let i = 0; i < MAX_ITERATIONS; i++) {
     const virtualFiles = new Map<string, string>([
@@ -211,19 +225,11 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
       [join(out, "errors.d.ts"), generated.get("errors.d.ts")!],
       [join(out, "dataModel.d.ts"), generated.get("dataModel.d.ts")!],
       [join(out, "server.d.ts"), generated.get("server.d.ts")!],
+      [join(out, "claims.d.ts"), generated.get("claims.d.ts")!],
     ]);
-    // The last pass needs diagnostics; a pass from the stub api never converges, so it skips them (unless it is the
-    // only one: an app without functions).
-    let withDiagnostics = i > 0 || fromDisk || wanted.size === 0;
-    let r = oracle.infer({ modules: files.modules, wanted, inferReturns, virtualFiles, generatedDir: out, projectDir: project.dir, diagnostics: withDiagnostics });
-    if (!withDiagnostics && apiDts(withInferredErrors(manifest, r.functions, known), r.functions, known, out, r.named).text === api && typesDts(r.named) === types) {
-      // Converged on the first pass after all (every result has a validator): this pass is the last, so check it.
-      withDiagnostics = true;
-      r = oracle.infer({ modules: files.modules, wanted, inferReturns, virtualFiles, generatedDir: out, projectDir: project.dir, diagnostics: true });
-    }
+    const r = oracle.infer({ modules: files.modules, wanted, inferReturns, virtualFiles, generatedDir: out, projectDir: project.dir });
     infos = r.functions;
     named = r.named;
-    diagnostics = r.diagnostics;
     const nextApi = apiDts(withInferredErrors(manifest, infos, known), infos, known, out, named).text;
     const nextTypes = typesDts(named);
     if (nextApi === api && nextTypes === types) {
@@ -233,6 +239,8 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
     api = nextApi;
     types = nextTypes;
   }
+  // Type errors of the pass that settled (it checked the modules against the final api.d.ts).
+  const diagnostics = oracle.diagnostics();
   if (!converged) warnings.push(`return types did not settle after ${MAX_ITERATIONS} passes (functions returning each other's results?): add \`returns:\` validators`);
   for (const d of diagnostics) warnings.push(d);
 
@@ -263,7 +271,9 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   generated.set("api.d.ts", rendered.text);
   generated.set("api.d.ts.map", rendered.map);
   generated.set("types.d.ts", typesDts(named));
-  generated.set("manifest.json", JSON.stringify(manifest, null, 2) + "\n");
+  const outside = outsideFiles(project, [...oracle.programFiles(), ...(loaded.inputs ?? [])]);
+  const sources: SourcesStamp = { hash: sourcesHash(project, outside), ...(outside.length ? { files: outside } : {}) };
+  generated.set("manifest.json", JSON.stringify({ ...manifest, sources }, null, 2) + "\n");
   generated.set("ai/guidelines.md", aiGuidelines(manifest, rendered.contracts));
 
   // 5. Write (or compare).
@@ -468,24 +478,31 @@ const SERVER_JS = `${HEADER}export {
 const serverDts = (hasApp: boolean, hasReplicas = false) => `${HEADER}// Server-only: typed builders over the schema. Client code should import ./api and ./dataModel instead.
 import type {
   ActionBuilder,
+  ClaimName,
   ComponentsApi,
   ActionCtx as GenericActionCtx,
   DataModelFromSchema,
   DefineTriggers,
   Change as GenericChange,
+  FromAuth,
   TriggerCtx as GenericTriggerCtx,
   DatabaseReader as GenericDatabaseReader,
   EnvOf,
   DatabaseWriter as GenericDatabaseWriter,
   HttpActionBuilder,
+  Identity as GenericIdentity,
   MutationBuilder,
   MutationCtx as GenericMutationCtx,
   QueryBuilder,
   QueryCtx as GenericQueryCtx,
 } from "@freecorps/ember-server";
 import type schema from "../schema";
+import type { Claims } from "./claims";
 ${hasApp ? 'import type app from "../ember.config";\n' : ""}${hasReplicas ? 'import type { ReplicaDataModel } from "./dataModel";\n' : ""}
 export type DataModel = DataModelFromSchema<typeof schema>${hasReplicas ? " & ReplicaDataModel" : ""};
+export type { Claims };
+/** The signed-in caller, as \`ctx.auth.getUserIdentity()\` / \`ctx.auth.require()\` return it (claims from ./claims). */
+export type Identity = GenericIdentity<Claims>;
 /** Declared env vars (\`defineApp({ env })\` in ember.config.ts), typed in actions' \`ctx.env\`. */
 export type Env = ${hasApp ? "EnvOf<typeof app>" : "{}"};
 type EnvCtx = { env: Env & Record<string, unknown> };
@@ -496,31 +513,46 @@ type EnvCtx = { env: Env & Record<string, unknown> };
  */
 export declare const components: ${hasApp ? "ComponentsApi<typeof app>" : "{}"};
 
-export declare const query: QueryBuilder<DataModel, "public">;
-export declare const internalQuery: QueryBuilder<DataModel, "internal">;
-export declare const mutation: MutationBuilder<DataModel, "public">;
-export declare const internalMutation: MutationBuilder<DataModel, "internal">;
-export declare const action: ActionBuilder<"public", DataModel, EnvCtx>;
-export declare const internalAction: ActionBuilder<"internal", DataModel, EnvCtx>;
-export declare const httpAction: HttpActionBuilder<DataModel, EnvCtx>;
+export declare const query: QueryBuilder<DataModel, "public", {}, {}, readonly [], Claims>;
+export declare const internalQuery: QueryBuilder<DataModel, "internal", {}, {}, readonly [], Claims>;
+export declare const mutation: MutationBuilder<DataModel, "public", {}, {}, readonly [], Claims>;
+export declare const internalMutation: MutationBuilder<DataModel, "internal", {}, {}, readonly [], Claims>;
+export declare const action: ActionBuilder<"public", DataModel, EnvCtx, {}, readonly [], Claims>;
+export declare const internalAction: ActionBuilder<"internal", DataModel, EnvCtx, {}, readonly [], Claims>;
+export declare const httpAction: HttpActionBuilder<DataModel, EnvCtx, Claims>;
 /**
  * \`ember/triggers.ts\`: \`export default defineTriggers({ table: (ctx, change) => ... })\`. Each trigger runs in the
  * mutation's transaction after every write of a row of its table (contracts.md "Triggers").
  */
 export declare const defineTriggers: DefineTriggers<DataModel>;
-/** \`shard: { org: fromAuth("org") }\`: the shard key is a claim of the caller's verified identity. */
-export { fromAuth } from "@freecorps/ember-server";
+/**
+ * \`shard: { org: fromAuth("org") }\`: the shard key is a claim of the caller's verified identity. With
+ * ember/auth.config.ts the name is one of its claims (./claims): another is a type error.
+ */
+export declare const fromAuth: <const C extends ClaimName<Claims>>(claim: C) => FromAuth<C>;
 
-export type QueryCtx = GenericQueryCtx<DataModel>;
-export type MutationCtx = GenericMutationCtx<DataModel>;
+export type QueryCtx = GenericQueryCtx<DataModel, Claims>;
+export type MutationCtx = GenericMutationCtx<DataModel, Claims>;
 /** Actions: shard calls, I/O, and the external index searches (ctx.vectorSearch / ctx.aiSearch) typed by schema. */
-export type ActionCtx = GenericActionCtx<DataModel> & EnvCtx;
+export type ActionCtx = GenericActionCtx<DataModel, Claims> & EnvCtx;
 export type DatabaseReader = GenericDatabaseReader<DataModel>;
 export type DatabaseWriter = GenericDatabaseWriter<DataModel>;
 /** What a trigger gets: a mutation ctx over the app's tables. */
 export type TriggerCtx = GenericTriggerCtx<DataModel>;
 /** One write of a row of \`T\`, as its triggers see it. */
 export type Change<T extends keyof DataModel & string> = GenericChange<DataModel[T]["document"]>;
+`;
+
+/** `_generated/claims.d.ts`: the identity's claims, printed from ember/auth.config.ts (`claims`; null: undeclared). */
+export const claimsDts = (claims: string | null) =>
+  claims === null
+    ? `${HEADER}// The claims of a signed-in identity. No ember/auth.config.ts declares them: any name, \`unknown\` values.
+export type Claims = Record<string, unknown>;
+`
+    : `${HEADER}// The claims of a signed-in identity, from ember/auth.config.ts (\`ClaimsOf\` of @freecorps/ember-auth): Better Auth's,
+// \`org\` with the organization plugin, and what \`ember.claims\` returns (optional: only a JWT carries those). They type
+// \`ctx.auth.getUserIdentity()\`, \`ctx.auth.require()\` and \`fromAuth("...")\` (./server). No imports: safe for clients.
+export type Claims = ${claims};
 `;
 
 const apiJs = (shards: Record<string, { kind: string; fromArg?: string; fromClaim?: string }>) => `${HEADER}// \`api.dir.mod.fn\` is a reference to "dir/mod:fn" (same symbol as @freecorps/ember-client and @freecorps/ember-server).
