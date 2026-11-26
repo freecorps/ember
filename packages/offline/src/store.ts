@@ -51,16 +51,19 @@ import {
 } from "@freecorps/ember-server";
 import { applyAnyDiff, isPlainObject, rowDiff, valueDiff } from "@freecorps/ember-values";
 import {
-  fingerprintOfJson,
   NeedData,
   ownerKey,
   recordKey,
+  hasFingerprint,
+  sameValue,
   UNKNOWN_OWNER,
   updateOwner,
+  valueFingerprint,
   type BackendReader,
   type Commit,
   type ExternalChange,
   type OfflineBackend,
+  type PendingOp as PendingWrite,
   type QueryLogEntry,
   type QueryRecord,
   type SavedNotice,
@@ -145,14 +148,15 @@ interface ShardTx {
 type Pending = { u: QueryUpdate; resolve(): void; reject(e: unknown): void };
 
 /** A pending-queue write (`persistPending.put` with `record`, `.remove` without) waiting in a batch. */
-type PendingOp = { mid: string; record?: PendingMutationRecord; resolve(): void; reject(e: unknown): void };
+type PendingOp = PendingWrite & { resolve(): void; reject(e: unknown): void };
 
 interface Watch {
   req: LocalQueryRequest;
   key: string;
   fn: AnyRegisteredFunction | undefined;
   readSet: ReadSet | null;
-  last: string | null;
+  /** The last result sent (null: none yet). */
+  last: LocalQueryResult | undefined | null;
   dirty: boolean;
   closed: boolean;
   failed: boolean;
@@ -420,6 +424,21 @@ export class OfflineStore implements StorageAdapter {
       if (list) list.push(it);
       else byMid.set(it.mid, [it]);
     }
+    if (this.backend.batchPending) {
+      // One transaction for the whole batch: every write lands, or none (they all reject).
+      const writes = [...byMid].map(([mid, ops]) => {
+        const last = ops[ops.length - 1]!;
+        return last.record ? { mid, record: last.record } : { mid };
+      });
+      try {
+        await this.backend.batchPending(writes);
+      } catch (e) {
+        for (const it of batch) it.reject(e);
+        return;
+      }
+      for (const it of batch) it.resolve();
+      return;
+    }
     for (const [mid, ops] of byMid) {
       const last = ops[ops.length - 1]!;
       try {
@@ -635,19 +654,20 @@ export class OfflineStore implements StorageAdapter {
     // the retry of a write that failed). No owner or an unknown one, or a record without a fingerprint (written
     // before it): taken, the value may be another identity's. Coalesced, not dropped: past `refreshAfter()` it is
     // written again, so `updatedAt` keeps the record from expiring while the server keeps refreshing it.
-    const json = encodeJson(u.value);
-    const fp = fingerprintOfJson(json);
-    if (
+    // The fingerprint is a structural hash memoized per object (`valueFingerprint`): the rows the client kept from the
+    // previous value cost nothing. A match is confirmed by comparing the values in full (`sameValue`, identity first),
+    // so a collision never skips a write.
+    const fp = valueFingerprint(u.value);
+    const coalesce =
       sameEpoch &&
       u.version === prev.version &&
       prev.fp === fp &&
       owner !== undefined &&
       owner !== UNKNOWN_OWNER &&
       prev.owner === owner &&
-      this.now() - prev.updatedAt < this.refreshAfter()
-    )
-      return;
-    // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved.
+      this.now() - prev.updatedAt < this.refreshAfter();
+    // The previous rows' content tells which rows are unchanged (not rewritten) and how changed rows moved (and, to
+    // coalesce, whether the value is the same).
     if (prev && !prev.materialized) {
       // Resolved against memory as this burst left it (rows an earlier update of it wrote): undone with the burst,
       // or the record would keep rows its storage never got.
@@ -660,6 +680,7 @@ export class OfflineStore implements StorageAdapter {
         });
       }
     }
+    if (coalesce && prev.materialized && sameValue(prev.value, u.value)) return;
     const found = this.replicated.has(u.fn) ? documentsIn(m, u.value, undefined, this.options.foreignIds) : [];
     const prevIds = new Set(prev?.ids ?? []);
     const newIds = new Set<string>();
@@ -680,6 +701,8 @@ export class OfflineStore implements StorageAdapter {
     let skel: unknown;
     let entry: QueryLogEntry | null = null;
     let entryBytes = 0;
+    /** `encodeJson` of the persisted base, when written whole. */
+    let json: string | undefined;
     try {
       for (const { table, doc } of found) {
         const k = `${u.shard}\u0000${doc._id}`;
@@ -750,7 +773,8 @@ export class OfflineStore implements StorageAdapter {
           ...(docSet.size && diffs ? { refs: true as const } : {}),
           fp,
         };
-        record.size = skel === u.value ? json.length : encodeJson(skel).length;
+        json = encodeJson(skel);
+        record.size = json.length;
         c.put = [record];
       }
     } catch (e) {
@@ -788,7 +812,8 @@ export class OfflineStore implements StorageAdapter {
       logCount: entry ? prev!.logCount + 1 : 0,
       logBytes: entry ? prev!.logBytes + entryBytes : 0,
       baseBytes,
-      json,
+      // The full value's encoding, when that is what went to storage (no row references).
+      json: skel === u.value ? json : undefined,
       fp,
     });
   }
@@ -858,26 +883,21 @@ export class OfflineStore implements StorageAdapter {
   }
 
   /**
-   * The local result of a request (registered: run over the replica; else / on failure: the cached value), and its
-   * `encodeJson` when computed. A local run that is exactly the value cached for its owner carries that value's
-   * `version`/`epoch`/`ik`: it is the server's value at that version, so the client may `resume` from it.
+   * The local result of a request (registered: run over the replica; else / on failure: the cached value). A local run
+   * that is exactly the value cached for its owner carries that value's `version`/`epoch`/`ik`: it is the server's
+   * value at that version, so the client may `resume` from it.
    */
-  private async evaluate(
-    req: LocalQueryRequest,
-    fn: AnyRegisteredFunction | undefined,
-  ): Promise<{ result: LocalQueryResult | undefined; readSet: ReadSet | null; json?: string }> {
+  private async evaluate(req: LocalQueryRequest, fn: AnyRegisteredFunction | undefined): Promise<{ result: LocalQueryResult | undefined; readSet: ReadSet | null }> {
     const cached = this.records.get(recordKey(req.shard, req.fn, req.argsJson));
     // Only its owner's (an unknown owner is nobody's); one stored before owners were recorded is shown, never resumed.
     const mine = cached !== undefined && cached.owner !== undefined && cached.owner === ownerKey(req.identity);
     const resumable = mine && cached.epoch !== undefined && cached.ik !== undefined;
-    // The cached value's `encodeJson` comes along when known (a watch compares it with what it sent last).
-    const fromCache = async (): Promise<{ result: LocalQueryResult | undefined; json?: string }> => {
+    const fromCache = async (): Promise<{ result: LocalQueryResult | undefined }> => {
       if (!cached) return { result: undefined };
       if (cached.owner !== undefined && !mine) return { result: undefined };
       try {
         const value = await this.valueOf(cached);
-        const result: LocalQueryResult = resumable ? { value, source: "cache", version: cached.version, epoch: cached.epoch!, ik: cached.ik! } : { value, source: "cache" };
-        return cached.json !== undefined ? { result, json: cached.json } : { result };
+        return { result: resumable ? { value, source: "cache", version: cached.version, epoch: cached.epoch!, ik: cached.ik! } : { value, source: "cache" } };
       } catch {
         return { result: undefined };
       }
@@ -891,7 +911,6 @@ export class OfflineStore implements StorageAdapter {
       if (c.result) return { ...c, readSet: null };
       throw e;
     }
-    const json = encodeJson(local.value);
     if (resumable) {
       // Is the local run the value the server sent at `cached.version`? Its fingerprint says so without resolving
       // the record's row references (a cold record: no backend reads) — and against the value as it was stored, not
@@ -899,14 +918,14 @@ export class OfflineStore implements StorageAdapter {
       // fingerprints existed is compared by its encoding, as before.
       const same =
         cached.fp !== undefined
-          ? fingerprintOfJson(json) === cached.fp
+          ? hasFingerprint(local.value, cached.fp)
           : await this.jsonOf(cached).then(
-              (j) => j === json,
+              (j) => j === encodeJson(local.value),
               () => false,
             );
-      if (same) return { result: { value: local.value, source: "local", version: cached.version, epoch: cached.epoch!, ik: cached.ik! }, readSet: local.readSet, json };
+      if (same) return { result: { value: local.value, source: "local", version: cached.version, epoch: cached.epoch!, ik: cached.ik! }, readSet: local.readSet };
     }
-    return { result: { value: local.value, source: "local" }, readSet: local.readSet, json };
+    return { result: { value: local.value, source: "local" }, readSet: local.readSet };
   }
 
   /** Runs a registered query over a shard's replica (re-running after async fetches until nothing is missing). */
@@ -979,11 +998,9 @@ export class OfflineStore implements StorageAdapter {
   private async rerun(w: Watch): Promise<void> {
     w.dirty = false;
     let result: LocalQueryResult | undefined;
-    let json: string | undefined;
     try {
       const r = await this.evaluate(w.req, w.fn);
       result = r.result;
-      json = r.json;
       w.readSet = r.readSet;
       w.failed = false;
     } catch (e) {
@@ -993,10 +1010,11 @@ export class OfflineStore implements StorageAdapter {
       return;
     }
     if (w.closed) return;
-    // The version too: a local value that becomes resumable (its record caught up) is sent again with it.
-    const sig = result ? `${result.source}\u0000${result.version ?? ""}\u0000${json ?? encodeJson(result.value)}` : "";
-    if (sig === w.last) return;
-    w.last = sig;
+    // The version too: a local value that becomes resumable (its record caught up) is sent again with it. Values are
+    // compared in full (a re-run reuses the rows it read before by identity: `reader`), not encoded.
+    const last = w.last;
+    if (last !== null && (last === undefined ? result === undefined : result !== undefined && last.source === result.source && last.version === result.version && sameValue(last.value, result.value))) return;
+    w.last = result;
     try {
       w.onResult(result);
     } catch {

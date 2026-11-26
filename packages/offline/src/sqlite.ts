@@ -23,7 +23,7 @@ import {
   type LocalSchema,
   type SqlDriver,
 } from "@freecorps/ember-server";
-import type { BackendReader, Commit, OfflineBackend, QueryLogEntry, QueryRecord } from "./backend.ts";
+import type { BackendReader, Commit, OfflineBackend, PendingOp, QueryLogEntry, QueryRecord } from "./backend.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
 export type OpenSqlite = (name: string) => SqlDriver & { close?(): void };
@@ -158,6 +158,14 @@ export class SqliteBackend implements OfflineBackend {
   }
   removePending(mid: string) {
     this.db.exec(`DELETE FROM "_ember_local_pending" WHERE "mid" = ?`, mid);
+  }
+  batchPending(ops: ReadonlyArray<PendingOp>) {
+    this.db.transaction(() => {
+      for (const op of ops) {
+        if (op.record) this.putPending(op.record);
+        else this.removePending(op.mid);
+      }
+    });
   }
 
   commit(shard: string, c: Commit) {

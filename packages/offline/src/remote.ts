@@ -35,7 +35,7 @@
 // it was still running is resent to the next one rather than failed with an error it got while closing.
 
 import { applyAnyDiff, type RowDiff, type ValueDiff } from "@freecorps/ember-values";
-import { recordKey, UNKNOWN_OWNER, updateOwner, valueFingerprint, type SavedNotice } from "./backend.ts";
+import { hasFingerprint, recordKey, UNKNOWN_OWNER, updateOwner, type SavedNotice } from "./backend.ts";
 import { identityDiff } from "./diff.ts";
 import {
   getFunctionName,
@@ -422,8 +422,10 @@ export class RemoteStorage implements StorageAdapter {
     if (u.version !== s.version || s.fp === null || s.freshUntil === null || !(Date.now() < s.freshUntil)) return false;
     const owner = updateOwner(u);
     if (owner === undefined || owner === UNKNOWN_OWNER || s.owner !== owner) return false;
-    // CPU only (encode + hash, ~12 µs for 50 rows): cheaper than handing the value over for the leader to encode.
-    return valueFingerprint(u.value) === s.fp;
+    // CPU only (a structural hash, memoized per object: the rows the client kept cost nothing): cheaper than handing
+    // the value over. The leader's store compares the values in full before it skips a write; here a collision
+    // (about 2^-53) would leave the record at the same version until its refresh, as before.
+    return hasFingerprint(u.value, s.fp);
   }
   async runQueryLocally(req: LocalQueryRequest): Promise<LocalQueryResult | undefined> {
     return ((await this.call("runQueryLocally", req)) as LocalQueryResult | null) ?? undefined;

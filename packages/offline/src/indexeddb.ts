@@ -15,7 +15,7 @@
 import type { PendingMutationRecord } from "@freecorps/ember-client";
 import { dbIndexesOf, indexFields, indexKey, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
 import { bytesToBase64 } from "@freecorps/ember-values";
-import { NeedData, type BackendReader, type Commit, type OfflineBackend, type QueryLogEntry, type QueryRecord } from "./backend.ts";
+import { NeedData, type BackendReader, type Commit, type OfflineBackend, type PendingOp, type QueryLogEntry, type QueryRecord } from "./backend.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
 
 export interface IndexedDbStorageOptions extends OfflineOptions {
@@ -155,6 +155,22 @@ export class IndexedDbBackend implements OfflineBackend {
     const s = tx.objectStore(PENDING);
     const g = s.index("mid").getKey(mid);
     g.onsuccess = () => void (g.result !== undefined && s.delete(g.result));
+    await done(tx);
+  }
+
+  /** A batch of the queue in one readwrite transaction (each lookup issues its write from its callback). */
+  async batchPending(ops: ReadonlyArray<PendingOp>) {
+    if (!ops.length) return;
+    const tx = this.conn.transaction(PENDING, "readwrite");
+    const s = tx.objectStore(PENDING);
+    const byMid = s.index("mid");
+    for (const op of ops) {
+      const g = byMid.getKey(op.mid);
+      g.onsuccess = () => {
+        if (op.record) void (g.result === undefined ? s.add(op.record) : s.put(op.record, g.result));
+        else if (g.result !== undefined) s.delete(g.result);
+      };
+    }
     await done(tx);
   }
 
