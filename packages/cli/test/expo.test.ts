@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { defineApp, defineSchema, unsafeRef } from "@freecorps/ember-server";
 import { expoUpdates, parseMultipart } from "@freecorps/ember-expo-updates";
 import { emberTest } from "@freecorps/ember-testing";
-import { afterAll, describe, expect, test } from "vitest";
+import { afterAll, describe, expect, test, vi } from "vitest";
 import type { Project } from "../src/config.ts";
 import { contentTypeOf, expoChannel, expoInstall, expoList, expoPause, expoPublish, expoRollback, expoRollout, readExpoExport, runtimeVersionOf, type ExpoOptions } from "../src/expo.ts";
 import { TMP } from "./helpers.ts";
@@ -86,6 +86,12 @@ describe("reading an expo export", () => {
     expect(runtimeVersionOf("ios", { runtimeVersion: "3.0" })).toBe("3.0");
     expect(runtimeVersionOf("android", { version: "2.0", android: { versionCode: 12 }, runtimeVersion: { policy: "nativeVersion" } })).toBe("2.0(12)");
     expect(runtimeVersionOf("ios", { sdkVersion: "55.0.0", runtimeVersion: { policy: "sdkVersion" } })).toBe("exposdk:55.0.0");
+    // Expo's defaults: no build number / version code is 1, no version is 1.0.0.
+    expect(runtimeVersionOf("ios", { version: "1.2.0", runtimeVersion: { policy: "nativeVersion" } })).toBe("1.2.0(1)");
+    expect(runtimeVersionOf("android", { runtimeVersion: { policy: "nativeVersion" } })).toBe("1.0.0(1)");
+    expect(runtimeVersionOf("ios", { ios: { buildNumber: "7" }, runtimeVersion: { policy: "nativeVersion" } })).toBe("1.0.0(7)");
+    expect(runtimeVersionOf("android", { runtimeVersion: { policy: "appVersion" } })).toBe("1.0.0");
+    expect(runtimeVersionOf("android", { runtimeVersion: { policy: "appVersion" } }, "9.9")).toBe("9.9");
     expect(() => runtimeVersionOf("ios", { runtimeVersion: { policy: "fingerprint" } })).toThrow(/--runtime-version/);
     expect(contentTypeOf("TTF")).toBe("font/ttf");
     expect(contentTypeOf("weird")).toBe("application/octet-stream");
@@ -157,6 +163,21 @@ describe("ember expo", () => {
     expect(list.branches.map((b) => b.name).sort()).toEqual(["beta", "production"]);
     await expoChannel(api.o, { name: "production", branch: "production", rolloutBranch: null });
     expect((await expoList(api.o)).channels.find((c) => c.name === "production")).not.toHaveProperty("rolloutBranch");
+  });
+
+  test("--json: the note about a missing expoConfig.json goes to stderr, not into the JSON on stdout", async () => {
+    const api = fakeApi();
+    const dist = fixture("noconf", { ios: "nc-ios", android: "nc-android", image: "NC" });
+    rmSync(join(dist, "expoConfig.json"));
+    const err: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => (err.push(String(chunk)), true));
+    try {
+      await expoPublish({ ...api.o, json: true }, { dir: dist, branch: "production", runtimeVersion: "1.2.0" });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(err.join("")).toMatch(/no expoConfig\.json/);
+    expect(api.lines.join("\n")).not.toMatch(/expoConfig/);
   });
 
   test("errors from the component reach the command", async () => {

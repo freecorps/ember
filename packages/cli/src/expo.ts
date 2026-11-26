@@ -116,15 +116,12 @@ export function runtimeVersionOf(platform: ExpoPlatform, config: Record<string, 
   const rv = plat.runtimeVersion ?? config.runtimeVersion;
   if (typeof rv === "string" && rv) return rv;
   const policy = rv && typeof rv === "object" ? (rv as { policy?: unknown }).policy : undefined;
-  const version = (typeof plat.version === "string" ? plat.version : undefined) ?? (typeof config.version === "string" ? config.version : undefined);
-  if (policy === "appVersion") {
-    if (!version) throw new Error(`runtimeVersion policy "appVersion" but the config has no version`);
-    return version;
-  }
+  // Expo's own defaults (@expo/config-plugins): no version is "1.0.0", no ios.buildNumber / android.versionCode is 1.
+  const version = (typeof plat.version === "string" && plat.version ? plat.version : undefined) ?? (typeof config.version === "string" && config.version ? config.version : "1.0.0");
+  if (policy === "appVersion") return version;
   if (policy === "nativeVersion") {
     const build = platform === "ios" ? plat.buildNumber : plat.versionCode;
-    if (!version || build === undefined) throw new Error(`runtimeVersion policy "nativeVersion" needs version and ${platform === "ios" ? "ios.buildNumber" : "android.versionCode"}`);
-    return `${version}(${String(build)})`;
+    return `${version}(${build === undefined || build === null || build === "" ? "1" : String(build)})`;
   }
   if (policy === "sdkVersion") {
     if (typeof config.sdkVersion !== "string") throw new Error(`runtimeVersion policy "sdkVersion" but the config has no sdkVersion`);
@@ -215,7 +212,12 @@ export async function expoPublish(o: ExpoOptions, p: PublishOptions): Promise<Pu
   const install = expoInstall(o);
   if (p.rollout !== undefined && (!Number.isInteger(p.rollout) || p.rollout < 0 || p.rollout > 100)) throw new Error("--rollout must be an integer in 0..100");
   const exp = readExpoExport(p.dir, { ...(p.platforms ? { platforms: p.platforms } : {}), ...(p.runtimeVersion ? { runtimeVersion: p.runtimeVersion } : {}), ...(p.expoConfig ? { expoConfig: p.expoConfig } : {}) });
-  if (!exp.expoConfig && !o.json) log("note: no expoConfig.json next to metadata.json: the update carries no extra.expoClient (Constants.expoConfig). `npx expo config --json --type public > dist/expoConfig.json`");
+  if (!exp.expoConfig) {
+    const note = "note: no expoConfig.json next to metadata.json: the update carries no extra.expoClient (Constants.expoConfig). `npx expo config --json --type public > dist/expoConfig.json`";
+    // With --json, stdout is the result: the note goes to stderr, where a CI log still shows it.
+    if (o.json) process.stderr.write(`${note}\n`);
+    else log(note);
+  }
   const files = new Map<string, ExportFile>();
   for (const pl of exp.platforms) for (const f of [pl.bundle, ...pl.assets]) files.set(f.sha256, f);
   const all = [...files.values()];

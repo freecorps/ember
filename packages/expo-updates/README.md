@@ -19,8 +19,16 @@ export default defineApp().use(expoUpdates); // GET /expoUpdates/manifest, GET /
 
 ```sh
 npx expo export                                         # dist/metadata.json + bundles + assets
-npx expo config --json --type public > dist/expoConfig.json   # optional: becomes Constants.expoConfig in the update
+npx expo config --json --type public > dist/expoConfig.json   # the runtime version (and Constants.expoConfig)
 ember expo publish --branch production --message "Fix checkout" --env prod
+```
+
+`ember expo publish` reads the runtime version from `dist/expoConfig.json` (a string, or the `appVersion`,
+`nativeVersion` and `sdkVersion` policies, with Expo's defaults). Without that file, pass it yourself (the update
+then carries no `Constants.expoConfig`), and do so for the `fingerprint` policy, which only the native build computes:
+
+```sh
+ember expo publish --branch production --runtime-version 1.2.0 --env prod
 ```
 
 ## The Expo app
