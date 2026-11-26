@@ -141,6 +141,28 @@ describe("workersAi", () => {
     expect([...plain.push("  <"), ...plain.push("b>bold"), ...plain.end()]).toEqual([{ type: "text-delta", text: "  <b>bold" }]);
   });
 
+  test("reasoning: whitespace after </think> is dropped whatever the chunk boundaries; no text or reasoning twice", async () => {
+    const texts = (evs: Array<{ type: string }>, t: string) => evs.filter((e) => e.type === t).map((e) => (e as { text: string }).text).join("");
+    for (const chunks of [["<think>x</think>\n    code"], ["<think>x</think>", "\n", "    code"], ["<think>x</think>\n  ", "  ", "code"]]) {
+      const sp = new ThinkSplitter();
+      const evs = [...chunks.flatMap((c) => sp.push(c)), ...sp.end()];
+      expect(texts(evs, "text-delta")).toBe("code");
+      expect(texts(evs, "reasoning-delta")).toBe("x");
+    }
+    // A chunk that mirrors `response` in `choices[0].delta.content`: the text once.
+    const both = { run: async () => sseStream([{ response: "Hi", choices: [{ delta: { content: "Hi" } }] }, { response: " there", choices: [{ delta: { content: " there" } }] }, "[DONE]"]) };
+    expect(texts(await collect(workersAi("@cf/m", { ai: both, stream: true }).stream(request({ tools: [] }))), "text-delta")).toBe("Hi there");
+    // A reasoning field and a <think> block in the content: the reasoning once (the field's), the text without the tag.
+    const once = { run: async () => ({ choices: [{ message: { content: "<think>dup</think>Answer", reasoning_content: "Thought" } }], usage: {} }) };
+    const ev = await collect(workersAi("@cf/m", { ai: once, stream: false }).stream(request({ tools: [] })));
+    expect(texts(ev, "reasoning-delta")).toBe("Thought");
+    expect(texts(ev, "text-delta")).toBe("Answer");
+    const streamed = { run: async () => sseStream([{ choices: [{ delta: { reasoning_content: "Thought" } }] }, { choices: [{ delta: { content: "<think>dup</think>" } }] }, { choices: [{ delta: { content: "Answer" } }] }, "[DONE]"]) };
+    const ev2 = await collect(workersAi("@cf/m", { ai: streamed, stream: true }).stream(request({ tools: [] })));
+    expect(texts(ev2, "reasoning-delta")).toBe("Thought");
+    expect(texts(ev2, "text-delta")).toBe("Answer");
+  });
+
   test("generateObject: response_format json_schema", async () => {
     let inputs: any;
     const ai = {

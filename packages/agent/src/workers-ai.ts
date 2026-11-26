@@ -128,7 +128,8 @@ const CLOSE = "</think>";
  * across chunk boundaries. Text that does not start with the tag (whitespace aside) is all text.
  */
 export class ThinkSplitter {
-  private state: "start" | "think" | "text" = "start";
+  /** `after`: just past `</think>`, dropping whitespace until the first other character (in this chunk or a later one). */
+  private state: "start" | "think" | "after" | "text" = "start";
   private buf = "";
 
   push(chunk: string): ModelEvent[] {
@@ -150,8 +151,8 @@ export class ThinkSplitter {
         const end = this.buf.indexOf(CLOSE);
         if (end >= 0) {
           if (end > 0) out.push({ type: "reasoning-delta", text: this.buf.slice(0, end) });
-          this.buf = this.buf.slice(end + CLOSE.length).replace(/^\s+/, "");
-          this.state = "text";
+          this.buf = this.buf.slice(end + CLOSE.length);
+          this.state = "after";
           continue;
         }
         // Keep what could be the start of `</think>`; the rest is reasoning.
@@ -164,6 +165,11 @@ export class ThinkSplitter {
         if (text) out.push({ type: "reasoning-delta", text });
         this.buf = this.buf.slice(this.buf.length - keep);
         return out;
+      }
+      if (this.state === "after") {
+        this.buf = this.buf.replace(/^\s+/, "");
+        if (!this.buf) return out;
+        this.state = "text";
       }
       if (this.buf) out.push({ type: "text-delta", text: this.buf });
       this.buf = "";
@@ -212,7 +218,8 @@ export function workersAi(model: string, opts: WorkersAiOptions = {}): AgentMode
         const split = new ThinkSplitter();
         const parts = [...split.push(raw), ...split.end()];
         if (field) yield { type: "reasoning-delta", text: field };
-        for (const ev of parts) yield ev;
+        // A reasoning field and a `<think>` block in the content are the same reasoning: the field wins.
+        for (const ev of parts) if (!field || ev.type !== "reasoning-delta") yield ev;
         const calls = toolCallsOf(r.tool_calls ?? msg?.tool_calls);
         for (const c of calls) yield { type: "tool-call", ...c };
         const usage = waiUsage(r.usage);
@@ -225,19 +232,30 @@ export function workersAi(model: string, opts: WorkersAiOptions = {}): AgentMode
       const flat: Array<{ toolCallId: string; toolName: string; args: unknown }> = [];
       const indexed = new Map<number, { id?: string; name?: string; args: string }>();
       const think = new ThinkSplitter();
+      /** A reasoning field was streamed: a `<think>` block in the content would repeat it (the field wins). */
+      let fieldSeen = false;
+      const content = function* (text: string): Generator<ModelEvent> {
+        for (const ev of think.push(text)) if (!fieldSeen || ev.type !== "reasoning-delta") yield ev;
+      };
       for await (const chunk of sse(result as ReadableStream<Uint8Array>, req.signal)) {
         const c = rec(chunk);
         if (!c) continue;
         if (c.usage) usage = waiUsage(c.usage) ?? usage;
-        if (typeof c.response === "string" && c.response) yield* think.push(c.response);
+        // `response` (Workers AI format) or `choices[0].delta.content` (OpenAI format): a chunk with both carries the
+        // same text twice, so `response` is taken and the delta's content skipped.
+        const response = typeof c.response === "string" && c.response ? c.response : null;
+        if (response) yield* content(response);
         if (Array.isArray(c.tool_calls)) flat.push(...toolCallsOf(c.tool_calls));
         const choice = rec(Array.isArray(c.choices) ? c.choices[0] : undefined);
         if (!choice) continue;
         if (typeof choice.finish_reason === "string") finishReason = choice.finish_reason;
         const delta = rec(choice.delta);
         const thought = reasoningField(delta);
-        if (thought) yield { type: "reasoning-delta", text: thought };
-        if (typeof delta?.content === "string" && delta.content) yield* think.push(delta.content);
+        if (thought) {
+          fieldSeen = true;
+          yield { type: "reasoning-delta", text: thought };
+        }
+        if (!response && typeof delta?.content === "string" && delta.content) yield* content(delta.content);
         // OpenAI-style tool call fragments, merged by index.
         for (const t of Array.isArray(delta?.tool_calls) ? delta.tool_calls : []) {
           const r = rec(t);
@@ -250,7 +268,7 @@ export function workersAi(model: string, opts: WorkersAiOptions = {}): AgentMode
           indexed.set(i, cur);
         }
       }
-      yield* think.end();
+      for (const ev of think.end()) if (!fieldSeen || ev.type !== "reasoning-delta") yield ev;
       for (const c of flat) yield { type: "tool-call", ...c };
       for (const c of indexed.values()) if (c.name) yield { type: "tool-call", toolCallId: c.id ?? newToolCallId(), toolName: c.name, args: parseArgs(c.args || "{}") };
       yield { type: "finish", finishReason: flat.length || indexed.size ? "tool-calls" : (finishReason ?? "stop"), ...(usage ? { usage } : {}) };
