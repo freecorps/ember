@@ -56,7 +56,8 @@ export const start = mutation({
 1. A disabled flag serves `defaultValue`.
 2. Otherwise, the first rule whose conditions all match serves that rule's `value`. Condition operators: `eq`, `neq`,
    `in`, `notIn`, `startsWith`, `semverGte` and `semverLt`. When the context attribute is an array, a condition
-   matches if any element matches.
+   matches if any element matches (`neq`/`notIn`: if none does). A missing attribute or an empty array satisfies
+   `neq` and `notIn`; add an `in`/`eq` condition when the attribute must be present.
 3. Otherwise, a flag with a `rollout: { percent, salt }` serves its on value to units whose bucket is inside the
    percent, and `defaultValue` to the rest and to contexts without a `unitId`. The bucket is
    `hash32(salt + "." + key + "." + unitId) % 10000`: the same in every shard and on every client. Raising the percent
