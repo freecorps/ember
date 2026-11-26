@@ -866,6 +866,10 @@ export const ROUTES: Route[] = [
       const t = await targetOf(c, v2 ? "sql" : "data/list");
       if (t instanceof Response) return t;
       if (v2) {
+        // A runtime whose capabilities could not be read is not sent filters it might ignore (the unfiltered page
+        // would read as the answer, an `id` lookup would open another document): its refusal or 502.
+        const probe = await probeCapabilities(c.env, t.target, c.fetch);
+        if ("error" in probe) return probe.error;
         const old = await requireFeature(c.env, t.target, "data/list", c.fetch);
         if (old) return old;
       }

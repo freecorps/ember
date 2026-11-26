@@ -32,7 +32,7 @@ const POOL_SPEC = {
 };
 
 /** A project Worker behind a service binding: answers like @freecorps/ember-runtime's admin API. */
-function fakeProject(o: { features?: string[] | null; fail?: boolean; specsDown?: boolean } = {}) {
+function fakeProject(o: { features?: string[] | null; fail?: boolean; specsDown?: boolean; capsDown?: boolean } = {}) {
   const calls: Call[] = [];
   const svc = {
     fetch: async (r: Request | string) => {
@@ -42,6 +42,7 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean; specsDown?
       calls.push({ method: req.method, url: req.url, body });
       if (req.headers.get("authorization") !== "Bearer proj-admin") return Response.json({ ok: false, error: { code: "unauthenticated", message: "invalid admin token" } }, { status: 401 });
       if (path === "/api/_ember/capabilities") {
+        if (o.capsDown) return Response.json({ ok: false, error: { code: "internal", message: "boom" } }, { status: 500 });
         if (o.features === null) return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
         return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run", "sql"], auth: false, files: false, system: true });
       }
@@ -71,7 +72,7 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean; specsDown?
   return { svc, calls };
 }
 
-function setup(o: { features?: string[] | null; fail?: boolean; specsDown?: boolean; env?: Partial<DashboardEnv> } = {}) {
+function setup(o: { features?: string[] | null; fail?: boolean; specsDown?: boolean; capsDown?: boolean; env?: Partial<DashboardEnv> } = {}) {
   const { db, binding } = seeded();
   const project = fakeProject(o);
   const env: DashboardEnv = {
@@ -531,6 +532,13 @@ describe("SQL Explorer", () => {
     const sent = new URL(t2.project.calls.at(-1)!.url);
     expect(Object.fromEntries(sent.searchParams)).toEqual({ shard: "org:acme", table: "messages", index: "by_b", eq: "[1]", gte: "2", lt: "9", search: "x", id: "messages_1" });
     expect((await t2.call("GET", "/api/rows?project=chat&env=prod&shard=org:acme&table=messages&id=a%20b", h)).status).toBe(400);
+    // Capabilities that could not be read: a plain page goes on, filters are not sent to a runtime that may ignore them.
+    clearCapabilities();
+    const t3 = setup({ capsDown: true });
+    expect((await t3.call("GET", "/api/rows?project=chat&env=prod&shard=org:acme&table=messages", h)).status).toBe(200);
+    const blind = await t3.call("GET", "/api/rows?project=chat&env=prod&shard=org:acme&table=messages&id=messages_1", h);
+    expect(blind.status).toBe(500);
+    expect(t3.project.calls.filter((c) => new URL(c.url).pathname === "/api/_ember/data/list")).toHaveLength(1);
   });
 });
 
