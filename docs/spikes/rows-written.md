@@ -181,3 +181,22 @@ compara com a linha lida e grava só o que mudou (`changedValues` em `engine.ts`
   - a busca de dedup por mutation só vai ao SQL para clientes com resultado gravado nas gerações (um cliente com
     `ack` nunca tem);
   - frames em lote (feature `batch`).
+
+## Índice esparso (0.10, PR 3a)
+
+`.index(name, fields, { sparse: true })`: a chave fica `NULL` quando falta um campo e o índice SQLite é parcial
+(`WHERE "_k_<índice>" IS NOT NULL`), então o documento sem o campo opcional não tem entrada no índice. Medido no
+workerd (`packages/runtime/test/rows-written.test.ts`, 40 operações cada, WebSocket com dedup), uma tabela com um
+campo opcional sob um índice:
+
+| Operação | Índice comum | Esparso |
+|---|---:|---:|
+| Insert sem o campo | 4 | **3** (o mesmo de uma tabela sem índice do usuário) |
+| Insert com o campo | 4 | 4 |
+| Patch que dá o campo a um documento sem ele | 4 | 4 |
+
+- O ganho é no insert (e no armazenamento): o índice comum guarda uma entrada com a chave `undefined` para todo
+  documento. Num componente com vários índices em campos opcionais isso soma: um `send` do `ember-email` sem chave de
+  idempotência nem thread tinha 6 entradas de índice no email e agora tem 3.
+- O patch que faz o documento entrar no índice custa o mesmo nos dois (no comum a entrada muda de chave; no esparso
+  ela é criada).

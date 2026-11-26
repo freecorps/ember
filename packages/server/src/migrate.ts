@@ -12,7 +12,8 @@
 //                                          the two-step flow is optional + a data migration, then required
 //   any other type change                  rebuildTable if empty, refused otherwise
 //   removed field                          dropColumn/noop if no row has it, refused otherwise
-//   new / changed index                    createIndex (staged + backfill if the table has data)
+//   new / changed index                    createIndex (staged + backfill if the table has data); `sparse` on or
+//                                          off is a change (the key column and the SQLite index are rebuilt)
 //   removed index                          dropIndex
 //   removed table                          keepTable (data kept)
 
@@ -24,6 +25,7 @@ import {
   dbIndexesOf,
   docKey,
   indexFields,
+  indexKey,
   legacyIdIndex,
   legacyIdIndexSql,
   ownedObjects,
@@ -556,8 +558,13 @@ export function backfillStep(driver: SqlDriver, m: SchemaManifest, kinds: Readon
       processed = batch.length;
       end = processed ? Number(batch[processed - 1]!._rowid) : until;
       if (isDb) {
-        // One UPDATE per row: on DO SQLite an `UPDATE … FROM (VALUES …)` bills three rows read per row (one here).
-        for (const row of batch) driver.exec(`UPDATE ${q(table)} SET ${q(keyColumn(index))} = ? WHERE "_rowid" = ?`, docKey(decodeRow(layout, row), fields), row._rowid as number);
+        // One UPDATE per row: on DO SQLite an `UPDATE … FROM (VALUES …)` bills three rows read per row (one here). A
+        // sparse index skips the rows missing a field: their key stays NULL (the column was added empty).
+        const sparse = spec?.kind === "db" && spec.sparse === true;
+        for (const row of batch) {
+          const key = indexKey(decodeRow(layout, row), fields, sparse);
+          if (key) driver.exec(`UPDATE ${q(table)} SET ${q(keyColumn(index))} = ? WHERE "_rowid" = ?`, key, row._rowid as number);
+        }
       } else if (processed > 0) {
         // Live writes skip rows in (cursor, until]; the batch's documents are added here once, one write per group.
         const agg = new AggregateMaintainer((sql, ...p) => driver.exec(sql, ...p).rows, table, t.document);
@@ -754,7 +761,7 @@ function copyComputingCreationKey(driver: SqlDriver, table: string, tmp: string,
 
 /** Makes `_creationTime` unique at µs resolution, in key order: a document sharing its µs moves to the next free one. */
 function spreadCreationTimes(driver: SqlDriver, table: string, t: TableManifest, layout: ReturnType<typeof layoutOf>): void {
-  const indexes = dbIndexesOf(t).map((i) => ({ column: keyColumn(i.name), fields: indexFields(t, i.name)! }));
+  const indexes = dbIndexesOf(t).map((i) => ({ column: keyColumn(i.name), fields: indexFields(t, i.name)!, sparse: i.sparse === true }));
   let prev = -SAFE;
   // Only the creation times in key order; a whole document is read only when it has to move.
   for (const r of rows(driver, `SELECT "_rowid", "_creationTime" FROM ${q(table)} ORDER BY ${q(keyColumn("by_creation_time"))}`)) {
@@ -765,7 +772,7 @@ function spreadCreationTimes(driver: SqlDriver, table: string, t: TableManifest,
     if (us === Math.round(ct * 1000)) continue;
     const row = rows(driver, `SELECT * FROM ${q(table)} WHERE "_rowid" = ?`, Number(r._rowid))[0]!;
     const doc = { ...decodeRow(layout, row), _creationTime: us / 1000 };
-    const sets: Array<[string, SqlValue]> = [["_creationTime", us / 1000], ...indexes.map((i): [string, SqlValue] => [i.column, docKey(doc, i.fields)])];
+    const sets: Array<[string, SqlValue]> = [["_creationTime", us / 1000], ...indexes.map((i): [string, SqlValue] => [i.column, indexKey(doc, i.fields, i.sparse)])];
     for (let i = 0; i < sets.length; i += 90) {
       const part = sets.slice(i, i + 90);
       driver.exec(`UPDATE ${q(table)} SET ${part.map(([c]) => `${q(c)} = ?`).join(", ")} WHERE "_rowid" = ?`, ...part.map(([, x]) => x), Number(row._rowid));

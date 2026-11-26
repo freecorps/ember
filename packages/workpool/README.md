@@ -41,10 +41,10 @@ export const progress = query({ args: { workId: v.string() }, handler: (ctx, a) 
 - `status(ctx, id)`: `{ state: "pending", position }`, `{ state: "running", attempt, retryAt?, lastError? }` or
   `{ state: "finished", result }`; null once unknown. `stats(ctx)`: pending, running, finished by outcome, totals.
 - `cancel(ctx, id)`, `cancelAll(ctx)`: `onComplete` gets `{ kind: "canceled" }`.
-- `key`: an idempotency key; while an item with that key is retained, enqueueing again returns its id. In the
-  `...Batch` variants `key` is a function, `(args, index) => string`, so each item gets its own key
-  (`{ key: (a) => \`summarize:${a.docId}\` }`); a fixed string is a type error (and throws), since it would make the
-  whole batch one item.
+- `key`: an idempotency key; while an item with that key is retained, enqueueing again returns its id. Its index is
+  sparse (0.10): items without a key cost no index row. In the `...Batch` variants `key` is a function,
+  `(args, index) => string`, so each item gets its own key (`{ key: (a) => \`summarize:${a.docId}\` }`); a fixed
+  string is a type error (and throws), since it would make the whole batch one item.
 - `onComplete` is typed against the work: its `result.returnValue` must accept what the work function returns
   (`vOnCompleteArgs` takes anything; an args validator with a typed result is checked).
 

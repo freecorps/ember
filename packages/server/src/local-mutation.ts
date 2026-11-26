@@ -12,7 +12,7 @@
 // - Triggers (`ember/triggers.ts`) do not run here: what they write reaches the client with the server's result.
 
 import { compareBytes, validate, withDefaults } from "@freecorps/ember-values";
-import { docKey, readSetFields } from "./ddl.ts";
+import { indexKey, readSetFields, readSetSparse } from "./ddl.ts";
 import { EmberError } from "./errors.ts";
 import { authApi, failApi, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
 import type { ForeignIds } from "./foreignIds.ts";
@@ -33,11 +33,16 @@ export interface OverlayReader extends LocalReader {
   changes(): LocalRowChange[];
 }
 
-export function overlayReader(base: LocalReader, schema: LocalSchema): OverlayReader {
+export function overlayReader(base: LocalReader, schema: LocalSchema): OverlayReader & { savepoint<T>(op: () => T): T } {
   const m = schema.manifest;
   // table → id → doc (null: deleted)
   const writes = new Map<string, Map<string, Doc | null>>();
   const before = new Map<string, { table: string; id: string; before: Doc | null }>();
+  // While a savepoint is open: what each write replaced (`own` absent: undefined), undone when it throws.
+  let journal: Array<{ table: string; id: string; prev: Doc | null | undefined; remembered: boolean }> | null = null;
+  const journaled = (table: string, id: string) => {
+    if (journal) journal.push({ table, id, prev: writes.get(table)?.get(id), remembered: before.has(`${table}\u0000${id}`) });
+  };
   const own = (table: string) => {
     let t = writes.get(table);
     if (!t) writes.set(table, (t = new Map()));
@@ -55,12 +60,34 @@ export function overlayReader(base: LocalReader, schema: LocalSchema): OverlayRe
   return {
     get,
     put(table, doc) {
+      journaled(table, doc._id as string);
       remember(table, doc._id as string);
       own(table).set(doc._id as string, doc);
     },
     remove(table, id) {
+      journaled(table, id);
       remember(table, id);
       own(table).set(id, null);
+    },
+    savepoint<T>(op: () => T): T {
+      const outer = journal;
+      const mine: NonNullable<typeof journal> = (journal = []);
+      try {
+        return op();
+      } catch (e) {
+        for (let i = mine.length - 1; i >= 0; i--) {
+          const { table, id, prev, remembered } = mine[i]!;
+          if (prev === undefined) writes.get(table)?.delete(id);
+          else own(table).set(id, prev);
+          if (!remembered) before.delete(`${table}\u0000${id}`);
+        }
+        mine.length = 0;
+        throw e;
+      } finally {
+        // A nested savepoint's writes belong to the outer one too (undone if it throws later).
+        journal = outer;
+        if (outer) outer.push(...mine);
+      }
     },
     changes() {
       return [...before.values()].map((b) => ({ table: b.table, id: b.id, before: b.before, after: get(b.table, b.id) }));
@@ -72,10 +99,12 @@ export function overlayReader(base: LocalReader, schema: LocalSchema): OverlayRe
       if (!fields) throw new EmberError("ValidationError", `Unknown index ${table}.${index}`);
       // The base's rows of this range, minus those the overlay rewrote; then the overlay's own, keyed the same way.
       const rows: ScannedRow[] = base.scan(table, index, lo, hi, asc, limit + w.size).filter((r) => !w.has(r.doc._id as string));
+      const sparse = readSetSparse(m, table, index);
       for (const doc of w.values()) {
         if (!doc) continue;
-        const key = docKey(doc, fields);
-        if (compareBytes(key, lo) >= 0 && compareBytes(key, hi) < 0) rows.push({ key, doc });
+        // A sparse index: a document missing one of its fields is not in it.
+        const key = indexKey(doc, fields, sparse);
+        if (key && compareBytes(key, lo) >= 0 && compareBytes(key, hi) < 0) rows.push({ key, doc });
       }
       // Key order (ties by id, as the index's own order would place equal keys), then the direction asked.
       rows.sort((x, y) => compareBytes(x.key, y.key) || (String(x.doc._id) < String(y.doc._id) ? -1 : String(x.doc._id) > String(y.doc._id) ? 1 : 0));
@@ -211,12 +240,32 @@ export function runLocalMutation(fn: AnyRegisteredFunction, args: unknown, o: Lo
       throw unsupported("ctx.db.sql");
     },
     insert: (name: string, value: unknown): string => {
-      const fields = checkFields(value);
-      checkDoc(name, fields);
+      const fieldsOf = (x: unknown) => {
+        const f = checkFields(x);
+        checkDoc(name, f);
+        return f;
+      };
+      if (typeof value !== "function") {
+        const fields = fieldsOf(value);
+        const ct = (lastCreationTime = Math.max(now, lastCreationTime + 0.001));
+        const id = makeId(table(name).manifest.idPrefix, ct, random);
+        layer.put(name, normalize(name, id, ct, fields));
+        return id;
+      }
+      // `insert(table, (id) => doc)`: built from its id, as on the server; what the callback writes or schedules is
+      // undone with the insert when either throws.
+      const queued = [...jobs];
       const ct = (lastCreationTime = Math.max(now, lastCreationTime + 0.001));
       const id = makeId(table(name).manifest.idPrefix, ct, random);
-      layer.put(name, normalize(name, id, ct, fields));
-      return id;
+      try {
+        return layer.savepoint(() => {
+          layer.put(name, normalize(name, id, ct, fieldsOf((value as (id: string) => unknown)(id))));
+          return id;
+        });
+      } catch (e) {
+        jobs.splice(0, jobs.length, ...queued);
+        throw e;
+      }
     },
     patch: (id: string, value: unknown) => {
       const cur = current(id);

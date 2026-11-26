@@ -82,14 +82,25 @@ export class TableDefinition<
     });
   }
 
-  /** A b-tree index over `fields` (then `_creationTime`, `_id`), stored as an order-preserving BLOB key. */
+  /**
+   * A b-tree index over `fields` (then `_creationTime`, `_id`), stored as an order-preserving BLOB key.
+   *
+   * `{ sparse: true }`: only documents where **every** one of `fields` is present (not `undefined`; `null` counts as
+   * present) are in the index, an SQLite partial index (`WHERE "_k_<index>" IS NOT NULL`): the others cost no index
+   * row on insert or patch. For an index on an optional field most documents leave out (an idempotency key, a provider
+   * id). `withIndex` on it sees only the documents in it: `eq`/range bounds on present values give what a full index
+   * would, but a scan without bounds (or one whose range includes `undefined`) leaves the other documents out.
+   */
   index<N extends string, const F extends [FieldPathsOf<V>, ...FieldPathsOf<V>[]]>(
     name: N,
     fields: F,
+    options?: IndexOptions,
   ): TableDefinition<V, Expand<Indexes & Record<N, [...F, "_creationTime"]>>, Ext> {
     if (!Array.isArray(fields) || fields.length === 0) throw new Error(`Index ${name}: needs at least one field`);
     if (fields.length > 16) throw new Error(`Index ${name}: at most 16 fields`);
-    this.dbIndexes.push({ kind: "db", name, fields: [...fields] });
+    const sparse = options?.sparse;
+    if (sparse !== undefined && typeof sparse !== "boolean") throw new Error(`Index ${name}: sparse must be a boolean`);
+    this.dbIndexes.push({ kind: "db", name, fields: [...fields], ...(sparse ? { sparse: true as const } : {}) });
     return this as any;
   }
 
@@ -133,6 +144,15 @@ export class TableDefinition<
     return this;
   }
 }
+
+/** Options of `.index(name, fields, options)`. */
+export type IndexOptions = {
+  /**
+   * Only documents with every indexed field present are in the index (see `TableDefinition.index`). Changing it on a
+   * table with data rebuilds the index with a staged backfill, like any other index change.
+   */
+  sparse?: boolean;
+};
 
 /** Type-level description of an aggregate (`TableInfo["ext"]["aggregates"][name]`). */
 export type AggregateTypeInfo<B extends string[], S extends string, Mn extends string, Mx extends string> = { by: B; sum: S; min: Mn; max: Mx };

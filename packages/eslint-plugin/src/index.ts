@@ -58,6 +58,11 @@ const stringValue = (n: unknown): string | null => {
   if (is(n, "TemplateLiteral") && n.expressions.length === 0) return n.quasis[0]?.value.cooked ?? null;
   return null;
 };
+/** A property's static key: `{ a: ... }` / `{ "a": ... }` (not computed `[a]`). */
+const keyName = (p: unknown): string | null => {
+  if (!is(p, "Property") || p.computed) return null;
+  return is(p.key, "Identifier") ? p.key.name : stringValue(p.key);
+};
 /** `"chat/messages:send"` → `api.chat.messages.send` (null for component names, which have no api path). */
 const apiPath = (name: string): string | null => {
   if (name.includes("@") || name.includes("$")) return null;
@@ -104,7 +109,6 @@ const noStringFunctionRefs: Rule = {
   },
 };
 
-const SYNC_BUILDERS = new Set(["query", "mutation", "internalQuery", "internalMutation", "queryGeneric", "mutationGeneric", "internalQueryGeneric", "internalMutationGeneric"]);
 type Fn = Extract<Node, { type: "ArrowFunctionExpression" | "FunctionExpression" }>;
 const isFn = (n: unknown): n is Fn => is(n, "ArrowFunctionExpression") || is(n, "FunctionExpression");
 /** The handler passed to a builder (or to its `.use(...)`, a middleware): a function, or `{ handler }` (or `field`). */
@@ -112,36 +116,351 @@ function handlerOf(arg: unknown, field = "handler"): Fn | undefined {
   if (isFn(arg)) return field === "handler" ? arg : undefined;
   if (!is(arg, "ObjectExpression")) return undefined;
   for (const p of arg.properties) {
-    if (is(p, "Property") && is(p.key, "Identifier") && p.key.name === field && isFn(p.value)) return p.value;
+    if (is(p, "Property") && keyName(p) === field && isFn(p.value)) return p.value;
   }
   return undefined;
 }
-/** `query`, `mutation`, ... or `mutation.use(...)` (builders made from them and stored in variables are not tracked). */
-const builderKind = (callee: unknown): string | null => {
-  if (is(callee, "Identifier") && SYNC_BUILDERS.has(callee.name)) return callee.name;
-  if (is(callee, "MemberExpression") && !callee.computed && is(callee.property, "Identifier") && callee.property.name === "use" && is(callee.object, "Identifier") && SYNC_BUILDERS.has(callee.object.name)) {
-    return `${callee.object.name}.use`;
+
+// ------------------------------------------------------------------ builders and the functions they run
+
+type Kind = "query" | "mutation" | "action" | "http";
+/** A function builder: what it builds, who may call it, and its name as written (for messages). */
+type Builder = { kind: Kind; visibility: "public" | "internal"; name: string };
+const BUILDERS: Record<string, Omit<Builder, "name">> = {};
+for (const [k, kind] of [["query", "query"], ["mutation", "mutation"], ["action", "action"]] as const) {
+  const cap = k[0]!.toUpperCase() + k.slice(1);
+  BUILDERS[k] = BUILDERS[`${k}Generic`] = { kind, visibility: "public" };
+  BUILDERS[`internal${cap}`] = BUILDERS[`internal${cap}Generic`] = { kind, visibility: "internal" };
+}
+BUILDERS.httpAction = BUILDERS.httpActionGeneric = { kind: "http", visibility: "public" };
+/** Builders stored in variables of the file: `const authed = mutation.use(mw)` (name → builder). */
+type Aliases = Map<string, Builder>;
+
+const isUse = (n: unknown): n is Extract<Node, { type: "MemberExpression" }> => is(n, "MemberExpression") && !n.computed && is(n.property, "Identifier") && n.property.name === "use";
+
+/**
+ * The builder an expression is: `query`, `internalMutationGeneric`, `cb.query` (componentBuilders), a variable
+ * holding one, or any of them with `.use(mw)` applied (a builder too).
+ */
+function builderOf(n: unknown, aliases: Aliases): Builder | null {
+  if (is(n, "Identifier")) {
+    // A parameter or local of the same name (`function make(build) { build({...}) }`) is not the file's builder.
+    if (shadowedIn.get(aliases)?.(n)) return null;
+    return aliases.get(n.name) ?? (BUILDERS[n.name] ? { ...BUILDERS[n.name]!, name: n.name } : null);
+  }
+  if (is(n, "MemberExpression") && !n.computed && is(n.property, "Identifier") && BUILDERS[n.property.name]) return { ...BUILDERS[n.property.name]!, name: n.property.name };
+  if (is(n, "CallExpression") && isUse(n.callee)) return builderOf(n.callee.object, aliases);
+  return null;
+}
+
+/**
+ * Top-level `const x = <builder>` (also exported), chains included. Only `const`: a `let` may be reassigned
+ * (`let b = query; b = action`), so what it holds at a call is not known from its declaration.
+ */
+function collectAliases(program: unknown): Aliases {
+  const aliases: Aliases = new Map();
+  if (!is(program, "Program")) return aliases;
+  const decls: Array<[string, unknown]> = [];
+  for (const st of program.body) {
+    const d = is(st, "VariableDeclaration") ? st : is(st, "ExportNamedDeclaration") && is(st.declaration, "VariableDeclaration") ? st.declaration : null;
+    if (d?.kind === "const") for (const v of d.declarations) if (is(v.id, "Identifier") && v.init && (isUse((v.init as { callee?: unknown }).callee) || is(v.init, "Identifier") || is(v.init, "MemberExpression"))) decls.push([v.id.name, v.init]);
+  }
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const [name, init] of decls) {
+      if (aliases.has(name)) continue;
+      const b = builderOf(init, aliases);
+      if (b) {
+        aliases.set(name, { ...b, name });
+        changed = true;
+      }
+    }
+  }
+  return aliases;
+}
+
+/** What a function is to Ember: a builder's handler / `authorize`, a middleware, or a trigger. */
+type Role = { builder: Builder; role: "handler" | "authorize" | "middleware" | "trigger" };
+
+const parentOf = (n: unknown): unknown => (n as { parent?: unknown }).parent;
+const TRIGGERS_BUILDER: Builder = { kind: "mutation", visibility: "internal", name: "defineTriggers" };
+
+function roleOf(fn: Fn, aliases: Aliases): Role | null {
+  let arg: unknown = fn;
+  let field: "handler" | "authorize" = "handler";
+  const parent = parentOf(fn);
+  const key = keyName(parent);
+  if (is(parent, "Property") && parent.value === fn && key !== null) {
+    const obj = parentOf(parent);
+    // defineTriggers({ table: fn }) / defineTriggers({ "table": [fn, fn] })
+    const call = parentOf(obj);
+    if (is(call, "CallExpression") && call.arguments[0] === obj && is(call.callee, "Identifier") && call.callee.name === "defineTriggers") return { builder: TRIGGERS_BUILDER, role: "trigger" };
+    if (key !== "handler" && key !== "authorize") return null;
+    field = key;
+    arg = obj;
+  } else if (is(parent, "ArrayExpression")) {
+    const prop = parentOf(parent);
+    const call = parentOf(parentOf(prop));
+    if (is(prop, "Property") && is(call, "CallExpression") && is(call.callee, "Identifier") && call.callee.name === "defineTriggers") return { builder: TRIGGERS_BUILDER, role: "trigger" };
+    return null;
+  }
+  const call = parentOf(arg);
+  if (!is(call, "CallExpression") || call.arguments[0] !== arg) return null;
+  if (isUse(call.callee)) {
+    const b = builderOf(call.callee.object, aliases);
+    return b && field === "handler" ? { builder: { ...b, name: `${b.name}.use` }, role: "middleware" } : null;
+  }
+  const b = builderOf(call.callee, aliases);
+  return b ? { builder: b, role: field } : null;
+}
+
+/** The innermost function around `node` that Ember runs as a handler, middleware or trigger (callbacks in it included). */
+function enclosingRole(context: Context, node: Node, aliases: Aliases): Role | null {
+  const chain = context.sourceCode.getAncestors(node);
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const a = chain[i];
+    if (isFn(a)) {
+      const r = roleOf(a, aliases);
+      if (r) return r;
+    }
   }
   return null;
-};
+}
+
+/**
+ * Per-alias-map check: does this identifier resolve to a binding inside a function or block (a parameter, a local)
+ * rather than to the file's own (module or global) one? Lexical, through ESLint's scope manager.
+ */
+const shadowedIn = new WeakMap<Aliases, (id: Extract<Node, { type: "Identifier" }>) => boolean>();
+
+/** Per-file builder aliases, computed once. */
+function aliasesOf(context: Context): () => Aliases {
+  let cached: Aliases | undefined;
+  return () => {
+    if (cached) return cached;
+    const aliases = collectAliases(context.sourceCode.ast);
+    shadowedIn.set(aliases, (id) => {
+      for (let scope: ReturnType<typeof context.sourceCode.getScope> | null = context.sourceCode.getScope(id); scope; scope = scope.upper) {
+        if (scope.set.has(id.name)) return scope.type !== "module" && scope.type !== "global";
+      }
+      return false;
+    });
+    return (cached = aliases);
+  };
+}
 
 const noAsyncQueryHandler: Rule = {
   meta: {
     type: "problem",
-    docs: { description: "Queries and mutations (and their middlewares) are synchronous: no async handlers", url: `${DOCS}#no-async-query-handler` },
+    docs: { description: "Queries, mutations, their middlewares and triggers are synchronous: no async handlers", url: `${DOCS}#no-async-query-handler` },
     messages: { async: "{{kind}} handlers must be synchronous (the database API returns values, not Promises): drop `async`; do I/O in an action." },
+    schema: [],
+  },
+  create(context) {
+    const aliases = aliasesOf(context);
+    const check = (fn: Fn) => {
+      if (!fn.async) return;
+      const r = roleOf(fn, aliases());
+      // A query's `authorize` runs in the same synchronous transaction; action middlewares may be async.
+      if (r && (r.builder.kind === "query" || r.builder.kind === "mutation")) context.report({ node: fn, messageId: "async", data: { kind: r.builder.name } });
+    };
+    return { ArrowFunctionExpression: check, FunctionExpression: check };
+  },
+};
+
+// ------------------------------------------------------------------ no-nondeterministic-in-sync
+
+/** `a.b` as written (identifiers only), or null. `globalThis.crypto.x` reads as `crypto.x`. */
+const dotted = (n: unknown): string | null => {
+  if (is(n, "Identifier")) return n.name;
+  if (is(n, "MemberExpression") && !n.computed && is(n.property, "Identifier")) {
+    const o = dotted(n.object);
+    if (o === null) return null;
+    return o === "globalThis" || o === "window" || o === "self" ? n.property.name : `${o}.${n.property.name}`;
+  }
+  return null;
+};
+const CLOCK = new Set(["Date.now", "performance.now"]);
+const RANDOM = new Set(["Math.random", "crypto.randomUUID", "crypto.getRandomValues"]);
+
+const noNondeterministicInSync: Rule = {
+  meta: {
+    type: "problem",
+    docs: { description: "No clock or randomness of the runtime in queries, mutations and triggers: use `ctx.now` / `ctx.random()`", url: `${DOCS}#no-nondeterministic-in-sync` },
+    messages: {
+      clock: "`{{call}}` in a {{kind}}: use `ctx.now` (the function's time, fixed for the whole run, so re-runs and client replays see the same value).",
+      randomMutation: "`{{call}}` in a {{kind}}: use `ctx.random()` (seeded per mutation, so the client's optimistic run and the server agree; ids come from `ctx.db.insert`).",
+      randomQuery: "`{{call}}` in a {{kind}}: a query must give the same result for the same data (its result is cached, shared and re-run on every change). Take the value as an argument, or draw it in a mutation with `ctx.random()`.",
+    },
+    schema: [],
+  },
+  create(context) {
+    const aliases = aliasesOf(context);
+    /** `what`: the clock or randomness; `call`: as the message shows it. */
+    const check = (node: Node, what: "clock" | "random", call: string) => {
+      const r = enclosingRole(context, node, aliases());
+      if (!r || (r.builder.kind !== "query" && r.builder.kind !== "mutation")) return;
+      const kind = r.role === "trigger" ? "trigger" : r.role === "middleware" ? `${r.builder.kind} middleware` : r.builder.name;
+      const messageId = what === "clock" ? "clock" : r.builder.kind === "query" ? "randomQuery" : "randomMutation";
+      context.report({ node, messageId, data: { call, kind } });
+    };
+    return {
+      CallExpression(node) {
+        const name = dotted(node.callee);
+        if (!name) return;
+        if (CLOCK.has(name)) check(node, "clock", `${name}()`);
+        else if (RANDOM.has(name)) check(node, "random", `${name}()`);
+        else if (name === "Date") check(node, "clock", "Date()"); // a string of the current time
+      },
+      NewExpression(node) {
+        if (dotted(node.callee) === "Date" && node.arguments.length === 0) check(node, "clock", "new Date()");
+      },
+    };
+  },
+};
+
+// ------------------------------------------------------------------ no-collect-length
+
+const memberName = (n: unknown): string | null => (is(n, "MemberExpression") && !n.computed && is(n.property, "Identifier") ? n.property.name : null);
+/** `db` or `<anything>.db` (`ctx.db`, `this.ctx.db`): a database the chain is read from. */
+const isDbRoot = (n: unknown): boolean => (is(n, "Identifier") && n.name === "db") || memberName(n) === "db";
+
+/** `ctx.db.query(...)...` (`.withIndex(...)`, `.withSearchIndex(...)` on it): a database query chain, not any `.collect()`. */
+function isDbChain(n: unknown): boolean {
+  for (let cur = n; ; ) {
+    if (is(cur, "CallExpression")) {
+      if (memberName(cur.callee) === "query" && is(cur.callee, "MemberExpression")) return isDbRoot(cur.callee.object);
+      cur = cur.callee;
+    } else if (is(cur, "MemberExpression")) cur = cur.object;
+    else return false;
+  }
+}
+
+const noCollectLength: Rule = {
+  meta: {
+    type: "suggestion",
+    docs: { description: "Do not load every document to count them (`.collect().length`)", url: `${DOCS}#no-collect-length` },
+    messages: {
+      length:
+        "`.collect().length` reads every matching document to count them (all of them count against `documentsRead` and join the read set). Keep a count with a materialized aggregate (`defineTable(...).aggregate(name, { by })`, then `ctx.db.aggregate(table, name).get([...]).count`), check existence with `.first() !== null`, or bound it with `.take(n).length`.",
+    },
+    schema: [],
+  },
+  create(context) {
+    return {
+      MemberExpression(node) {
+        if (node.computed || !is(node.property, "Identifier") || node.property.name !== "length") return;
+        const call = node.object;
+        if (!is(call, "CallExpression") || call.arguments.length !== 0 || memberName(call.callee) !== "collect") return;
+        if (isDbChain((call.callee as { object?: unknown }).object)) context.report({ node, messageId: "length" });
+      },
+    };
+  },
+};
+
+// ------------------------------------------------------------------ no-db-in-loop
+
+const DB_READS = new Set(["get", "query", "aggregate"]);
+const DB_WRITES = new Set(["insert", "patch", "replace", "delete", "increment"]);
+const RUN = new Set(["runQuery", "runMutation", "runAction"]);
+/** Array methods whose callback runs once per element. */
+const ITERATORS = new Set(["forEach", "map", "flatMap", "filter", "reduce", "reduceRight", "some", "every", "find", "findIndex", "findLast", "findLastIndex"]);
+const PARALLEL = new Set(["Promise.all", "Promise.allSettled", "Promise.any", "Promise.race"]);
+const LOOPS = new Set(["ForStatement", "ForInStatement", "ForOfStatement", "WhileStatement", "DoWhileStatement"]);
+
+/**
+ * Whether `node` runs once per iteration of a loop of its own function: a loop body (or its per-iteration test),
+ * or a callback of `xs.map/forEach/...` / `Array.from(xs, fn)`. Other nested functions (declarations too) end the
+ * search: defined, not necessarily run. `"parallel"`: the callback of `Promise.all(xs.map(...))`, which starts the
+ * calls together; still once per element, so only the round trips of actions are not repeated one after another.
+ */
+function inLoop(context: Context, node: Node): false | "sequential" | "parallel" {
+  const chain = context.sourceCode.getAncestors(node);
+  let child: unknown = node;
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const a = chain[i] as Node;
+    if (LOOPS.has(a.type)) {
+      const l = a as unknown as { body: unknown; test?: unknown; update?: unknown };
+      if (child === l.body || (a.type !== "ForInStatement" && a.type !== "ForOfStatement" && (child === l.test || child === l.update))) return "sequential";
+    }
+    if (is(a, "FunctionDeclaration")) return false;
+    if (isFn(a)) {
+      const call = parentOf(a);
+      if (!is(call, "CallExpression") || !call.arguments.includes(a as never)) return false;
+      const m = memberName(call.callee);
+      const iterates = (m !== null && ITERATORS.has(m) && call.arguments[0] === a) || (dotted(call.callee) === "Array.from" && call.arguments[1] === a);
+      if (!iterates) return false;
+      const outer = parentOf(call);
+      if (is(outer, "CallExpression") && outer.arguments[0] === call && PARALLEL.has(dotted(outer.callee) ?? "")) return "parallel";
+      return "sequential";
+    }
+    child = a;
+  }
+  return false;
+}
+
+const noDbInLoop: Rule = {
+  meta: {
+    type: "suggestion",
+    docs: { description: "No database call (or awaited ctx.run*) per loop iteration: read ranges, batch, or run together", url: `${DOCS}#no-db-in-loop` },
+    messages: {
+      read: "`{{call}}` runs once per iteration (N+1): each lookup counts against this transaction's read limits and joins the read set. Read the rows with one index range (`withIndex`) or an aggregate, or keep the list bounded. (The database API is synchronous: there is nothing to `Promise.all` here.)",
+      write: "`{{call}}` writes once per iteration, all in this mutation's transaction: fine for a short, bounded list; an unbounded one runs into `rowsWritten`. Split the work into batches that reschedule themselves (`ctx.scheduler.runAfter`).",
+      roundTrip: "`await {{call}}` in a loop is one round trip per iteration, one after another: do the work in one query or mutation (many rows, one transaction), or start the calls together with `Promise.all`.",
+    },
     schema: [],
   },
   create(context) {
     return {
       CallExpression(node) {
-        const kind = builderKind(node.callee);
-        if (!kind) return;
-        const h = handlerOf(node.arguments[0]);
-        if (h?.async) context.report({ node: h, messageId: "async", data: { kind } });
-        // A query's `authorize` runs in the same synchronous transaction.
-        const check = handlerOf(node.arguments[0], "authorize");
-        if (check?.async) context.report({ node: check, messageId: "async", data: { kind } });
+        const m = memberName(node.callee);
+        if (!m) return;
+        const object = (node.callee as { object?: unknown }).object;
+        let messageId: "read" | "write" | "roundTrip";
+        if (isDb(object) && (DB_READS.has(m) || DB_WRITES.has(m))) messageId = DB_READS.has(m) ? "read" : "write";
+        else if (RUN.has(m) && is(parentOf(node), "AwaitExpression")) messageId = "roundTrip";
+        else return;
+        const loop = inLoop(context, node);
+        // `Promise.all(ids.map((id) => ctx.db.get(id)))`: the database API is synchronous, so the reads still run
+        // one per element (N+1); only an action's `await ctx.run*` calls really run together there.
+        if (!loop || (loop === "parallel" && messageId === "roundTrip")) return;
+        const call = `${context.sourceCode.getText(object as Node)}.${m}()`;
+        context.report({ node, messageId, data: { call } });
+      },
+    };
+  },
+};
+
+// ------------------------------------------------------------------ no-throw-raw-error
+
+const RAW_ERRORS = new Set(["Error", "TypeError", "RangeError"]);
+const noThrowRawError: Rule = {
+  meta: {
+    type: "suggestion",
+    docs: { description: "Public functions throw application errors (`defineErrors`), not plain `Error`s", url: `${DOCS}#no-throw-raw-error` },
+    messages: {
+      raw: "`throw new {{name}}(...)` in a public {{kind}} is not part of its contract: the client gets an untyped system error (code `Error`) that `isError(e, fn, code)` cannot match. Declare it with `defineErrors` and `throw errors.X(...)` (or `ctx.fail.X(...)`): a typed code, data and message. Plain errors are fine in internal functions and helpers.",
+    },
+    schema: [],
+  },
+  create(context) {
+    const aliases = aliasesOf(context);
+    return {
+      ThrowStatement(node) {
+        const e = node.argument;
+        if (!(is(e, "NewExpression") || is(e, "CallExpression")) || !is(e.callee, "Identifier") || !RAW_ERRORS.has(e.callee.name)) return;
+        // Caught right there (`try { ... throw new Error() } catch`): not the function's error.
+        const chain = context.sourceCode.getAncestors(node);
+        let child: unknown = node;
+        for (let i = chain.length - 1; i >= 0; i--) {
+          const a = chain[i];
+          if (isFn(a) || is(a, "FunctionDeclaration")) break;
+          if (is(a, "TryStatement") && a.handler && child === a.block) return;
+          child = a;
+        }
+        const r = enclosingRole(context, node, aliases());
+        if (!r || r.builder.visibility !== "public" || r.builder.kind === "http" || r.role === "trigger") return;
+        context.report({ node, messageId: "raw", data: { name: e.callee.name, kind: r.builder.kind } });
       },
     };
   },
@@ -162,7 +481,7 @@ const requireArgsValidators: Rule = {
         const arg = node.arguments[0];
         const h = handlerOf(arg);
         if (!arg || !h || h.params.length < 2) return;
-        const hasArgs = is(arg, "ObjectExpression") && arg.properties.some((p) => is(p, "Property") && is(p.key, "Identifier") && p.key.name === "args");
+        const hasArgs = is(arg, "ObjectExpression") && arg.properties.some((p) => keyName(p) === "args");
         if (!hasArgs) context.report({ node: arg, messageId: "args", data: { kind: node.callee.name } });
       },
     };
@@ -207,6 +526,10 @@ export const rules = {
   "no-async-query-handler": noAsyncQueryHandler,
   "require-args-validators": requireArgsValidators,
   "no-floating-mutation": noFloatingMutation,
+  "no-nondeterministic-in-sync": noNondeterministicInSync,
+  "no-db-in-loop": noDbInLoop,
+  "no-collect-length": noCollectLength,
+  "no-throw-raw-error": noThrowRawError,
 };
 
 const plugin = {
@@ -222,6 +545,10 @@ plugin.configs.recommended = {
     "ember/no-async-query-handler": "error",
     "ember/require-args-validators": "error",
     "ember/no-floating-mutation": "warn",
+    "ember/no-nondeterministic-in-sync": "error",
+    "ember/no-db-in-loop": "warn",
+    "ember/no-collect-length": "warn",
+    "ember/no-throw-raw-error": "warn",
   },
 };
 

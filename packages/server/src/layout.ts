@@ -100,12 +100,16 @@ export function projectLayout(layout: Layout, paths: Iterable<string>): { layout
   return { layout: projected, select: [`"_id"`, `"_creationTime"`, json, ...columns.map((c) => q(c.field))].join(", ") };
 }
 
-/** A (dotted) path of a document; undefined when absent or when it walks through a non-object. */
+/**
+ * A (dotted) path of a document; undefined when absent or when it walks through a non-object. Own properties only, as
+ * `decodeRow`: a field named like an Object.prototype member (`toString`) that the document lacks is absent, not the
+ * prototype's function (which no index key could encode, and a sparse index must leave out).
+ */
 export function fieldOf(doc: Record<string, unknown>, path: string): unknown {
-  if (!path.includes(".")) return doc[path];
+  if (!path.includes(".")) return hasOwn(doc, path) ? doc[path] : undefined;
   let cur: unknown = doc;
   for (const part of path.split(".")) {
-    if (!isPlainObject(cur)) return undefined;
+    if (!isPlainObject(cur) || !hasOwn(cur, part)) return undefined;
     cur = cur[part];
   }
   return cur;
