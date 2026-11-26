@@ -11,6 +11,7 @@ import { app, functions, models, schema } from "../app.ts";
 export { Shard } from "@freecorps/ember-runtime";
 
 export const ANSWER = "Your order A-1 is shipped and should arrive on Friday, between nine and noon.";
+export const REASONING = "The order shipped Tuesday; delivery takes three days, so Friday.";
 const enc = new TextEncoder();
 
 const fakeAi: WorkersAiBinding = {
@@ -21,7 +22,10 @@ const fakeAi: WorkersAiBinding = {
     const chunks: unknown[] =
       prompt.includes("order") && !toolDone
         ? [{ response: "Checking. " }, { tool_calls: [{ name: "lookupOrder", arguments: { orderId: "A-1" } }] }]
-        : (ANSWER.match(/.{1,6}/g) ?? []).map((response) => ({ response }));
+        : prompt.includes("think")
+          ? // A reasoning model (OpenAI-style chunks): `reasoning_content` deltas, then the answer.
+            [...(REASONING.match(/.{1,6}/g) ?? []).map((r) => ({ choices: [{ delta: { reasoning_content: r } }] })), { choices: [{ delta: { content: "Friday." } }] }]
+          : (ANSWER.match(/.{1,6}/g) ?? []).map((response) => ({ response }));
     chunks.push({ response: "", usage: { prompt_tokens: 40, completion_tokens: 20, total_tokens: 60 } });
     return new ReadableStream<Uint8Array>({
       async start(c) {

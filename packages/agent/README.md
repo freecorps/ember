@@ -72,7 +72,7 @@ function Bubble({ m }) {
    for your `generate` action, all in the same transaction. If the mutation fails afterwards, none of them exist.
 2. The action moves the message to `streaming` and claims it with a fresh run id. It loads the context window and
    calls the model.
-3. While text arrives, it writes **deltas** in small batches: every `streaming.throttleMs` (200 ms by default) or
+3. While text (and, for models that expose it, reasoning) arrives, it writes **deltas** in small batches: every `streaming.throttleMs` (200 ms by default) or
    `maxChars` (4000) characters, at most one write in flight: the stream is not paused by it, and text that arrives
    meanwhile joins the next batch. Deltas are rows of their own, so the message row is untouched while it streams.
    A live `listMessages` subscription gets each batch as one inserted row through the rowdiff/vdiff patches.
@@ -89,8 +89,11 @@ function Bubble({ m }) {
    then runs the next step. This repeats up to `maxSteps` model calls.
 
 **Statuses:** `pending` → `streaming` → `success` | `failed` | `aborted`.
-- **Model errors:** the message becomes `failed` with `error`, and the text streamed so far is kept.
-  `assistant.retry(ctx, messageId)` runs it again.
+- **Model errors:** a call that fails **before its first delta** with 429 or 5xx (or an error marked `isRetryable`,
+  as AI SDK errors are) is retried, waiting `Retry-After` when the error has one: `retry: { maxAttempts: 3,
+  initialBackoffMs: 500, maxBackoffMs: 20_000 }` by default, `retry: false` to turn it off. After the first delta
+  (text, reasoning or a tool call) the step is not repeated: the message becomes `failed` with `error`, and the text
+  streamed so far is kept. `assistant.retry(ctx, messageId)` runs it again.
 - **Tool errors:** a throw, an unknown tool or invalid arguments become a `tool-result` with `isError: true`. The
   model sees it and goes on.
 - **Abort:** `assistant.abort(ctx, { threadId } | { messageId })`. A pending response never runs. A streaming one
@@ -107,7 +110,7 @@ All tables live in the shard of whoever calls, next to the app's tables:
 |---|---|
 | `threads` | `userId`, `title`, `summary`, `status` (active/archived), `metadata`, `usage` totals |
 | `messages` | `order` (one per prompt), `stepOrder`, `role` (user/assistant/tool/system), `parts`, `text`, `status`, `model`, `provider`, `usage`, `finishReason`, `error` |
-| `deltas` | `message`, `seq`, `text`: batches of text still being streamed |
+| `deltas` | `message`, `seq`, `text`, `reasoning`: batches of text (and reasoning) still being streamed |
 
 **Parts:**
 - `text` and `reasoning`
@@ -138,8 +141,31 @@ fixed at install. Use your own `vectorIndex` in a tool if you need it.
   on the non-streamed response, so a step that offers tools is not streamed unless you set `stream: true`.
 - An AI SDK `LanguageModel` (specification v1, v2 or v3), passed as `model` or wrapped with `aiSdk(model,
   settings)`. Only `doStream` is used: the agent runs the tool loop itself.
-- `defineModel({ stream } | { generate })` for anything else, and `mockModel(steps)` for tests (scripted deltas,
-  tool calls, usage and errors).
+- `defineModel({ stream } | { generate })` for anything else, and `mockModel(steps)` for tests (scripted text and
+  reasoning deltas, tool calls, usage and errors with a status / `Retry-After`).
+- `withRetry(model, retryOptions)`: the retry wrapper the agent uses, for your own calls.
+
+**Reasoning.** Models that expose their reasoning stream it as `reasoning-delta` events: AI SDK reasoning parts
+(v1 `reasoning`, v2/v3 `reasoning-delta`), Workers AI `reasoning_content` deltas (OpenAI-style chunks) and a leading
+`<think>…</think>` (DeepSeek R1 style). It goes into the same delta rows as the text (`reasoning` column), so a live
+subscription sees it grow; the finished message keeps it as a `reasoning` part (a failed or aborted one too).
+`useThreadMessages` / `withStreams` give each message a `reasoning` string.
+
+## Structured output: `generateObject`
+
+```ts
+const recipe = v.object({ title: v.string(), minutes: v.number(), tags: v.optional(v.array(v.string())) });
+// in an action: one model call, nothing saved to a thread
+const { object } = await assistant.generateObject(ctx, { schema: recipe, prompt: "a quick soup" });
+// object: { title: string; minutes: number; tags?: string[] }
+// or with any model: generateObject(workersAi("@cf/..."), { schema: { city: v.string() }, prompt, env: ctx.env })
+```
+
+The validator's JSON Schema (`toJsonSchema` of `@freecorps/ember-values`, without the wire-only `$float` branch) goes
+to the model as its response format (AI SDK `responseFormat` / v1 `object-json` mode, Workers AI
+`response_format: { type: "json_schema" }`) and into the system prompt. The answer is parsed (plain, fenced
+` ```json `, or the outermost object in the text), defaults are applied, and it is validated: a mismatch throws
+`ObjectGenerationError` with the model's `text` and the failing `path`. Retries before the first delta apply.
 
 ## Usage, billing and rate limits
 

@@ -1,7 +1,9 @@
 // Model adapters against fakes of their wire shapes: the Workers AI binding (`run`, SSE streams) and AI SDK
 // LanguageModels (v1, v2, v3 stream parts), no network.
 import { describe, expect, test } from "vitest";
-import { Agent, aiSdk, defineModel, workersAi, type ModelEvent, type ModelRequest } from "../src/index.ts";
+import { Agent, aiSdk, defineModel, generateObject, workersAi, type ModelEvent, type ModelRequest } from "../src/index.ts";
+import { ThinkSplitter } from "../src/workers-ai.ts";
+import { v } from "@freecorps/ember-server";
 
 const enc = new TextEncoder();
 const sseStream = (chunks: unknown[], split = 7) => {
@@ -107,6 +109,51 @@ describe("workersAi", () => {
     ]);
   });
 
+  test("reasoning: reasoning_content deltas and a <think> prefix (split across chunks) become reasoning-delta", async () => {
+    const ai = {
+      run: async () =>
+        sseStream([
+          { choices: [{ delta: { reasoning_content: "Look up " } }] },
+          { choices: [{ delta: { reasoning_content: "the order." } }] },
+          { choices: [{ delta: { content: "Shipped." } }] },
+          "[DONE]",
+        ]),
+    };
+    const events = await collect(workersAi("@cf/m", { ai, stream: true }).stream(request({ tools: [] })));
+    expect(events.slice(0, 3)).toEqual([
+      { type: "reasoning-delta", text: "Look up " },
+      { type: "reasoning-delta", text: "the order." },
+      { type: "text-delta", text: "Shipped." },
+    ]);
+    const r1 = { run: async () => sseStream([{ response: "<thi" }, { response: "nk>Hmm, " }, { response: "A-1 shipped</th" }, { response: "ink>\n\nIt" }, { response: " shipped." }, "[DONE]"]) };
+    const ev2 = await collect(workersAi("@cf/deepseek", { ai: r1 }).stream(request({ tools: [] })));
+    const join = (t: string) => ev2.filter((e) => e.type === t).map((e) => (e as { text: string }).text).join("");
+    expect(join("reasoning-delta")).toBe("Hmm, A-1 shipped");
+    expect(join("text-delta")).toBe("It shipped.");
+    // Not streamed: the whole response at once.
+    const once = { run: async () => ({ response: "<think>x</think>y", usage: {} }) };
+    const ev3 = await collect(workersAi("@cf/deepseek", { ai: once, stream: false }).stream(request({ tools: [] })));
+    expect(ev3.slice(0, 2)).toEqual([
+      { type: "reasoning-delta", text: "x" },
+      { type: "text-delta", text: "y" },
+    ]);
+    const plain = new ThinkSplitter();
+    expect([...plain.push("  <"), ...plain.push("b>bold"), ...plain.end()]).toEqual([{ type: "text-delta", text: "  <b>bold" }]);
+  });
+
+  test("generateObject: response_format json_schema", async () => {
+    let inputs: any;
+    const ai = {
+      run: async (_m: string, i: any) => {
+        inputs = i;
+        return { response: { city: "Lisbon" } };
+      },
+    };
+    const r = await generateObject(workersAi("@cf/m", { ai }), { schema: { city: v.string() }, prompt: "capital of Portugal" });
+    expect(r.object).toEqual({ city: "Lisbon" });
+    expect(inputs.response_format).toEqual({ type: "json_schema", json_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"], additionalProperties: false } });
+  });
+
   test("a missing binding is a clear error", async () => {
     await expect(collect(workersAi("@cf/m").stream(request()))).rejects.toThrow(/no Workers AI binding EMBER_AI/);
   });
@@ -188,6 +235,32 @@ describe("aiSdk (structural LanguageModel)", () => {
     expect(o.prompt[3].content[0]).toEqual({ type: "tool-result", toolCallId: "c1", toolName: "lookupOrder", result: { status: "shipped" } });
     expect(events.at(-1)).toEqual({ type: "finish", finishReason: "tool-calls", usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 } });
     expect(events[1]).toMatchObject({ type: "tool-call", args: { orderId: "E-5" } });
+  });
+
+  test("reasoning parts stream as reasoning-delta (v2 reasoning-delta, v1 reasoning)", async () => {
+    const v2 = fake("v2", [
+      { type: "reasoning-start", id: "r" },
+      { type: "reasoning-delta", id: "r", delta: "think" },
+      { type: "reasoning-end", id: "r" },
+      { type: "text-delta", id: "1", delta: "answer" },
+    ]);
+    expect(await collect(aiSdk(v2.model).stream(request({ tools: [] })))).toEqual([
+      { type: "reasoning-delta", text: "think" },
+      { type: "text-delta", text: "answer" },
+    ]);
+    const v1 = fake("v1", [{ type: "reasoning", textDelta: "hmm" }]);
+    expect(await collect(aiSdk(v1.model).stream(request({ tools: [] })))).toEqual([{ type: "reasoning-delta", text: "hmm" }]);
+  });
+
+  test("generateObject: responseFormat json (v2/v3), mode object-json (v1)", async () => {
+    const schema = { n: v.number() };
+    const v2 = fake("v2", [{ type: "text-delta", id: "1", delta: '{"n": 3}' }]);
+    expect((await generateObject(v2.model, { schema, prompt: "three", name: "num" })).object).toEqual({ n: 3 });
+    expect(v2.calls[0].responseFormat).toEqual({ type: "json", name: "num", schema: { type: "object", properties: { n: { type: "number" } }, required: ["n"], additionalProperties: false } });
+    expect(v2.calls[0].tools).toBeUndefined();
+    const v1 = fake("v1", [{ type: "text-delta", textDelta: '{"n": 4}' }]);
+    expect((await generateObject(v1.model, { schema, prompt: "four" })).object).toEqual({ n: 4 });
+    expect(v1.calls[0].mode).toMatchObject({ type: "object-json", schema: { type: "object" } });
   });
 
   test("an Agent given an AI SDK model wraps it; defineModel turns generate into one step", async () => {

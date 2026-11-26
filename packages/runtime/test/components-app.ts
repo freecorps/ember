@@ -178,7 +178,7 @@ export const officialFunctions = {
   flow: workflow.define({
     args: { x: v.number() },
     handler: async (step: WorkflowStep, { x }: { x: number }) => {
-      const y = await step.runAction<number>("official:fetchish", { x });
+      const y = (await step.runAction("official:fetchish", { x })) as number;
       await step.runMutation("official:record", { label: `wf:${y}` });
       await step.sleep(30);
       const ev = await step.waitForEvent<{ z: number }>("go");

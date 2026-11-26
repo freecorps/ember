@@ -115,7 +115,7 @@ export const lookup = internalAction({ args: { x: v.number() }, handler: async (
 export const flow = workflow.define({
   args: { x: v.number() },
   handler: async (step, { x }) => {
-    const r = await step.runAction<{ x: number; at: number }>("fns:lookup", { x });
+    const r = (await step.runAction("fns:lookup", { x })) as { x: number; at: number };
     await step.runMutation("fns:record", { label: "looked-up:" + r.x });
     await step.sleep(3000);
     const ev = await step.waitForEvent<{ y: number }>("go", { timeoutMs: 600_000 });
