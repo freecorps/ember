@@ -117,6 +117,9 @@ describe("dashboard data endpoints", () => {
     expect(bs(await list(`index=by_b&gte=${j(2)}&lt=${j(4)}`))).toEqual([2, 3]);
     expect(bs(await list(`index=by_b&gt=${j(3)}&order=desc`))).toEqual([5, 4]);
     expect(bs(await list(`index=by_b&lte=${j(1)}`))).toEqual([1]);
+    // A text bound as the Data Browser sends it (JSON.stringify of the typed value: `"odd"` with its quotes).
+    expect(bs(await list(`index=by_a&gte=${encodeURIComponent(JSON.stringify("odd"))}`))).toEqual([1, 3, 5]);
+    expect(bs(await list(`index=by_a&lt=${encodeURIComponent('"odd"')}`))).toEqual([2, 4]);
     const all = (await list("limit=10")).body.value.page as Array<{ _creationTime: number; b: number }>;
     expect(bs(await list(`gt=${j(all[2]!._creationTime)}`))).toEqual([4, 5]);
     expect(bs(await list(`index=by_a&eq=${j(["odd"])}&gte=${j(all[1]!._creationTime)}`))).toEqual([3, 5]);
