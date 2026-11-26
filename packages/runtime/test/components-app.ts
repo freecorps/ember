@@ -18,7 +18,11 @@ import {
   queryGeneric,
   anyComponents as components,
   actionGeneric,
+  makeFunctionReference,
   v,
+  type AppDefinition,
+  type ChannelsConfig,
+  type DashboardSpecInput,
 } from "@freecorps/ember-server";
 import { MINUTE, rateLimit, RateLimiter } from "@freecorps/ember-rate-limit";
 import { WorkflowManager, workflows, type WorkflowStep } from "@freecorps/ember-workflows";
@@ -45,12 +49,7 @@ const hooks = {
   }),
 };
 
-export const tally = defineComponent({
-  name: "tally",
-  schema,
-  config: v.object({ label: v.string() }),
-  functions: {
-    lib: {
+const tallyLib = {
       bump: c.mutation({ args: { key: v.string(), by: v.number() }, handler: (ctx, a) => bump(ctx, a.key, a.by) }),
       get: c.query({ args: { key: v.string() }, handler: (ctx, { key }) => ctx.db.query("tallies").withIndex("by_key", (q) => q.eq("key", key)).unique()?.n ?? 0 }),
       /** Schedules its own internal mutation (relative name), and optionally an app callback (handle). */
@@ -80,8 +79,34 @@ export const tally = defineComponent({
       /** Tries to reach an app function by name from the component: must not resolve. */
       reachApp: c.action({ args: {}, handler: async (ctx) => ctx.runQuery("components:count" as any, { key: "x" }) }),
       label: c.query({ args: {}, handler: (ctx) => ctx.component.config.label }),
-    },
-    hooks,
+      /** Dashboard screens (dashboards.test.ts): every tally, and a reset. */
+      list: c.query({ args: { min: v.optional(v.number()) }, handler: (ctx, { min }) => ctx.db.query("tallies").collect().filter((t) => t.n >= (min ?? 0)) }),
+      reset: c.mutation({ args: { key: v.string() }, handler: (ctx, { key }) => {
+        const row = ctx.db.query("tallies").withIndex("by_key", (q) => q.eq("key", key)).unique();
+        if (row) ctx.db.delete(row._id);
+        return !!row;
+      } }),
+};
+
+export const tally = defineComponent({
+  name: "tally",
+  schema,
+  config: v.object({ label: v.string() }),
+  functions: { lib: tallyLib, hooks },
+  dashboard: {
+    label: "Tallies",
+    icon: "gauge",
+    tabs: [
+      {
+        id: "all",
+        label: "All",
+        blocks: [
+          { kind: "stats", id: "dash", query: tallyLib.get, args: { key: "dash" }, items: [{ label: "dash", path: "", format: "number" }] },
+          { kind: "table", id: "tallies", query: tallyLib.list, columns: [{ label: "Key", path: "key" }, { label: "Count", path: "n", format: "number" }], rowActions: [{ id: "reset", label: "Reset", fn: tallyLib.reset, fromRow: { key: "key" }, destructive: true }] },
+          { kind: "actions", actions: [{ id: "bump", label: "Bump", fn: tallyLib.bump, args: { by: 1 } }, { id: "twice", label: "Bump twice", fn: tallyLib.bumpTwice }] },
+        ],
+      },
+    ],
   },
   http: httpRouter().route({ path: "/hit", method: "POST", handler: hooks.hit, shard: (r) => new URL(r.url).searchParams.get("shard") ?? "global:main" }),
 });
@@ -151,22 +176,30 @@ export const hooksComponent = defineComponent({
 });
 
 // Project limits (PLAN §3, L6): documents raised above the default, so metrics.test.ts sees them reach the shard.
-export const app = defineApp({
-  limits: { documentsRead: 20_000 },
-  // Ephemeral channels (ephemeral.test.ts): signed-in rooms, a "vip" room only ana may join, rooms of the active
-  // organization (the `org` claim), typed payloads and member state, and a channel tied to its shard.
-  channels: {
-    "room:*": { authorize: (identity, { param }) => identity !== null && (param !== "vip" || identity.subject === "ana") },
-    "org:*": { authorize: (identity, { param }) => identity?.claims?.org === param },
-    "typed:*": { authorize: () => true, payload: v.object({ x: v.number(), y: v.number() }), state: v.optional(v.object({ name: v.string() })) },
-    "here:*": { authorize: (_identity, { param, shard }) => shard === `eph:${param}` },
-    "open": { authorize: () => true },
-  },
-})
-  .use(tally, { config: { label: "tallies" } })
-  .use(rateLimit)
-  .use(workflows)
-  .use(hooksComponent, { config: { domain: "hooks.test", shard: "hooks:main" } });
+/** The app's own screen (dashboards.test.ts): global, so always on global:main. Names the app's `components:*`. */
+const appScreens: DashboardSpecInput = {
+  label: "Runs",
+  scope: "global",
+  tabs: [{ id: "tally", label: "Tally", blocks: [{ kind: "detail", query: makeFunctionReference<"query">("components:count"), sections: [{ kind: "json" }] }, { kind: "actions", actions: [{ label: "Bump", fn: makeFunctionReference<"mutation">("components:bump") }] }] }],
+};
+const installs = (base: AppDefinition) =>
+  base
+    .use(tally, { config: { label: "tallies" } })
+    .use(rateLimit)
+    .use(workflows)
+    .use(hooksComponent, { config: { domain: "hooks.test", shard: "hooks:main" } });
+// Ephemeral channels (ephemeral.test.ts): signed-in rooms, a "vip" room only ana may join, rooms of the active
+// organization (the `org` claim), typed payloads and member state, and a channel tied to its shard.
+const channels = {
+  "room:*": { authorize: (identity, { param }) => identity !== null && (param !== "vip" || identity.subject === "ana") },
+  "org:*": { authorize: (identity, { param }) => identity?.claims?.org === param },
+  "typed:*": { authorize: () => true, payload: v.object({ x: v.number(), y: v.number() }), state: v.optional(v.object({ name: v.string() })) },
+  "here:*": { authorize: (_identity, { param, shard }) => shard === `eph:${param}` },
+  open: { authorize: () => true },
+} satisfies ChannelsConfig;
+export const app = installs(defineApp({ limits: { documentsRead: 20_000 }, dashboard: appScreens, channels }));
+/** The same installs without the app's screen: for configs with other app functions (ai-indexes.test.ts). */
+export const appWithoutScreens = installs(defineApp({ limits: { documentsRead: 20_000 }, channels }));
 
 // ------------------------------------------------------------------ official components (rateLimit, workflows)
 
@@ -189,7 +222,7 @@ export const officialFunctions = {
   flow: workflow.define({
     args: { x: v.number() },
     handler: async (step: WorkflowStep, { x }: { x: number }) => {
-      const y = await step.runAction<number>("official:fetchish", { x });
+      const y = (await step.runAction("official:fetchish", { x })) as number;
       await step.runMutation("official:record", { label: `wf:${y}` });
       await step.sleep(30);
       const ev = await step.waitForEvent<{ z: number }>("go");
@@ -197,6 +230,17 @@ export const officialFunctions = {
       return y + ev.z;
     },
   }),
+  /** Parallel steps: two actions and a mutation in one batch, then a sleep and a mutation with the sum. */
+  parallelFlow: workflow.define({
+    args: { x: v.number() },
+    handler: async (step: WorkflowStep, { x }: { x: number }) => {
+      const [a, b] = (await Promise.all([step.runAction("official:fetchish", { x }), step.runAction("official:fetchish", { x: x + 1 }), step.runMutation("official:record", { label: "wf-par" })])) as [number, number, unknown];
+      await step.sleep(10);
+      await step.runMutation("official:record", { label: `wf-sum:${a + b}` });
+      return a + b;
+    },
+  }),
+  startParallel: mutationGeneric({ args: { x: v.number() }, handler: (ctx: any, { x }: { x: number }) => workflow.start(ctx, "official:parallelFlow", { x }) }),
   startFlow: mutationGeneric({ args: { x: v.number() }, handler: (ctx: any, { x }: { x: number }) => workflow.start(ctx, "official:flow", { x }) }),
   flowStatus: queryGeneric({ args: { id: v.string() }, handler: (ctx: any, { id }: { id: string }) => workflow.status(ctx, id) }),
   flowEvent: mutationGeneric({ args: { id: v.string(), z: v.number() }, handler: (ctx: any, a: { id: string; z: number }) => workflow.sendEvent(ctx, a.id, "go", { z: a.z }) }),

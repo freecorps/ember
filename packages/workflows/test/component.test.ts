@@ -21,7 +21,14 @@ import {
 } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { describe, expect, test } from "vitest";
+import { makeFunctionReference } from "@freecorps/ember-values";
 import { WorkflowManager, workflows, type WorkflowStep } from "../src/index.ts";
+
+/** Typed references to the step functions below (what `internal.steps.*` would be in an app). */
+const ref = {
+  double: makeFunctionReference<"query", { n: number }, number>("steps:double"),
+  remote: makeFunctionReference<"action", { v: number }, number>("steps:remote"),
+};
 
 const T0 = 1_700_000_000_000;
 const appWith = (maxSteps: number) => defineApp().use(workflows, { config: { maxSteps } });
@@ -60,11 +67,11 @@ const flows = {
   main: workflow.define({
     args: { n: v.number() },
     handler: async (step: WorkflowStep, { n }) => {
-      const d = await step.runQuery<number>("steps:double", { n });
+      const d = await step.runQuery(ref.double, { n });
       await step.runMutation("steps:save", { v: d });
       await step.sleep(60_000);
       const ev = await step.waitForEvent<{ add: number }>("go", { timeoutMs: 3_600_000 });
-      return step.runAction<number>("steps:remote", { v: d + ev.add }, { retry: { maxAttempts: 3, initialBackoffMs: 10 } });
+      return step.runAction(ref.remote, { v: d + ev.add }, { retry: { maxAttempts: 3, initialBackoffMs: 10 } });
     },
   }),
   catchy: workflow.define({
@@ -79,7 +86,7 @@ const flows = {
   remoteOnly: workflow.define({ handler: async (step: WorkflowStep) => step.runAction("steps:remote", { v: 1 }, { retry: { maxAttempts: 2, initialBackoffMs: 10 } }) }),
   waitOnly: workflow.define({ handler: async (step: WorkflowStep) => step.waitForEvent("ping", { timeoutMs: 1000 }) }),
   twoEvents: workflow.define({
-    handler: async (step: WorkflowStep) => [await step.waitForEvent<number>("a"), await step.runQuery<number>("steps:double", { n: 1 }), await step.waitForEvent<number>("b")],
+    handler: async (step: WorkflowStep) => [await step.waitForEvent<number>("a"), await step.runQuery(ref.double, { n: 1 }), await step.waitForEvent<number>("b")],
   }),
   forever: workflow.define({
     handler: async (step: WorkflowStep) => {
@@ -93,7 +100,7 @@ const flows = {
       let sum = 0;
       for (let i = 0; i < n; i++) {
         if (i % 2) await step.runMutation("steps:save", { v: i });
-        else sum += await step.runQuery<number>("steps:double", { n: i });
+        else sum += await step.runQuery(ref.double, { n: i });
       }
       return sum;
     },
@@ -104,20 +111,65 @@ const flows = {
     handler: async (step: WorkflowStep, { n }) => {
       let total = 0;
       for (let i = 0; i < n; i++) {
-        total += await step.runAction<number>("steps:remote", { v: i });
+        total += await step.runAction(ref.remote, { v: i });
         await step.runMutation("steps:save", { v: total });
       }
       return total;
     },
   }),
+  /** Two action steps in parallel, then a mutation with their sum. */
+  parallel: workflow.define({
+    handler: async (step: WorkflowStep) => {
+      const [a, b] = await Promise.all([step.runAction(ref.remote, { v: 1 }, { retry: { maxAttempts: 3, initialBackoffMs: 10 } }), step.runAction(ref.remote, { v: 2 }, { retry: { maxAttempts: 3, initialBackoffMs: 10 } })]);
+      await step.runMutation("steps:save", { v: a + b });
+      return a + b;
+    },
+  }),
+  /** Parallel query + mutation (both inline), then parallel branches that each continue with their own step. */
+  parallelInline: workflow.define({
+    handler: async (step: WorkflowStep) => {
+      const [d] = await Promise.all([step.runQuery(ref.double, { n: 3 }), step.runMutation("steps:save", { v: 7 })]);
+      const branch = async (n: number) => step.runQuery(ref.double, { n: (await step.runQuery(ref.double, { n })) + 1 });
+      const [x, y] = await Promise.all([branch(d), branch(10)]);
+      return [d, x, y];
+    },
+  }),
+  /** Parallel branches at different microtask depths (B awaits once more between its steps). */
+  uneven: workflow.define({
+    handler: async (step: WorkflowStep) =>
+      Promise.all([
+        (async () => {
+          const a1 = await step.runAction(ref.remote, { v: 1 }, { name: "A1" });
+          const a2 = await step.runAction(ref.remote, { v: a1 }, { name: "A2" });
+          return step.runQuery(ref.double, { n: a2 }, { name: "A3" });
+        })(),
+        (async () => {
+          await step.runAction(ref.remote, { v: 2 }, { name: "B1" });
+          await Promise.resolve();
+          return step.runAction(ref.remote, { v: 3 }, { name: "B2" });
+        })(),
+      ]),
+  }),
+  /** A sleep and an event wait in parallel. */
+  parallelWait: workflow.define({
+    handler: async (step: WorkflowStep) => {
+      const [, ev] = await Promise.all([step.sleep(1000), step.waitForEvent<number>("go", { timeoutMs: 5000 })]);
+      return ev;
+    },
+  }),
+  /** `n` actions in parallel. */
+  fanOut: workflow.define({
+    args: { n: v.number() },
+    handler: async (step: WorkflowStep, { n }) => (await Promise.all(Array.from({ length: n }, (_, i) => step.runAction(ref.remote, { v: i })))).reduce((a, b) => a + b, 0),
+  }),
   /** Two synchronous steps, a sleep, two more. */
   mixed: workflow.define({
     handler: async (step: WorkflowStep) => {
       await step.runMutation("steps:save", { v: 1 });
-      const d = await step.runQuery<number>("steps:double", { n: 2 });
+      const d = await step.runQuery(ref.double, { n: 2 });
       await step.sleep(1000);
       await step.runMutation("steps:save", { v: d });
-      return step.runQuery<number>("steps:double", { n: d });
+      return step.runQuery(ref.double, { n: d });
     },
   }),
 };
@@ -147,9 +199,10 @@ type Counters = { rowsRead: number; rowsWritten: number; scheduled: Record<strin
  * Usage measured on the node:sqlite driver (rows returned / changed), before PR 2D → after:
  * `chain` n = 2: rowsWritten 11 → 7, rowsRead 16 → 7; n = 40: rowsRead 985 → 95, rowsWritten 182 → 102, drive jobs
  * 40 → 2 after the first. Rows read are still O(n²) in steps (each drive job reloads the whole journal), but the
- * journal is reloaded once per LOCAL_STEPS steps instead of once per step.
+ * journal is reloaded once per LOCAL_STEPS steps instead of once per step. `actions` n = 10 (PR 5c, actionStep):
+ * rowsRead 165 → 145, reads 21 → 11.
  */
-const BUDGET = { chain2Written: 7, chain2Read: 7, chain40Read: 95, chain40Written: 102 };
+const BUDGET = { chain2Written: 7, chain2Read: 7, chain40Read: 95, chain40Written: 102, actions10Read: 145 };
 
 function harness(opts: { app?: ReturnType<typeof appWith>; failMutation?: (name: string, n: number) => "before" | "after" | undefined } = {}) {
   let now = T0;
@@ -522,11 +575,12 @@ describe("workflows component", () => {
     expect(h.status(id)).toMatchObject({ status: "completed", result: [1, 2, 2] });
   });
 
-  test("no index without a reader: workflows.by_status and steps.by_event are gone (an index write each)", () => {
+  test("no index without a reader: steps.by_event is gone; workflows.by_status serves list", () => {
     const h = harness();
     const names = h.sql(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name LIKE 'workflows$%'`).map((r: any) => String(r.name));
     expect(names.some((n) => n.includes("by_workflow"))).toBe(true);
-    expect(names.filter((n) => n.includes("by_status") || n.includes("by_event"))).toEqual([]);
+    expect(names.filter((n) => n.includes("by_event"))).toEqual([]);
+    expect(names.filter((n) => n.includes("by_status"))).toEqual(["workflows$workflows__by_status"]);
   });
 
   test("cancel with a stale pendingJob (the action that already ran) cancels the next job only", async () => {
@@ -689,6 +743,207 @@ describe("workflows component", () => {
     expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
     expect(h.jobs()).toEqual([]);
     probe.flaky = 0;
+  });
+
+  test("parallel action steps: one batch, each step once, the last one to settle drives on", async () => {
+    probe.flaky = 0;
+    probe.remoteCalls = 0;
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "parallel" }) as string;
+    await h.tick(1); // the drive job records the batch: two runAction jobs
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@workflows/lib:runAction", "@workflows/lib:runAction"]);
+    const st = h.status(id);
+    expect(st).toMatchObject({ status: "running", stepCount: 2, current: { index: 0, kind: "action" } });
+    expect(st.parallel.map((s: any) => s.index)).toEqual([0, 1]);
+    await h.tick(1); // the first action settles: the other one is still running, so nothing replays further
+    expect(h.status(id)).toMatchObject({ status: "running", stepCount: 2, parallel: [{ index: 1 }] });
+    expect(h.counters.calls["@workflows/lib:actionDone"]).toBe(1);
+    await h.tick(); // the second one settles last: it replays and advances (the mutation), no lib:drive job
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 203, stepCount: 3 });
+    expect(h.sql(`SELECT v FROM saved`)).toEqual([{ v: 203 }]);
+    expect(probe.remoteCalls).toBe(2);
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
+    expect(h.sql(`SELECT "index", status, batchEnd, job IS NOT NULL AS hasJob FROM "workflows$steps" ORDER BY "index"`)).toEqual([
+      { index: 0, status: "done", batchEnd: 2, hasJob: 1 },
+      { index: 1, status: "done", batchEnd: 2, hasJob: 1 },
+      { index: 2, status: "done", batchEnd: null, hasJob: 0 },
+    ]);
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("parallel actions finishing at the same time (overlapping jobs): exactly one drives on", async () => {
+    probe.flaky = 0;
+    probe.remoteCalls = 0;
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "parallel" }) as string;
+    await h.tick(1);
+    const [a, b] = h.jobs();
+    h.jobs().splice(0);
+    // Both runAction jobs read the run before either settles: each replay sees the other still running.
+    await Promise.all([h.runJob(a!), h.runJob(b!)]);
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 203, stepCount: 3 });
+    expect(h.sql(`SELECT v FROM saved`)).toEqual([{ v: 203 }]);
+    expect(probe.remoteCalls).toBe(2);
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(2); // the start's, and the one the last settle schedules
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("a parallel action that fails retries on its own; duplicates of batch jobs are fenced out", async () => {
+    probe.flaky = 1;
+    probe.remoteCalls = 0;
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "parallel" }) as string;
+    const seen = new Set<string>();
+    for (let i = 0; i < 30 && h.jobs().length; i++) {
+      for (const j of h.jobs().filter((j) => j.fn.endsWith("lib:runAction") && !seen.has(j.id))) {
+        seen.add(j.id);
+        h.pushJob({ ...j, id: `${j.id}-dup` });
+        seen.add(`${j.id}-dup`);
+      }
+      h.advance(10);
+      await h.tick(1);
+    }
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 203, stepCount: 3 });
+    expect(h.sql(`SELECT v FROM saved`)).toEqual([{ v: 203 }]);
+    expect(h.sql(`SELECT "index", attempts FROM "workflows$steps" WHERE kind = 'action' ORDER BY "index"`)).toEqual([
+      { index: 0, attempts: 2 },
+      { index: 1, attempts: 1 },
+    ]);
+    expect(h.jobs()).toEqual([]);
+  });
+
+  test("parallel synchronous steps run inline in one transaction; branches continue as new batches", async () => {
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "parallelInline" }) as string;
+    await h.tick();
+    // d = 6; branch(6) = double(double(6) + 1) = 26; branch(10) = double(21) = 42
+    expect(h.status(id)).toMatchObject({ status: "completed", result: [6, 26, 42], stepCount: 6 });
+    expect(h.sql(`SELECT v FROM saved`)).toEqual([{ v: 7 }]);
+    expect(h.sql(`SELECT "index", name, batchEnd FROM "workflows$steps" ORDER BY "index"`)).toEqual([
+      { index: 0, name: "steps:double", batchEnd: 2 },
+      { index: 1, name: "steps:save", batchEnd: 2 },
+      { index: 2, name: "steps:double", batchEnd: 4 },
+      { index: 3, name: "steps:double", batchEnd: 4 },
+      { index: 4, name: "steps:double", batchEnd: 6 },
+      { index: 5, name: "steps:double", batchEnd: 6 },
+    ]);
+    expect(h.counters.calls["@workflows/lib:advance"]).toBe(4); // 3 batches + done, in the start's drive job
+    expect(h.counters.scheduled["@workflows/lib:drive"]).toBe(1);
+  });
+
+  test("parallel branches at different microtask depths replay batch by batch (no NonDeterminism)", async () => {
+    probe.flaky = 0;
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "uneven" }) as string;
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", result: [402, 103], stepCount: 5 });
+    expect(h.sql(`SELECT "index", name, batchEnd FROM "workflows$steps" ORDER BY "index"`)).toEqual([
+      { index: 0, name: "A1", batchEnd: 2 },
+      { index: 1, name: "B1", batchEnd: 2 },
+      { index: 2, name: "A2", batchEnd: 4 },
+      { index: 3, name: "B2", batchEnd: 4 },
+      { index: 4, name: "A3", batchEnd: null },
+    ]);
+  });
+
+  test("parallel sleep + event: sendEvent finds the waiting step in the batch; cancel cancels every pending job", async () => {
+    const h = harness();
+    const id = h.mutate("api:start", { flow: "parallelWait" }) as string;
+    await h.tick();
+    expect(h.jobs().map((j) => j.fn).sort()).toEqual(["@workflows/lib:wake", "@workflows/lib:wake"]);
+    expect(h.mutate("api:event", { id, event: "go", payload: 5 })).toBe(true);
+    expect(h.jobs().map((j) => j.fn)).toEqual(["@workflows/lib:wake"]); // the event's timeout is gone; the sleep stays
+    expect(h.status(id)).toMatchObject({ status: "running", parallel: [{ index: 0, kind: "sleep" }] });
+    h.advance(1000);
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "completed", result: 5 });
+
+    const h2 = harness();
+    const id2 = h2.mutate("api:start", { flow: "parallelWait" }) as string;
+    await h2.tick();
+    expect(h2.mutate("api:cancel", { id: id2 })).toBe(true);
+    expect(h2.jobs()).toEqual([]);
+    expect(h2.status(id2)).toMatchObject({ status: "canceled" });
+  });
+
+  test("a parallel batch counts every step against maxSteps", async () => {
+    const h = harness({ app: appWith(3) });
+    const id = h.mutate("api:start", { flow: "fanOut", args: { n: 4 } }) as string;
+    await h.tick();
+    expect(h.status(id)).toMatchObject({ status: "failed", error: "workflow exceeded 3 steps" });
+    const ok = harness({ app: appWith(4) });
+    const id2 = ok.mutate("api:start", { flow: "fanOut", args: { n: 4 } }) as string;
+    await ok.tick();
+    expect(ok.status(id2)).toMatchObject({ status: "completed", result: 406 });
+    expect(ok.counters.scheduled["@workflows/lib:runAction"]).toBe(4);
+  });
+
+  test("an action step reads the step and the journal once (actionStep): rows read per action step", async () => {
+    probe.flaky = 0;
+    const h = harness({ app: appWith(100) });
+    h.mutate("api:start", { flow: "actions", args: { n: 10 } });
+    h.resetCounters();
+    await h.tick();
+    // 10 actions + 10 mutations. Before (pendingStep, then load after the action): 165 rows read in 21 reads; now
+    // (actionStep, one read before the action): 145 rows in 11 reads, 2 rows and 1 read fewer per action step.
+    expect(h.counters.calls["@workflows/lib:actionStep"]).toBe(10);
+    expect(h.counters.calls["@workflows/lib:load"]).toBe(1); // the start's drive job only
+    expect(h.counters.rowsRead).toBeLessThanOrEqual(BUDGET.actions10Read);
+  });
+
+  test("list: workflows by status, newest first, paginated", async () => {
+    const h = harness();
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      ids.push(h.mutate("api:start", { flow: i % 2 ? "waitOnly" : "chain", args: { n: 1 } }) as string);
+      h.advance(1);
+    }
+    await h.tick();
+    const page = (status?: string, cursor: string | null = null) => h.engine.runQuery("@workflows/lib:list", { ...(status ? { status } : {}), paginationOpts: { numItems: 2, cursor } }).value as any;
+    const done = page("completed");
+    expect(done.page.map((w: any) => w.id)).toEqual([ids[4], ids[2]]);
+    expect(done.page[0]).toMatchObject({ status: "completed", stepCount: 1, result: 0 });
+    const rest = page("completed", done.continueCursor);
+    expect(rest.page.map((w: any) => w.id)).toEqual([ids[0]]);
+    expect(rest.isDone).toBe(true);
+    expect(page("running").page.map((w: any) => w.id)).toEqual([ids[3], ids[1]]);
+    expect(page().page.map((w: any) => w.id)).toEqual([ids[4], ids[3]]);
+  });
+
+  test("retentionMs deletes completed workflows (and their journal) after the retention; failed ones per failedRetentionMs", async () => {
+    const h = harness({ app: defineApp().use(workflows, { config: { retentionMs: 60_000 } }) });
+    const ok = h.mutate("api:start", { flow: "chain", args: { n: 3 } }) as string;
+    const bad = h.mutate("api:start", { flow: "catchy" }) as string;
+    const failing = h.mutate("api:start", { flow: "forever" }) as string; // fails at maxSteps
+    await h.tick();
+    expect(h.status(ok)).toMatchObject({ status: "completed" });
+    h.advance(59_999);
+    await h.tick();
+    expect(h.status(ok)).toMatchObject({ status: "completed" });
+    h.advance(1);
+    await h.tick();
+    expect(h.status(ok)).toBeNull();
+    expect(h.status(bad)).toBeNull(); // catchy completes (it catches the failed step)
+    expect(h.status(failing)).toMatchObject({ status: "failed" }); // no failedRetentionMs: kept
+    expect(h.sql(`SELECT COUNT(*) AS n FROM "workflows$steps" WHERE workflow IN ('${ok}', '${bad}')`)[0]!.n).toBe(0);
+
+    const h2 = harness({ app: defineApp().use(workflows, { config: { failedRetentionMs: 1000 } }) });
+    probe.flaky = 5;
+    let f: string;
+    try {
+      f = h2.mutate("api:start", { flow: "remoteOnly" }) as string;
+      await h2.tick();
+      h2.advance(10);
+      await h2.tick();
+    } finally {
+      probe.flaky = 0;
+    }
+    expect(h2.status(f)).toMatchObject({ status: "failed" });
+    h2.advance(1000);
+    await h2.tick();
+    expect(h2.status(f)).toBeNull();
   });
 
   test("the app cannot reach the component's internal loop functions", () => {

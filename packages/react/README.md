@@ -34,18 +34,47 @@ function Room({ roomId }: { roomId: Id<"rooms"> }) {
 
 | Hook | What it returns |
 |---|---|
-| `useQuery(ref, args?, { shard }?)` | the live value, `undefined` while loading or with `"skip"`; errors go to the nearest error boundary |
+| `useQuery(ref, args?, { shard?, select?, equals? }?)` | the live value (or `select(value)`), `undefined` while loading or with `"skip"`; errors go to the nearest error boundary |
 | `useQueryState(ref, args?)` | `{ status: "loading" \| "success" \| "error", data, error }` with the function's typed errors; never throws |
 | `useQuerySnapshot(ref, args?)` | the raw `QuerySnapshot` (`optimistic`, `source: "local" \| "cache"` included) |
 | `useSuspenseQuery(ref, args?)` | the value, suspending while loading (wrap in `<Suspense>`) |
-| `useMutation(ref)` | a stable function; `.withOptimisticUpdate(fn)`, `.safe(args)` (a `{ ok, value } \| { ok: false, error }` result) |
-| `useMutationState(ref)` | `{ mutate, isPending, data, error, reset }` for forms and buttons |
+| `useMutation(ref, { optimisticUpdate? }?)` | a stable function; `.withOptimisticUpdate(fn)`, `.safe(args)` (a `{ ok, value } \| { ok: false, error }` result) |
+| `useMutationState(ref, { optimisticUpdate? }?)` | `{ mutate, isPending, data, error, result, reset }` for forms and buttons (memoized) |
 | `useAction(ref)` | a function calling the action over HTTP; `.safe(args)` |
+| `useActionState(ref)` | `{ run, isPending, data, error, result, reset, reducer }`; `reducer` plugs into React 19's `useActionState` |
 | `usePaginatedQuery(ref, args, { initialNumItems })` | `{ results, status, isLoading, loadMore(n) }`; each page is its own live query |
-| `useConnectionState()` | online flag, per-shard socket state, unconfirmed mutations |
+| `useConnectionState(select?, equals?)` | online flag, per-shard socket state, unconfirmed mutations (or the part `select` picks) |
+| `<EmberHydrate state>` | hands `client.dehydrate()` (as is or `encodeJson`ed) to the client before its children render |
+| `usePreloadedQuery(preloaded)` | the live value of a `preloadQuery(client, ref, args)` / `fetchForHydration` result: the preloaded value at once, then live |
 | `useEmberClient()` | the `EmberClient` of the nearest `EmberProvider` |
 
 Functions declared with a named shard kind (`shard: "org"`) require `{ shard }` in the hook options; the types say so.
+
+### Selectors
+
+`select` renders a part of a value and re-renders only when that part changes:
+
+```tsx
+const doneCount = useQuery(api.todos.list, { list }, { select: (todos) => todos.filter((t) => t.done).length });
+const open = useQuery(api.todos.list, { list }, { select: (todos) => todos.filter((t) => !t.done) });
+const saving = useConnectionState((s) => s.pendingMutations > 0);
+```
+
+Two selections compare with `equals` (default `shallowEqual`: `Object.is`, or one level of an array / plain object).
+The client keeps the identity of rows that did not change, so a filtered array of rows compares equal while none of
+its rows changed. An inline selector is fine.
+
+### Actions and forms
+
+```tsx
+const summarize = useActionState(api.ai.summarize);
+<button disabled={summarize.isPending} onClick={() => summarize.run({ text })}>Summarize</button>;
+{summarize.error?.kind === "app" && <p>{summarize.error.message}</p>}
+// React 19: const [result, dispatch, pending] = useActionState(summarize.reducer, null);
+```
+
+`useMutationState(api.todos.add, { optimisticUpdate: (store, args) => ... })` applies the update on every call; the
+latest (inline) function runs, and `mutate` keeps its identity.
 
 ## Limits
 
@@ -72,6 +101,21 @@ const state = encodeJson(client.dehydrate());
 client.hydrate(...(decodeJson(state) as HydratedQuery[]));
 hydrateRoot(root, <EmberProvider client={client}><App /></EmberProvider>);
 ```
+`<EmberHydrate state={state}>` does the `hydrate()` step in React (before its children render, so a client component
+tree is enough), and `usePreloadedQuery` takes one preloaded query:
+
+```tsx
+// server (a loader, a server component)
+const todos = await preloadQuery(serverClient, api.todos.list, { list });
+// browser
+function Todos({ todos }: { todos: Preloaded<typeof api.todos.list> }) {
+  const list = usePreloadedQuery(todos); // never undefined; live after the first render
+}
+```
+
+A preload the client refuses (read for another identity than the one signed in now) is not shown:
+`usePreloadedQuery` then suspends until the live value comes.
+
 - For TanStack Query, use `@freecorps/ember-react-query`; for Expo / React Native, `@freecorps/ember-react-native`
   (it re-exports these hooks).
 

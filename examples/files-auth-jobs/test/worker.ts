@@ -4,6 +4,7 @@ import { authOutbox, createEmberWorker } from "@freecorps/ember-runtime";
 import { authReplicaSpec } from "@freecorps/ember-auth";
 import { emberAuth } from "@freecorps/ember-auth/worker";
 import { emberAuthLazy } from "@freecorps/ember-auth/lazy";
+import app from "../ember/ember.config.ts";
 import authConfig from "../ember/auth.config.ts";
 import crons from "../ember/crons.ts";
 import createEngine from "@freecorps/ember-server";
@@ -48,6 +49,8 @@ export const clock = { skew: 0 };
 export default createEmberWorker({
   schema,
   functions: { files, orgs, rates, users, testing },
+  // ember/ember.config.ts: the app's dashboard screens (dashboard.test.ts).
+  app,
   crons,
   auth,
   replicas: outbox.replicas,

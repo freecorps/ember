@@ -43,10 +43,28 @@ export {
   type Usage,
 } from "./component.ts";
 export { Agent, tool, type AgentComponentApi, type AgentOptions, type AgentTool, type ToolCtx, type SendMessageArgs, type UsageEvent, type ListMessagesArgs, type ListMessagesResult, type StreamArgs } from "./agent.ts";
-export { defineModel, mockModel, usageOf, type AgentModel, type ModelEvent, type ModelMessage, type ModelPart, type ModelRequest, type ModelToolSpec, type GenerateResult, type MockStep } from "./model.ts";
+export {
+  defineModel,
+  mockModel,
+  usageOf,
+  withRetry,
+  isRetryableError,
+  errorStatus,
+  retryAfterMs,
+  type AgentModel,
+  type ModelEvent,
+  type ModelMessage,
+  type ModelPart,
+  type ModelRequest,
+  type ModelToolSpec,
+  type GenerateResult,
+  type MockStep,
+  type RetryOptions,
+} from "./model.ts";
+export { generateObject, parseJsonAnswer, modelJsonSchema, ObjectGenerationError, type ObjectSchema, type SchemaType, type GenerateObjectOptions, type GenerateObjectResult } from "./object.ts";
 export { workersAi, toWorkersAiMessages, type WorkersAiBinding, type WorkersAiOptions } from "./workers-ai.ts";
 export { aiSdk, isLanguageModel, toAiSdkPrompt, type LanguageModelLike } from "./ai-sdk.ts";
-export { withStreams, streamedTexts, type UIMessage } from "./streams.ts";
+export { withStreams, streamedTexts, streamed, type UIMessage } from "./streams.ts";
 
 /** `streamArgs` of the app's messages query (what `useThreadMessages` sends). */
 export const vStreamArgs = streamArgsValidator;

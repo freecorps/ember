@@ -14,8 +14,8 @@ Peer dependencies: `@tanstack/react-query`, `react`.
 
 ```tsx
 import { EmberClient } from "@freecorps/ember-client";
-import { EmberQueryClient, emberMutation, emberQuery } from "@freecorps/ember-react-query";
-import { QueryClient, useMutation, useQuery } from "@tanstack/react-query";
+import { EmberQueryClient, emberAction, emberMutation, emberPaginatedQuery, emberQuery } from "@freecorps/ember-react-query";
+import { QueryClient, useInfiniteQuery, useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "../ember/_generated/api";
 
 const ember = new EmberClient({ url, defaultShard: "global:main" });
@@ -25,6 +25,8 @@ new EmberQueryClient(ember).connect(queryClient);   // ember-aware key hash + fo
 function Messages({ roomId }: { roomId: Id<"rooms"> }) {
   const { data } = useQuery(emberQuery(api.messages.list, { roomId, paginationOpts: { numItems: 20, cursor: null } }));
   const send = useMutation(emberMutation(api.messages.send)); // send.error is EmberErrorOf<typeof api.messages.send>
+  const summarize = useMutation(emberAction(api.ai.summarize));  // an action, same typing
+  const feed = useInfiniteQuery(emberPaginatedQuery(api.messages.page, { roomId }, { numItems: 20 })); // feed.fetchNextPage()
   // ...
 }
 ```
@@ -37,6 +39,11 @@ function Messages({ roomId }: { roomId: Id<"rooms"> }) {
 - `emberQuery(ref, args | "skip", { shard }?)`: `queryOptions` under the key `["ember", shard | null, "module:fn", args]`,
   `staleTime: Infinity`.
 - `emberMutation(ref, opts?)` (full `useMutation` options) and `emberMutationFn(ref, opts?)` (just the `mutationFn`).
+- `emberAction(ref, { shard }?)`: `useMutation` options for an action (`POST /api/action`), typed variables, result
+  and `EmberErrorOf` errors; `emberActionFn` is just its `mutationFn`.
+- `emberPaginatedQuery(ref, args | "skip", { numItems, shard? })`: `infiniteQueryOptions` over Ember's cursor
+  pagination for `useInfiniteQuery`: the first page has `cursor: null`, `fetchNextPage` starts at `continueCursor`,
+  `hasNextPage` is `!isDone`. Key `["ember:paginated", shard | null, "module:fn", args, numItems]`.
 - SSR: `prefetchEmberQuery(queryClient, client, ref, args)` and `emberQueryOneShot(client, ref, args)` fetch over HTTP
   (`POST /api/query`); after hydration the browser's subscription resumes from that value instead of downloading it
   again (`emberHydrationKey`).
@@ -50,8 +57,15 @@ function Messages({ roomId }: { roomId: Id<"rooms"> }) {
   with another reference does not reroute it). A key restored from a persisted cache routes with the reference of an
   observer's `emberQuery`, else the last one seen for that function name, else on the key's shard (or the client's
   `defaultShard`).
-- Paginated live queries with stable pages are `usePaginatedQuery` in `@freecorps/ember-react`; here a paginated query
-  is one TanStack query per page arguments.
+- `emberAction` and `emberPaginatedQuery` route like every other call: `{ shard }`, else the reference's own routing
+  (`fromArg`, `fromAuth`), else the client's `defaultShard`.
+- `emberPaginatedQuery` pages are one-shot reads (the socket when one is open, else HTTP), not live: refetch or
+  invalidate the key to see new rows (TanStack reads every loaded page again from its cursor). Paginated live queries
+  with stable pages are `usePaginatedQuery` in `@freecorps/ember-react`.
+- Sign-out or account switch on the same `QueryClient` (`setAuth` replacing a source in use, `clearAuth`, or the token
+  source answering for someone else): `ember:paginated` queries are reset (observed ones load page 1 again as the new
+  identity) and Ember queries nobody observes are removed, so nothing read for the previous identity is shown.
+- Needs `@tanstack/react-query` 5.89.0 or later (`emberAction` reads the `QueryClient` from the `mutationFn` context).
 
 Contracts: [`docs/design/contracts.md`](https://github.com/freecorps/ember/blob/main/docs/design/contracts.md) (in
 Portuguese), "Protocolo WS v1". Tests with usage: [`packages/react-query/test`](https://github.com/freecorps/ember/tree/main/packages/react-query/test).
