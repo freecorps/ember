@@ -1,7 +1,7 @@
 // `ember shards ls` (registry catalog) and `ember shards inspect` (status + data + inspect admin endpoints).
 import { describe, expect, it } from "vitest";
 import { D1Registry } from "../src/registry.ts";
-import { AdminApiError, bytes, formatShardList, formatShardReport, inspectShard, listShards } from "../src/shards.ts";
+import { AdminApiError, bytes, catalogShards, CatalogUnavailableError, formatShardList, formatShardReport, inspectShard, listShards } from "../src/shards.ts";
 import { fakeAccount } from "./fake-account.ts";
 
 const V = "a".repeat(64);
@@ -90,5 +90,52 @@ describe("ember shards", () => {
     const down = (async () => new Response(JSON.stringify({ ok: false, error: { code: "unauthorized", message: "bad token" } }), { status: 401 })) as typeof fetch;
     await expect(inspectShard({ url: "http://localhost:8787", adminToken: "x", fetch: down }, "global:main")).rejects.toBeInstanceOf(AdminApiError);
     await expect(inspectShard({ url: "http://example.com", adminToken: "adm", fetch: w.fetchImpl }, "global:main")).rejects.toThrow(/http/);
+  });
+
+  it("ls: an account without a registry, or a registry without the shard catalog, is a clear error, not a raw one", async () => {
+    const cf = fakeAccount();
+    // No ember-registry D1 at all (what D1Registry.open says with create: false).
+    const none = catalogShards(() => D1Registry.open(cf.client, "ember-registry", { create: false, ddl: false }), "chat", "prod");
+    await expect(none).rejects.toBeInstanceOf(CatalogUnavailableError);
+    await expect(none).rejects.toThrow(/no registry \(ember-registry\) yet.*ember deploy --env prod/);
+    // A registry that predates the catalog: no `shards` table.
+    const old = catalogShards(async () => ({ exec: async () => Promise.reject(new Error("D1 query: no such table: shards: SQLITE_ERROR")) }), "chat", "prod", { registry: "my-reg" });
+    await expect(old).rejects.toThrow(/my-reg has no shard catalog yet/);
+    // Any other failure stays as it is.
+    await expect(catalogShards(async () => Promise.reject(new Error("Authentication error")), "chat", "prod")).rejects.toThrow(/^Authentication error$/);
+    const reg = await D1Registry.open(cf.client, "ember-registry");
+    expect(await catalogShards(async () => reg, "chat", "prod")).toEqual([]);
+  });
+
+  it("inspect: reports the requested shard's status, never another entry of the answer", async () => {
+    const w = fakeWorker();
+    const other = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname !== "/api/_ember/status") return w.fetchImpl(input, init);
+      const entry = (shard: string, version: number) => ({ shard, expectedVersion: V, schemaVersion: V, ready: true, staged: [], migrationError: null, version, databaseSize: 1 });
+      return new Response(JSON.stringify({ ok: true, expectedVersion: V, shards: [entry("global:main", 1), entry("org:acme", 7)], restores: [] }));
+    }) as typeof fetch;
+    expect((await inspectShard({ url: "http://127.0.0.1:8787", adminToken: "adm", fetch: other }, "org:acme")).status.version).toBe(7);
+    const missing = (async (input: string | URL | Request, init?: RequestInit) =>
+      new URL(String(input)).pathname === "/api/_ember/status" ? new Response(JSON.stringify({ ok: true, expectedVersion: V, shards: [{ shard: "global:main" }], restores: [] })) : w.fetchImpl(input, init)) as typeof fetch;
+    await expect(inspectShard({ url: "http://127.0.0.1:8787", adminToken: "adm", fetch: missing }, "org:acme")).rejects.toThrow(/no status for org:acme/);
+  });
+
+  it("inspect: every admin call has a deadline; a stalled optional call is an error of its own, a stalled status fails", async () => {
+    const w = fakeWorker();
+    const never = new Promise<Response>(() => {});
+    const stallData = (async (input: string | URL | Request, init?: RequestInit) => (new URL(String(input)).pathname === "/api/_ember/data" ? never : w.fetchImpl(input, init))) as typeof fetch;
+    const t0 = Date.now();
+    const r = await inspectShard({ url: "http://127.0.0.1:8787", adminToken: "adm", fetch: stallData, timeoutMs: 50 }, "org:acme");
+    expect(Date.now() - t0).toBeLessThan(5000);
+    expect(r.tables).toBeNull();
+    expect(r.tablesError).toMatch(/no answer within 0\.05 s/);
+    expect(r.live).not.toBeNull();
+    // A body that never ends counts too.
+    const stallBody = (async (input: string | URL | Request, init?: RequestInit) =>
+      new URL(String(input)).pathname === "/api/_ember/status" ? new Response(new ReadableStream({ start() {} })) : w.fetchImpl(input, init)) as typeof fetch;
+    const err = await inspectShard({ url: "http://127.0.0.1:8787", adminToken: "adm", fetch: stallBody, timeoutMs: 50 }, "org:acme").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AdminApiError);
+    expect((err as AdminApiError).code).toBe("timeout");
   });
 });

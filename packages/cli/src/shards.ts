@@ -9,7 +9,12 @@ export interface AdminTarget {
   url: string;
   adminToken: string;
   fetch?: typeof fetch;
+  /** Deadline of one call, response body included (default `ADMIN_TIMEOUT_MS`). */
+  timeoutMs?: number;
 }
+
+/** How long one admin call may take before it fails (a stalled Worker never hangs the CLI or `ember mcp`). */
+export const ADMIN_TIMEOUT_MS = 20_000;
 
 /** An admin endpoint's error: `code` is the runtime's (`bad_shard`, `RuntimeSchemaTooNew`...) or the HTTP status. */
 export class AdminApiError extends Error {
@@ -25,12 +30,27 @@ export class AdminApiError extends Error {
 
 /** One admin call (JSON in, JSON out); a non-2xx answer or `{ ok: false }` throws `AdminApiError`. */
 export async function adminRequest<T>(t: AdminTarget, method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
-  const res = await (t.fetch ?? fetch)(apiUrl(checkCredentialUrl(t.url), path), {
-    method,
-    headers: { authorization: `Bearer ${t.adminToken}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-  });
-  const text = await res.text();
+  const url = apiUrl(checkCredentialUrl(t.url), path);
+  const ms = t.timeoutMs ?? ADMIN_TIMEOUT_MS;
+  // One deadline for the request and its body: the signal aborts a stalled body read too.
+  const signal = AbortSignal.timeout(ms);
+  let res: Response;
+  let text: string;
+  try {
+    res = await abortable(
+      (t.fetch ?? fetch)(url, {
+        method,
+        headers: { authorization: `Bearer ${t.adminToken}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        signal,
+      }),
+      signal,
+    );
+    text = await abortable(res.text(), signal);
+  } catch (e) {
+    if (signal.aborted) throw new AdminApiError(`${method} ${path}: no answer within ${ms / 1000} s`, "timeout", 0);
+    throw e;
+  }
   let parsed: { ok?: boolean; error?: { code?: string; message?: string } } & Record<string, unknown>;
   try {
     parsed = JSON.parse(text) as typeof parsed;
@@ -42,6 +62,19 @@ export async function adminRequest<T>(t: AdminTarget, method: "GET" | "POST", pa
     throw new AdminApiError(`${method} ${path}: ${code}: ${parsed.error?.message ?? text.slice(0, 200)}`, code, res.status);
   }
   return parsed as T;
+}
+
+/** `p`, or a rejection when `signal` aborts first (a fetch that ignores its signal still cannot outlive the deadline). */
+function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason as Error);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason as Error);
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => (signal.removeEventListener("abort", onAbort), resolve(v)),
+      (e: unknown) => (signal.removeEventListener("abort", onAbort), reject(e as Error)),
+    );
+  });
 }
 
 /** A shard as the registry catalog has it (the shard reports itself after writes: PLAN §21). */
@@ -76,6 +109,41 @@ export async function listShards(exec: (sql: string, ...params: unknown[]) => Pr
     lastWrite: num(r.last_write),
     reportedAt: Number(r.reported_at ?? 0),
   }));
+}
+
+/** The registry catalog cannot be read: the account has no registry yet, or it predates the shard catalog. */
+export class CatalogUnavailableError extends Error {
+  override name = "CatalogUnavailableError";
+}
+
+/**
+ * `listShards` on a registry opened on demand, with a readable error when there is nothing to read: no `ember-registry`
+ * D1 in the account (never deployed with the registry on) or no `shards` table in it (nothing reported yet).
+ */
+export async function catalogShards(
+  open: () => Promise<{ exec(sql: string, ...params: unknown[]): Promise<Row[]> }>,
+  project: string,
+  env: string,
+  o: { kind?: string; registry?: string } = {},
+): Promise<CatalogShard[]> {
+  const name = o.registry ?? "ember-registry";
+  let reg: { exec(sql: string, ...params: unknown[]): Promise<Row[]> };
+  try {
+    reg = await open();
+  } catch (e) {
+    if (/registry D1 database .* not found/.test((e as Error).message)) {
+      throw new CatalogUnavailableError(`the account has no registry (${name}) yet, so there is no shard catalog: \`ember deploy --env ${env}\` creates it, and each shard reports itself after its first writes`);
+    }
+    throw e;
+  }
+  try {
+    return await listShards((sql, ...p) => reg.exec(sql, ...p), project, env, o.kind ? { kind: o.kind } : {});
+  } catch (e) {
+    if (/no such table: shards/.test((e as Error).message)) {
+      throw new CatalogUnavailableError(`the registry ${name} has no shard catalog yet (it was created by an older ember): \`ember deploy --env ${env}\` adds it, and each shard reports itself after its first writes`);
+    }
+    throw e;
+  }
 }
 
 /** `12.3 KiB`. */
@@ -170,7 +238,8 @@ export async function inspectShard(t: AdminTarget, shard: string): Promise<Shard
     adminRequest<{ shard: RawInspection }>(t, "GET", `/api/_ember/inspect?shard=${q}`),
   ]);
   if (status.status === "rejected") throw status.reason;
-  const s = status.value.shards[0];
+  // Only the requested shard's entry: never another shard's versions under this name.
+  const s = status.value.shards.find((x) => x.shard === shard);
   if (!s) throw new AdminApiError(`GET /api/_ember/status: no status for ${shard}`, "not_found", 404);
   const err = (r: PromiseSettledResult<unknown>) => (r.status === "rejected" ? (r.reason as Error).message : undefined);
   const i = live.status === "fulfilled" ? live.value.shard : null;

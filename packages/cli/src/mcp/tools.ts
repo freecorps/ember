@@ -17,7 +17,7 @@ import { streamLogs, type StreamLogsOptions } from "../logs.ts";
 import { D1Registry, registryName } from "../registry.ts";
 import { DEFAULT_SHARD, normalizeFnName, resolveBaseUrl } from "../run.ts";
 import { apiUrl } from "../secure-url.ts";
-import { adminRequest, formatShardList, formatShardReport, inspectShard, listShards, table, type AdminTarget } from "../shards.ts";
+import { adminRequest, catalogShards, CatalogUnavailableError, formatShardList, formatShardReport, inspectShard, table, type AdminTarget } from "../shards.ts";
 import { ToolError, type JsonSchema, type McpTool, type ToolOutput } from "./server.ts";
 
 /** The environment name that means the running `ember dev` of this project. */
@@ -317,8 +317,9 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
           return out(formatShardReport(r), { env: t.env, ...r });
         }
         const env = deployedOnly(a.env as string | undefined, "The shard catalog and its sizes");
-        const reg = await registry(env);
-        const shards = await listShards((sql, ...p) => reg.exec(sql, ...p), project.config.project, env, a.kind ? { kind: a.kind as string } : {});
+        const shards = await catalogShards(() => registry(env), project.config.project, env, a.kind ? { kind: a.kind as string } : {}).catch((e: Error) => {
+          throw e instanceof CatalogUnavailableError ? new ToolError(e.message) : e;
+        });
         return out(formatShardList(shards), { env, shards });
       },
     },

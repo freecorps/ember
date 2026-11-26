@@ -28,7 +28,7 @@ import { exportEmber, importEmber } from "./export.ts";
 import { rotateKeys, type RotateKind } from "./keys.ts";
 import { filesOrphans, parseDuration } from "./files.ts";
 import { destroy } from "./destroy.ts";
-import { formatShardList, formatShardReport, inspectShard, listShards } from "./shards.ts";
+import { catalogShards, CatalogUnavailableError, formatShardList, formatShardReport, inspectShard, type CatalogShard } from "./shards.ts";
 import { checkEnvArgs, DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
 
 const HELP = `ember <command> [options]
@@ -508,8 +508,17 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       if ((sub ?? "ls") === "ls") {
         if (values.url) throw new Error("shards ls reads the registry catalog of an environment: pass --env, not --url");
         const env = resolveEnv(project, values.env);
-        const reg = await D1Registry.open(accountClient(project, undefined, env.name), registryName(values.registry), { create: false, ddl: false });
-        const shards = await listShards((sql, ...p) => reg.exec(sql, ...p), project.config.project, env.name, values.kind ? { kind: values.kind } : {});
+        let shards: CatalogShard[];
+        try {
+          shards = await catalogShards(() => D1Registry.open(accountClient(project, undefined, env.name), registryName(values.registry), { create: false, ddl: false }), project.config.project, env.name, {
+            registry: registryName(values.registry),
+            ...(values.kind ? { kind: values.kind } : {}),
+          });
+        } catch (e) {
+          if (!(e instanceof CatalogUnavailableError)) throw e;
+          console.error(`ember shards ls: ${e.message}`);
+          return 1;
+        }
         console.log(values.json ? JSON.stringify(shards, null, 2) : formatShardList(shards));
         return 0;
       }
