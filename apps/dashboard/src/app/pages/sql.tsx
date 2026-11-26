@@ -4,7 +4,7 @@
 // is a textarea with a small completer (tables, their columns, keywords) fed by `/api/schema`: no editor library.
 // Results are rendered as text and exported client-side (CSV, JSON).
 
-import { useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { api, ApiError, path } from "../api.ts";
 import { download, toCsv, toJson } from "../export.ts";
 import { fmtNum, text } from "../format.ts";
@@ -95,6 +95,13 @@ export function SqlExplorer({ project, env, shard }: { project: string; env: str
   const [result, setResult] = useState<{ value: SqlResult; at: number; roundTrip: number } | null>(null);
   const [menu, setMenu] = useState<{ from: number; items: Completion[]; active: number } | null>(null);
   const editor = useRef<HTMLTextAreaElement>(null);
+  /** The blur's delayed close (a click on a completion lands first): cleared when the editor is back or a menu opens. */
+  const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelBlur = () => {
+    if (blurTimer.current !== null) clearTimeout(blurTimer.current);
+    blurTimer.current = null;
+  };
+  useEffect(() => cancelBlur, []);
 
   const run = async () => {
     if (busy || !s.isAdmin || !value.trim()) return;
@@ -115,13 +122,15 @@ export function SqlExplorer({ project, env, shard }: { project: string; env: str
   };
 
   const suggest = (textValue: string, caret: number) => {
+    cancelBlur();
     const c = completionsAt(textValue, caret, tables, extra);
     setMenu(c.items.length ? { ...c, active: 0 } : null);
   };
   const accept = (c: Completion) => {
     const el = editor.current;
     const caret = el?.selectionStart ?? value.length;
-    const from = menu?.from ?? caret;
+    // The word being completed is the one at the caret now (it may have moved since the menu opened).
+    const from = completionsAt(value, caret, tables, extra).from;
     const next = value.slice(0, from) + c.insert + value.slice(caret);
     setSql(next);
     setMenu(null);
@@ -191,7 +200,11 @@ export function SqlExplorer({ project, env, shard }: { project: string; env: str
             suggest(e.target.value, e.target.selectionStart);
           }}
           onKeyDown={onKey}
-          onBlur={() => setTimeout(() => setMenu(null), 150)}
+          onFocus={cancelBlur}
+          onBlur={() => {
+            cancelBlur();
+            blurTimer.current = setTimeout(() => setMenu(null), 150);
+          }}
         />
         {menu && (
           <ul className="options sql-completions" id="sql-completions" role="listbox" aria-label="Completions">

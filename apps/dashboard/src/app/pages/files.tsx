@@ -168,13 +168,13 @@ function FileDialog({ project, env, shard, file, onClose, onDeleted }: { project
             <dt>Type</dt>
             <dd className="mono">{file.content_type ?? "—"}</dd>
             <dt>Size</dt>
-            <dd>{fmtBytes(file.size)}</dd>
+            <dd>{file.sha256 ? fmtBytes(file.size) : "—"}</dd>
             <dt>State</dt>
             <dd>{file.state}</dd>
             <dt>References</dt>
-            <dd>{fmtNum(file.refcount)}</dd>
+            <dd>{file.sha256 ? fmtNum(file.refcount) : "—"}</dd>
             <dt>sha256</dt>
-            <dd className="mono small">{file.sha256}</dd>
+            <dd className="mono small">{file.sha256 || "—"}</dd>
           </dl>
           <div className="preview">
             {error ? (

@@ -20,7 +20,8 @@ export function SchemaExplorer({ project, env, shard }: { project: string; env: 
   if (schema.error) return <Problem error={schema.error} onRetry={schema.reload} />;
   if (!schema.data) return <Loading lines={6} />;
   const rows = new Map((counts.data?.tables ?? []).map((t) => [t.name, t.rows]));
-  const staged = status.data?.shards[0]?.staged ?? null;
+  // `/api/status?shard=` answers that shard alone; picked by name all the same.
+  const staged = status.data?.shards.find((x) => x.shard === shard)?.staged ?? null;
   const tables = schema.data.tables.filter((t) => !q || t.name.toLowerCase().includes(q.toLowerCase()) || Object.keys(t.document.fields).some((f) => f.toLowerCase().includes(q.toLowerCase())));
   return (
     <div className="schema">
