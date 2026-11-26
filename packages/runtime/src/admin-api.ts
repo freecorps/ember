@@ -5,7 +5,7 @@
 // front of an older runtime shows "update the runtime" instead of failing on a 404. A runtime without this endpoint
 // is level 1 (the endpoints listed in `LEGACY_ADMIN_FEATURES` of the dashboard).
 
-import { errorCodesOf, fileKey, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
+import { errorCodesOf, fileKey, type DashboardManifest, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
 import { ORPHAN_PAGE_MAX, type OrphanSweepOptions, type OrphanSweepPage } from "./files.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
@@ -13,9 +13,10 @@ import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
 import { revokeMatchError, type RevokeMatch } from "./shard.ts";
 import { readLimited } from "./body.ts";
 import { parse } from "./wire.ts";
+import { validate, withDefaults } from "@freecorps/ember-values";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 12;
+export const ADMIN_API_LEVEL = 13;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -75,6 +76,11 @@ export const ADMIN_FEATURES = [
   "preflight",
   // level 12: objects of the files bucket that no `_files` row references (`ember files orphans`)
   "files/orphans",
+  // level 13: declarative screens of the app and its components (`defineApp/defineComponent({ dashboard })`): the specs,
+  // and running only the functions a spec names (queries apart from writes, so the dashboard's read role stays read-only)
+  "dashboards",
+  "dashboards/query",
+  "dashboards/run",
 ] as const;
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
@@ -327,6 +333,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     const status = reply.ok ? 200 : statusOf(reply.error.code) === 409 ? 409 : 400;
     return deps.json({ ...reply, ms, type: info.type, as: identity ? identity.subject : null }, status);
   }
+  if (url.pathname === "/api/_ember/dashboards" || url.pathname === "/api/_ember/dashboards/query" || url.pathname === "/api/_ember/dashboards/run") return handleDashboards(request, url, deps);
   const ops = await handleOps(request, url, deps, reply);
   if (ops) return ops;
   if (url.pathname.startsWith("/api/_ember/import/")) return handleImport(request, url, deps);
@@ -350,6 +357,74 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     return reply(await deps.stub(shard).mutation(shard, `${ADMIN_MODULE}:${fn}`, args, null, true));
   }
   return null;
+}
+
+/** Largest `args` of a dashboard query (JSON in the query string). */
+const DASHBOARD_ARGS_MAX = 8192;
+
+/**
+ * Declarative screens (contracts.md "Telas declarativas"). `GET dashboards`: the specs (app first, then each
+ * install). `GET dashboards/query?dashboard&fn&shard&args` runs a query the spec names; `POST dashboards/run
+ * {dashboard, fn, args, shard}` a mutation or action it names. Any other function is refused (even an internal one of
+ * the same component), and so is a query through `run` or a write through `query`: the dashboard maps its read role to
+ * `query` alone. Args are checked by the function's validators before it runs. A `global` spec runs on `global:main`.
+ */
+async function handleDashboards(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
+  const specs = deps.config.dashboards ?? [];
+  if (url.pathname === "/api/_ember/dashboards") {
+    if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
+    return deps.json({ ok: true, dashboards: specs });
+  }
+  const isQuery = url.pathname.endsWith("/query");
+  if (request.method !== (isQuery ? "GET" : "POST")) return deps.error(405, "method_not_allowed", `use ${isQuery ? "GET" : "POST"}`);
+  let input: { dashboard: unknown; fn: unknown; shard: unknown; args: unknown };
+  if (isQuery) {
+    const q = url.searchParams;
+    const raw = q.get("args") ?? "{}";
+    if (raw.length > DASHBOARD_ARGS_MAX) return deps.error(413, "too_large", `args up to ${DASHBOARD_ARGS_MAX} characters`);
+    let args: unknown;
+    try {
+      args = parse(raw);
+    } catch {
+      return deps.error(400, "bad_request", "args must be a JSON object");
+    }
+    input = { dashboard: q.get("dashboard"), fn: q.get("fn"), shard: q.get("shard") ?? undefined, args };
+  } else {
+    const b = await jsonBody(request);
+    if (!b) return deps.error(400, "bad_request", "body must be a JSON object { dashboard, fn, args, shard }");
+    input = { dashboard: b.dashboard, fn: b.fn, shard: b.shard, args: b.args ?? {} };
+  }
+  const spec: DashboardManifest | undefined = typeof input.dashboard === "string" ? specs.find((d) => d.key === input.dashboard) : undefined;
+  if (!spec) return deps.error(404, "unknown_dashboard", `no dashboard ${JSON.stringify(input.dashboard)} (the app's is "", a component's is its install name)`);
+  const name = typeof input.fn === "string" ? input.fn : "";
+  const declared = Object.hasOwn(spec.functions, name) ? spec.functions[name]! : undefined;
+  if (!declared) return deps.error(403, "not_in_dashboard", `${JSON.stringify(name)} is not a function the ${spec.key ? `${spec.key} ` : "app's "}dashboard runs`);
+  if (isQuery !== (declared.type === "query")) {
+    return deps.error(403, "not_in_dashboard", isQuery ? `${name} is a ${declared.type}: it runs through dashboards/run` : `${name} is a query: it runs through dashboards/query`);
+  }
+  let shard = typeof input.shard === "string" && input.shard ? input.shard : "global:main";
+  if (spec.scope === "global") {
+    if (shard !== "global:main") return deps.error(400, "bad_shard", `the ${spec.key || "app"} dashboard runs on global:main only (scope "global")`);
+    shard = "global:main";
+  }
+  if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(input.shard)}`);
+  const args = input.args;
+  if (typeof args !== "object" || args === null || Array.isArray(args)) return deps.error(400, "bad_request", "args must be an object");
+  // The function's own validators (ids as strings: the engine checks their table when it runs).
+  const checked = validate(declared.args, withDefaults(declared.args, args));
+  if (!checked.ok) return deps.json({ ok: false, error: { code: "ValidationError", message: `${name}: ${checked.message}${checked.path ? ` at ${checked.path}` : ""}` } }, 400);
+  const t0 = performance.now();
+  const out =
+    declared.type === "action"
+      ? await deps.runAction(name, args, shard, null)
+      : declared.type === "query"
+        ? await deps.stub(shard).query(shard, name, args, null, true)
+        : await deps.stub(shard).mutation(shard, name, args, null, true);
+  const ms = performance.now() - t0;
+  const { metrics: _m, ...reply } = out as AdminOutcome & { metrics?: unknown };
+  // As `run`: a refused shard is a 409; any other failure is the function's own (400).
+  const status = reply.ok ? 200 : statusOf(reply.error.code) === 409 ? 409 : 400;
+  return deps.json({ ...reply, ms, type: declared.type, shard }, status);
 }
 
 /**

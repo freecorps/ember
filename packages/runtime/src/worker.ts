@@ -322,6 +322,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
     ...(composed.crons.length ? { crons: [...cronList(input.crons), ...composed.crons] } : {}),
     componentQueues: composed.queues,
     emailHooks: composed.email,
+    dashboards: composed.dashboards,
   };
   setEmberConfig(config);
   const kinds = knownShardKinds(config);

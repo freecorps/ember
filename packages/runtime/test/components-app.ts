@@ -18,6 +18,7 @@ import {
   queryGeneric,
   anyComponents as components,
   actionGeneric,
+  makeFunctionReference,
   v,
 } from "@freecorps/ember-server";
 import { MINUTE, rateLimit, RateLimiter } from "@freecorps/ember-rate-limit";
@@ -45,12 +46,7 @@ const hooks = {
   }),
 };
 
-export const tally = defineComponent({
-  name: "tally",
-  schema,
-  config: v.object({ label: v.string() }),
-  functions: {
-    lib: {
+const tallyLib = {
       bump: c.mutation({ args: { key: v.string(), by: v.number() }, handler: (ctx, a) => bump(ctx, a.key, a.by) }),
       get: c.query({ args: { key: v.string() }, handler: (ctx, { key }) => ctx.db.query("tallies").withIndex("by_key", (q) => q.eq("key", key)).unique()?.n ?? 0 }),
       /** Schedules its own internal mutation (relative name), and optionally an app callback (handle). */
@@ -80,8 +76,34 @@ export const tally = defineComponent({
       /** Tries to reach an app function by name from the component: must not resolve. */
       reachApp: c.action({ args: {}, handler: async (ctx) => ctx.runQuery("components:count" as any, { key: "x" }) }),
       label: c.query({ args: {}, handler: (ctx) => ctx.component.config.label }),
-    },
-    hooks,
+      /** Dashboard screens (dashboards.test.ts): every tally, and a reset. */
+      list: c.query({ args: { min: v.optional(v.number()) }, handler: (ctx, { min }) => ctx.db.query("tallies").collect().filter((t) => t.n >= (min ?? 0)) }),
+      reset: c.mutation({ args: { key: v.string() }, handler: (ctx, { key }) => {
+        const row = ctx.db.query("tallies").withIndex("by_key", (q) => q.eq("key", key)).unique();
+        if (row) ctx.db.delete(row._id);
+        return !!row;
+      } }),
+};
+
+export const tally = defineComponent({
+  name: "tally",
+  schema,
+  config: v.object({ label: v.string() }),
+  functions: { lib: tallyLib, hooks },
+  dashboard: {
+    label: "Tallies",
+    icon: "gauge",
+    tabs: [
+      {
+        id: "all",
+        label: "All",
+        blocks: [
+          { kind: "stats", id: "dash", query: tallyLib.get, args: { key: "dash" }, items: [{ label: "dash", path: "", format: "number" }] },
+          { kind: "table", id: "tallies", query: tallyLib.list, columns: [{ label: "Key", path: "key" }, { label: "Count", path: "n", format: "number" }], rowActions: [{ id: "reset", label: "Reset", fn: tallyLib.reset, fromRow: { key: "key" }, destructive: true }] },
+          { kind: "actions", actions: [{ id: "bump", label: "Bump", fn: tallyLib.bump, args: { by: 1 } }, { id: "twice", label: "Bump twice", fn: tallyLib.bumpTwice }] },
+        ],
+      },
+    ],
   },
   http: httpRouter().route({ path: "/hit", method: "POST", handler: hooks.hit, shard: (r) => new URL(r.url).searchParams.get("shard") ?? "global:main" }),
 });
@@ -151,7 +173,15 @@ export const hooksComponent = defineComponent({
 });
 
 // Project limits (PLAN §3, L6): documents raised above the default, so metrics.test.ts sees them reach the shard.
-export const app = defineApp({ limits: { documentsRead: 20_000 } })
+export const app = defineApp({
+  limits: { documentsRead: 20_000 },
+  // The app's own screen (dashboards.test.ts): global, so always on global:main.
+  dashboard: {
+    label: "Runs",
+    scope: "global",
+    tabs: [{ id: "tally", label: "Tally", blocks: [{ kind: "detail", query: makeFunctionReference<"query">("components:count"), sections: [{ kind: "json" }] }, { kind: "actions", actions: [{ label: "Bump", fn: makeFunctionReference<"mutation">("components:bump") }] }] }],
+  },
+})
   .use(tally, { config: { label: "tallies" } })
   .use(rateLimit)
   .use(workflows)
