@@ -60,6 +60,8 @@ const schema = defineSchema({
       rolledBack: v.boolean(),
       /** The update a rollback took out (set on the row the rollback published). */
       rollbackOf: v.optional(v.string()),
+      /** The release a rollback row took out of service: its copies below this row are never served again. */
+      outRelease: v.optional(v.string()),
       /** The update this row republishes (a rollback to a previous update). */
       republishOf: v.optional(v.string()),
       createdAt: v.number(),
@@ -113,8 +115,8 @@ export const expoUpdatesErrors = defineErrors({
   RolloutInProgress: {
     data: v.object({ branch: v.string(), platform: v.string(), runtimeVersion: v.string(), update: v.string(), percent: v.number() }),
     status: 409,
-    message: (d: { branch: string; platform: string; update: string; percent: number }) =>
-      `${d.branch} (${d.platform}) has update ${d.update} in a ${d.percent}% rollout: finish it (rollout 100) or roll it back before publishing`,
+    message: (d: { branch: string; platform: string; runtimeVersion: string; update: string; percent: number }) =>
+      `${d.branch} (${d.platform} ${d.runtimeVersion}) has update ${d.update} in a ${d.percent}% rollout: finish it (rollout 100 --platform ${d.platform} --runtime-version ${d.runtimeVersion}) or roll it back before publishing`,
   },
   NotInRollout: { data: v.object({ branch: v.string() }), status: 409, message: (d: { branch: string }) => `no update of ${d.branch} is in a partial rollout` },
   AssetNotUploaded: { data: v.object({ sha256: v.string() }), status: 409, message: (d: { sha256: string }) => `asset ${d.sha256} is not uploaded (prepareAssets, PUT, confirm first; a copy already stored, e.g. confirmed late, is found again by prepareAssets with no upload)` },
@@ -192,8 +194,20 @@ function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runti
     rows.push(...step);
     const head = rows[0];
     if (!head) return null;
-    const prev = rows.find((r) => releaseOf(r) !== releaseOf(head)) ?? null;
-    if (prev || step.length < ROLLBACK_WINDOW) return { head, prev, rows: prev ? rows.slice(0, rows.indexOf(prev)) : rows };
+    // Newest to oldest: a row is the previous release unless its release is out — the head's, or one that a rollback
+    // row above it took out (`outRelease`: copies a bounded rollback left behind are never picked again).
+    const out = new Set<string>();
+    let at = -1;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i]!;
+      if (i > 0 && !out.has(releaseOf(r)) && releaseOf(r) !== releaseOf(head)) {
+        at = i;
+        break;
+      }
+      if (r.outRelease) out.add(r.outRelease);
+    }
+    const prev = at >= 0 ? rows[at]! : null;
+    if (prev || step.length < ROLLBACK_WINDOW) return { head, prev, rows: prev ? rows.slice(0, at) : rows };
     // Past the bound: to the embedded update the copies read so far go (a later rollback takes the rest);
     // otherwise no previous release can be told, and the rollback refuses rather than guess.
     if (rows.length >= ROLLBACK_SCAN_MAX && toEmbedded) return { head, prev: null, rows };
@@ -488,16 +502,17 @@ export const functions = {
           const { head, prev, rows } = scan;
           const bad = releaseOf(head);
           if (head.kind === "rollBackToEmbedded" && (a.toEmbedded || !prev)) continue; // already on the embedded update
-          for (const r of rows) if (releaseOf(r) === bad) ctx.db.patch(r._id, { rolledBack: true });
+          // Out of service: the head's release and the rows of releases already taken out read on the way.
+          for (const r of rows) ctx.db.patch(r._id, { rolledBack: true });
           const uuid = uuidOf(ctx.random);
           const toEmbedded = !!a.toEmbedded || !prev;
           // What the new head is: the previous row may itself be a directive (a publish after a rollback to embedded).
           const kind = toEmbedded ? "rollBackToEmbedded" : prev!.kind;
-          const base = { uuid, group: uuid, branch: a.branch, platform: p.platform, runtimeVersion: p.runtimeVersion, rolloutPercent: 100, rolledBack: false, rollbackOf: head.uuid };
+          const base = { uuid, group: uuid, branch: a.branch, platform: p.platform, runtimeVersion: p.runtimeVersion, rolloutPercent: 100, rolledBack: false, rollbackOf: head.uuid, outRelease: bad };
           if (toEmbedded) {
             insertHead(ctx, { ...base, kind: "rollBackToEmbedded", assets: [], metadata: {}, message: a.message ?? `Roll back ${head.uuid} to the embedded update` }, head.createdAt);
           } else {
-            const { _id: _x, _creationTime: _y, uuid: prevUuid, group: _g, createdAt: _c, rollbackOf: _r, republishOf: _p, message: _m, ...copy } = prev!;
+            const { _id: _x, _creationTime: _y, uuid: prevUuid, group: _g, createdAt: _c, rollbackOf: _r, republishOf: _p, outRelease: _o, message: _m, ...copy } = prev!;
             insertHead(ctx, { ...copy, ...base, republishOf: releaseOf(prev!), message: a.message ?? `Roll back ${head.uuid} to ${prevUuid}` }, head.createdAt);
           }
           out.push({ platform: p.platform, runtimeVersion: p.runtimeVersion, rolledBack: head.uuid, now: uuid, kind });

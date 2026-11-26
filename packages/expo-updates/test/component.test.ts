@@ -278,6 +278,11 @@ describe("expo updates component", () => {
     await expect(t.mutation(m("rollback"), { branch: "production" })).rejects.toThrow(/live copies.*toEmbedded/);
     expect(((await t.mutation(m("rollback"), { branch: "production", toEmbedded: true })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
     expect((await ask(t)).kind).toBe("rollBackToEmbedded");
+    // Copies of B the bounded rollback left behind are never served again: another to-embedded changes nothing, and
+    // rolling the directive back reaches A, not a leftover B.
+    expect(await t.mutation(m("rollback"), { branch: "production", toEmbedded: true })).toEqual([]);
+    await t.mutation(m("rollback"), { branch: "production" });
+    expect((await ask(t)).manifest.launchAsset.hash).toBe(createHash("sha256").update("A").digest("base64url"));
   }, 180_000);
 
   test("branch-wide commands find every live platform and runtime version, however many rows other ones have", async () => {

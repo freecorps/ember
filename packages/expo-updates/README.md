@@ -123,7 +123,7 @@ carry its own query string; `key` is added to it.
 
 ```sh
 ember expo publish --branch production [--dir dist] [--message m] [--rollout 25] [--platform ios] [--runtime-version 1.2.0]
-ember expo rollout 60 --branch production          # raise (or lower) the share; 100 ends the rollout
+ember expo rollout 60 --branch production [--platform ios] [--runtime-version 1.2.0]   # raise (or lower) the share; 100 ends it
 ember expo rollback --branch production [--platform ios] [--runtime-version 1.2.0] [--to-embedded]
 ember expo kill --channel production               # or --branch b; `resume` undoes it
 ember expo channel production --branch production --rollout-branch beta --rollout-percent 10   # --no-rollout clears
