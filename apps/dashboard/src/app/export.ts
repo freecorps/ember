@@ -24,14 +24,20 @@ export function toCsv(columns: readonly string[], rows: ReadonlyArray<readonly C
   return [columns.map(field), ...rows.map((r) => columns.map((_, i) => field(r[i])))].map((l) => l.join(",")).join("\r\n") + "\r\n";
 }
 
-/** Column names made unique (`SELECT a, a` → `a`, `a_2`): the keys of the JSON objects. */
+/**
+ * Column names made unique (`SELECT a, a` → `a`, `a_2`): the keys of the JSON objects. A repeat never takes a name the
+ * result has (`a`, `a`, `a_2` → `a`, `a_2_`, `a_2`) nor one given to another repeat.
+ */
 export function uniqueColumns(columns: readonly string[]): string[] {
   const seen = new Map<string, number>();
+  const taken = new Set(columns);
   return columns.map((c) => {
     const n = (seen.get(c) ?? 0) + 1;
     seen.set(c, n);
-    let name = n === 1 ? c : `${c}_${n}`;
-    while (n > 1 && columns.includes(name)) name = `${name}_`;
+    if (n === 1) return c;
+    let name = `${c}_${n}`;
+    while (taken.has(name)) name = `${name}_`;
+    taken.add(name);
     return name;
   });
 }

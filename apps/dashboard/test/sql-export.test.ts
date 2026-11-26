@@ -12,6 +12,10 @@ describe("exports", () => {
 
   it("JSON: one object per row; repeated column names made unique", () => {
     expect(uniqueColumns(["a", "a", "a_2", "b"])).toEqual(["a", "a_2_", "a_2", "b"]);
+    // A generated name never collides with another generated one either.
+    const many = uniqueColumns(["a", "a", "a_2", "a_2_", "a_2", "a"]);
+    expect(new Set(many).size).toBe(many.length);
+    expect(Object.keys(JSON.parse(toJson(["a", "a", "a_2", "a_2_"], [[1, 2, 3, 4]]))[0])).toHaveLength(4);
     expect(JSON.parse(toJson(["n", "n"], [[1, 2]]))).toEqual([{ n: 1, n_2: 2 }]);
   });
 });
