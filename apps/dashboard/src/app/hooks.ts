@@ -83,7 +83,14 @@ export function href(r: { project: string; env: string; section?: string | undef
 const RENAVIGATE = "ember:renavigate";
 
 /** Same page: the hashes parse to the same route (`#/` and `` are both the projects list; encoding aside). */
-export const sameRoute = (a: string, b: string) => JSON.stringify(parseHash(a)) === JSON.stringify(parseHash(b));
+export function sameRoute(a: string, b: string): boolean {
+  const x = parseHash(a);
+  const y = parseHash(b);
+  const rx = x.rest ?? [];
+  const ry = y.rest ?? [];
+  // Field by field (not the objects' JSON, which depends on the order parseHash builds them in).
+  return x.page === y.page && x.project === y.project && x.env === y.env && x.section === y.section && x.shard === y.shard && x.fn === y.fn && x.user === y.user && rx.length === ry.length && rx.every((s, i) => s === ry[i]);
+}
 
 /**
  * Goes to `hash`. Choosing the route already shown re-runs the navigation instead of doing nothing: the shell remounts

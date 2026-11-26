@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { curlFor, HISTORY_KEY, HISTORY_MAX, loadHistory, refFor, RESULT_MAX, saveRun, shellQuote, tsFor, tsLiteral } from "../src/app/runner.ts";
 import { EXPORT_MAX, searchLogs, toNdjson, type LogRecord } from "../src/app/logsearch.ts";
 import { fileName } from "../src/app/export.ts";
+import { sameRoute } from "../src/app/hooks.ts";
 
 const g = globalThis as { localStorage?: unknown };
 afterEach(() => {
@@ -130,5 +131,17 @@ describe("logs search and NDJSON export", () => {
     expect(big.trimEnd().split("\n")).toHaveLength(EXPORT_MAX);
     expect(big.endsWith("}\n")).toBe(true);
     expect(big.endsWith("\n\n")).toBe(false);
+  });
+});
+
+describe("same-route navigation (⌘K on the page shown)", () => {
+  it("compares the parsed routes field by field (encoding, a trailing slash and the default section aside)", () => {
+    expect(sameRoute("", "#/")).toBe(true);
+    expect(sameRoute("#/p/chat/prod/data/org%3Aacme", "#/p/chat/prod/data/org:acme/")).toBe(true);
+    expect(sameRoute("#/p/chat/prod", "#/p/chat/prod/health")).toBe(true);
+    expect(sameRoute("#/p/chat/prod/data/org:acme", "#/p/chat/prod/data/org:beta")).toBe(false);
+    expect(sameRoute("#/p/chat/prod/functions/a:b", "#/p/chat/prod/users/a:b")).toBe(false);
+    expect(sameRoute("#/p/chat/prod/screens/x/@pool", "#/p/chat/prod/screens/x/@pool/jobs")).toBe(false);
+    expect(sameRoute("#/audit", "#/")).toBe(false);
   });
 });
