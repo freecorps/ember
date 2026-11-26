@@ -384,6 +384,11 @@ class Resolver {
         }
         if (o.pageSize !== undefined && (!Number.isInteger(o.pageSize) || (o.pageSize as number) < 1 || (o.pageSize as number) > DASHBOARD_PAGE_MAX)) throw new SpecError(`${at}.pageSize must be an integer in 1..${DASHBOARD_PAGE_MAX}`);
         if (o.pageSize !== undefined && q.args && !paged) throw new SpecError(`${at}.pageSize: ${q.name} is not paginated (no paginationOpts argument)`);
+        const pageSize = (o.pageSize as number | undefined) ?? 25;
+        // The pager sends `numItems: pageSize`: the query's own validator must take it (a `numItems: v.number().max(10)`).
+        if (paged && q.args && !validate(q.args.fields.paginationOpts!.shape, { numItems: pageSize, cursor: null }).ok) {
+          throw new SpecError(`${at}.pageSize: ${q.name}'s paginationOpts.numItems does not accept ${pageSize}${o.pageSize === undefined ? " (the default; set pageSize)" : ""}`);
+        }
         const columns = this.list(o.columns, `${at}.columns`, MAX_ITEMS, true).map((c, i) => this.column(c, `${at}.columns[${i}]`));
         const rowActions = o.rowActions === undefined ? undefined : this.actions(o.rowActions, `${at}.rowActions`, true);
         return {
@@ -394,7 +399,7 @@ class Resolver {
           ...(o.rows !== undefined ? { rows: this.path(o.rows, `${at}.rows`) } : {}),
           columns,
           filters,
-          ...(paged ? { pageSize: (o.pageSize as number | undefined) ?? 25 } : {}),
+          ...(paged ? { pageSize } : {}),
           rowKey: o.rowKey === undefined ? "_id" : this.path(o.rowKey, `${at}.rowKey`),
           ...(o.detail !== undefined ? { detail: this.detail(this.object(o.detail, `${at}.detail`, ["query", "args", "fromRow", "sections"]), `${at}.detail`, true) } : {}),
           ...(rowActions ? { rowActions } : {}),
@@ -619,6 +624,8 @@ class Resolver {
     if (!Array.isArray(input)) throw new SpecError(`${at} must be an array`);
     if (nonEmpty && !input.length) throw new SpecError(`${at} is empty`);
     if (input.length > max) throw new SpecError(`${at}: at most ${max}`);
+    // A sparse array (`new Array(1)`): `map` would skip the hole and the manifest would carry a null.
+    for (let i = 0; i < input.length; i++) if (!Object.hasOwn(input, i)) throw new SpecError(`${at}[${i}] is missing (a sparse array)`);
     return input;
   }
 

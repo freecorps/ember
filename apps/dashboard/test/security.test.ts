@@ -3,6 +3,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { isAdminEmail } from "../src/auth.ts";
 import { clearCapabilities, CSRF_HEADER, handleApi, ROUTES, summarizeArgs, type DashboardEnv } from "../src/worker.ts";
+import { pass, type Target } from "../src/projects.ts";
 import { seeded } from "./helpers.ts";
 
 const ORIGIN = "https://dash.example";
@@ -519,5 +520,14 @@ describe("catalog search", () => {
     expect(await names("beta")).toEqual(["org:betaX1", "org:beta_1"]);
     expect(await names("a_1")).toEqual(["org:beta_1"]);
     expect(await names("%")).toEqual([]);
+  });
+});
+
+describe("relaying a project's answer", () => {
+  it("a 404 is always declared JSON: an HTML body that names json in its content type is never served as HTML", async () => {
+    const target: Target = { project: "chat", env: "prod", worker: "chat-prod", url: null };
+    const html = new Response("<script>alert(1)</script>", { status: 404, headers: { "content-type": "text/html; x=json" } });
+    const res = await pass(html, target, "dashboards");
+    expect([res.status, res.headers.get("content-type"), res.headers.get("x-content-type-options")]).toEqual([404, "application/json", "nosniff"]);
   });
 });

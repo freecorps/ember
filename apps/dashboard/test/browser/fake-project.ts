@@ -54,7 +54,8 @@ export const POOL_SPEC = {
     "@pool/lib:stats": { type: "query", args: { kind: "object", fields: {} } },
     "@pool/lib:listWork": { type: "query", args: { kind: "object", fields: { status, paginationOpts: { shape: { kind: "object", fields: { numItems: { shape: { kind: "number" }, optional: false }, cursor: { shape: { kind: "union", members: [{ kind: "string" }, { kind: "null" }] }, optional: false } } }, optional: false } } } },
     "@pool/lib:item": { type: "query", args: { kind: "object", fields: { id: str } } },
-    "@pool/lib:pause": { type: "mutation", args: { kind: "object", fields: { id: str, paused: { shape: { kind: "boolean" }, optional: false } } } },
+    // Destructive (the spec also names it in a destructive action): on prod the switch asks for the typed name too.
+    "@pool/lib:pause": { type: "mutation", args: { kind: "object", fields: { id: str, paused: { shape: { kind: "boolean" }, optional: false } } }, destructive: true },
     "@pool/lib:cancel": { type: "mutation", args: { kind: "object", fields: { id: str } } },
     "@pool/lib:cancelAll": { type: "mutation", args: { kind: "object", fields: {} }, destructive: true },
     "@pool/lib:enqueueTest": { type: "action", args: { kind: "object", fields: { label: str } } },
