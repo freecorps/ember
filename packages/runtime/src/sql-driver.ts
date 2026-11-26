@@ -1,4 +1,5 @@
 import { EmberError } from "@freecorps/ember-server";
+import type { SqlRawResult } from "@freecorps/ember-server";
 import type { SqlDriver, SqlExecResult, SqlValue } from "./engine-types.ts";
 
 function isThenable(v: unknown): v is PromiseLike<unknown> {
@@ -72,14 +73,7 @@ export class DoSqlDriver implements SqlDriver {
   constructor(private readonly storage: DurableObjectStorage) {}
 
   exec(sql: string, ...params: SqlValue[]): SqlExecResult {
-    if (this.readOnly !== null && !isSingleSelect(sql)) throw new EmberError(this.readOnly.code, this.readOnly.message, this.readOnly.data);
-    for (const p of params) {
-      const t = typeof p;
-      if (t === "bigint" || t === "boolean" || t === "undefined") {
-        throw new TypeError(`SqlDriver: unsupported bind value of type ${t}; convert it in the engine`);
-      }
-    }
-    const cursor = this.storage.sql.exec(sql, ...(params as (string | number | null | ArrayBuffer | ArrayBufferView)[]));
+    const cursor = this.cursor(sql, params);
     // Arrays (`raw()`) and one object per row built here: cheaper than the cursor's own row objects, copied again.
     const rows: Record<string, SqlValue>[] = [];
     const names = cursor.columnNames;
@@ -93,6 +87,43 @@ export class DoSqlDriver implements SqlDriver {
       }
       rows.push(row);
     }
+    const { r, w } = this.count(sql, cursor);
+    return { rows, rowsRead: r, rowsWritten: w };
+  }
+
+  /**
+   * `exec` with the cursor's own arrays (`raw()`) as the rows: no object per row. BLOBs are turned into Uint8Array in
+   * place (as `exec` does); the counters move exactly as for `exec`.
+   */
+  execRaw(sql: string, ...params: SqlValue[]): SqlRawResult {
+    const cursor = this.cursor(sql, params);
+    const rows: SqlValue[][] = [];
+    const n = cursor.columnNames.length;
+    if (n > 0) for (const raw of cursor.raw()) {
+      const row = raw as unknown as SqlValue[];
+      for (let i = 0; i < n; i++) {
+        const v = raw[i];
+        if (v instanceof ArrayBuffer) row[i] = new Uint8Array(v);
+      }
+      rows.push(row);
+    }
+    const { r, w } = this.count(sql, cursor);
+    return { rows, rowsRead: r, rowsWritten: w };
+  }
+
+  private cursor(sql: string, params: SqlValue[]): SqlStorageCursor<Record<string, SqlStorageValue>> {
+    if (this.readOnly !== null && !isSingleSelect(sql)) throw new EmberError(this.readOnly.code, this.readOnly.message, this.readOnly.data);
+    for (const p of params) {
+      const t = typeof p;
+      if (t === "bigint" || t === "boolean" || t === "undefined") {
+        throw new TypeError(`SqlDriver: unsupported bind value of type ${t}; convert it in the engine`);
+      }
+    }
+    return this.storage.sql.exec(sql, ...(params as (string | number | null | ArrayBuffer | ArrayBufferView)[]));
+  }
+
+  /** Read after the rows were: the cursor's counters are final once it is consumed. */
+  private count(sql: string, cursor: SqlStorageCursor<Record<string, SqlStorageValue>>): { r: number; w: number } {
     const r = cursor.rowsRead;
     const w = cursor.rowsWritten;
     this.rowsRead += r;
@@ -101,7 +132,7 @@ export class DoSqlDriver implements SqlDriver {
     c[0]++;
     c[1] += r;
     c[2] += w;
-    return { rows, rowsRead: r, rowsWritten: w };
+    return { r, w };
   }
 
   transaction<T>(fn: () => T): T {
