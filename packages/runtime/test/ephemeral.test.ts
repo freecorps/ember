@@ -249,6 +249,78 @@ describe("ephemeral channels", () => {
     b.close();
   });
 
+  it("ref: the answer to a join or pub carries it; a pub with ref is answered published once it went out", async () => {
+    const shard = "eph:ref";
+    const a = await member(shard, "good:ana");
+    const b = await member(shard, "good:bia");
+    a.send({ t: "join", ch: "typed:r", ref: 1 });
+    expect(await a.waitFor<Joined>(is("joined"))).toMatchObject({ ch: "typed:r", ref: 1 });
+    b.send({ t: "join", ch: "room:vip", ref: 2 });
+    expect(await b.waitFor<Left>(is("left"))).toMatchObject({ ch: "room:vip", code: "channel_denied", ref: 2 });
+    // A refused update of a member that stays in: `err` with the ref.
+    a.send({ t: "join", ch: "typed:r", state: { name: 1 }, ref: 3 });
+    expect(await a.waitFor(is("err"))).toMatchObject({ code: "invalid_state", ch: "typed:r", ref: 3 });
+    await join(b, "typed:r");
+    a.send({ t: "pub", ch: "typed:r", data: { x: "no", y: 0 }, ref: 4 });
+    expect(await a.waitFor(is("err", (m) => m.ref === 4))).toMatchObject({ code: "invalid_payload", ch: "typed:r" });
+    a.send({ t: "pub", ch: "typed:r", data: { x: 1, y: 2 }, ref: 5 });
+    expect(await a.waitFor(is("published"))).toEqual({ t: "published", ch: "typed:r", ref: 5 });
+    expect((await b.waitFor<Msg>(is("msg"))).data).toEqual({ x: 1, y: 2 });
+    // Without ref: no answer to a pub that went out (as before).
+    b.send({ t: "pub", ch: "typed:r", data: { x: 3, y: 4 } });
+    await a.waitFor<Msg>(is("msg"));
+    await sleep(30);
+    expect(b.frames.filter((f) => f.t === "published")).toEqual([]);
+    a.send({ t: "pub", ch: "typed:r", data: { x: 1, y: 2 }, ref: -1 });
+    expect(await a.waitFor(is("err", (m) => m.code === "bad_frame"))).toBeTruthy();
+    a.close();
+    b.close();
+  });
+
+  it("a join that would push the socket's subscriptions out of its attachment is refused: still no row written", async () => {
+    const shard = "eph:attach";
+    const a = await member(shard, "good:ana");
+    const stub = shardStub(shard);
+    const size = () => runInDurableObject(stub, (instance: Shard) => JSON.stringify([...(instance as unknown as { attachments: Map<string, unknown> }).attachments.values()][0]).length);
+    const subsRows = () => runInDurableObject(stub, (_i, state) => Number(state.storage.sql.exec("SELECT COUNT(*) AS n FROM _ember_subs").toArray()[0]?.n ?? 0));
+    // A subscription whose args leave about 300 chars free in the 16 KB attachment.
+    const pad = "p".repeat(15_700 - (await size()));
+    a.send({ t: "sub", qid: 1, fn: "messages:list", args: { channel: pad } });
+    await a.waitFor(is("snap"));
+    expect(await subsRows()).toBe(0);
+    const before = await writes(shard);
+    a.send({ t: "join", ch: "open", state: { blob: "s".repeat(480) } });
+    expect(await a.waitFor<Left>(is("left"))).toMatchObject({ ch: "open", code: "too_large" });
+    expect(await subsRows()).toBe(0);
+    expect(await writes(shard)).toEqual(before);
+    // A join that fits still goes in, the subscription still in the attachment.
+    await join(a, "open");
+    expect(await subsRows()).toBe(0);
+    expect(await writes(shard)).toEqual(before);
+    a.close();
+  });
+
+  it("a join refused by the rate limit still sweeps the channel", async () => {
+    const shard = "eph:sweep-limited";
+    const a = await member(shard, "good:ana", ["ephemeral", "batch"]);
+    const b = await member(shard, "good:bia");
+    await join(a, "room:other");
+    await join(b, "room:s");
+    const bClosed = new Promise<number>((resolve) => b.ws.addEventListener("close", (e) => resolve(e.code)));
+    const stub = shardStub(shard);
+    await runInDurableObject(stub, (instance: Shard) => {
+      const eph = (instance as unknown as { eph: { seen: Map<string, number>; swept: Map<string, number> } }).eph;
+      for (const sid of eph.seen.keys()) eph.seen.set(sid, Date.now() - EPHEMERAL_TTL_MS - 1_000);
+      eph.swept.clear();
+    });
+    // `a` spends its bucket on another channel, then (same frame: no refill in between) joins `b`'s.
+    a.send(JSON.stringify([...Array.from({ length: EPHEMERAL_BURST + 5 }, () => ({ t: "pub", ch: "room:other", data: 0 })), { t: "join", ch: "room:s" }]));
+    expect(await a.waitFor<Left>(is("left"))).toMatchObject({ ch: "room:s", code: "rate_limited" });
+    expect(await bClosed).toBe(EPHEMERAL_TTL_CLOSE);
+    expect((await stub.inspect()).ephemeral).toMatchObject({ timedOut: 1 });
+    a.close();
+  });
+
   it("a member silent past the TTL is closed and leaves; an auto-response ping keeps it", async () => {
     const shard = "eph:ttl";
     const a = await member(shard, "good:ana");

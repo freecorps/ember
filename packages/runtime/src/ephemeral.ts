@@ -40,12 +40,15 @@ export interface EphemeralAttachment {
 export interface EphemeralHost {
   socket(sid: string): WebSocket | undefined;
   attachment(sid: string): { identity: Identity | null; eph?: EphemeralAttachment } | undefined;
-  /** Writes `eph` into the socket's attachment (no row). */
-  saveEph(ws: WebSocket, eph: EphemeralAttachment): void;
+  /**
+   * Writes `eph` into the socket's attachment (no row). False (nothing written) when a larger `eph` would not fit in
+   * it as it is: its subscriptions would move to `_ember_subs` (a row each), or its identity lose its claims or token.
+   */
+  saveEph(ws: WebSocket, eph: EphemeralAttachment): boolean;
   send(ws: WebSocket, frame: string): void;
   /** The socket's access expired or was revoked (told `authExpired` once, as on a patch). */
   blocked(sid: string): boolean;
-  /** Closes the socket and forgets it (its channels included). */
+  /** Closes the socket and forgets it: its channels included (the shard's close drops it here, as any close does). */
   close(ws: WebSocket, code: number, reason: string): void;
   /** Last auto-response (`ping` → `pong`) of the socket, ms since epoch (0: none). */
   autoResponseAt(ws: WebSocket): number;
@@ -148,19 +151,20 @@ export class EphemeralChannels {
     return n;
   }
 
-  private joinedFrame(name: string, self: string): string {
+  private joinedFrame(name: string, self: string, ref?: number): string {
     const room = this.rooms.get(name);
     const list = room ? [...room.values()].map((m) => this.memberJson(m)).join(",") : "";
-    return `{"t":"joined","ch":${q(name)},"self":${q(self)},"members":[${list}]}`;
+    return `{"t":"joined","ch":${q(name)},"self":${q(self)},"members":[${list}]${ref === undefined ? "" : `,"ref":${ref}`}}`;
   }
 
-  private persist(ws: WebSocket, sid: string): void {
+  /** The socket's memberships into its attachment, with `name` at `state` (`undefined`: out of it); false: did not fit. */
+  private persist(ws: WebSocket, sid: string, name?: string, state?: string | null): boolean {
     const att = this.host.attachment(sid);
-    if (!att?.eph) return;
-    const mine = this.bySocket.get(sid);
+    if (!att?.eph) return true;
     const ch: Array<[string, string | null]> = [];
-    for (const name of mine ?? []) ch.push([name, this.rooms.get(name)?.get(sid)?.state ?? null]);
-    this.host.saveEph(ws, { m: att.eph.m, ch });
+    for (const n of this.bySocket.get(sid) ?? []) if (n !== name) ch.push([n, this.rooms.get(n)?.get(sid)?.state ?? null]);
+    if (name !== undefined && state !== undefined) ch.push([name, state]);
+    return this.host.saveEph(ws, { m: att.eph.m, ch });
   }
 
   private take(sid: string, now = Date.now()): boolean {
@@ -185,30 +189,34 @@ export class EphemeralChannels {
       const last = Math.max(this.seen.get(sid) ?? now, ws ? this.host.autoResponseAt(ws) : 0);
       if (ws && now - last <= EPHEMERAL_TTL_MS) continue;
       this.stats.timedOut++;
+      // A close drops the socket (and so its memberships, the others told); one already gone only has to leave.
       if (ws) this.host.close(ws, EPHEMERAL_TTL_CLOSE, "ember: silent in channels");
-      this.drop(sid);
+      else this.drop(sid);
     }
   }
 
-  private error(ws: WebSocket, name: string, code: string, message: string): void {
+  private error(ws: WebSocket, name: string, code: string, message: string, ref?: number): void {
     this.stats.refused++;
-    this.host.send(ws, stringify({ t: "err", code, message, ch: name }));
+    this.host.send(ws, stringify(ref === undefined ? { t: "err", code, message, ch: name } : { t: "err", code, message, ch: name, ref }));
   }
 
-  private left(ws: WebSocket, name: string, code: string, message: string): void {
-    this.host.send(ws, stringify({ t: "left", ch: name, code, message }));
+  private left(ws: WebSocket, name: string, code: string, message: string, ref?: number): void {
+    this.host.send(ws, stringify(ref === undefined ? { t: "left", ch: name, code, message } : { t: "left", ch: name, code, message, ref }));
   }
 
-  /** `{t:"join", ch, state?}`: join, or (already in) update the member state. Answered with `joined` or `left`. */
-  join(ws: WebSocket, sid: string, name: string, state: unknown, hasState: boolean): void {
+  /**
+   * `{t:"join", ch, state?, ref?}`: join, or (already in) update the member state. Answered with `joined` or `left` (a
+   * refused update of a member that stays in: `err`), carrying the frame's `ref`.
+   */
+  join(ws: WebSocket, sid: string, name: string, state: unknown, hasState: boolean, ref?: number): void {
     const att = this.host.attachment(sid);
-    if (!att?.eph) return this.error(ws, name, "bad_frame", "channels need feature ephemeral");
+    if (!att?.eph) return this.error(ws, name, "bad_frame", "channels need feature ephemeral", ref);
     const member = this.rooms.get(name)?.get(sid) ?? null;
     // Already in: a refused update leaves it in, with its state. Not in: it did not join.
     const refuse = (code: string, message: string) => {
-      if (member) return this.error(ws, name, code, message);
+      if (member) return this.error(ws, name, code, message, ref);
       this.stats.refused++;
-      this.left(ws, name, code, message);
+      this.left(ws, name, code, message, ref);
     };
     if (!CHANNEL_NAME.test(name)) return refuse("bad_channel", "channel names are 1 to 128 of A-Z a-z 0-9 _ . : @ / -");
     if (this.host.blocked(sid)) return refuse("auth_expired", 'the token expired; send {t:"auth"} with a fresh one');
@@ -217,7 +225,7 @@ export class EphemeralChannels {
       // Not (or no longer) allowed: out.
       if (member) this.leaveRoom(ws, sid, name);
       this.stats.refused++;
-      return this.left(ws, name, "channel_denied", `not allowed to join ${name}`);
+      return this.left(ws, name, "channel_denied", `not allowed to join ${name}`, ref);
     }
     let stateJson: string | null = member?.state ?? null;
     if (hasState || !member) {
@@ -228,19 +236,21 @@ export class EphemeralChannels {
       const bad = checkChannelValue(match.def, "state", hasState ? state : undefined);
       if (bad) return refuse("invalid_state", bad);
     }
+    // Before the limits: every join (a refused one too) sweeps, so silent members do not keep a room full.
+    this.sweep(name);
     if (!this.take(sid)) return refuse("rate_limited", `at most ${EPHEMERAL_RATE_PER_SEC} channel messages per second per socket`);
     if (!member) {
       if ((this.bySocket.get(sid)?.size ?? 0) >= EPHEMERAL_MAX_CHANNELS) return refuse("too_many_channels", `a socket is in at most ${EPHEMERAL_MAX_CHANNELS} channels`);
       if ((this.rooms.get(name)?.size ?? 0) >= EPHEMERAL_MAX_MEMBERS) return refuse("channel_full", `a channel has at most ${EPHEMERAL_MAX_MEMBERS} members`);
     }
-    this.sweep(name);
     const changed = !member || member.state !== stateJson;
+    // Into the attachment first: one that does not fit changes nothing (a channel never writes a row).
+    if (changed && !this.persist(ws, sid, name, stateJson)) return refuse("too_large", "the socket's attachment is full (its subscriptions): no room for this channel");
     const m: Member = { sid, id: att.eph.m, state: stateJson };
     this.add(name, m);
     this.seen.set(sid, Date.now());
     this.stats.joins++;
-    if (changed) this.persist(ws, sid);
-    this.host.send(ws, this.joinedFrame(name, m.id));
+    this.host.send(ws, this.joinedFrame(name, m.id, ref));
     if (changed) this.broadcast(name, `{"t":"members","ch":${q(name)},"join":[${this.memberJson(m)}]}`, sid);
   }
 
@@ -256,24 +266,28 @@ export class EphemeralChannels {
     this.broadcast(name, `{"t":"members","ch":${q(name)},"leave":[${q(m.id)}]}`, null);
   }
 
-  /** `{t:"pub", ch, data}`: to every other member, as `msg`. Refusals are `err` with `ch`. */
-  publish(ws: WebSocket, sid: string, name: string, data: unknown): void {
+  /**
+   * `{t:"pub", ch, data, ref?}`: to every other member, as `msg`. Refusals are `err` with `ch` (and the `ref`); with a
+   * `ref`, one that went out is answered `published` (the `multiTab` leader hands it to the other tabs only then).
+   */
+  publish(ws: WebSocket, sid: string, name: string, data: unknown, ref?: number): void {
     const att = this.host.attachment(sid);
-    if (!att?.eph) return this.error(ws, name, "bad_frame", "channels need feature ephemeral");
+    if (!att?.eph) return this.error(ws, name, "bad_frame", "channels need feature ephemeral", ref);
     const member = this.rooms.get(name)?.get(sid);
-    if (!member) return this.error(ws, name, "not_joined", `join ${name} before publishing to it`);
-    if (this.host.blocked(sid)) return this.error(ws, name, "auth_expired", 'the token expired; send {t:"auth"} with a fresh one');
+    if (!member) return this.error(ws, name, "not_joined", `join ${name} before publishing to it`, ref);
+    if (this.host.blocked(sid)) return this.error(ws, name, "auth_expired", 'the token expired; send {t:"auth"} with a fresh one', ref);
     const json = stringify(data);
-    if (json.length > EPHEMERAL_MAX_PAYLOAD_CHARS) return this.error(ws, name, "too_large", `a message is at most ${EPHEMERAL_MAX_PAYLOAD_CHARS} chars of JSON`);
+    if (json.length > EPHEMERAL_MAX_PAYLOAD_CHARS) return this.error(ws, name, "too_large", `a message is at most ${EPHEMERAL_MAX_PAYLOAD_CHARS} chars of JSON`, ref);
     const match = matchChannel(this.host.channels(), name);
-    if (!match) return this.error(ws, name, "channel_denied", `not allowed to publish to ${name}`);
+    if (!match) return this.error(ws, name, "channel_denied", `not allowed to publish to ${name}`, ref);
     const bad = checkChannelValue(match.def, "payload", data);
-    if (bad) return this.error(ws, name, "invalid_payload", bad);
-    if (!this.take(sid)) return this.error(ws, name, "rate_limited", `at most ${EPHEMERAL_RATE_PER_SEC} channel messages per second per socket`);
+    if (bad) return this.error(ws, name, "invalid_payload", bad, ref);
     this.sweep(name);
+    if (!this.take(sid)) return this.error(ws, name, "rate_limited", `at most ${EPHEMERAL_RATE_PER_SEC} channel messages per second per socket`, ref);
     const user = att.identity?.subject ?? null;
     this.stats.messages++;
     this.stats.delivered += this.broadcast(name, `{"t":"msg","ch":${q(name)},"from":${q(member.id)},"user":${user === null ? "null" : q(user)},"data":${json}}`, sid);
+    if (ref !== undefined) this.host.send(ws, `{"t":"published","ch":${q(name)},"ref":${ref}}`);
   }
 
   /**

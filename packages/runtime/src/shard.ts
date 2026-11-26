@@ -895,7 +895,15 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private readonly eph = new EphemeralChannels({
     socket: (sid) => this.sockets.get(sid),
     attachment: (sid) => this.attachments.get(sid),
-    saveEph: (ws, eph) => this.saveAttachment(ws, { ...this.attachmentOf(ws), eph }),
+    saveEph: (ws, eph) => {
+      const att = this.attachmentOf(ws);
+      const next: Attachment = { ...att, eph };
+      // A channel never writes a row: a larger `eph` that would push the subscriptions out to `_ember_subs` (or drop the
+      // identity's claims or token) is refused instead. Smaller (a leave) always fits.
+      if (JSON.stringify(eph).length > JSON.stringify(att.eph ?? null).length && JSON.stringify(next).length > MAX_ATTACHMENT_BYTES) return false;
+      this.saveAttachment(ws, next);
+      return true;
+    },
     send: (ws, frame) => this.send(ws, frame),
     blocked: (sid) => this.expiredSocket(sid),
     close: (ws, code, reason) => {
@@ -3992,13 +4000,13 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         return;
       // Feature "ephemeral": channels in memory, no row and no version (ephemeral.ts).
       case "join":
-        this.eph.join(ws, att.sid, msg.ch, msg.state, "state" in msg);
+        this.eph.join(ws, att.sid, msg.ch, msg.state, "state" in msg, msg.ref);
         return;
       case "leave":
         this.eph.leave(ws, att.sid, msg.ch);
         return;
       case "pub":
-        this.eph.publish(ws, att.sid, msg.ch, msg.data);
+        this.eph.publish(ws, att.sid, msg.ch, msg.data, msg.ref);
         return;
       case "mut": {
         const ctx: AuthCtx = { identity: att.identity };
