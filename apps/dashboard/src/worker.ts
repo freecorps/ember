@@ -73,6 +73,12 @@ const BOOKMARK = /^[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{8}-[0-9a-f]{16,}$/i;
 /** An app table the dashboard may edit: not internal (`_jobs`...) nor a component's (`rl$buckets`). */
 const TABLE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const DOC_ID = /^[A-Za-z0-9_-]{1,200}$/;
+/** A dashboard spec's key: `""` (the app's) or a component's install path (`workpool`, `email/rateLimit`). */
+const DASHBOARD_KEY = /^(?:[A-Za-z][A-Za-z0-9_]{0,39}(?:\/[A-Za-z][A-Za-z0-9_]{0,39}){0,7})?$/;
+/** A function name of the app or a component (`jobs:list`, `@workpool/lib:stats`). */
+const FN = /^[A-Za-z0-9_$@./:-]{1,200}$/;
+/** Largest `args` of a dashboard query (JSON in the query string), as the runtime's. */
+const DASH_ARGS_MAX = 8192;
 
 interface Ctx {
   request: Request;
@@ -110,6 +116,11 @@ interface WritePlan {
   args: unknown;
   /** Text the caller types to confirm (destructive actions on protected environments). */
   confirm: string;
+  /**
+   * Decides, from the project itself, whether this write is destructive and what to type (a dashboard spec's action):
+   * runs after the capability check and before the confirmation and the audit row. A Response refuses the write.
+   */
+  resolve?(c: Ctx, target: Target): Promise<{ destructive: boolean; confirm: string } | Response>;
   run(c: Ctx, target: Target): Promise<Response>;
 }
 
@@ -268,6 +279,24 @@ async function passFile(res: Response, target: Target): Promise<Response> {
   const len = res.headers.get("content-length");
   if (len && /^\d+$/.test(len)) headers["content-length"] = len;
   return new Response(res.body, { headers });
+}
+
+/** One function of a project's dashboard spec (`GET /api/_ember/dashboards`), or why it cannot run from the dashboard. */
+async function dashboardFunction(c: Ctx, target: Target, key: string, fn: string): Promise<{ type: string; destructive: boolean } | Response> {
+  const res = await projectAdmin(c.env, target, "/api/_ember/dashboards", c.fetch);
+  if (!res.ok) return pass(res, target, "dashboards");
+  let specs: Array<{ key?: unknown; functions?: Record<string, { type?: unknown; destructive?: unknown }> }>;
+  try {
+    const b = (await res.json()) as { dashboards?: unknown };
+    specs = Array.isArray(b.dashboards) ? (b.dashboards as typeof specs) : [];
+  } catch {
+    return err(502, "bad_upstream", `${target.worker} answered dashboards with something that is not JSON`);
+  }
+  const spec = specs.find((d) => d.key === key);
+  if (!spec) return err(404, "unknown_dashboard", `${target.project}/${target.env} has no dashboard ${JSON.stringify(key)}`);
+  const f = spec.functions && Object.hasOwn(spec.functions, fn) ? spec.functions[fn] : undefined;
+  if (!f) return err(403, "not_in_dashboard", `${fn} is not a function this dashboard runs`);
+  return { type: typeof f.type === "string" ? f.type : "", destructive: f.destructive === true };
 }
 
 export const ROUTES: Route[] = [
@@ -725,6 +754,63 @@ export const ROUTES: Route[] = [
       };
     },
   },
+  adminGet("/api/dash/specs", "dashboards", [], "declarative screens of the app and its components (defineApp/defineComponent({ dashboard }))"),
+  {
+    method: "GET",
+    path: "/api/dash/query",
+    role: "read",
+    feature: "dashboards/query",
+    summary: "run a query a dashboard spec names (?dashboard&fn&shard&args=<json>); any other function is refused by the project",
+    async run(c) {
+      const t = await targetOf(c, "dashboards/query");
+      if (t instanceof Response) return t;
+      const dashboard = c.q.get("dashboard") ?? "";
+      const fn = c.q.get("fn") ?? "";
+      const shard = c.q.get("shard") ?? "";
+      const args = c.q.get("args") ?? "{}";
+      if (!DASHBOARD_KEY.test(dashboard) || !FN.test(fn)) return err(400, "bad_request", "?dashboard=&fn= required");
+      if (shard && !SHARD.test(shard)) return err(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
+      if (args.length > DASH_ARGS_MAX) return err(413, "too_large", `args up to ${DASH_ARGS_MAX} characters`);
+      const qs = new URLSearchParams({ dashboard, fn, args, ...(shard ? { shard } : {}) });
+      return pass(await projectAdmin(c.env, t.target, `/api/_ember/dashboards/query?${qs}`, c.fetch), t.target, "dashboards/query");
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/dash/run",
+    role: "admin",
+    action: "dashboard.run",
+    // Decided per function by the spec (`resolve`): its destructive actions ask for the typed confirmation.
+    destructive: false,
+    feature: "dashboards/run",
+    summary: "run a mutation or action a dashboard spec names; destructive ones are confirmed with the function's name",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const dashboard = str(b.dashboard);
+      const fn = str(b.fn);
+      if (!DASHBOARD_KEY.test(dashboard) || typeof b.dashboard !== "string") return err(400, "bad_request", "dashboard: the spec's key (\"\" for the app's, a component's install name)");
+      if (!FN.test(fn)) return err(400, "bad_request", "fn: a function the spec names");
+      const args = b.args === undefined ? {} : b.args;
+      if (!args || typeof args !== "object" || Array.isArray(args)) return err(400, "bad_request", "args must be an object");
+      // What to type: the function's own name (`cancelAll` of `@pool/lib:cancelAll`).
+      const confirm = fn.slice(fn.lastIndexOf(":") + 1);
+      return {
+        ...s,
+        target: fn,
+        // As for the function runner: argument values are user data, the log keeps their names.
+        args: { dashboard, fn, fields: Object.keys(args as Record<string, unknown>).slice(0, 50) },
+        confirm,
+        async resolve(c, t) {
+          const f = await dashboardFunction(c, t, dashboard, fn);
+          if (f instanceof Response) return f;
+          if (f.type === "query") return err(403, "not_in_dashboard", `${fn} is a query: it runs through /api/dash/query`);
+          return { destructive: f.destructive, confirm };
+        },
+        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/dashboards/run", c.fetch, { method: "POST", body: { shard: s.shard, dashboard, fn, args } }), t, "dashboards/run"),
+      };
+    },
+  },
   adminGet("/api/rows", "data/list", ["shard", "table", "index", "eq", "order", "cursor", "limit"], "a page of an app table through an index (eq on a prefix of its fields), asc or desc"),
   docWrite("insert", "doc.insert", false, "insert a document (validated by the engine)"),
   docWrite("patch", "doc.patch", false, "change fields of a document"),
@@ -883,7 +969,14 @@ async function write(route: WriteRoute, c: Ctx): Promise<Response> {
   if (!target) return err(404, "not_found", `${plan.project}/${plan.env} is not in the registry`);
   const old = await requireFeature(c.env, target, route.feature, c.fetch);
   if (old) return old;
-  const unconfirmed = checkConfirmation({ destructive: route.destructive, envName: plan.env, protectedEnvs: protectedEnvs(c.env), expected: plan.confirm, sent: body.confirm });
+  let destructive = route.destructive;
+  let confirm = plan.confirm;
+  if (plan.resolve) {
+    const r = await plan.resolve(c, target);
+    if (r instanceof Response) return r;
+    ({ destructive, confirm } = r);
+  }
+  const unconfirmed = checkConfirmation({ destructive, envName: plan.env, protectedEnvs: protectedEnvs(c.env), expected: confirm, sent: body.confirm });
   if (unconfirmed) return unconfirmed;
   const entry: AuditEntry = { action: plan.action ?? route.action, project: plan.project, env: plan.env, shard: plan.shard || null, target: plan.target, args: plan.args };
   let id: number;

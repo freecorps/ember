@@ -14,6 +14,21 @@ interface Call {
   body: unknown;
 }
 
+/** A component's dashboard spec as the runtime lists it (`GET /api/_ember/dashboards`). */
+const POOL_SPEC = {
+  key: "pool",
+  component: "workpool",
+  label: "Pool",
+  icon: "queue",
+  scope: "shard",
+  tabs: [],
+  functions: {
+    "@pool/lib:list": { type: "query", args: { kind: "object", fields: {} } },
+    "@pool/lib:cancel": { type: "mutation", args: { kind: "object", fields: { id: { shape: { kind: "string" }, optional: false } } } },
+    "@pool/lib:cancelAll": { type: "mutation", args: { kind: "object", fields: {} }, destructive: true },
+  },
+};
+
 /** A project Worker behind a service binding: answers like @freecorps/ember-runtime's admin API. */
 function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
   const calls: Call[] = [];
@@ -26,8 +41,10 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
       if (req.headers.get("authorization") !== "Bearer proj-admin") return Response.json({ ok: false, error: { code: "unauthenticated", message: "invalid admin token" } }, { status: 401 });
       if (path === "/api/_ember/capabilities") {
         if (o.features === null) return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
-        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke"], auth: false, files: false, system: true });
+        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run"], auth: false, files: false, system: true });
       }
+      // The specs are read before a dashboard write is audited: they answer even when the project's writes fail.
+      if (path === "/api/_ember/dashboards") return Response.json({ ok: true, dashboards: [POOL_SPEC] });
       if (o.fail) return Response.json({ ok: false, error: { code: "restore_failed", message: "boom" } }, { status: 500 });
       if (path === "/api/_ember/bookmark") return Response.json({ ok: true, shard: (body as { shard: string }).shard, bookmark: { id: 1, at: 1, bookmark: BOOKMARK, reason: "manual" } });
       if (path === "/api/_ember/env/reveal") return Response.json({ ok: true, name: "SMTP_PASSWORD", value: "s3cr3t-value" });
@@ -35,6 +52,8 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
       if (path === "/api/_ember/auth/revoke") return Response.json({ ok: true, value: { revoked: 1, sockets: 2, shards: (body as { shards: string[] }).shards.length } });
       if (path === "/api/_ember/files/upload") return Response.json({ ok: true, value: { id: "_storage_new", size: 10 } });
       if (path === "/api/_ember/files/delete" || path === "/api/_ember/jobs/cancel" || path === "/api/_ember/jobs/run" || path === "/api/_ember/crons/run") return Response.json({ ok: true, value: "job_2" });
+      if (path === "/api/_ember/dashboards/run") return Response.json({ ok: true, value: 1, ms: 1, type: "mutation", shard: (body as { shard: string }).shard });
+      if (path === "/api/_ember/dashboards/query") return Response.json({ ok: true, value: [{ _id: "w1" }], ms: 1, type: "query", shard: new URL(req.url).searchParams.get("shard") });
       if (path === "/api/_ember/run") return Response.json({ ok: true, value: { who: (body as { as?: { subject: string } }).as?.subject ?? null }, ms: 1, type: "query" });
       if (path.startsWith("/api/_ember/data/")) return Response.json({ ok: true, value: path.endsWith("/delete") ? { deleted: 1 } : "messages_1" });
       if (path === "/api/_ember/restore") return Response.json({ ok: true, shard: (body as { shard: string }).shard, restoredTo: BOOKMARK, undo: BOOKMARK, version: 3, epoch: "e", schemaVersion: "abc" });
@@ -102,6 +121,7 @@ const bodies: Record<string, Record<string, unknown>> = {
   "/api/env/reveal": { project: "chat", env: "dev", name: "SMTP_PASSWORD" },
   "/api/keys/rotate": { project: "chat", env: "dev" },
   "/api/users/revoke": { project: "chat", env: "dev", userId: "user_1", sessionId: "sess_1" },
+  "/api/dash/run": { project: "chat", env: "dev", shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancel", args: { id: "secret plans" } },
 };
 
 describe("roles", () => {
@@ -304,6 +324,67 @@ describe("function runner", () => {
       expect((await t.post("/api/fn/run", { project: "chat", env: "prod", shard: "org:acme", ...bad })).status).toBe(400);
     }
     expect(t.project.calls.filter((c) => c.method === "POST")).toHaveLength(2);
+  });
+});
+
+describe("declarative screens", () => {
+  const h = { headers: { authorization: "Bearer read-secret" } };
+  it("the read role reads specs and runs the queries they name; params are checked before the project", async () => {
+    const t = setup();
+    const specs = await t.call("GET", "/api/dash/specs?project=chat&env=prod", h);
+    expect(((await specs.json()) as { dashboards: unknown[] }).dashboards).toEqual([POOL_SPEC]);
+    const q = await t.call("GET", `/api/dash/query?project=chat&env=prod&shard=org:acme&dashboard=pool&fn=${encodeURIComponent("@pool/lib:list")}&args=${encodeURIComponent('{"status":"pending"}')}`, h);
+    expect(q.status).toBe(200);
+    expect((await q.json()) as unknown).toMatchObject({ ok: true, value: [{ _id: "w1" }] });
+    const sent = new URL(t.project.calls.at(-1)!.url);
+    expect([sent.pathname, Object.fromEntries(sent.searchParams)]).toEqual(["/api/_ember/dashboards/query", { dashboard: "pool", fn: "@pool/lib:list", args: '{"status":"pending"}', shard: "org:acme" }]);
+    const before = t.project.calls.length;
+    for (const bad of ["dashboard=pool&fn=a%20b", "dashboard=..&fn=x:y", "dashboard=pool&fn=x:y&shard=nocolon", `dashboard=pool&fn=x:y&args=${"x".repeat(9000)}`]) {
+      expect((await t.call("GET", `/api/dash/query?project=chat&env=prod&${bad}`, h)).status, bad).toBeGreaterThanOrEqual(400);
+    }
+    expect(t.project.calls.slice(before).every((c) => new URL(c.url).pathname === "/api/_ember/capabilities")).toBe(true);
+    // Reads are never audited (nor create the dashboard's tables).
+    expect(t.db.prepare("SELECT name FROM sqlite_master WHERE name = 'audit_log'").all()).toEqual([]);
+  });
+
+  it("a destructive action on prod needs the function's name typed; a plain one does not", async () => {
+    const t = setup();
+    const prod = { project: "chat", env: "prod", shard: "org:acme", dashboard: "pool" };
+    const none = await t.post("/api/dash/run", { ...prod, fn: "@pool/lib:cancelAll" });
+    expect(none.status).toBe(428);
+    expect((await none.json()) as unknown).toMatchObject({ error: { code: "confirmation_required", data: { expected: "cancelAll" } } });
+    expect(t.project.calls.filter((c) => c.method === "POST")).toEqual([]);
+    expect(t.audit()).toEqual([]);
+    expect((await t.post("/api/dash/run", { ...prod, fn: "@pool/lib:cancelAll", confirm: "cancelAll" })).status).toBe(200);
+    expect((await t.post("/api/dash/run", { ...prod, fn: "@pool/lib:cancel", args: { id: "w1" } })).status).toBe(200);
+    expect((await t.post("/api/dash/run", { ...prod, env: "dev", fn: "@pool/lib:cancelAll" })).status).toBe(200);
+    expect(t.project.calls.filter((c) => c.method === "POST").map((c) => c.body)).toEqual([
+      { shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", args: {} },
+      { shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancel", args: { id: "w1" } },
+      { shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", args: {} },
+    ]);
+    expect(t.audit().map((a) => [a.action, a.target, a.env, a.outcome, a.args])).toEqual([
+      ["dashboard.run", "@pool/lib:cancelAll", "prod", "ok", JSON.stringify({ dashboard: "pool", fn: "@pool/lib:cancelAll", fields: [] })],
+      ["dashboard.run", "@pool/lib:cancel", "prod", "ok", JSON.stringify({ dashboard: "pool", fn: "@pool/lib:cancel", fields: ["id"] })],
+      ["dashboard.run", "@pool/lib:cancelAll", "dev", "ok", JSON.stringify({ dashboard: "pool", fn: "@pool/lib:cancelAll", fields: [] })],
+    ]);
+  });
+
+  it("functions outside the spec, queries and unknown dashboards are refused before the project runs anything", async () => {
+    const t = setup();
+    const base = { project: "chat", env: "dev", shard: "org:acme", dashboard: "pool" };
+    for (const [body, status, code] of [
+      [{ ...base, fn: "@pool/lib:run" }, 403, "not_in_dashboard"],
+      [{ ...base, fn: "@pool/lib:list" }, 403, "not_in_dashboard"],
+      [{ ...base, dashboard: "other", fn: "@pool/lib:cancel" }, 404, "unknown_dashboard"],
+      [{ ...base, dashboard: 3, fn: "@pool/lib:cancel" }, 400, "bad_request"],
+      [{ ...base, fn: "@pool/lib:cancel", args: [1] }, 400, "bad_request"],
+    ] as const) {
+      const res = await t.post("/api/dash/run", body);
+      expect([res.status, ((await res.json()) as { error: { code: string } }).error.code], JSON.stringify(body)).toEqual([status, code]);
+    }
+    expect(t.project.calls.filter((c) => c.method === "POST")).toEqual([]);
+    expect(t.audit()).toEqual([]);
   });
 });
 
