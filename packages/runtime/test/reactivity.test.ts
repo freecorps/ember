@@ -93,7 +93,7 @@ describe("reactivity", () => {
       // one timer armed for the three writes; flushing it is the single debounced re-run
       const armed = await runInDurableObject(stub, (inst: Shard) => {
         const d = inst as unknown as Debouncing;
-        d.cfg = { ...d.cfg, reactivity: { ...d.cfg.reactivity, searchDebounceMs: windowMs } };
+        d.cfg = { ...d.cfg, reactivity: { ...d.cfg.reactivity, searchDebounceMs: windowMs! } };
         const armed = d.debounceTimer !== null;
         d.flushDebounced();
         return armed;
