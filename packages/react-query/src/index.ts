@@ -12,29 +12,46 @@
 // goes (or until TanStack garbage-collects it, if sooner): a remount within the grace keeps the subscription, a later
 // one subscribes again (resuming from the client's cached value when it has one). Every server patch (and optimistic
 // update) is pushed with setQueryData; the client already keeps unchanged rows' identity, so no structural sharing.
-import { hashKey, mutationOptions, queryOptions, skipToken, type QueryCacheNotifyEvent, type QueryClient, type QueryKey, type Query } from "@tanstack/react-query";
+import {
+  hashKey,
+  infiniteQueryOptions,
+  mutationOptions,
+  queryOptions,
+  skipToken,
+  type InfiniteData,
+  type QueryCacheNotifyEvent,
+  type QueryClient,
+  type QueryKey,
+  type Query,
+} from "@tanstack/react-query";
 import {
   EmberError,
   encodeJson,
   getFunctionName,
   stableStringify,
   unsafeRef,
+  type ActionReference,
   type ArgsAndOptions,
   type ArgsOrSkipAndOptions,
   type EmberClient,
   type EmberErrorOf,
+  type FunctionReference,
   type HydratedQuery,
   type MutationOptions,
   type MutationReference,
+  type OptionsFor,
+  type PaginationOptions,
+  type PaginationResult,
   type QueryReference,
   type QuerySnapshot,
   type ShardOptions,
+  type Visibility,
 } from "@freecorps/ember-client";
 
 type QueryRef = QueryReference;
 type MutationRef = MutationReference;
-type ArgsOf<F extends QueryRef | MutationRef> = F["_args"];
-type ReturnOf<F extends QueryRef | MutationRef> = F["_returnType"];
+type ArgsOf<F extends QueryRef | MutationRef | ActionReference> = F["_args"];
+type ReturnOf<F extends QueryRef | MutationRef | ActionReference> = F["_returnType"];
 
 /** `["ember", shard | null, "module:export", args]`; a null shard means the client's `defaultShard`. */
 export type EmberQueryKey = readonly ["ember", string | null, string, Record<string, unknown> | "skip"];
@@ -43,7 +60,7 @@ export const isEmberQueryKey = (key: QueryKey): key is EmberQueryKey => key[0] =
 
 /** Hash for TanStack: ember keys via the tagged stable JSON (bigint/bytes safe), others via `hashKey`. */
 export function emberQueryKeyHashFn(key: QueryKey): string {
-  return isEmberQueryKey(key) || key[0] === "ember:hydration" ? `ember:${stableStringify(key)}` : hashKey(key);
+  return isEmberQueryKey(key) || key[0] === "ember:hydration" || key[0] === "ember:paginated" ? `ember:${stableStringify(key)}` : hashKey(key);
 }
 
 const registry = new WeakMap<QueryClient, EmberQueryClient>();
@@ -180,6 +197,61 @@ export function emberMutation<M extends MutationRef>(ref: M, opts?: MutationOpti
   return mutationOptions<ReturnOf<M>, EmberErrorOf<M>, ArgsOf<M>>({
     mutationKey: ["ember", opts?.shard ?? null, getFunctionName(ref)],
     mutationFn: emberMutationFn(ref, opts) as (variables: ArgsOf<M>) => Promise<ReturnOf<M>>,
+  });
+}
+
+/**
+ * `useMutation` options for an action (`POST /api/action`), with typed variables and errors:
+ * `const run = useMutation(emberAction(api.ai.summarize))` → `run.data` is the action's result, `run.error` its
+ * `EmberErrorOf`. Routed like any call: `{ shard }`, else the function's own routing (`fromArg`, `fromAuth`), else the
+ * client's `defaultShard`.
+ */
+export function emberAction<A extends ActionReference>(ref: A, opts?: ShardOptions) {
+  return mutationOptions<ReturnOf<A>, EmberErrorOf<A>, ArgsOf<A>>({
+    mutationKey: ["ember:action", opts?.shard ?? null, getFunctionName(ref)],
+    mutationFn: emberActionFn(ref, opts) as (variables: ArgsOf<A>) => Promise<ReturnOf<A>>,
+  });
+}
+
+/** `mutationFn` of `emberAction`: runs the action with the client connected to the mutation's QueryClient. */
+export function emberActionFn<A extends ActionReference>(ref: A, opts?: ShardOptions) {
+  return (variables: ArgsOf<A>, context: { client: QueryClient }): Promise<ReturnOf<A>> =>
+    (connected(context.client).client.action as (r: A, a: unknown, o: unknown) => Promise<ReturnOf<A>>)(ref, variables, opts);
+}
+
+/** A query usable with `emberPaginatedQuery`: it takes `paginationOpts` and returns a `PaginationResult`. */
+export type PaginatedQueryReference = FunctionReference<"query", Visibility, { paginationOpts: PaginationOptions }, PaginationResult<unknown>>;
+type PageItem<Q extends PaginatedQueryReference> = ReturnOf<Q> extends PaginationResult<infer T> ? T : never;
+/** `["ember:paginated", shard | null, "module:export", args (without paginationOpts), numItems]`. */
+export type EmberPaginatedKey = readonly ["ember:paginated", string | null, string, Record<string, unknown> | "skip", number];
+
+/**
+ * `infiniteQueryOptions` over Ember's cursor pagination, for `useInfiniteQuery` / `useSuspenseInfiniteQuery`:
+ * page 1 is `paginationOpts: { numItems, cursor: null }`, the next one starts at the page's `continueCursor`
+ * (`hasNextPage` is `!isDone`). Each page is one read (`client.query`: the socket when it is open, else HTTP), routed
+ * by the reference (`fromArg` / `fromAuth`) unless `{ shard }` names one. Pages are not live: refetch or invalidate
+ * the key to see new rows (TanStack refetches every loaded page from its cursor); for live pages use
+ * `usePaginatedQuery` of `@freecorps/ember-react`. `"skip"` disables it.
+ */
+export function emberPaginatedQuery<Q extends PaginatedQueryReference>(ref: Q, args: Omit<ArgsOf<Q>, "paginationOpts"> | "skip", opts: OptionsFor<Q, ShardOptions> & { numItems: number }) {
+  const o = opts as ShardOptions & { numItems: number };
+  const shard = o.shard;
+  const key: EmberPaginatedKey = ["ember:paginated", shard ?? null, getFunctionName(ref), args === "skip" ? "skip" : (args as Record<string, unknown>), o.numItems];
+  type Page = PaginationResult<PageItem<Q>>;
+  return infiniteQueryOptions<Page, EmberErrorOf<Q>, InfiniteData<Page, string | null>, EmberPaginatedKey, string | null>({
+    queryKey: key,
+    queryFn:
+      args === "skip"
+        ? skipToken
+        : (ctx) =>
+            (connected(ctx.client).client.query as (r: Q, a: unknown, x: unknown) => Promise<Page>)(
+              ref,
+              { ...(args as Record<string, unknown>), paginationOpts: { numItems: o.numItems, cursor: ctx.pageParam } },
+              shard === undefined ? undefined : { shard },
+            ),
+    initialPageParam: null,
+    getNextPageParam: (last) => (last.isDone ? undefined : last.continueCursor),
+    queryKeyHashFn: emberQueryKeyHashFn,
   });
 }
 
