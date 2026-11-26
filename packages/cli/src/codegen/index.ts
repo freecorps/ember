@@ -196,13 +196,12 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
   const onDisk = (name: string) => (existsSync(join(out, name)) ? readFileSync(join(out, name), "utf8") : undefined);
   const known = new Set(errorCodes.map((e) => e.code));
   const disk = onDisk("api.d.ts");
-  // The api on disk is usually current (one pass converges): only then is the first pass worth its diagnostics.
+  // The api on disk is usually current: then one pass converges.
   const fromDisk = !!disk && disk.includes("export type Mutation<Args, Returns, Errors extends ErrorSpec>");
   let api = fromDisk ? disk! : apiDts(manifest, new Map(), known, out).text;
   let types = onDisk("types.d.ts") ?? typesDts([]);
   let infos = new Map<string, FunctionTypeInfo>();
   let named: NamedType[] = [];
-  let diagnostics: string[] = [];
   let converged = false;
   for (let i = 0; i < MAX_ITERATIONS; i++) {
     const virtualFiles = new Map<string, string>([
@@ -212,18 +211,9 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
       [join(out, "dataModel.d.ts"), generated.get("dataModel.d.ts")!],
       [join(out, "server.d.ts"), generated.get("server.d.ts")!],
     ]);
-    // The last pass needs diagnostics; a pass from the stub api never converges, so it skips them (unless it is the
-    // only one: an app without functions).
-    let withDiagnostics = i > 0 || fromDisk || wanted.size === 0;
-    let r = oracle.infer({ modules: files.modules, wanted, inferReturns, virtualFiles, generatedDir: out, projectDir: project.dir, diagnostics: withDiagnostics });
-    if (!withDiagnostics && apiDts(withInferredErrors(manifest, r.functions, known), r.functions, known, out, r.named).text === api && typesDts(r.named) === types) {
-      // Converged on the first pass after all (every result has a validator): this pass is the last, so check it.
-      withDiagnostics = true;
-      r = oracle.infer({ modules: files.modules, wanted, inferReturns, virtualFiles, generatedDir: out, projectDir: project.dir, diagnostics: true });
-    }
+    const r = oracle.infer({ modules: files.modules, wanted, inferReturns, virtualFiles, generatedDir: out, projectDir: project.dir });
     infos = r.functions;
     named = r.named;
-    diagnostics = r.diagnostics;
     const nextApi = apiDts(withInferredErrors(manifest, infos, known), infos, known, out, named).text;
     const nextTypes = typesDts(named);
     if (nextApi === api && nextTypes === types) {
@@ -233,6 +223,8 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
     api = nextApi;
     types = nextTypes;
   }
+  // Type errors of the pass that settled (it checked the modules against the final api.d.ts).
+  const diagnostics = oracle.diagnostics();
   if (!converged) warnings.push(`return types did not settle after ${MAX_ITERATIONS} passes (functions returning each other's results?): add \`returns:\` validators`);
   for (const d of diagnostics) warnings.push(d);
 

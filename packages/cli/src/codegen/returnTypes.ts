@@ -5,7 +5,12 @@
 //
 // The generated files the modules import (`_generated/api.d.ts`, ...) are served from memory: codegen iterates until
 // the printed api no longer changes (a function returning `ctx.runQuery(internal.x.y)` needs `x.y`'s type first).
-// The program is kept between runs (`ember dev`), so a save re-checks incrementally.
+//
+// Incremental (`ember dev`): the oracle keeps a builder program between runs (the previous program is reused) and
+// caches each module's results and diagnostics, keyed by the versions of the module and of every file it imports,
+// transitively (the builder's reference graph). A pass re-infers only the modules whose file changed and the ones
+// importing them (directly or not); the others are replayed from the cache, so a save re-checks the edited module and
+// its callers, not the app. The output is the same as a run from scratch's (codegen-incremental.test.ts).
 
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import ts from "typescript";
@@ -43,16 +48,14 @@ export interface InferOptions {
   generatedDir: string;
   /** The functions directory (types declared under it can be emitted by name). */
   projectDir: string;
-  /** Collect semantic diagnostics of the user's modules (only the last iteration needs them). */
-  diagnostics?: boolean;
 }
 
 export interface InferResult {
   functions: Map<string, FunctionTypeInfo>;
   /** Types exported by the user's modules that the printed types refer to by name (→ `_generated/types.d.ts`). */
   named: NamedType[];
-  /** Type errors in the user's modules (codegen still succeeds; printed as warnings). */
-  diagnostics: string[];
+  /** Modules (paths) whose functions this pass inferred; the others came from the cache. */
+  inferred: string[];
 }
 
 const COMPILER_OPTIONS: ts.CompilerOptions = {
@@ -68,10 +71,51 @@ const COMPILER_OPTIONS: ts.CompilerOptions = {
   lib: ["lib.es2023.d.ts", "lib.dom.d.ts"],
 };
 
-/** Keeps the TypeScript program between runs (incremental re-checks in `ember dev`). */
+/** A module's results, valid while its key and the named types before it are the same. */
+interface ModuleCache {
+  /** Versions of the module and of every file it imports (transitively), and what was asked about it. */
+  key: string;
+  /** The named types defined before this module (they decide what its printing names and how). */
+  before: string;
+  functions: Array<[string, FunctionTypeInfo]>;
+  /** Named types its printing defined, in order. */
+  named: Array<[string, NamedType]>;
+}
+
+type VersionedSourceFile = ts.SourceFile & { version?: string };
+
+/**
+ * Keeps the TypeScript program between runs (`ember dev`): a builder program (the previous program is reused, and its
+ * reference graph tells what each module imports) and caches of each module's inferred types and diagnostics, keyed
+ * by the versions of the module and of everything it imports, so a run re-checks only what an edit can change.
+ */
 export class TypeOracle {
-  private program: ts.Program | undefined;
-  private readonly cache = new Map<string, { text: string; sf: ts.SourceFile }>();
+  private builder: ts.SemanticDiagnosticsBuilderProgram | undefined;
+  private readonly files = new Map<string, { text: string; sf: VersionedSourceFile }>();
+  private readonly modules = new Map<string, ModuleCache>();
+  private readonly checked = new Map<string, { key: string; diagnostics: string[] }>();
+  private nextVersion = 0;
+  /** The modules of the last `infer` and the dependency key of each. */
+  private last: Array<{ file: string; key: string }> = [];
+
+  /**
+   * Syntax and type errors of the user's modules in the program of the last `infer` (codegen asks once, after the pass
+   * that converged; codegen still succeeds with them, printed as warnings). A module nothing it depends on changed
+   * keeps the diagnostics of an earlier run.
+   */
+  diagnostics(): string[] {
+    const program = this.builder?.getProgram();
+    if (!program) return [];
+    for (const f of this.checked.keys()) if (!this.last.some((m) => m.file === f)) this.checked.delete(f);
+    return this.last.flatMap(({ file, key }) => {
+      const hit = this.checked.get(file);
+      if (hit && hit.key === key) return hit.diagnostics;
+      const sf = program.getSourceFile(file);
+      const diagnostics = sf ? [...program.getSyntacticDiagnostics(sf), ...program.getSemanticDiagnostics(sf)].map((d) => formatDiagnostic(d)) : [];
+      this.checked.set(file, { key, diagnostics });
+      return diagnostics;
+    });
+  }
 
   infer(o: InferOptions): InferResult {
     const host = ts.createCompilerHost(COMPILER_OPTIONS, true);
@@ -81,21 +125,32 @@ export class TypeOracle {
     const virtual = new Map([...o.virtualFiles].map(([k, v]) => [resolve(k), v]));
     host.fileExists = (f) => virtual.has(resolve(f)) || exists(f);
     host.readFile = (f) => virtual.get(resolve(f)) ?? read(f);
+    // One SourceFile per (file, text), with a version (the builder requires one): an unchanged file keeps its version,
+    // which is what the caches' keys are made of.
     host.getSourceFile = (f, lang, onError, create) => {
       const text = virtual.get(resolve(f)) ?? read(f);
       if (text === undefined) return getSf(f, lang, onError, create);
       const key = resolve(f);
-      const hit = this.cache.get(key);
+      const hit = this.files.get(key);
       if (hit && hit.text === text) return hit.sf;
-      const sf = ts.createSourceFile(f, text, lang, true);
-      this.cache.set(key, { text, sf });
+      const sf: VersionedSourceFile = ts.createSourceFile(f, text, lang, true);
+      sf.version = String(++this.nextVersion);
+      this.files.set(key, { text, sf });
       return sf;
     };
     const docsFile = resolve(o.generatedDir, "__ember_docs.ts");
     virtual.set(docsFile, DOCS_PROBE);
-    const program = ts.createProgram({ rootNames: [...o.modules.map((m) => m.file), docsFile], options: COMPILER_OPTIONS, host, ...(this.program ? { oldProgram: this.program } : {}) });
-    this.program = program;
-    return new Inference(program, o).run();
+    const rootNames = [...o.modules.map((m) => m.file), docsFile];
+    // Only its program and reference graph are used: its own diagnostics bookkeeping (declaration emits to compare
+    // signatures) costs more than it saves here, where a module's results depend on its imports' bodies too (errors).
+    const builder = ts.createSemanticDiagnosticsBuilderProgram(rootNames, COMPILER_OPTIONS, host, this.builder);
+    this.builder = builder;
+    const present = new Set(o.modules.map((m) => m.file));
+    for (const f of this.modules.keys()) if (!present.has(f)) this.modules.delete(f);
+    const inference = new Inference(builder.getProgram(), o, builder, this.modules);
+    const result = inference.run();
+    this.last = inference.keys;
+    return result;
   }
 }
 
@@ -120,55 +175,101 @@ class Inference {
   private readonly printer: TypePrinter;
   private readonly program: ts.Program;
   private readonly o: InferOptions;
-  constructor(program: ts.Program, o: InferOptions) {
+  private readonly builder: ts.SemanticDiagnosticsBuilderProgram;
+  private readonly cache: Map<string, ModuleCache>;
+  private readonly versions = new Map<string, string>();
+  /** Versions every module's results depend on: the files outside any import graph (global scripts) and the data model. */
+  private readonly sharedKey: string;
+  /** Each module's dependency key (its diagnostics depend on nothing else). */
+  readonly keys: Array<{ file: string; key: string }> = [];
+  constructor(program: ts.Program, o: InferOptions, builder: ts.SemanticDiagnosticsBuilderProgram, cache: Map<string, ModuleCache>) {
     this.program = program;
     this.o = o;
+    this.builder = builder;
+    this.cache = cache;
     this.checker = program.getTypeChecker();
-    this.printer = new TypePrinter(this.checker, program, o, documentTypes(program, this.checker, o.generatedDir));
+    this.printer = new TypePrinter(this.checker, program, o, () => documentTypes(program, this.checker, o.generatedDir));
+    const globals: string[] = [];
+    for (const sf of program.getSourceFiles()) {
+      const v = (sf as VersionedSourceFile).version ?? "";
+      this.versions.set(sf.fileName, v);
+      if (!ts.isExternalModule(sf) && !program.isSourceFileDefaultLibrary(sf)) globals.push(v);
+    }
+    const docs = program.getSourceFile(resolve(o.generatedDir, "__ember_docs.ts"));
+    this.sharedKey = `${globals.join(",")}|${docs ? this.dependencyKey(docs) : ""}|${o.generatedDir}|${o.projectDir}`;
+  }
+
+  /** The versions of `sf` and of everything it imports, transitively (TypeScript's reference graph). */
+  private dependencyKey(sf: ts.SourceFile): string {
+    return this.builder
+      .getAllDependencies(sf)
+      .map((f) => this.versions.get(f) ?? `?${f}`)
+      .join(",");
   }
 
   run(): InferResult {
     const functions = new Map<string, FunctionTypeInfo>();
-    const c = this.checker;
+    const inferred: string[] = [];
     for (const m of this.o.modules) {
       const sf = this.program.getSourceFile(m.file);
-      const modSym = sf && c.getSymbolAtLocation(sf);
-      if (!sf || !modSym) continue;
-      for (const exported of c.getExportsOfModule(modSym)) {
-        const name = `${m.path}:${exported.getName()}`;
-        if (!this.o.wanted.has(name)) continue;
-        const sym = exported.flags & ts.SymbolFlags.Alias ? c.getAliasedSymbol(exported) : exported;
-        const decl = sym.valueDeclaration ?? sym.declarations?.[0];
-        const info: FunctionTypeInfo = { returns: "unknown", errors: [], doc: docOf(c, exported, sym), source: null };
-        if (decl) {
-          const nameNode = ts.isVariableDeclaration(decl) || ts.isFunctionDeclaration(decl) ? decl.name : undefined;
-          const at = nameNode ?? decl;
-          const pos = at.getSourceFile().getLineAndCharacterOfPosition(at.getStart());
-          info.source = { file: at.getSourceFile().fileName, line: pos.line, character: pos.character };
-        }
-        if (this.o.inferReturns.has(name)) {
-          const t = c.getTypeOfSymbolAtLocation(sym, sf);
-          const ret = registeredReturnType(c, t);
-          info.returns = ret ? this.printer.print(ret, "", true) : "unknown";
-          if (ret && ret.flags & ts.TypeFlags.Any) info.problem = "is `any`";
-          else if (/\bany\b/.test(info.returns)) info.problem = "contains `any`";
-          else if (info.returns === "unknown") info.problem = "could not be inferred (`unknown`)";
-        }
-        const handlers = decl ? handlersOf(c, decl) : [];
-        if (handlers.length) {
-          const walker = new ErrorWalker(c, this.o.projectDir);
-          info.errors = [...new Set(handlers.flatMap((h) => [...walker.errorsOf(h)]))].sort();
-        }
-        functions.set(name, info);
+      if (!sf) {
+        this.cache.delete(m.file);
+        continue;
       }
+      const deps = `${this.sharedKey}|${this.dependencyKey(sf)}`;
+      this.keys.push({ file: m.file, key: deps });
+      const asked = [...this.o.wanted].filter((n) => n.startsWith(`${m.path}:`));
+      const key = `${deps}|${m.path}|${asked.map((n) => `${n}${this.o.inferReturns.has(n) ? "+" : ""}`).join(",")}`;
+      const before = this.printer.trail;
+      const hit = this.cache.get(m.file);
+      if (hit && hit.key === key && hit.before === before) {
+        this.printer.adopt(hit.named);
+        for (const [name, info] of hit.functions) functions.set(name, info);
+        continue;
+      }
+      inferred.push(m.path);
+      this.printer.docs();
+      const mark = this.printer.mark();
+      const own = this.inferModule(m, sf);
+      for (const [name, info] of own) functions.set(name, info);
+      this.cache.set(m.file, { key, before, functions: own, named: this.printer.since(mark) });
     }
-    const diagnostics = this.o.diagnostics
-      ? this.o.modules.flatMap((m) => {
-          const sf = this.program.getSourceFile(m.file);
-          return sf ? [...this.program.getSyntacticDiagnostics(sf), ...this.program.getSemanticDiagnostics(sf)].map((d) => formatDiagnostic(d)) : [];
-        })
-      : [];
-    return { functions, named: this.printer.namedTypes(), diagnostics };
+    return { functions, named: this.printer.namedTypes(), inferred };
+  }
+
+  private inferModule(m: { path: string; file: string }, sf: ts.SourceFile): Array<[string, FunctionTypeInfo]> {
+    const out: Array<[string, FunctionTypeInfo]> = [];
+    const c = this.checker;
+    const modSym = c.getSymbolAtLocation(sf);
+    if (!modSym) return out;
+    for (const exported of c.getExportsOfModule(modSym)) {
+      const name = `${m.path}:${exported.getName()}`;
+      if (!this.o.wanted.has(name)) continue;
+      const sym = exported.flags & ts.SymbolFlags.Alias ? c.getAliasedSymbol(exported) : exported;
+      const decl = sym.valueDeclaration ?? sym.declarations?.[0];
+      const info: FunctionTypeInfo = { returns: "unknown", errors: [], doc: docOf(c, exported, sym), source: null };
+      if (decl) {
+        const nameNode = ts.isVariableDeclaration(decl) || ts.isFunctionDeclaration(decl) ? decl.name : undefined;
+        const at = nameNode ?? decl;
+        const pos = at.getSourceFile().getLineAndCharacterOfPosition(at.getStart());
+        info.source = { file: at.getSourceFile().fileName, line: pos.line, character: pos.character };
+      }
+      if (this.o.inferReturns.has(name)) {
+        const t = c.getTypeOfSymbolAtLocation(sym, sf);
+        const ret = registeredReturnType(c, t);
+        info.returns = ret ? this.printer.print(ret, "", true) : "unknown";
+        if (ret && ret.flags & ts.TypeFlags.Any) info.problem = "is `any`";
+        else if (/\bany\b/.test(info.returns)) info.problem = "contains `any`";
+        else if (info.returns === "unknown") info.problem = "could not be inferred (`unknown`)";
+      }
+      const handlers = decl ? handlersOf(c, decl) : [];
+      if (handlers.length) {
+        const walker = new ErrorWalker(c, this.o.projectDir);
+        info.errors = [...new Set(handlers.flatMap((h) => [...walker.errorsOf(h)]))].sort();
+      }
+      out.push([name, info]);
+    }
+    return out;
   }
 }
 
@@ -381,17 +482,21 @@ const MAX_DEPTH = 16;
 
 class TypePrinter {
   private readonly stack = new Set<ts.Type>();
-  private readonly named = new Map<ts.Symbol, NamedType>();
+  /** Named types by declaration (fully qualified name; `gen:<name>` for the ones of _generated/types.d.ts). */
+  private readonly named = new Map<string, NamedType>();
   private readonly usedNames = new Set<string>();
+  /** The named types defined so far, in order: what the printing of the next module depends on. */
+  trail = "";
   private readonly checker: ts.TypeChecker;
   private readonly program: ts.Program;
   private readonly o: InferOptions;
-  private readonly docs: Map<string, ts.Type>;
-  constructor(checker: ts.TypeChecker, program: ts.Program, o: InferOptions, docs: Map<string, ts.Type>) {
+  private readonly docsOf: () => Map<string, ts.Type>;
+  private docsCache: Map<string, ts.Type> | undefined;
+  constructor(checker: ts.TypeChecker, program: ts.Program, o: InferOptions, docs: () => Map<string, ts.Type>) {
     this.checker = checker;
     this.program = program;
     this.o = o;
-    this.docs = docs;
+    this.docsOf = docs;
   }
 
   /** `t` is exactly the document type of a table (both ways assignable). */
@@ -403,13 +508,38 @@ class TypePrinter {
     const tag = parts.find((m) => m.getProperty("__tableName"));
     const table = tag && this.checker.getTypeOfSymbol(tag.getProperty("__tableName")!);
     if (!table?.isStringLiteral()) return undefined;
-    const doc = this.docs.get(table.value);
+    const doc = this.docs().get(table.value);
     if (!doc) return undefined;
     return this.checker.isTypeAssignableTo(t, doc) && this.checker.isTypeAssignableTo(doc, t) ? table.value : undefined;
   }
 
+  /** The document type of each table (resolved on first use: a pass that infers nothing does not check the schema). */
+  docs(): Map<string, ts.Type> {
+    return (this.docsCache ??= this.docsOf());
+  }
+
   namedTypes(): NamedType[] {
     return [...this.named.values()].sort((a, b) => (a.name < b.name ? -1 : 1));
+  }
+
+  private define(key: string, entry: NamedType) {
+    this.named.set(key, entry);
+    this.usedNames.add(entry.name);
+    this.trail += `${key}\u0000${entry.name}\n`;
+  }
+
+  mark(): number {
+    return this.named.size;
+  }
+
+  /** The named types defined after `mark`. */
+  since(mark: number): Array<[string, NamedType]> {
+    return [...this.named].slice(mark);
+  }
+
+  /** Defines named types a cached module's printing defined (as that printing would). */
+  adopt(entries: Array<[string, NamedType]>) {
+    for (const [key, entry] of entries) this.define(key, entry);
   }
 
   print(t: ts.Type, indent: string, top = false): string {
@@ -458,9 +588,8 @@ class TypePrinter {
     if (resolve(sf.fileName) === resolve(this.o.generatedDir, "types.d.ts")) {
       const n = sym.getName();
       if (!this.usedNames.has(n)) {
-        this.usedNames.add(n);
         const entry: NamedType = { name: n, text: "unknown" };
-        this.named.set(sym, entry);
+        this.define(`gen:${n}`, entry);
         this.stack.add(t);
         try {
           entry.text = this.printStructured(t, "", false);
@@ -473,13 +602,13 @@ class TypePrinter {
     const rel = relative(this.o.projectDir, sf.fileName);
     if (rel.startsWith("..") || isAbsolute(rel) || rel.split(/[\\/]/).includes("_generated") || rel.includes("node_modules")) return undefined;
     if (!ts.getCombinedModifierFlags(decl) || !(ts.getCombinedModifierFlags(decl) & ts.ModifierFlags.Export)) return undefined;
-    const hit = this.named.get(sym);
+    const key = this.checker.getFullyQualifiedName(sym);
+    const hit = this.named.get(key);
     if (hit) return hit.name;
     let name = sym.getName();
     if (this.usedNames.has(name)) name = `${rel.replace(/\.[a-z]+$/, "").replace(/[^A-Za-z0-9]+/g, "_")}_${name}`;
-    this.usedNames.add(name);
     const entry: NamedType = { name, text: "unknown" };
-    this.named.set(sym, entry);
+    this.define(key, entry);
     this.stack.add(t);
     try {
       entry.text = this.printStructured(t, "", false);
@@ -569,9 +698,12 @@ class TypePrinter {
       } else if (top && m.flags & (ts.TypeFlags.Void | ts.TypeFlags.Undefined)) parts.push("null");
       else parts.push(this.print(m, indent));
     }
-    // `null` last reads better in a hover (`Doc<"rooms"> | null`).
+    // Sorted: the compiler orders a union by when it created each member's type, which depends on what it checked
+    // before (an incremental run checks less than a full one); the printed order must not. `null` last reads better
+    // in a hover (`Doc<"rooms"> | null`).
     const uniq = [...new Set(parts)];
-    return [...uniq.filter((p) => p !== "null" && p !== "undefined"), ...uniq.filter((p) => p === "null" || p === "undefined")].join(" | ");
+    const nullish = (p: string) => p === "null" || p === "undefined";
+    return [...uniq.filter((p) => !nullish(p)).sort(byText), ...uniq.filter(nullish).sort(byText)].join(" | ");
   }
 
   /** Parenthesizes unions/intersections inside arrays and intersections. */
@@ -587,6 +719,7 @@ class TypePrinter {
   }
 }
 
+const byText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
 const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const propName = (k: string) => (IDENT.test(k) ? k : JSON.stringify(k));
 
