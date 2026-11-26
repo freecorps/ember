@@ -14,7 +14,8 @@
 //   - the column is NULL: the field is `null` (nullable) or absent, compared in JS once, when the SQL is built;
 //   - the literal has another type than the column: the type order decides, also once, in JS;
 //   - same type: SQLite compares. Text with BINARY collation is UTF-8 byte order, which is the code point order of
-//     `compareStrings`; literals with a lone surrogate or a NUL are left to JS. Numbers: only finite literals other
+//     `compareStrings`; literals with a lone surrogate or a NUL, and stored texts that may hold one (WTF8), are left
+//     to JS. Numbers: only finite literals other
 //     than -0 (columns never hold NaN, -0 or ±Infinity: those go to `_json`). Booleans: 0 / 1.
 // Anything else in the expression is NULL (left to JS). An expression with no decided part, a malformed one, or one
 // with a non-primitive literal or a non-string field path (whose JS evaluation could throw) is not pushed at all.
@@ -66,7 +67,14 @@ function fieldInfo(layout: Layout, path: string): FieldInfo | undefined {
   }
 }
 
-/** A string SQLite stores, binds and compares as JS does: no lone surrogate (bound as U+FFFD), no NUL. */
+/**
+ * A stored text that may not be the UTF-8 of the string read back: DO SQLite stores a lone surrogate as its WTF-8
+ * bytes (ED A0..BF xx) and reads them back as U+FFFD each, so SQLite would compare other bytes than the document's
+ * string. Such a row is left to JS: any ED byte (valid UTF-8 has it only for U+D000..U+D7FF, which just fall back).
+ */
+const WTF8 = (col: string): string => `instr(CAST(${col} AS BLOB), X'ED') > 0`;
+
+/** A string SQLite binds and compares as JS does: no lone surrogate (bound as other bytes), no NUL. */
 function plainString(s: string): boolean {
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
@@ -135,19 +143,24 @@ class Builder {
     const f = fieldInfo(this.layout, path);
     if (!f) return "NULL";
     const test = TEST[op];
+    const col = q(f.column);
     let present: string;
+    // A stored text SQLite compares as JS compares the document's string (see WTF8).
+    let text = false;
     if (typeof x !== f.type) present = test(compareValues(f.sample, x)) ? "1" : "0";
     else if (f.type === "string" && (!this.text || !plainString(x as string))) return "NULL";
     else if (f.type === "number" && !(Number.isFinite(x) && !Object.is(x, -0))) return "NULL";
     else {
-      present = `${q(f.column)} ${SQL_OP[op]} ?`;
+      present = `${col} ${SQL_OP[op]} ?`;
       this.params.push(f.type === "boolean" ? (x ? 1 : 0) : (x as SqlValue));
+      text = f.type === "string";
     }
     this.decided = true;
-    if (f.notNull) return `(${present})`;
+    const exact = text ? `WHEN ${WTF8(col)} THEN NULL ` : "";
+    if (f.notNull) return text ? `(CASE ${exact}ELSE ${present} END)` : `(${present})`;
     const absent = test(compareValues(f.nullValue, x)) ? "1" : "0";
     // `_json` holds the field (an escaped value) only if its quoted name is in the text: otherwise the column decides.
-    return `(CASE WHEN instr("_json", ${lit(`"${f.column}"`)}) > 0 THEN NULL WHEN ${q(f.column)} IS NULL THEN ${absent} ELSE ${present} END)`;
+    return `(CASE WHEN instr("_json", ${lit(`"${f.column}"`)}) > 0 THEN NULL WHEN ${col} IS NULL THEN ${absent} ${exact}ELSE ${present} END)`;
   }
 }
 

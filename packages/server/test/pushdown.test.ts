@@ -147,6 +147,9 @@ describe("the SQL verdict is passes() wherever it decides", () => {
     const { e, inner } = engine({ pushdown: true });
     const docs = Array.from({ length: 300 }, () => randomDoc(r));
     seed(e, docs);
+    // Texts as DO SQLite stores a lone surrogate (WTF-8 bytes, read back as U+FFFD each): SQLite must not decide them.
+    inner.exec(`UPDATE "t" SET "s" = CAST(X'EDA080' AS TEXT) WHERE "_rowid" % 7 = 0`);
+    inner.exec(`UPDATE "t" SET "os" = CAST(X'61EDB080' AS TEXT) WHERE "_rowid" % 5 = 0 AND "os" IS NOT NULL`);
     const layout = layoutOf("t", schema.manifest.tables.t!.document);
     const rows = inner.exec(`SELECT * FROM "t"`).rows;
     const decoded = rows.map((row) => decodeRow(layout, row));
