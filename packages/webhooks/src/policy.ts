@@ -29,13 +29,16 @@ export function classify(status: number | undefined, retryAfterMs?: number): Att
   return { kind: "terminal" };
 }
 
-/** `Retry-After` (delta seconds or an HTTP date) in ms from `now`; undefined when absent or unreadable. */
+/**
+ * `Retry-After` (delta seconds or an HTTP date) in ms from `now`, at most `MAX_RETRY_AFTER_MS`; undefined when absent
+ * or unreadable.
+ */
 export function parseRetryAfter(value: string | null | undefined, now: number): number | undefined {
   if (value === null || value === undefined) return undefined;
   const v = value.trim();
-  if (/^\d+$/.test(v)) return Number(v) * SECOND;
+  if (/^\d+$/.test(v)) return Math.min(MAX_RETRY_AFTER_MS, Number(v) * SECOND);
   const at = Date.parse(v);
-  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+  return Number.isNaN(at) ? undefined : Math.min(MAX_RETRY_AFTER_MS, Math.max(0, at - now));
 }
 
 /**

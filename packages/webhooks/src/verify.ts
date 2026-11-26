@@ -52,17 +52,26 @@ const keys = new Map<string, Promise<CryptoKey>>();
 function hmacKey(secret: string): Promise<CryptoKey> {
   let k = keys.get(secret);
   if (!k) {
-    k = crypto.subtle.importKey("raw", secretKey(secret) as BufferSource, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    // A failed import is not cached (the next call tries again).
+    k = crypto.subtle.importKey("raw", secretKey(secret) as BufferSource, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]).catch((e: unknown) => {
+      keys.delete(secret);
+      throw e;
+    });
     if (keys.size > 256) keys.clear();
     keys.set(secret, k);
   }
   return k;
 }
 
+/** The base64 HMAC-SHA256 of `id.timestamp.body` (the part after `v1,`). */
+async function mac(secret: string, id: string, timestamp: number, body: string): Promise<string> {
+  const m = await crypto.subtle.sign("HMAC", await hmacKey(secret), enc.encode(`${id}.${timestamp}.${body}`) as BufferSource);
+  return b64encode(new Uint8Array(m));
+}
+
 /** `v1,<base64 HMAC-SHA256(secret, id.timestamp.body)>`. `timestamp` in seconds. */
 export async function signWebhook(secret: string, id: string, timestamp: number, body: string): Promise<string> {
-  const mac = await crypto.subtle.sign("HMAC", await hmacKey(secret), enc.encode(`${id}.${timestamp}.${body}`) as BufferSource);
-  return `v1,${b64encode(new Uint8Array(mac))}`;
+  return `v1,${await mac(secret, id, timestamp, body)}`;
 }
 
 /** The three headers of a delivery, signed with each of `secrets` (newest first), space-separated. */
@@ -114,12 +123,13 @@ export async function verifyWebhook<T = unknown>(secret: string | readonly strin
   const tolerance = opts.toleranceSeconds ?? DEFAULT_TOLERANCE_SECONDS;
   if (now - t > tolerance) throw new WebhookVerificationError("webhook-timestamp too old");
   if (t - now > tolerance) throw new WebhookVerificationError("webhook-timestamp too new");
+  // The `v1` entries' signatures (other versions are skipped); compared without the version prefix.
   const given = sig.split(" ").filter(Boolean).flatMap((s) => {
     const comma = s.indexOf(",");
-    return comma > 0 && s.slice(0, comma) === "v1" ? [s] : [];
+    return comma > 0 && s.slice(0, comma) === "v1" ? [s.slice(comma + 1)] : [];
   });
   for (const s of typeof secret === "string" ? [secret] : secret) {
-    const want = await signWebhook(s, id, t, body);
+    const want = await mac(s, id, t, body);
     if (given.some((g) => equal(g, want))) return JSON.parse(body) as T;
   }
   throw new WebhookVerificationError("no matching signature");

@@ -33,6 +33,9 @@ describe("classify", () => {
     expect(parseRetryAfter("Thu, 26 Nov 2026 11:00:00 GMT", now)).toBe(0);
     expect(parseRetryAfter("soon", now)).toBeUndefined();
     expect(parseRetryAfter(null, now)).toBeUndefined();
+    // Capped at MAX_RETRY_AFTER_MS (24 h), both forms.
+    expect(parseRetryAfter("999999999", now)).toBe(86_400_000);
+    expect(parseRetryAfter("Thu, 31 Dec 2099 00:00:00 GMT", now)).toBe(86_400_000);
   });
 });
 

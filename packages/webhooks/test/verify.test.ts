@@ -1,7 +1,7 @@
 // Standard Webhooks signatures: the specification's test vector, verification (tolerance, rotation, header forms),
 // and refusals.
 import { createHmac } from "node:crypto";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { generateWebhookSecret, signWebhook, verifyWebhook, webhookHeaders, WebhookVerificationError } from "../src/verify.ts";
 
 // From the Standard Webhooks specification's reference libraries (standard-webhooks/standard-webhooks, test vectors).
@@ -54,5 +54,27 @@ describe("signatures", () => {
     expect(await verifyWebhook(VECTOR.secret, h, VECTOR.body, { now: at })).toEqual({ test: 2432232314 });
     // A receiver mid-rotation on its side can pass both of its secrets.
     expect(await verifyWebhook([generateWebhookSecret(), next], h, VECTOR.body, { now: at })).toEqual({ test: 2432232314 });
+  });
+
+  test("a repeated webhook-signature header (Node's req.headers: an array) is one space-separated list", async () => {
+    const other = await signWebhook(generateWebhookSecret(), VECTOR.id, VECTOR.timestamp, VECTOR.body);
+    const headers = { "webhook-id": VECTOR.id, "webhook-timestamp": String(VECTOR.timestamp), "webhook-signature": [other, VECTOR.signature] };
+    expect(await verifyWebhook(VECTOR.secret, headers, VECTOR.body, { now: at })).toEqual({ test: 2432232314 });
+    // Other versions' entries next to the v1 one are skipped, not compared.
+    expect(await verifyWebhook(VECTOR.secret, { ...headers, "webhook-signature": `v1a,xyz ${VECTOR.signature}` }, VECTOR.body, { now: at })).toEqual({ test: 2432232314 });
+  });
+
+  test("a failed key import is not cached: the same secret is tried again", async () => {
+    const real = crypto.subtle.importKey.bind(crypto.subtle);
+    const secret = generateWebhookSecret();
+    let calls = 0;
+    const spy = vi.spyOn(crypto.subtle, "importKey").mockImplementation(((...args: Parameters<SubtleCrypto["importKey"]>) => (++calls === 1 ? Promise.reject(new Error("transient")) : real(...args))) as SubtleCrypto["importKey"]);
+    try {
+      await expect(signWebhook(secret, "m", 1, "{}")).rejects.toThrow(/transient/);
+      expect(await signWebhook(secret, "m", 1, "{}")).toMatch(/^v1,/);
+      expect(calls).toBe(2);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
