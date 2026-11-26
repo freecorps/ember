@@ -28,7 +28,7 @@ export const RUM_MAX_BYTES = 4096;
 /** Histograms per batch, and data points written per batch (Analytics Engine takes 250 per invocation). */
 export const RUM_MAX_HISTOGRAMS = 32;
 export const RUM_MAX_POINTS = 200;
-/** Buckets: `floor(2·log2(ms + 1))`, so each is ~√2 wide; 0 (< 0.41 ms) to 40 (≥ ~1048 s). */
+/** Buckets: `floor(2·log2(ms + 1))`, so each is ~√2 wide; 0 (< 0.41 ms) to 40 (≥ ~1049 s). */
 export const RUM_MAX_BUCKET = 40;
 
 /** The bucket of a duration (the client's and the dashboard's copy are the same formula). */

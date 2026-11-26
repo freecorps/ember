@@ -346,3 +346,7 @@ dialog.palette { width: min(640px, calc(100vw - 32px)); margin-top: 12vh; }
 .timeline-detail { flex-basis: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
 .screen-detail { display: grid; gap: 14px; }
 pre.stacktrace { color: var(--bad); white-space: pre-wrap; }
+
+/* real latency (RUM) */
+table.heat td, table.heat th[scope="row"] { white-space: nowrap; font-family: var(--mono); font-size: 12px; }
+table.heat td.warn { background: color-mix(in srgb, var(--warn) 10%, transparent); }

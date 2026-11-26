@@ -23,7 +23,7 @@ Investigação sobre a `main` em `7e57209`, com uma mudança que saiu dela: o au
 | **S3.** O bundle com auth pesa no isolate frio | **Confirmada e reduzida à metade** | Antes: `startup_time_ms` 53 contra 6 sem auth, e primeira chamada ao shard +98 ms. Com o auth sob demanda: 32 ms e +48 ms. |
 | **S4.** +24 ms de RTT e cauda maior | **Não reproduz hoje** (medido, sem o Convex no mesmo dia) | Query p50 de 139 ms por HTTP e 127 ms pelo socket, contra 177–179 e 169–172 na rodada 7. A cauda vem da última milha do laptop (p95 de `/health` = 104 ms). |
 | **S5.** Pendências de produção das PRs #77 e #79 | **Não medido nesta rodada** | — |
-| **S6.** Telemetria do usuário real | **Desenho** (§6) | — |
+| **S6.** Telemetria do usuário real | **Implementado** na v0.10 (PR 6a-2; contrato em contracts.md "Telemetria", RUM) | — |
 
 ## 1. S1: compressão do WebSocket (`permessage-deflate`)
 
@@ -207,7 +207,12 @@ para uma rodada própria:
 - `put` sob carga com um savepoint por lote;
 - paginação com fronteira fixa.
 
-## 6. S6: telemetria do usuário real (desenho, sem implementação)
+## 6. S6: telemetria do usuário real (desenho; implementado na v0.10)
+
+> Implementado na PR 6a-2 com estas diferenças do desenho: `rum: { sampleRate }` (não `sample`), sem ajuste pelo
+> servidor no `ready`; um ponto por balde (`double10` balde, `double11` amostras, `double12` peso) em vez de baldes
+> em colunas; o colo do DO só em memória (não em `_ember_rt_meta` nem no catálogo), por `ready.colo` ou `{t:"colo"}`;
+> a tela mostra cartões e o mapa país × colo (sem a série com marcadores de deploy). Contrato: contracts.md, RUM.
 
 **O que coletar no cliente** (`EmberClient`, sem custo quando desligado):
 
