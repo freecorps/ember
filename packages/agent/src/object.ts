@@ -72,10 +72,10 @@ export function modelJsonSchema(schema: unknown): unknown {
   if (Array.isArray(schema)) return schema.map(modelJsonSchema);
   if (typeof schema !== "object" || schema === null) return schema;
   const o = schema as Record<string, unknown>;
-  const any = o.anyOf;
-  if (Array.isArray(any) && any.length === 2) {
-    const tag = (any[1] as { properties?: Record<string, unknown> } | null)?.properties;
-    if (tag && Object.keys(tag).length === 1 && "$float" in tag) return modelJsonSchema(any[0]);
+  const branches = o.anyOf;
+  if (Array.isArray(branches) && branches.length === 2) {
+    const tag = (branches[1] as { properties?: Record<string, unknown> } | null)?.properties;
+    if (tag && Object.keys(tag).length === 1 && "$float" in tag) return modelJsonSchema(branches[0]);
   }
   return Object.fromEntries(Object.entries(o).map(([k, x]) => [k, modelJsonSchema(x)]));
 }

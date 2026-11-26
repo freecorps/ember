@@ -37,7 +37,7 @@
   "packages/server/src/sqlQuery.ts": 3,
   "packages/values/src/refs.ts": 9,
   "packages/values/src/validators.ts": 10,
-  "packages/workflows/src/component.ts": 5,
-  "packages/workflows/src/index.ts": 32,
-  "packages/workflows/src/replay.ts": 4
+  "packages/workflows/src/component.ts": 2,
+  "packages/workflows/src/index.ts": 29,
+  "packages/workflows/src/replay.ts": 1
 }

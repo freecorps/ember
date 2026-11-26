@@ -186,6 +186,17 @@ export const officialFunctions = {
       return y + ev.z;
     },
   }),
+  /** Parallel steps: two actions and a mutation in one batch, then a sleep and a mutation with the sum. */
+  parallelFlow: workflow.define({
+    args: { x: v.number() },
+    handler: async (step: WorkflowStep, { x }: { x: number }) => {
+      const [a, b] = (await Promise.all([step.runAction("official:fetchish", { x }), step.runAction("official:fetchish", { x: x + 1 }), step.runMutation("official:record", { label: "wf-par" })])) as [number, number, unknown];
+      await step.sleep(10);
+      await step.runMutation("official:record", { label: `wf-sum:${a + b}` });
+      return a + b;
+    },
+  }),
+  startParallel: mutationGeneric({ args: { x: v.number() }, handler: (ctx: any, { x }: { x: number }) => workflow.start(ctx, "official:parallelFlow", { x }) }),
   startFlow: mutationGeneric({ args: { x: v.number() }, handler: (ctx: any, { x }: { x: number }) => workflow.start(ctx, "official:flow", { x }) }),
   flowStatus: queryGeneric({ args: { id: v.string() }, handler: (ctx: any, { id }: { id: string }) => workflow.status(ctx, id) }),
   flowEvent: mutationGeneric({ args: { id: v.string(), z: v.number() }, handler: (ctx: any, a: { id: string; z: number }) => workflow.sendEvent(ctx, a.id, "go", { z: a.z }) }),
