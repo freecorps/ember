@@ -8,7 +8,7 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: "./wrangler.test.jsonc" },
       miniflare: {
-        bindings: { RUN_LONG: process.env.RUN_LONG ?? "0", EMBER_ADMIN_TOKEN: "admin-secret", EMBER_PROJECT: "test", EMBER_ENV: "test", EMBER_VERSION: { id: "test-version-1" } },
+        bindings: { RUN_LONG: process.env.RUN_LONG ?? "0", EMBER_ADMIN_TOKEN: "admin-secret", EMBER_PROJECT: "test", EMBER_ENV: "test", EMBER_VERSION: { id: "test-version-1" }, EMBER_COLO: "TST" },
         d1Databases: ["EMBER_REGISTRY"],
       },
     }),

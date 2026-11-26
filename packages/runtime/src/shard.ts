@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { probeColo } from "./colo.ts";
 import { claimKey, encodeParts, rowDiffJson, valueDiffJson, type EncodedValue } from "@freecorps/ember-values";
 import {
   createMatchIndex,
@@ -431,6 +432,8 @@ export interface Attachment {
   batch?: true;
   /** The client negotiated `features: ["zframe"]`: frames to it above ZFRAME_MIN_CHARS go compressed (binary). */
   zframe?: true;
+  /** The client negotiated `features: ["rum"]` (a sampled RUM session): it gets this object's colo (`ready`, `colo`). */
+  rum?: true;
   /**
    * The client negotiated `features: ["ack"]`: it acknowledges settled outcomes, so the effect-free ones need not stay
    * in the dedup generations (`Pending.acks`). Missing (a client without it, or a socket from an older runtime): they
@@ -2531,6 +2534,26 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Sockets that negotiated feature "zframe" (from `hello`, or their attachment after a wake). */
   private readonly zframes = new WeakSet<WebSocket>();
+  /**
+   * Where this object runs (RUM, rum.ts `probeColo`): undefined until a sampled client asks, then the probe (one per
+   * object lifetime), then the colo or null (unknown).
+   */
+  private colo: string | null | undefined;
+  private coloProbe: Promise<void> | null = null;
+
+  /** This object's colo for a RUM socket: known → returned; else probed once, then sent as `{t:"colo"}` to RUM sockets. */
+  private coloFor(): string | null {
+    if (this.colo !== undefined) return this.colo;
+    this.coloProbe ??= probeColo(this.env as { EMBER_COLO?: unknown; EMBER_ENV?: unknown }).then((c) => {
+      this.colo = c;
+      if (!c) return;
+      for (const ws of this.ctx.getWebSockets()) {
+        const att = ws.deserializeAttachment() as Attachment | null;
+        if (att?.rum) this.send(ws, { t: "colo", colo: c });
+      }
+    });
+    return null;
+  }
   /** Per "zframe" socket, the last frame still being compressed (or waiting behind one): what comes after waits. */
   private readonly zsending = new Map<WebSocket, Promise<void>>();
 
@@ -3917,10 +3940,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const acks = msg.features?.includes("ack") === true;
         const batch = msg.features?.includes("batch") === true;
         const zframe = msg.features?.includes("zframe") === true && zframeSupported();
-        att = { ...prevAtt, identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}), ...(zframe ? { zframe: true as const } : {}) };
+        const rum = msg.features?.includes("rum") === true;
+        att = { ...prevAtt, ...(rum ? { rum: true as const } : {}), identity, clientId: msg.clientId, hello: true, ...(identity && token ? { token } : {}), ...(rowdiff ? { rowdiff: true as const } : {}), ...(vdiff ? { vdiff: true as const } : {}), ...(ident ? { ident: true as const } : {}), ...(batch ? { batch: true as const } : {}), ...(acks ? { ack: true as const } : {}), ...(zframe ? { zframe: true as const } : {}) };
         this.saveAttachment(ws, att);
-        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : []), ...(msg.features?.includes("qbatch") ? ["qbatch" as const] : []), ...(zframe ? ["zframe" as const] : [])];
-        this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}) });
+        const features = [...(rowdiff ? ["rowdiff" as const] : []), ...(vdiff ? ["vdiff" as const] : []), ...(ident ? ["ident" as const] : []), ...(msg.features?.includes("query") ? ["query" as const] : []), ...(acks ? ["ack" as const] : []), ...(batch ? ["batch" as const] : []), ...(msg.features?.includes("qbatch") ? ["qbatch" as const] : []), ...(zframe ? ["zframe" as const] : []), ...(rum ? ["rum" as const] : [])];
+        const colo = rum ? this.coloFor() : null;
+        this.send(ws, { t: "ready", shard: this.shardName ?? "", version: this.version, epoch: this.epoch, ...(features.length ? { features } : {}), ...(colo ? { colo } : {}) });
         // `ready` goes out alone (the client reads it before it knows the server batches), and as text (before it knows
         // the server compresses); everything after may batch, and go compressed.
         if (batch) this.batching.add(ws);

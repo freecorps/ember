@@ -9,4 +9,5 @@ export * from "./files.ts";
 export { multiTabSupported, type MultiTabOptions, type TabRole, type LockManagerLike, type BroadcastChannelLike, type BroadcastChannelConstructor } from "./multitab.ts";
 export type { ClientMessage, ServerMessage, Id, ErrorCode } from "./protocol.ts";
 export { PROTOCOL_VERSION } from "./protocol.ts";
+export type { RumOptions, RumMetric } from "./rum.ts";
 export { stringify as encodeJson, parse as decodeJson, stableStringify } from "./wire.ts";

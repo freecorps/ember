@@ -36,7 +36,7 @@ export const MAX_BATCH_MESSAGES = 512;
  *   only; frames keep their order. A client announces it only where it can decode it.
  * Unknown features are ignored (not echoed), so newer clients work with older servers.
  */
-export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "zframe"] as const;
+export const SERVER_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "zframe", "rum"] as const;
 export type Feature = (typeof SERVER_FEATURES)[number];
 
 export type Id = string | number;
@@ -54,7 +54,9 @@ export type ClientMessage =
 
 export type ServerMessage =
   /** `features`: the subset of the hello's features this server speaks (omitted when none). */
-  | { t: "ready"; shard: string; version: number; epoch: string; features?: Feature[] }
+  | { t: "ready"; shard: string; version: number; epoch: string; features?: Feature[]; colo?: string }
+  /** Feature "rum": the colo this shard runs in, once learned after `ready` (rum.ts `probeColo`). */
+  | { t: "colo"; colo: string }
   /** `unchanged: true` (value omitted) answers a successful `resume`. Proposed v1 extension. */
   /** `ik` (feature "ident"): identity tag of the value, echoed by the client in `resume.ik`. */
   | { t: "snap"; qid: Id; version: number; value: unknown; ik?: string }

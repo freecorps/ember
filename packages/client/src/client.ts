@@ -13,6 +13,7 @@ import {
 import { applyRowDiff, applyValueDiff, claimKey, reuseUnchanged, validate, type ObjectShape, type RowDiff, type ShardSpec, type ValueDiff } from "@freecorps/ember-values";
 import { jwtPayload } from "./jwt.ts";
 import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG, PROTOCOL_VERSION, type ClientMessage, type Id, type ServerMessage } from "./protocol.ts";
+import type { RumCollector, RumMetric, RumOptions } from "./rum.ts";
 import {
   isStorageAdapter,
   MemoryPendingStorage,
@@ -159,6 +160,13 @@ export interface EmberClientOptions {
    * first `client.files.upload()` loads it with `import()` (a chunk of its own in a bundler that splits code).
    */
   files?: (client: EmberClient) => FilesApi;
+  /**
+   * Real-user latency (contracts.md "RUM"), opt-in: a `sampleRate` share of sessions (drawn once per client) measures
+   * socket connect, heartbeat RTT, mutation ack and the first value of a subscription, per shard kind and Durable
+   * Object colo, and posts small histograms to `/api/_ember/rum` (every 60 s, on `pagehide`, on `close()`). Nothing
+   * personal is sent. A session not drawn loads and measures nothing.
+   */
+  rum?: RumOptions;
   /** Injected for tests. */
   random?: () => number;
 }
@@ -274,6 +282,8 @@ export interface ConnectionState {
 // ------------------------------------------------------------------------------------------------ internals
 
 interface Sub {
+  /** RUM: when the subscription was created, until its first value from the server. */
+  rumAt?: number | undefined;
   key: string;
   shard: string;
   fn: string;
@@ -354,6 +364,11 @@ interface Pending {
 }
 
 interface Conn {
+  /** RUM: when the current socket was created (until its `ready`), and when the last heartbeat ping went (until its pong). */
+  rumOpenAt?: number | undefined;
+  rumPingAt?: number | undefined;
+  /** The colo the shard said it runs in (feature "rum"). */
+  colo?: string | undefined;
   /** Who this socket runs as: the subject of the token its `hello` or last `auth` frame carried (null: anonymous). */
   identity?: LocalIdentity | null;
   shard: string;
@@ -750,6 +765,14 @@ export class EmberClient {
   private readonly stateListeners = new Set<() => void>();
 
   private filesApi: FilesApi | undefined;
+  /** This session was drawn for RUM (its sockets announce feature "rum" to learn the shard's colo). */
+  private rumWanted = false;
+  /** RUM collector of a drawn session (loaded on demand), else null. */
+  private rum: RumCollector | null = null;
+  /** RUM samples taken before the collector loaded (bounded). */
+  private rumEarly: Array<{ m: RumMetric; shard: string; colo: string | undefined; ms: number }> | null = [];
+  /** RUM: when each pending mutation's `mut` last went out. */
+  private readonly rumMutAt = new Map<string, number>();
 
   /** File uploads (PLAN §7): `client.files.upload(data, opts)`. */
   get files(): FilesApi {
@@ -794,6 +817,24 @@ export class EmberClient {
     this.snapshots = this.offline ? null : (options.snapshotCache ?? null);
     this.random = options.random ?? Math.random;
     this.sessionId = randomId(this.random, 10);
+    // RUM: one draw per client; only a drawn session loads the collector (a chunk of its own in a bundler that splits).
+    const rum = options.rum;
+    if (rum && typeof rum.sampleRate === "number" && rum.sampleRate > 0 && this.WS && this.random() < Math.min(1, rum.sampleRate)) {
+      this.rumWanted = true;
+      void import("./rum.ts").then(
+        (m) => {
+          if (this.closed) return;
+          this.rum = new m.RumCollector(`${this.httpBase}/api/_ember/rum`, rum, this.fetchImpl);
+          // What was measured while the chunk loaded (the page's first connect, its first values).
+          for (const x of this.rumEarly ?? []) this.rum.record(x.m, x.shard, x.colo, x.ms);
+          this.rumEarly = null;
+        },
+        () => {
+          this.rumWanted = false;
+          this.rumEarly = null;
+        },
+      );
+    }
     this.authFetcher = options.auth;
     this.clientIdValue = options.clientId ?? null;
 
@@ -896,6 +937,9 @@ export class EmberClient {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // RUM: what was measured goes out now.
+    this.rum?.stop();
+    this.rum = null;
     this.stopConnectivity?.();
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     for (const conn of this.conns.values()) {
@@ -1508,6 +1552,7 @@ export class EmberClient {
         authGen: -1,
         error: null,
         snapshot: LOADING,
+        ...(this.rumWanted ? { rumAt: this.rumMark()! } : {}),
       };
       const hydrated = seed ? undefined : this.hydrated.get(key);
       if (hydrated) {
@@ -1689,6 +1734,7 @@ export class EmberClient {
           sub.ik = r.ik;
           sub.authGen = gen;
           sub.fromHttp = true;
+          this.rumFirst(undefined, sub);
           sub.owner = tokenOwner(this.token);
           this.dropLocal(sub);
           this.persist([sub]);
@@ -2634,6 +2680,7 @@ export class EmberClient {
     }
     let ws: WebSocketLike;
     try {
+      conn.rumOpenAt = this.rumMark();
       ws = new this.WS(`${this.wsBase}/ws?shard=${encodeURIComponent(conn.shard)}`);
     } catch (e) {
       this.report(new EmberError("connect_failed", (e as Error).message), { shard: conn.shard });
@@ -2673,6 +2720,7 @@ export class EmberClient {
       conn.opaque = !!t && !conn.identity;
       m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch"] : ["ident", "query", "ack", "batch", "qbatch"];
       if (this.options.zframe && zframeSupported()) m.features.push("zframe");
+      if (this.rumWanted) m.features.push("rum");
       this.send(conn, m);
       conn.helloSent = true;
       // Pipelined: the first subscriptions ride with hello (one round trip less to the first snapshot); one whose
@@ -3022,6 +3070,7 @@ export class EmberClient {
     }
     p.held = false;
     p.sentAuthSeq = conn.authSeq;
+    if (this.rumWanted) this.rumMutAt.set(String(p.record.mid), this.rumMark()!);
     this.send(conn, { t: "mut", mid: p.record.mid, fn: p.record.fn, args: p.record.args });
   }
 
@@ -3099,6 +3148,7 @@ export class EmberClient {
     const hb = this.options.heartbeat;
     if (hb === false || !conn.ready || conn.deadlineTimer) return;
     this.clearTimer(conn, "pingTimer");
+    conn.rumPingAt = this.rumMark();
     this.send(conn, PING);
     conn.deadlineTimer = setTimeout(() => {
       conn.deadlineTimer = null;
@@ -3175,7 +3225,11 @@ export class EmberClient {
   private onFrame(conn: Conn, data: unknown): void {
     this.heard(conn);
     if (typeof data !== "string") return;
-    if (data === PONG) return;
+    if (data === PONG) {
+      if (conn.rumPingAt !== undefined) this.rumRecord("rtt", conn.shard, conn.colo, conn.rumPingAt);
+      conn.rumPingAt = undefined;
+      return;
+    }
     let parsed: ServerMessage | ServerMessage[];
     try {
       parsed = parse(data) as ServerMessage | ServerMessage[];
@@ -3254,6 +3308,7 @@ export class EmberClient {
         sub.authGen = this.authGen;
         sub.error = null;
         sub.fromHttp = false;
+        this.rumFirst(conn, sub);
         if (!m.unchanged || promoted) this.persist([sub]);
         if (same) return;
         return this.recompute([sub]);
@@ -3309,6 +3364,11 @@ export class EmberClient {
       case "mres": {
         const p = this.pendingByMid.get(String(m.mid));
         if (!p || p.record.shard !== conn.shard) return;
+        const sentAt = this.rumMutAt.get(String(m.mid));
+        if (sentAt !== undefined) {
+          this.rumMutAt.delete(String(m.mid));
+          this.rumRecord("ack", conn.shard, conn.colo, sentAt);
+        }
         if (!m.ok && m.error.code === "auth_expired" && !p.authRetried) {
           // Refused before running (not deduped): re-auth, then resend once with the same mid.
           p.authRetried = true;
@@ -3399,14 +3459,43 @@ export class EmberClient {
       case "authExpired":
         void this.reauth(conn);
         return;
+      case "colo":
+        // Feature "rum": the shard learned where it runs after `ready`.
+        conn.colo = m.colo;
+        return;
       default:
         return;
     }
   }
 
+  /** RUM: a start mark (undefined when this session does not measure). */
+  private rumMark(): number | undefined {
+    if (!this.rumWanted) return undefined;
+    return typeof performance !== "undefined" ? performance.now() : Date.now();
+  }
+
+  /** RUM: one sample since `start`, kept until the collector is loaded. */
+  private rumRecord(m: RumMetric, shard: string, colo: string | undefined, start: number): void {
+    if (!this.rumWanted) return;
+    const ms = (typeof performance !== "undefined" ? performance.now() : Date.now()) - start;
+    if (this.rum) this.rum.record(m, shard, colo, ms);
+    else if (this.rumEarly && this.rumEarly.length < 64) this.rumEarly.push({ m, shard, colo, ms });
+  }
+
+  /** RUM: a subscription's first value from the server (socket `snap`, or its HTTP-first fetch). */
+  private rumFirst(conn: Conn | undefined, sub: Sub): void {
+    if (sub.rumAt === undefined) return;
+    this.rumRecord("first_value", sub.shard, conn?.colo ?? this.conns.get(sub.shard)?.colo, sub.rumAt);
+    sub.rumAt = undefined;
+  }
+
   private onReady(conn: Conn, m: Extract<ServerMessage, { t: "ready" }>): void {
     // What was queued before `ready` goes out as pipelined (so the fallback below accounts for it).
     if (conn.out) this.flushOut(conn);
+    // RUM: the shard's colo (feature "rum"), and how long this socket took to be ready.
+    if (m.colo) conn.colo = m.colo;
+    if (conn.rumOpenAt !== undefined) this.rumRecord("connect", conn.shard, conn.colo, conn.rumOpenAt);
+    conn.rumOpenAt = undefined;
     conn.ready = true;
     conn.attempt = 0;
     conn.quickRetry = false;

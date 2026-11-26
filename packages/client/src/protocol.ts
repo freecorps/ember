@@ -29,7 +29,9 @@ export type ClientMessage =
   | { t: "auth"; token: string | null };
 
 export type ServerMessage =
-  | { t: "ready"; shard: string; version: number; epoch: string; features?: string[] }
+  | { t: "ready"; shard: string; version: number; epoch: string; features?: string[]; colo?: string }
+  /** Feature "rum": the colo the shard runs in, once it learned it after `ready`. */
+  | { t: "colo"; colo: string }
   /** `ik` (feature "ident"): identity tag of the value, echoed in `resume.ik`. */
   | { t: "snap"; qid: Id; version: number; value: unknown; unchanged?: undefined; ik?: string }
   /** Answers a successful `resume` (same epoch and identity): the client's value is still current. */

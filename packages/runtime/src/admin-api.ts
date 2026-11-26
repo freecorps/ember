@@ -16,7 +16,7 @@ import { parse } from "./wire.ts";
 import { validate, withDefaults } from "@freecorps/ember-values";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 13;
+export const ADMIN_API_LEVEL = 14;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -81,6 +81,9 @@ export const ADMIN_FEATURES = [
   "dashboards",
   "dashboards/query",
   "dashboards/run",
+  // level 14: real-user latency (rum.ts). Public (no admin token: what clients post), listed so the dashboard knows the
+  // runtime takes RUM batches and its shards report their colo.
+  "rum",
 ] as const;
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
