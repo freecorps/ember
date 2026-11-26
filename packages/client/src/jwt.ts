@@ -1,7 +1,7 @@
 // The payload of a JWT, decoded once per token. The client looks at the same token on every `fromAuth` call (its claim
 // picks the shard), every frame that renews it, every refresh check and, with `multiTab`, every hello and `auth` the
 // leader routes: a base64 + JSON decode each time, for a value that never changes. Only a few tokens are alive at once
-// (the current one, the one replacing it, the tabs' own): the last ones are kept.
+// (the current one, the one replacing it, the tabs' own): the most recently used ones are kept.
 //
 // No runtime import (as `unverifiedJwtPayload` of `@freecorps/ember-values`, which reads a payload the same way): the
 // modules the client loads with `import()` (`multitab.ts`) use it, and a module they share with the main graph that
@@ -39,7 +39,14 @@ function base64(s: string): Uint8Array | null {
 /** The payload of a JWT (frozen; null: not a JWT), decoded once per token. NOT verified: routing hints only. */
 export function jwtPayload(token: string): Readonly<Record<string, unknown>> | null {
   const hit = payloads.get(token);
-  if (hit !== undefined) return hit;
+  if (hit !== undefined) {
+    // Least recently used goes first: the current token, read on every call, never leaves while others churn.
+    if (payloads.size > 1) {
+      payloads.delete(token);
+      payloads.set(token, hit);
+    }
+    return hit;
+  }
   let payload: Readonly<Record<string, unknown>> | null = null;
   const parts = token.split(".");
   const bytes = parts.length === 3 && parts[1] ? base64(parts[1]) : null;
@@ -51,7 +58,10 @@ export function jwtPayload(token: string): Readonly<Record<string, unknown>> | n
       payload = null;
     }
   }
-  if (payloads.size >= MAX) payloads.delete(payloads.keys().next().value!);
+  if (payloads.size >= MAX) {
+    const oldest = payloads.keys().next();
+    if (!oldest.done) payloads.delete(oldest.value);
+  }
   payloads.set(token, payload);
   return payload;
 }
