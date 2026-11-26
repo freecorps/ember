@@ -12,6 +12,7 @@ export { errorCodesOf, isLazyFunction, lazyActions, loadFunction, type LazyActio
 export * from "./crons.ts";
 export * from "./triggers.ts";
 export * from "./components.ts";
+export * from "./channels.ts";
 export * from "./http.ts";
 export { MAX_HTTP_BODY_BYTES, readLimited, readLimitedText } from "./body.ts";
 export { createMatchIndex, IntervalSet, type MatchIndex, type MatchResult } from "./matchIndex.ts";
