@@ -142,7 +142,7 @@ describe("workersAi", () => {
   });
 
   test("reasoning: whitespace after </think> is dropped whatever the chunk boundaries; no text or reasoning twice", async () => {
-    const texts = (evs: Array<{ type: string }>, t: string) => evs.filter((e) => e.type === t).map((e) => (e as { text: string }).text).join("");
+    const texts = (evs: ModelEvent[], t: string) => evs.map((e) => (e.type === t && "text" in e ? e.text : "")).join("");
     for (const chunks of [["<think>x</think>\n    code"], ["<think>x</think>", "\n", "    code"], ["<think>x</think>\n  ", "  ", "code"]]) {
       const sp = new ThinkSplitter();
       const evs = [...chunks.flatMap((c) => sp.push(c)), ...sp.end()];

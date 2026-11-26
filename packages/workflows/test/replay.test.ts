@@ -139,14 +139,14 @@ describe("replay", () => {
     const par = async (step: WorkflowStep) =>
       Promise.all([
         (async () => {
-          await step.runQuery(math.double, {}, { name: "A1" });
-          await step.runQuery(math.double, {}, { name: "A2" });
-          return step.runQuery(math.double, {}, { name: "A3" });
+          await step.runQuery("math:double", {}, { name: "A1" });
+          await step.runQuery("math:double", {}, { name: "A2" });
+          return step.runQuery("math:double", {}, { name: "A3" });
         })(),
         (async () => {
-          await step.runQuery(math.double, {}, { name: "B1" });
+          await step.runQuery("math:double", {}, { name: "B1" });
           await Promise.resolve();
-          return step.runQuery(math.double, {}, { name: "B2" });
+          return step.runQuery("math:double", {}, { name: "B2" });
         })(),
       ]);
     const rec = (index: number, name: string, batchEnd: number): JournalEntry => ({ ...done(index, "query", name, index), batchEnd });
