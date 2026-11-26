@@ -32,18 +32,20 @@ export async function inflateFrame(data: unknown): Promise<string> {
 
 /**
  * Frames of one socket, handled in the order they came: text at once while no binary frame is being decoded, else
- * behind it. `handle` gets each frame's text; `failed` a binary frame that did not decode.
+ * behind it. `handle` gets each frame's text, with the `tag` it was pushed with (what held when it arrived: a frame
+ * decoded later is still of then); `failed` a binary frame that did not decode.
  */
-export class FrameQueue {
+export class FrameQueue<T = undefined> {
   private behind: Promise<void> | null = null;
 
   constructor(
-    private readonly handle: (text: string) => void,
+    private readonly handle: (text: string, tag: T) => void,
     private readonly failed: (e: unknown) => void,
   ) {}
 
-  push(data: unknown): void {
-    if (typeof data === "string" && !this.behind) return this.handle(data);
+  push(data: unknown, tag?: T): void {
+    const t = tag as T;
+    if (typeof data === "string" && !this.behind) return this.handle(data, t);
     const text = typeof data === "string" ? Promise.resolve(data) : inflateFrame(data);
     // Decoded meanwhile (in parallel), handled in order. The chain below reads `text` only once the frames ahead are
     // handled: a decode that fails before then would be an unhandled rejection meanwhile (the chain reports it).
@@ -51,7 +53,7 @@ export class FrameQueue {
     const next: Promise<void> = (this.behind ?? Promise.resolve())
       .then(() => text)
       .then(
-        (t) => this.handle(t),
+        (text_) => this.handle(text_, t),
         (e: unknown) => this.failed(e),
       )
       .catch((e: unknown) => this.failed(e));
@@ -60,4 +62,23 @@ export class FrameQueue {
       if (this.behind === next) this.behind = null;
     });
   }
+}
+
+/**
+ * A frame's text without its subscription deliveries (`snap`, `patch`): null when nothing is left. For a frame that
+ * arrived under an identity replaced since (see the socket's `FrameQueue`): the rest (`mres`, `qres`, …) is not tied
+ * to whose values a subscription holds.
+ */
+export function withoutDeliveries(text: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return text; // not ours to judge: `onFrame` reports it
+  }
+  const isDelivery = (m: unknown) => typeof m === "object" && m !== null && ((m as { t?: unknown }).t === "snap" || (m as { t?: unknown }).t === "patch");
+  if (!Array.isArray(parsed)) return isDelivery(parsed) ? null : text;
+  const kept = parsed.filter((m) => !isDelivery(m));
+  if (!kept.length) return null;
+  return kept.length === parsed.length ? text : JSON.stringify(kept);
 }

@@ -25,7 +25,7 @@ import {
 import { parse, stableStringify, stringify } from "./wire.ts";
 import type { PageHost } from "./paginate.ts";
 import { RoutedStore, type ClaimRoute } from "./route.ts";
-import { FrameQueue, zframeSupported } from "./zframe.ts";
+import { FrameQueue, withoutDeliveries, zframeSupported } from "./zframe.ts";
 import type { CachedSnapshot, SnapshotCache } from "./snapshot-cache.ts";
 // Type-only: the multi-tab hub and the upload helpers are subpaths (`@freecorps/ember-client/multitab`, `/files`), or a
 // lazy `import()` for the old options, never in the static graph of an app that does not use them.
@@ -1269,6 +1269,11 @@ export class EmberClient {
         for (const p of [...this.pending]) if (p.held && p.record.shard === conn.shard) this.sendMut(conn, p);
       }
     }
+  }
+
+  /** Who the socket runs as now (what `sendAuth` / `hello` last set): the tag of the frames that arrive. */
+  private connIdentityKey(conn: Conn): string {
+    return conn.opaque ? `opaque:${conn.lastToken ?? ""}` : identityCacheKey(conn.identity ?? null);
   }
 
   private sendAuth(conn: Conn, token: string | null): void {
@@ -2639,9 +2644,15 @@ export class EmberClient {
     // Feature "zframe": binary frames as bytes, not a Blob to read first (a socket that has the property). Its frames
     // are handled in order: a binary one is decoded before what follows it.
     if ("binaryType" in ws) (ws as { binaryType: string }).binaryType = "arraybuffer";
-    const inbox = new FrameQueue(
-      (text) => {
-        if (conn.ws === ws) this.onFrame(conn, text);
+    // Each frame tagged with the identity the socket had when it arrived: a compressed one decoded after an `auth` for
+    // someone else (sent meanwhile) carries the previous identity's values. Its `snap`/`patch` are dropped (the shard
+    // sends every subscription a fresh `snap` under the new identity, after that `auth`); the rest is handled.
+    const inbox = new FrameQueue<string>(
+      (text, arrivedAs) => {
+        if (conn.ws !== ws) return;
+        if (arrivedAs === this.connIdentityKey(conn)) return this.onFrame(conn, text);
+        const kept = withoutDeliveries(text);
+        if (kept !== null) this.onFrame(conn, kept);
       },
       (e) => {
         if (conn.ws === ws) this.report(new EmberError("bad_frame", `could not decode a compressed frame: ${(e as Error)?.message ?? String(e)}`), { shard: conn.shard });
@@ -2692,7 +2703,7 @@ export class EmberClient {
     };
     ws.onmessage = (ev) => {
       if (conn.ws !== ws) return;
-      inbox.push(ev.data);
+      inbox.push(ev.data, this.connIdentityKey(conn));
     };
     ws.onclose = () => {
       if (conn.ws !== ws) return;
