@@ -196,6 +196,51 @@ describe("hydrate and whose read it is", () => {
     c2.close();
   });
 
+  it("a fetchForHydration read is not hydrated once setAuth replaced its source, even before the new token is known", async () => {
+    const w = worker();
+    const { c } = client(w.fetch, [jwt("ana", 3600)]);
+    const h = await c.fetchForHydration(q, {});
+    // The new source has not answered yet: whom it answers for is unknown, and Ana's read is not theirs.
+    c.setAuth(() => new Promise<string>(() => {}));
+    c.hydrate(h);
+    expect(c.dehydrate()).toEqual([]);
+    expect(c.watchQuery(q, {}).getSnapshot().status).toBe("loading");
+    c.close();
+  });
+
+  it("a fetchForHydration read for one identity is not installed into another identity's loading subscription", async () => {
+    let hang = false;
+    const w = worker();
+    const fetch = ((input: RequestInfo | URL, init?: RequestInit) => (hang ? new Promise<Response>(() => {}) : w.fetch(input, init))) as typeof globalThis.fetch;
+    const ana = jwt("ana", 10);
+    const { c } = client(fetch, [ana, jwt("bob", 3600)]);
+    const h = await c.fetchForHydration(q, {});
+    await c.query(q, { other: 1 }); // renewed: now bob's (same source, same authGen)
+    hang = true; // bob's own read of the query stays on its way: the subscription is loading
+    const watched = c.watchQuery(q, {});
+    let notified = 0;
+    const off = watched.subscribe(() => notified++);
+    expect(watched.getSnapshot().status).toBe("loading");
+    c.hydrate(h);
+    expect(watched.getSnapshot().status).toBe("loading");
+    expect(notified).toBe(0);
+    off();
+    c.close();
+
+    // The same identity's read still fills its loading subscription.
+    hang = false;
+    const { c: c2 } = client(fetch, [jwt("ana", 3600)]);
+    const h2 = await c2.fetchForHydration(q, {});
+    hang = true;
+    const watched2 = c2.watchQuery(q, {});
+    const off2 = watched2.subscribe(() => {});
+    expect(watched2.getSnapshot().status).toBe("loading");
+    c2.hydrate(h2);
+    expect(watched2.getSnapshot()).toMatchObject({ status: "success", value: h2.value });
+    off2();
+    c2.close();
+  });
+
   it("values hydrated before the first token belong to the identity it names, and leave when the fetcher answers for another", async () => {
     const w = worker();
     const ana = jwt("ana", 10);

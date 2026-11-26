@@ -607,8 +607,11 @@ export class EmberClient {
    * fetcher answers for someone else.
    */
   private readonly hydrated = new Map<string, { query: HydratedQuery; snapshot: QuerySnapshot; owner: string | undefined }>();
-  /** Whose token read each `fetchForHydration` result (`ownerKey`): `hydrate()` refuses it for anyone else. */
-  private readonly hydrationOwners = new WeakMap<HydratedQuery, string>();
+  /**
+   * Whose token read each `fetchForHydration` result (`ownerKey`) and under which `authGen`: `hydrate()` refuses it for
+   * anyone else, and once `setAuth` replaced that source (even before the new one answers).
+   */
+  private readonly hydrationOwners = new WeakMap<HydratedQuery, { owner: string; authGen: number }>();
   private storedIdentity: LocalIdentity | null = null;
   private readonly syncOffs: Array<() => void> = [];
   private readonly random: () => number;
@@ -1794,7 +1797,7 @@ export class EmberClient {
     this.checkArgs(fn, a);
     const routed = this.shardOrWait(opts, ref, a);
     const shard = typeof routed === "string" ? routed : await routed;
-    const { status, body, owner } = await this.post("query", stringify({ fn, args: a, shard }));
+    const { status, body, owner, authGen } = await this.post("query", stringify({ fn, args: a, shard }));
     const b = body as { ok?: boolean; value?: unknown; version?: unknown; epoch?: unknown; ik?: unknown; error?: WireErrorLike };
     if (!b || b.ok !== true) throw errorFromWire(b?.error ? { message: `HTTP ${status}`, ...b.error } : { message: `HTTP ${status}` }, `http_${status}`);
     // A runtime without them (older): the client then subscribes without `resume`.
@@ -1803,7 +1806,7 @@ export class EmberClient {
     const ik = typeof b.ik === "string" ? b.ik : "";
     const h: HydratedQuery<Q["_returnType"]> = { fn, args: a, shard, value: b.value as Q["_returnType"], version, epoch, ik };
     // Whose read it is: this client's `hydrate()` takes it only while the token is still theirs.
-    this.hydrationOwners.set(h, owner);
+    this.hydrationOwners.set(h, { owner, authGen });
     return h;
   }
 
@@ -1815,6 +1818,14 @@ export class EmberClient {
     for (const h of entries) {
       if (!h || typeof h.fn !== "string" || typeof h.shard !== "string") continue;
       const key = this.subKey(h.shard, h.fn, stableStringify(toArgs(h.args)));
+      // Read here (`fetchForHydration`) under a source `setAuth` replaced since (its new token may still be on its
+      // way), or for someone the token no longer is: never shown to who it is now, loading subscription or not.
+      // (A renewed JWT of the same source keeps its `authGen`; an entry from the server takes the first token's owner.)
+      const local = this.hydrationOwners.get(h);
+      if (local && local.authGen !== this.authGen) continue;
+      const current = this.currentOwner();
+      const owner = local?.owner ?? current;
+      if (owner !== undefined && current !== undefined && owner !== current) continue;
       const sub = this.subs.get(key);
       if (sub?.confirmed) continue;
       if (sub) {
@@ -1829,10 +1840,6 @@ export class EmberClient {
         this.recompute([sub]);
         continue;
       }
-      // Read here (`fetchForHydration`) for someone the token no longer is: never shown to who it is now.
-      const current = this.currentOwner();
-      const owner = this.hydrationOwners.get(h) ?? current;
-      if (owner !== undefined && current !== undefined && owner !== current) continue;
       // The same entry again (a `hydrate()` in render): its snapshot stays the same object.
       if (this.hydrated.get(key)?.query === h) continue;
       this.hydrated.set(key, { query: h, owner, snapshot: Object.freeze({ status: "success", value: h.value, error: undefined, optimistic: false }) });
@@ -2035,10 +2042,10 @@ export class EmberClient {
    * `POST /api/<kind>` with the current token, renewed first when it expired or is inside its refresh window. A
    * `401 unauthenticated` (the token expired on the way, or was revoked) fetches a fresh token and sends the call again,
    * once, if the fetcher gave a different one for the same identity (the call ran nothing: the Worker refuses it before
-   * the shard; as someone else it is not sent again). Returns the status, the parsed body and whose token it went with
-   * (`ownerKey`).
+   * the shard; as someone else it is not sent again). Returns the status, the parsed body, whose token it went with
+   * (`ownerKey`) and the `authGen` it started under.
    */
-  private async post(kind: "query" | "mutation" | "action", payload: string): Promise<{ status: number; body: unknown; owner: string }> {
+  private async post(kind: "query" | "mutation" | "action", payload: string): Promise<{ status: number; body: unknown; owner: string; authGen: number }> {
     if (!this.fetchImpl) throw new EmberError("no_fetch", "no fetch implementation available");
     const gen = this.authGen;
     let token = await this.httpToken();
@@ -2069,7 +2076,7 @@ export class EmberClient {
           continue;
         }
       }
-      return { status: res.status, body, owner: ownerKey(token) };
+      return { status: res.status, body, owner: ownerKey(token), authGen: gen };
     }
   }
 
