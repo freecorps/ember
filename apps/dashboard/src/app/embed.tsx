@@ -17,7 +17,7 @@
 // Replies go to the iframe's window with targetOrigin "*": an opaque origin has no name to target, and the window is
 // the one this block created (a navigated iframe gets nothing more).
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { DashboardTheme, EmbedContext, EmbedOp, HostMessage } from "@freecorps/ember-dashboard-sdk";
 import { api, ApiError, path } from "./api.ts";
 import { useApi, useSession } from "./hooks.ts";
@@ -80,22 +80,26 @@ export function EmbedBlock({ c, b, tab }: { c: EmbedHost; b: EmbedSpec; tab: str
   // Each generation is a new ticket, iframe and bridge: on Refresh or a write elsewhere on the screen (c.version), and
   // on another shard (in the key: the old page never sends a request on the new shard). Not after the page's own
   // confirmed write: it has the answer and keeps its state.
-  const [gen, setGen] = useState(0);
+  //
+  // The generation, a counter that never comes back: it moves on every new version that is not the page's own write,
+  // and on every shard change (A → B → A is a third generation). The shard change is folded in during render, the way
+  // React has state follow a prop (no ref written while rendering).
+  const [g, setG] = useState({ shard: c.shard, n: 0 });
+  if (g.shard !== c.shard) setG({ shard: c.shard, n: g.n + 1 });
   const seen = useRef(c.version);
   const own = useRef<number | null>(null);
   useEffect(() => {
     if (c.version === seen.current) return;
     seen.current = c.version;
     if (own.current === c.version) return;
-    setGen((g) => g + 1);
+    setG((x) => ({ ...x, n: x.n + 1 }));
   }, [c.version]);
-  // A generation never comes back: a counter moved by every new `gen` and every shard change (A → B → A is a third
-  // generation, not the first again), so a write answered after its page was replaced never passes for current.
-  const seq = useRef({ shard: c.shard, gen, n: 0 });
-  if (seq.current.shard !== c.shard || seq.current.gen !== gen) seq.current = { shard: c.shard, gen, n: seq.current.n + 1 };
-  const generation = `${c.shard}#${seq.current.n}`;
+  const generation = `${c.shard}#${g.n}`;
+  // Which generation is current, set once it is on screen (after commit, not while rendering).
   const current = useRef(generation);
-  current.current = generation;
+  useLayoutEffect(() => {
+    current.current = generation;
+  }, [generation]);
   // The exemption only for the page that is still the current one: a write answered after the page was replaced (by
   // Refresh, another write or another shard) leaves the next version a normal refresh, for the page now shown.
   const ownWrite = () => {
