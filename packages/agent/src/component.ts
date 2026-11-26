@@ -127,7 +127,7 @@ function checkSearch(ctx: { component: { config: AgentInstallConfig | undefined 
   if (!searchOn(ctx)) throw new EmberError("ValidationError", SEARCH_OFF);
 }
 
-const { query, mutation, internalMutation } = componentBuilders<typeof schema, AgentInstallConfig | undefined>();
+const { query, mutation, internalMutation, internalQuery } = componentBuilders<typeof schema, AgentInstallConfig | undefined>();
 
 type DM = DataModelFromSchema<typeof schema>;
 type Ctx = ComponentCtx<typeof schema, AgentInstallConfig | undefined>["mutation"];
@@ -721,10 +721,83 @@ export const functions = {
   },
 };
 
+// ------------------------------------------------------------------------------------------------ dashboard
+
+/** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
+const dashboardFunctions = {
+  /** Threads in this shard (one user's, by their activity; else newest first), optionally by status. */
+  threads: internalQuery({
+    args: { userId: v.optional(v.string()), status: v.optional(v.union(v.literal("active"), v.literal("archived"))), paginationOpts: paginationOptsValidator },
+    handler: (ctx, a) => {
+      const base = a.userId !== undefined ? ctx.db.query("threads").withIndex("by_user", (q) => q.eq("userId", a.userId)).order("desc") : ctx.db.query("threads").order("desc");
+      const page = (a.status !== undefined ? base.filter((f) => f.eq(f.field("status"), a.status!)) : base).paginate(a.paginationOpts);
+      return {
+        ...page,
+        page: page.page.map((t) => ({ _id: t._id, userId: t.userId ?? null, title: t.title ?? null, status: t.status, prompts: t.lastOrder, tokens: t.usage.totalTokens ?? null, updatedAt: t.updatedAt })),
+      };
+    },
+  }),
+  /** One thread with its last 100 messages, oldest first (a timeline); null when unknown. */
+  thread: internalQuery({
+    args: { threadId: v.string() },
+    handler: (ctx, { threadId }) => {
+      const t = thread(ctx, threadId);
+      if (!t) return null;
+      const messages = ctx.db
+        .query("messages")
+        .withIndex("by_thread", (q) => q.eq("thread", t._id))
+        .order("desc")
+        .take(100)
+        .reverse()
+        .map((m) => ({ at: m._creationTime, title: `${m.role}${m.agentName ? ` (${m.agentName})` : ""}${m.model ? ` · ${m.model}` : ""}`, status: m.status, detail: m.error ?? (m.text.length > 500 ? `${m.text.slice(0, 500)}…` : m.text || null) }));
+      return { ...publicThread(t), messages };
+    },
+  }),
+};
+
 export const agent = defineComponent({
   name: "agent",
   schema,
-  functions,
+  functions: { ...functions, dashboard: dashboardFunctions },
+  // The threads' screen in the Ember Dashboard (contracts.md "Telas declarativas"): threads live per shard.
+  dashboard: {
+    label: "Agent",
+    icon: "bot",
+    description: "Threads and their messages (a timeline of prompts, steps and tool calls); archive or delete a thread.",
+    tabs: [
+      {
+        id: "threads",
+        label: "Threads",
+        blocks: [
+          {
+            kind: "table",
+            id: "threads",
+            query: dashboardFunctions.threads,
+            columns: [
+              { label: "Title", path: "title" },
+              { label: "User", path: "userId", format: "code" },
+              { label: "Status", path: "status", format: "badge" },
+              { label: "Prompts", path: "prompts", format: "number" },
+              { label: "Tokens", path: "tokens", format: "number" },
+              { label: "Updated", path: "updatedAt", format: "ago" },
+            ],
+            detail: {
+              query: dashboardFunctions.thread,
+              fromRow: { threadId: "_id" },
+              sections: [
+                { kind: "kv", items: [{ label: "Title", path: "title" }, { label: "Summary", path: "summary" }, { label: "Status", path: "status", format: "badge" }, { label: "Usage", path: "usage", format: "json" }] },
+                { kind: "timeline", label: "Messages", path: "messages", time: "at", title: "title", status: "status", detail: "detail" },
+              ],
+            },
+            rowActions: [
+              { id: "archive", label: "Archive", fn: functions.lib.updateThread, args: { patch: { status: "archived" } }, fromRow: { threadId: "_id" } },
+              { id: "delete", label: "Delete", fn: functions.lib.deleteThread, fromRow: { threadId: "_id" }, destructive: true, description: "Deletes the thread with its messages." },
+            ],
+          },
+        ],
+      },
+    ],
+  },
   config: v.optional(v.object({ workersAi: v.optional(v.boolean()), search: v.optional(v.boolean()) })),
   bindings: (config) => (config?.workersAi === false ? [] : [{ type: "ai", name: "EMBER_AI" }]),
   // The FTS5 index only where search is on (AgentInstallConfig.search).
