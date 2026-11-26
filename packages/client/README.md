@@ -47,7 +47,7 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
   `StorageAdapter`), `optimisticUpdates`, `connectivity`, `snapshotCache`, `onError`, `WebSocket` / `fetch` (to
   inject), `backoff`, `heartbeat`, `idleTimeoutMs`, `multiTab`.
 - Methods: `query` (one shot), `subscribe` / `watchQuery` (live), `mutation`, `action`, `setAuth` / `clearAuth`,
-  `connectionState` / `onConnectionStateChange`, `discardPending`, `fetchForHydration` / `hydrate` (SSR),
+  `connectionState` / `onConnectionStateChange`, `discardPending`, `fetchForHydration` / `hydrate` / `dehydrate` (SSR; `WebSocket: null` on the server),
   `files.upload` / `files.url`, `close`.
 - `watchPaginatedQuery` for paginated queries (what `usePaginatedQuery` is built on).
 - Errors: `EmberError` (`code`, `data`, `kind: "app" | "system"`), `isError(e, ref, code)`, `isAppError`, `errorRef`.

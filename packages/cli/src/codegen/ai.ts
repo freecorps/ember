@@ -24,8 +24,9 @@ const RULES = `## Rules of Ember (read before writing functions)
 - After changing \`ember/\`, run \`ember codegen\` (the dev server does it) and fix its warnings: \`any\`/\`unknown\` results and undeclared errors.
 `;
 
-function table(name: string, t: { document: Shape; indexes?: Array<{ kind: string; name: string; fields: string[] }> }): string {
-  const idx = (t.indexes ?? []).map((i) => `- \`${i.name}\` (${i.kind === "db" ? "" : `${i.kind}: `}${i.fields.join(", ")})`);
+function table(name: string, t: { document: Shape; indexes?: Array<{ kind: string; name: string; fields: string[]; sparse?: boolean }> }): string {
+  // Sparse: a scan of it only sees documents with every field present.
+  const idx = (t.indexes ?? []).map((i) => `- \`${i.name}\` (${i.kind === "db" ? "" : `${i.kind}: `}${i.fields.join(", ")}${i.sparse ? "; sparse: only documents with every field" : ""})`);
   return `### \`${name}\`\n\n\`\`\`ts\n${shapeToTs(t.document)}\n\`\`\`\n${idx.length ? `\nIndexes:\n${idx.join("\n")}\n` : ""}`;
 }
 

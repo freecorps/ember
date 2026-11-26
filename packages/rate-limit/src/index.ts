@@ -18,14 +18,28 @@
  * State lives in the caller's shard: a limit is exact per shard. For a limit across shards, call it on one shard
  * from an action (`ctx.onShard("global:main")`), or use the Cloudflare binding (approximate, per location).
  */
-import { EmberError, type FunctionReference } from "@freecorps/ember-server";
+import { EmberError, type ErrorSpec, type FunctionReference } from "@freecorps/ember-server";
 import type { RateLimitConfig, ReserveResult } from "./algorithms.ts";
-import { RATE_LIMITED } from "./component.ts";
+import { rateLimitErrors } from "./component.ts";
 
 // Not `export *`: `consumeChecked`/`checkChecked` are the component's (they skip `checkConfig`).
-export { check, checkConfig, consume, refill, SECOND, MINUTE, HOUR, DAY } from "./algorithms.ts";
+export { check, checkConfig, consume, fullAt, refill, SECOND, MINUTE, HOUR, DAY } from "./algorithms.ts";
 export type { FixedWindow, RateLimitConfig, RateLimitResult, RateLimitState, ReserveResult, TokenBucket } from "./algorithms.ts";
-export { rateLimit, functions as rateLimitFunctions, rateLimitConfigValidator, installConfigValidator, RATE_LIMITED, type RateLimitInstallConfig } from "./component.ts";
+export {
+  rateLimit,
+  functions as rateLimitFunctions,
+  rateLimitConfigValidator,
+  installConfigValidator,
+  rateLimitErrors,
+  edgeBindingsOf,
+  RATE_LIMITED,
+  DEFAULT_GC_BATCH,
+  DEFAULT_GC_INTERVAL_MS,
+  MAX_GC_BATCH,
+  type RateLimitEdgeBinding,
+  type RateLimitGcConfig,
+  type RateLimitInstallConfig,
+} from "./component.ts";
 
 type LimitArgs = { name: string; key?: string; count?: number; config?: RateLimitConfig; reserve?: boolean; throws?: boolean };
 type CheckArgs = { name: string; key?: string; count?: number; config?: RateLimitConfig };
@@ -34,7 +48,7 @@ type Result = { ok: boolean; retryAfter?: number };
 /** What `components.<name>` of the rateLimit component looks like (structural: any install name works). */
 export interface RateLimitComponentApi {
   lib: {
-    limit: FunctionReference<"mutation", "public", LimitArgs, Result>;
+    limit: FunctionReference<"mutation", "public", LimitArgs, Result, ErrorSpec<"RateLimited", { name: string; retryAfter: number }>>;
     check: FunctionReference<"query", "public", CheckArgs, Result>;
     getValue: FunctionReference<"query", "public", { name: string; key?: string; config?: RateLimitConfig }, { value: number; capacity: number; ts: number }>;
     reset: FunctionReference<"mutation", "public", { name: string; key?: string }, boolean>;
@@ -50,9 +64,12 @@ type AsyncCtx = { runAction(fn: unknown, args?: unknown): Promise<unknown>; runQ
 
 export type LimitOptions = { key?: string; count?: number; reserve?: boolean; throws?: boolean };
 
-/** Throws `RateLimited` for a refused result (what `throws: true` does inside the component). */
+/**
+ * Throws `RateLimited` (`rateLimitErrors.RateLimited`, an app error: `isError(e, rateLimitErrors.RateLimited)`) for a
+ * refused result: what `throws: true` does inside the component.
+ */
 export function assertAllowed(name: string, r: Result): void {
-  if (!r.ok) throw new EmberError(RATE_LIMITED, `Rate limit ${name} exceeded; retry in ${r.retryAfter} ms`, { name, retryAfter: r.retryAfter });
+  if (!r.ok) throw rateLimitErrors.RateLimited({ name, retryAfter: r.retryAfter ?? 0 });
 }
 
 /**

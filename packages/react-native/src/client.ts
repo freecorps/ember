@@ -6,7 +6,7 @@ import {
   type PendingStorage,
   type StorageAdapter,
 } from "@freecorps/ember-client";
-import { EmberAuthClient } from "./auth.ts";
+import { EmberAuthClient, bindEmberAuth } from "./auth.ts";
 import { createExpoConnectivity, type ExpoConnectivityOptions } from "./connectivity.ts";
 import { loadAsyncStorage } from "./modules.ts";
 import { AsyncStoragePendingStorage } from "./storage.ts";
@@ -26,7 +26,10 @@ export interface CreateEmberClientOptions extends Omit<EmberClientOptions, "auth
 
 const isSource = (c: unknown): c is ConnectivitySource => !!c && typeof (c as ConnectivitySource).subscribe === "function";
 
-/** `new EmberClient(...)` with React Native defaults: AppState/NetInfo connectivity and AsyncStorage pending storage. */
+/**
+ * `new EmberClient(...)` with React Native defaults: AppState/NetInfo connectivity and AsyncStorage pending storage.
+ * With an `EmberAuthClient` as `auth`, the client follows its sign-in/sign-out (`bindEmberAuth`) until `close()`.
+ */
 export function createEmberClient(opts: CreateEmberClientOptions): EmberClient {
   const { auth, storage, connectivity, ...rest } = opts;
   const o: EmberClientOptions = { ...rest };
@@ -37,5 +40,15 @@ export function createEmberClient(opts: CreateEmberClientOptions): EmberClient {
     if (as) o.storage = new AsyncStoragePendingStorage(as);
   }
   o.connectivity = connectivity === null ? null : isSource(connectivity) ? connectivity : createExpoConnectivity(connectivity ?? {});
-  return new EmberClient(o);
+  const client = new EmberClient(o);
+  if (auth instanceof EmberAuthClient) {
+    // Sign-in/out re-authenticates the open sockets in place; the binding goes with the client.
+    const unbind = bindEmberAuth(client, auth);
+    const close = client.close.bind(client);
+    client.close = () => {
+      unbind();
+      close();
+    };
+  }
+  return client;
 }

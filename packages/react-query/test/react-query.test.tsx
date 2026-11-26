@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider, QueryObserver, dehydrate, hydrate, useMutation, useQuery } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { EmberClient, anyApi, makeFunctionReference, memorySnapshotCache, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
+import { EmberClient, FUNCTION_SHARD, anyApi, makeFunctionReference, memorySnapshotCache, unsafeRef, type FunctionReference } from "@freecorps/ember-client";
 import { FakeEmberServer, FakeFunctionError } from "@freecorps/ember-client/testing";
 import { MemoryBackend, memoryStorage } from "@freecorps/ember-offline";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
@@ -595,5 +595,93 @@ describe("offline storage", () => {
     act(() => emit("online"));
     await waitFor(() => expect(screen.getByTestId("list").textContent).toBe("stored,fresh"));
     b.ember.close();
+  });
+});
+
+describe("functions routed by their own shard spec", () => {
+  const routed = <F,>(name: string, spec: { kind: string; fromArg?: string; fromClaim?: string }): F => {
+    const ref = makeFunctionReference(name) as unknown as Record<symbol, unknown>;
+    ref[FUNCTION_SHARD] = spec;
+    return ref as unknown as F;
+  };
+  const byArg = routed<FunctionReference<"query", "public", { orgId: string }, string>>("notes:byArg", { kind: "org", fromArg: "orgId" });
+  const byClaim = routed<FunctionReference<"query", "public", Record<string, never>, string>>("notes:byClaim", { kind: "org", fromClaim: "org" });
+  const jwt = (payload: object) => `x.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.y`;
+
+  function routedSetup(ssr = false) {
+    const server = new FakeEmberServer({
+      verify: (token) => {
+        const p = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString()) as { sub: string; org?: string };
+        return { subject: p.sub, claims: { org: p.org } };
+      },
+      queries: {
+        "notes:byArg": (_db, _args, ctx) => `from ${ctx.shard}`,
+        "notes:byClaim": (_db, _args, ctx) => `from ${ctx.shard} as ${ctx.identity?.subject}`,
+      },
+    });
+    // No defaultShard: without the spec, a call without `{ shard }` has nowhere to go.
+    const ember = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: server.fetch, connectivity: null, heartbeat: false, auth: () => jwt({ sub: "ana", org: "beta" }) });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    new EmberQueryClient(ember, { ssr }).connect(queryClient);
+    const wrap = (ui: React.ReactNode) => render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
+    return { server, ember, queryClient, wrap };
+  }
+  function ByArg() {
+    const { data, status, error } = useQuery(emberQuery(byArg, { orgId: "acme" }));
+    return <div data-testid="arg">{status === "success" ? data : status === "error" ? `error:${error.code}` : status}</div>;
+  }
+  function ByClaim() {
+    const { data, status, error } = useQuery(emberQuery(byClaim, {}));
+    return <div data-testid="claim">{status === "success" ? data : status === "error" ? `error:${error.code}` : status}</div>;
+  }
+
+  it("shard: { org: 'orgId' } (fromArg) and fromAuth subscribe on the shard the reference names", async () => {
+    const { server, ember, wrap } = routedSetup();
+    wrap(
+      <>
+        <ByArg />
+        <ByClaim />
+      </>,
+    );
+    await waitFor(() => expect(screen.getByTestId("arg").textContent).toBe("from org:acme"));
+    await waitFor(() => expect(screen.getByTestId("claim").textContent).toBe("from org:beta as ana"));
+    expect(server.subscriptionCount()).toBe(2);
+    ember.close();
+  });
+
+  it("the same over HTTP (SSR prefetch and an ssr EmberQueryClient)", async () => {
+    const { server, ember, queryClient } = routedSetup(true);
+    await prefetchEmberQuery(queryClient, ember, byArg, { orgId: "acme" });
+    expect(queryClient.getQueryData(emberQuery(byArg, { orgId: "acme" }).queryKey)).toBe("from org:acme");
+    expect(await queryClient.fetchQuery(emberQuery(byClaim, {}))).toBe("from org:beta as ana");
+    expect(server.httpRequests.map((r) => (r.body as { shard: string }).shard)).toEqual(["org:acme", "org:beta"]);
+    ember.close();
+  });
+  it("each query keeps the reference it was built with: a later emberQuery of the same name does not reroute it", async () => {
+    const { server, ember, queryClient } = routedSetup(true);
+    const first = emberQuery(byArg, { orgId: "acme" });
+    expect(await queryClient.fetchQuery(first)).toBe("from org:acme");
+    // The same name through a plain reference with an explicit shard (as a hand-written key would).
+    expect(await queryClient.fetchQuery(emberQuery(unsafeRef<"query">("notes:byArg"), { orgId: "x" }, { shard: "org:explicit" }))).toBe("from org:explicit");
+    // The first query routes as before (its reference: fromArg), not through the plain one (nowhere to go).
+    await queryClient.refetchQueries({ queryKey: first.queryKey, exact: true });
+    expect(queryClient.getQueryState(first.queryKey)?.status).toBe("success");
+    expect(server.httpRequests.map((r) => (r.body as { shard: string }).shard)).toEqual(["org:acme", "org:explicit", "org:acme"]);
+
+    // A key restored from a persisted cache (serialized: a new array no emberQuery built, and in SSR not live either):
+    // the cached query's observer, through its own key, routes it.
+    const restored = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    hydrate(restored, JSON.parse(JSON.stringify(dehydrate(queryClient))));
+    const e2 = new EmberQueryClient(ember, { ssr: true }).connect(restored);
+    const obs = new QueryObserver(restored, emberQuery(byArg, { orgId: "acme" }));
+    const off = obs.subscribe(() => {});
+    // The plain reference is now the one by name: only the observer's key can route the restored one.
+    emberQuery(unsafeRef<"query">("notes:byArg"), { orgId: "x" });
+    await restored.refetchQueries({ queryKey: first.queryKey, exact: true });
+    expect(restored.getQueryState(first.queryKey)?.status).toBe("success");
+    expect((server.httpRequests.at(-1)!.body as { shard: string }).shard).toBe("org:acme");
+    off();
+    e2.disconnect();
+    ember.close();
   });
 });

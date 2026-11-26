@@ -53,6 +53,9 @@ const tables = {
   photos: defineTable({ title: v.string(), file: v.file(), thumbs: v.optional(v.array(v.file())) }),
   /** Rows-written bench (rows-written.test.ts): three secondary indexes. */
   wide: defineTable({ a: v.string(), b: v.number(), c: v.string() }).index("by_a", ["a"]).index("by_b", ["b"]).index("by_c", ["c"]),
+  /** Rows-written bench: an optional field under a plain index, and under a sparse one (PR 3a). */
+  optPlain: defineTable({ a: v.string(), k: v.optional(v.string()) }).index("by_k", ["k"]),
+  optSparse: defineTable({ a: v.string(), k: v.optional(v.string()) }).index("by_k", ["k"], { sparse: true }),
   /** Shared query results (shared-cache.test.ts): documents of a room, some private to their owner, and members. */
   notes: defineTable({ room: v.string(), body: v.string(), private: v.optional(v.boolean()), owner: v.optional(v.string()) }).index("by_room", ["room"]),
   members: defineTable({ room: v.string(), user: v.string() }).index("by_room_user", ["room", "user"]),
@@ -408,6 +411,13 @@ const files = {
 const wide = {
   add: mutation({ args: { a: v.string(), b: v.number(), c: v.string() }, handler: (ctx: M, a: any) => ctx.db.insert("wide", a) }),
   list: query({ args: { a: v.string() }, handler: (ctx: Q, { a }: { a: string }) => ctx.db.query("wide").withIndex("by_a", (q: any) => q.eq("a", a)).collect() }),
+  /** Into `optSparse` or `optPlain`, with or without `k`. */
+  addOpt: mutation({
+    args: { sparse: v.boolean(), a: v.string(), k: v.optional(v.string()) },
+    handler: (ctx: M, { sparse, ...doc }: { sparse: boolean; a: string; k?: string }) => ctx.db.insert(sparse ? "optSparse" : "optPlain", doc),
+  }),
+  /** Sets (or removes) `k` of a document of either table. */
+  setOpt: mutation({ args: { id: v.string(), k: v.optional(v.string()) }, handler: (ctx: M, { id, k }: { id: any; k?: string }) => ctx.db.patch(id, { k }) }),
   /** Read-modify-write of one indexed field (`b`): the other two index entries stay as they are. */
   bump: mutation({
     args: { a: v.string() },

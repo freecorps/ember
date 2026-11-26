@@ -29,12 +29,23 @@ export function harness(def: {
     jobs = jobs.filter((j) => !r.cancelled.includes(j.id));
     for (const s of subs) s.onCommit(r.changes);
   };
+  /** node:sqlite usage (rows returned / changed) of every mutation and query, by function. */
+  const counters = new Map<string, { calls: number; rowsRead: number; rowsWritten: number }>();
+  const count = (name: string, u: { rowsRead: number; rowsWritten: number } | undefined) => {
+    const c = counters.get(name) ?? { calls: 0, rowsRead: 0, rowsWritten: 0 };
+    counters.set(name, { calls: c.calls + 1, rowsRead: c.rowsRead + (u?.rowsRead ?? 0), rowsWritten: c.rowsWritten + (u?.rowsWritten ?? 0) });
+  };
   const mutate = (name: string, args: unknown) => {
     const r = engine.runMutation(name, args);
+    count(name, r.usage);
     commit(r);
     return r.value;
   };
-  const query = (name: string, args: unknown) => engine.runQuery(name, args ?? {}).value;
+  const query = (name: string, args: unknown) => {
+    const r = engine.runQuery(name, args ?? {});
+    count(name, r.usage);
+    return r.value;
+  };
   const ctxFor = (name: string): any => {
     const path = splitFunctionName(name).path;
     const res = (ref: unknown) => {
@@ -109,6 +120,7 @@ export function harness(def: {
   }
   return {
     engine,
+    counters,
     jobs: () => jobs,
     mutate,
     query,

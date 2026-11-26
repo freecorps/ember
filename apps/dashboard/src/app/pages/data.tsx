@@ -27,7 +27,8 @@ type Shape =
 interface SchemaTable {
   name: string;
   document: Extract<Shape, { kind: "object" }>;
-  indexes: Array<{ name: string; kind: string; fields: string[] }>;
+  /** `sparse`: only documents with every field present are in the index (filtering by it leaves the others out). */
+  indexes: Array<{ name: string; kind: string; fields: string[]; sparse?: boolean }>;
 }
 
 type Doc = Record<string, unknown>;
@@ -385,7 +386,7 @@ function SchemaPanel({ table, onClose }: { table: SchemaTable; onClose: () => vo
                 <Mono>{i.name}</Mono>
               </dt>
               <dd>
-                {i.kind === "db" ? "" : <Badge>{i.kind}</Badge>} <span className="mono">{i.fields.join(", ")}</span>
+                {i.kind === "db" ? "" : <Badge>{i.kind}</Badge>} {i.sparse ? <Badge>sparse</Badge> : null} <span className="mono">{i.fields.join(", ")}</span>
               </dd>
             </div>
           ))}

@@ -193,6 +193,19 @@ describe("migrations component", () => {
     expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 8, changed: 0, batches: 3 });
   });
 
+  test("starting writes the migration row once, with its job (PR 3a: no insert and then a patch)", () => {
+    const h = harness();
+    h.mutate("api:seed", { n: 2 });
+    const r = h.mutateFull("api:run", { name: "addPlan" });
+    // node:sqlite rows written: 2 (the row, then a patch with its pendingJob) → 1.
+    expect(r.usage!.rowsWritten).toBe(1);
+    const row = h.sql(`SELECT "pendingJob" FROM "migrations$migrations"`)[0]!;
+    expect(row.pendingJob).toBe(r.scheduled[0]!.id);
+    expect(r.scheduled[0]!.args).toMatchObject({ run: 1 });
+    h.tick();
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 2 });
+  });
+
   test("a thrown batch is undone alone (the job's earlier batches commit), stops at its cursor, and a new start resumes from there", () => {
     const h = harness();
     h.mutate("api:seed", { n: 8 });

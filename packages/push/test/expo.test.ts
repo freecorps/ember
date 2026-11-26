@@ -3,6 +3,7 @@ import {
   EXPO_PUSH_URL,
   EXPO_RECEIPTS_URL,
   checkPushReceipts,
+  createPushLimiter,
   expoPushProvider,
   isExpoPushToken,
   sendPush,
@@ -176,6 +177,39 @@ describe("sendPush", () => {
       { status: 503, cancelled: true, read: false },
       { status: 503, cancelled: false, read: true },
     ]);
+  });
+
+  it("a retried answer whose body never ends is cancelled: its slot comes back (one slot, no hang)", async () => {
+    let n = 0;
+    let cancelled = 0;
+    const fetch = (async (_u: unknown, init?: RequestInit) => {
+      n++;
+      if (n === 1) {
+        // 503 headers, then a body that never closes.
+        const open = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => {}), cancel: () => void cancelled++ });
+        return new Response(open, { status: 503 });
+      }
+      return json({ data: JSON.parse(String(init!.body)).map(() => ({ status: "ok", id: "x" })) });
+    }) as unknown as typeof globalThis.fetch;
+    const limiter = createPushLimiter(1);
+    const r = await sendPush([tok(1)], { body: "hi" }, { fetch, limiter, retries: 1, ...noSleep });
+    expect(r.tickets[0]).toMatchObject({ status: "ok" });
+    expect(cancelled).toBe(1);
+    expect(limiter.active).toBe(0);
+  });
+
+  it("an accepted batch whose body fails to download is not sent again", async () => {
+    let n = 0;
+    const fetch = (async () => {
+      n++;
+      const broken = new ReadableStream<Uint8Array>({ pull: (c) => c.error(new Error("stream reset")) });
+      return new Response(broken, { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof globalThis.fetch;
+    const limiter = createPushLimiter(1);
+    const r = await sendPush([tok(1)], { body: "hi" }, { fetch, limiter, retries: 2, ...noSleep });
+    expect(n).toBe(1);
+    expect(r.tickets[0]).toMatchObject({ status: "error", error: "RequestFailed" });
+    expect(limiter.active).toBe(0);
   });
 
   it("turns a request-level error into error tickets for that batch only", async () => {

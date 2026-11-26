@@ -3,7 +3,7 @@
  * CLOUDFLARE.md §8): 100 messages per request, 600 notifications/s per project, 4096-byte payload, receipts kept
  * 24 h, optional access token ("enhanced push security").
  */
-import { soundName } from "./delivery.ts";
+import { sharedPushLimiter, limitedFetch, soundName, type PushLimiter } from "./delivery.ts";
 import type {
   AddressedPushMessage,
   PushMessage,
@@ -27,6 +27,8 @@ export interface ExpoPushOptions {
   /** Expo access token, required when the project enforces push security. Keep it in a Worker secret. */
   accessToken?: string;
   fetch?: typeof fetch;
+  /** The slots this call's requests take (default `sharedPushLimiter`; see `ApnsOptions.limiter`). */
+  limiter?: PushLimiter;
   /** Notifications per second across this call (default 600, the per-project limit). */
   ratePerSecond?: number;
   /** Retries of a whole request on 429 / 5xx / network errors (default 2), with exponential backoff. */
@@ -95,7 +97,7 @@ class Transport {
   constructor(private readonly o: ExpoPushOptions) {
     const f = o.fetch ?? globalThis.fetch;
     if (!f) throw new Error("@freecorps/ember-push: no fetch available; pass options.fetch");
-    this.fetch = f.bind(globalThis);
+    this.fetch = limitedFetch(f.bind(globalThis), o.limiter ?? sharedPushLimiter);
     this.sleep = o.sleep ?? defaultSleep;
     this.now = o.now ?? Date.now;
   }

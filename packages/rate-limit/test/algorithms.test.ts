@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { check, checkChecked, consume, consumeChecked, MINUTE, refill, SECOND, type RateLimitConfig, type RateLimitState } from "../src/algorithms.ts";
+import { check, checkChecked, consume, consumeChecked, fullAt, MINUTE, refill, SECOND, type RateLimitConfig, type RateLimitState } from "../src/algorithms.ts";
 
 const T0 = 1_700_000_000_000;
 
@@ -170,4 +170,20 @@ test("consumeChecked/checkChecked decide like consume/check; only the public one
   const bad = { kind: "token bucket", rate: 0, period: MINUTE } as RateLimitConfig;
   expect(() => consume(bad, null, T0)).toThrow(/rate/);
   expect(() => check(bad, null, T0)).toThrow(/rate/);
+});
+
+describe("fullAt", () => {
+  test("fixed window: a state stored under another period is full only at a boundary of the current one", () => {
+    // Taken at 60 000 under a 1-minute window; the config is now a 1-hour window.
+    const hour: RateLimitConfig = { kind: "fixed window", rate: 1, period: 3_600_000, capacity: 1 };
+    const s: RateLimitState = { value: 0, ts: 60_000 };
+    const at = fullAt(hour, s);
+    expect(at).toBe(7_200_000);
+    // Just before: refill still has no whole window, so deleting the row then would hand out a token early.
+    expect(refill(hour, s, at - 1).value).toBe(0);
+    expect(refill(hour, s, at).value).toBe(1);
+    // Aligned states keep their time.
+    expect(fullAt(hour, { value: 0, ts: 3_600_000 })).toBe(7_200_000);
+    expect(fullAt({ ...hour, start: 1_000 }, { value: 0, ts: 60_000 })).toBe(7_201_000);
+  });
 });

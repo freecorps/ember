@@ -191,8 +191,8 @@ function begin(ctx: Ctx, a: { name: string; fn: string; batchSize?: number; rese
       startedAt: ctx.now,
       updatedAt: ctx.now,
     };
-    const id = ctx.db.insert("migrations", doc);
-    ctx.db.patch(id, { pendingJob: schedule(ctx, id, 1) });
+    // Written once, with the job that runs it (no insert and then a patch).
+    const id = ctx.db.insert("migrations", (id) => ({ ...doc, pendingJob: schedule(ctx, id, 1) }));
     return ctx.db.get(id)!;
   }
   if (row.status === "running" && !a.reset) {

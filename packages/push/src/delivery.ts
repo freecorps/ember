@@ -68,6 +68,192 @@ export async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (it
   return out;
 }
 
+/**
+ * Most push requests (APNs + FCM + Expo + the OAuth exchange, together) in flight at once in one invocation. A Worker
+ * keeps at most 6 connections open per invocation (Cloudflare docs: "simultaneous open connections"; more wait in a
+ * queue, and a stalled one can deadlock the rest); push stays one under it, for the action's own calls.
+ */
+export const MAX_PUSH_CONCURRENCY = 5;
+
+/**
+ * How long one request may hold a slot (default 60 s). Past it the slot is taken back: a request whose invocation
+ * died (its promise never settles) would otherwise hold it for good, and the default limiter is the isolate's.
+ */
+export const PUSH_SLOT_HOLD_MS = 60_000;
+
+/** A counting semaphore over outbound requests (`sharedPushLimiter` by default, one per isolate). */
+export interface PushLimiter {
+  /** Requests allowed in flight at once (1..`MAX_PUSH_CONCURRENCY`). */
+  readonly limit: number;
+  /** In flight now. */
+  readonly active: number;
+  /** The most in flight at once so far. */
+  readonly peak: number;
+  /**
+   * Waits for a free slot (FIFO) and answers its release (calling it again does nothing). A `signal` aborted while
+   * waiting rejects without taking one.
+   */
+  acquire(signal?: AbortSignal | null): Promise<() => void>;
+  /** Runs `fn` in a slot, released when it settles. */
+  run<T>(fn: () => Promise<T>, signal?: AbortSignal | null): Promise<T>;
+}
+
+export interface PushLimiterOptions {
+  /** See `PUSH_SLOT_HOLD_MS`. */
+  holdMs?: number;
+  now?: () => number;
+}
+
+/** A `PushLimiter` of `limit` slots (clamped to 1..`MAX_PUSH_CONCURRENCY`; default the max). */
+export function createPushLimiter(limit: number = MAX_PUSH_CONCURRENCY, o: PushLimiterOptions = {}): PushLimiter {
+  const max = Number.isFinite(limit) ? Math.min(MAX_PUSH_CONCURRENCY, Math.max(1, Math.floor(limit))) : MAX_PUSH_CONCURRENCY;
+  const holdMs = Math.max(1, o.holdMs ?? PUSH_SLOT_HOLD_MS);
+  const now = o.now ?? Date.now;
+  /** Slots held now, by when each was taken. */
+  const held = new Set<{ at: number }>();
+  const waiting: Array<() => void> = [];
+  let peak = 0;
+  const take = (): (() => void) => {
+    const slot = { at: now() };
+    held.add(slot);
+    peak = Math.max(peak, held.size);
+    return () => {
+      if (held.delete(slot)) pump();
+    };
+  };
+  const pump = () => {
+    const t = now();
+    for (const s of held) if (t - s.at >= holdMs) held.delete(s);
+    while (held.size < max && waiting.length) waiting.shift()!();
+  };
+  /** When the oldest slot's hold ends (a waiter checks again then, in case its holder never releases). */
+  const nextExpiry = () => {
+    let oldest = Infinity;
+    for (const s of held) oldest = Math.min(oldest, s.at);
+    return oldest === Infinity ? holdMs : Math.max(0, oldest + holdMs - now());
+  };
+  const acquire = (signal?: AbortSignal | null): Promise<() => void> => {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    pump();
+    if (held.size < max && !waiting.length) return Promise.resolve(take());
+    return new Promise<() => void>((resolve, reject) => {
+      // The waiter's own timer (its invocation is alive; the holder's may not be).
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const arm = () => {
+        timer = setTimeout(() => {
+          pump();
+          if (waiting.includes(go)) arm();
+        }, nextExpiry());
+      };
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const go = () => {
+        done();
+        resolve(take());
+      };
+      const onAbort = () => {
+        const i = waiting.indexOf(go);
+        if (i >= 0) waiting.splice(i, 1);
+        done();
+        reject(signal!.reason);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      waiting.push(go);
+      arm();
+    });
+  };
+  return {
+    limit: max,
+    get active() {
+      return held.size;
+    },
+    get peak() {
+      return peak;
+    },
+    acquire,
+    async run<T>(fn: () => Promise<T>, signal?: AbortSignal | null): Promise<T> {
+      const release = await acquire(signal);
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    },
+  };
+}
+
+/**
+ * The limiter every send without its own `limiter` takes: one per isolate, so sends running at once in an invocation
+ * (two deliveries of a queue batch, a `sendNow` beside a scheduled send) never pass `MAX_PUSH_CONCURRENCY` together.
+ * Concurrent invocations of the isolate share it too (stricter than the platform's per-invocation limit).
+ */
+export const sharedPushLimiter: PushLimiter = createPushLimiter();
+
+/** Statuses whose `Response` cannot carry a body. */
+const NULL_BODY = new Set([101, 103, 204, 205, 304]);
+
+/**
+ * `fetchFn` under `limiter`: a slot is held from the request until its body is read to the end, cancelled or the
+ * request's `signal` aborts (an unread body keeps its connection open). The body is not buffered here: a retried
+ * answer is cancelled unread, and a body that fails to download fails its reader, not the request.
+ */
+export function limitedFetch(fetchFn: typeof fetch, limiter: PushLimiter): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const signal = init?.signal ?? undefined;
+    const release = await limiter.acquire(signal);
+    let res: Response;
+    try {
+      res = await fetchFn(input, init);
+    } catch (e) {
+      release();
+      throw e;
+    }
+    if (signal?.aborted || !res.body || NULL_BODY.has(res.status)) {
+      await res.body?.cancel().catch(() => {});
+      release();
+      signal?.throwIfAborted();
+      return res.body ? new Response(null, { status: res.status, statusText: res.statusText, headers: res.headers }) : res;
+    }
+    const reader = res.body.getReader();
+    let open = true;
+    const finish = () => {
+      if (!open) return;
+      open = false;
+      signal?.removeEventListener("abort", onAbort);
+      release();
+    };
+    const onAbort = () => {
+      finish();
+      reader.cancel(signal!.reason).catch(() => {});
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const body = new ReadableStream<Uint8Array>(
+      {
+        async pull(c) {
+          try {
+            const r = await reader.read();
+            if (r.done) {
+              finish();
+              c.close();
+            } else c.enqueue(r.value);
+          } catch (e) {
+            finish();
+            c.error(e);
+          }
+        },
+        cancel(reason) {
+          finish();
+          return reader.cancel(reason);
+        },
+      },
+      { highWaterMark: 0 }, // read only when the caller reads
+    );
+    return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+  }) as typeof fetch;
+}
+
 export interface RetryOptions {
   /** Retries on 429 / 5xx / network errors (default 2), exponential backoff from `retryDelayMs` (default 1000). */
   retries?: number;

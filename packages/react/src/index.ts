@@ -4,6 +4,7 @@ import {
   createElement,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -140,71 +141,124 @@ const SUSPENSE_ABANDON_MS = 60_000;
 interface Suspension {
   readonly promise: Promise<void>;
   settled: boolean;
+  /** Server render: the fetch failed. The render after the promise throws it to the error boundary. */
+  failed?: { error: unknown };
+  /** Lets go of what keeps the query (the subscription opened to suspend), once; later calls do nothing. */
+  release(): void;
 }
 const suspended = new WeakMap<EmberClient, Map<string, Suspension>>();
+
+/** The suspension of `key`: settles once the query answers (or `SUSPENSE_ABANDON_MS` pass). */
+function suspendOn<Q extends QueryReference>(client: EmberClient, map: Map<string, Suspension>, key: string, ref: Q, args: ArgsOf<Q>, opts: ShardOptions | undefined): Suspension {
+  let off: (() => void) | undefined;
+  let released = false;
+  let grace: ReturnType<typeof setTimeout> | undefined;
+  let resolveIt: () => void = () => {};
+  const mine: Suspension = {
+    promise: new Promise<void>((resolve) => (resolveIt = resolve)),
+    settled: false,
+    release: () => {
+      if (released) return;
+      released = true;
+      clearTimeout(abandon);
+      if (grace !== undefined) clearTimeout(grace);
+      off?.();
+      if (map.get(key) === mine) map.delete(key);
+    },
+  };
+  const settle = (): boolean => {
+    if (mine.settled) return false;
+    mine.settled = true;
+    resolveIt();
+    return true;
+  };
+  // Settled first, released after the grace: a component still mounted suspends again on a new subscription of
+  // the same query before this one lets go, so the client keeps the one it has (and its in-flight HTTP-first fetch).
+  const graceThenRelease = () => {
+    if (released) return;
+    grace = setTimeout(mine.release, SUSPENSE_GRACE_MS);
+    (grace as { unref?: () => void }).unref?.();
+  };
+  const abandon = setTimeout(() => {
+    if (settle()) graceThenRelease();
+  }, SUSPENSE_ABANDON_MS);
+  (abandon as { unref?: () => void }).unref?.();
+  map.set(key, mine);
+  if (!client.realtime) {
+    // A server render (no WebSocket): one HTTP read, handed to `hydrate`; the render that retries reads it from the
+    // client's snapshot, and `client.dehydrate()` hands it to the browser's `hydrate()`. Nothing is subscribed, so
+    // there is nothing to release but the entry (a failure is kept a grace, for the retry to throw it).
+    const epoch = client.authEpoch;
+    void (client.fetchForHydration as (r: Q, a: unknown, o: unknown) => ReturnType<EmberClient["fetchForHydration"]>)(ref, args, opts).then(
+      (h) => {
+        // Read for whoever was signed in when it started: never shown to the identity that replaced them.
+        if (client.authEpoch === epoch) client.hydrate(h);
+        clearTimeout(abandon);
+        // Read from the client's snapshot from now on: the entry has nothing more to keep.
+        if (settle()) mine.release();
+      },
+      (error: unknown) => {
+        clearTimeout(abandon);
+        // Failed for whoever was signed in when it started: the new identity's render reads again, never throws it.
+        if (client.authEpoch !== epoch) {
+          if (settle()) mine.release();
+          return;
+        }
+        mine.failed = { error };
+        if (settle()) graceThenRelease();
+      },
+    );
+    return mine;
+  }
+  try {
+    off = client.subscribe(ref, args, opts, (snap) => {
+      if (snap.status === "loading" || !settle()) return;
+      clearTimeout(abandon);
+      graceThenRelease();
+    });
+  } catch (e) {
+    mine.release();
+    throw e;
+  }
+  return mine;
+}
 
 /**
  * Like `useQuery`, but suspends while loading (wrap it in `<Suspense>`): the value is never `undefined`.
  *
- * The promise thrown is shared per (shard, function, args) and settles on the first value (or error); the
- * subscription behind it is released `SUSPENSE_GRACE_MS` after that, once: later snapshots do not start more timers,
- * and the release never removes a newer suspension of the same key. One that never settles is released after
- * `SUSPENSE_ABANDON_MS` (settled then, released after the same grace: no subscription outlives a component that
- * suspended and was unmounted, and one still mounted keeps the query's fetch across the boundary). A query loading
- * again after its promise settled (a sign-out) suspends on a new promise, never on the settled one. The timers do not
- * keep a server process alive.
+ * The promise thrown is shared per (identity, shard, function, args) — never across users, nor across the orgs of a
+ * `fromAuth` function — and settles on the first value (or error). The subscription behind it is released once the
+ * component mounts with the value (its own subscription holds the query then), or `SUSPENSE_GRACE_MS` after the value
+ * if it never mounts, once: later snapshots do not start more timers, and the release never removes a newer suspension
+ * of the same key. One that never settles is released after `SUSPENSE_ABANDON_MS` (settled then, released after the
+ * same grace: no subscription outlives a component that suspended and was unmounted, and one still mounted keeps the
+ * query's fetch across the boundary). A query loading again after its promise settled (a sign-out) suspends on a new
+ * promise, never on the settled one. The timers do not keep a server process alive.
+ *
+ * Server rendering (a client without WebSocket, `client.realtime === false`): no subscription; the query is read once
+ * with `fetchForHydration` and handed to `client.hydrate`, so a streaming render (`renderToPipeableStream`,
+ * `prerender`) waits for it and renders the value. A failed read goes to the error boundary.
  */
 export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>): ReturnOf<Q> {
   const client = useEmberClient();
   const { snap: s, argsKey, args, opts } = useWatched(ref, rest);
+  const key = `${client.identityScope(ref, opts)}\u0000${opts?.shard ?? ""}\u0000${getFunctionName(ref)}\u0000${argsKey ?? "{}"}`;
+  // Mounted with the value: this component's own subscription holds the query now, so the one opened to suspend
+  // goes at once (not a grace later). Only with the value: one settled without it (abandoned) keeps the query until
+  // the component's own subscription has it. Never runs on a server.
+  const has = s.status === "success";
+  useEffect(() => {
+    if (!has) return;
+    const cur = suspended.get(client)?.get(key);
+    if (cur?.settled && !cur.failed) cur.release();
+  }, [client, key, has]);
   if (s.status === "error") throw s.error;
   if (s.status === "success") return s.value as ReturnOf<Q>;
-  const key = `${opts?.shard ?? ""}\u0000${getFunctionName(ref)}\u0000${argsKey ?? "{}"}`;
   let byKey = suspended.get(client);
   if (!byKey) suspended.set(client, (byKey = new Map()));
-  const map = byKey;
-  let cur = map.get(key);
-  if (!cur || cur.settled) {
-    let off: (() => void) | undefined;
-    let released = false;
-    let resolveIt: () => void = () => {};
-    const release = () => {
-      if (released) return;
-      released = true;
-      clearTimeout(abandon);
-      off?.();
-      if (map.get(key) === mine) map.delete(key);
-    };
-    const settle = (): boolean => {
-      if (mine.settled) return false;
-      mine.settled = true;
-      resolveIt();
-      return true;
-    };
-    const mine: Suspension = { promise: new Promise<void>((resolve) => (resolveIt = resolve)), settled: false };
-    // Settled first, released after the grace: a component still mounted suspends again on a new subscription of
-    // the same query before this one lets go, so the client keeps the one it has (and its in-flight HTTP-first fetch).
-    const graceThenRelease = () => {
-      const t = setTimeout(release, SUSPENSE_GRACE_MS);
-      (t as { unref?: () => void }).unref?.();
-    };
-    const abandon = setTimeout(() => {
-      if (settle()) graceThenRelease();
-    }, SUSPENSE_ABANDON_MS);
-    (abandon as { unref?: () => void }).unref?.();
-    map.set(key, mine);
-    try {
-      off = client.subscribe(ref, (args ?? {}) as ArgsOf<Q>, opts, (snap) => {
-        if (snap.status === "loading" || !settle()) return;
-        clearTimeout(abandon);
-        graceThenRelease();
-      });
-    } catch (e) {
-      release();
-      throw e;
-    }
-    cur = mine;
-  }
+  let cur = byKey.get(key);
+  if (cur?.settled && cur.failed) throw cur.failed.error;
+  if (!cur || cur.settled) cur = suspendOn(client, byKey, key, ref, (args ?? {}) as ArgsOf<Q>, opts);
   throw cur.promise;
 }
 

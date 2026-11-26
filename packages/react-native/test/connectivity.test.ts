@@ -89,6 +89,51 @@ describe("createExpoConnectivity", () => {
     await vi.waitFor(() => expect(events).toEqual(["offline"]));
   });
 
+  it("isOnline(): optimistic until NetInfo first answers, then what it said (a client created later starts offline)", async () => {
+    let answer!: (s: { isConnected: boolean }) => void;
+    const netInfo = { ...fakeNetInfo({ isConnected: false }), fetch: () => new Promise<{ isConnected: boolean }>((r) => (answer = r)) };
+    const source = createExpoConnectivity({ appState: null, netInfo });
+    expect(source.isOnline!()).toBe(true);
+    answer({ isConnected: false });
+    await vi.waitFor(() => expect(source.isOnline!()).toBe(false));
+    const server = new FakeEmberServer({ queries: { "messages:list": () => [] } });
+    const client = new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: server.fetch, connectivity: source, heartbeat: false, defaultShard: "global:main" });
+    expect(client.connectionState().online).toBe(false);
+    const off = client.subscribe(unsafeRef("messages:list"), {}, {}, () => {});
+    await new Promise((r) => setTimeout(r, 20));
+    expect(server.history).toHaveLength(0);
+    // Network events keep it current.
+    netInfo.set({ isConnected: true });
+    expect(source.isOnline!()).toBe(true);
+    await vi.waitFor(() => expect(server.open()).toHaveLength(1));
+    off();
+    client.close();
+  });
+
+  it("a subscription made before NetInfo first answers gets that answer, even if its own fetch fails", async () => {
+    let answer!: (s: { isConnected: boolean }) => void;
+    let calls = 0;
+    const netInfo = {
+      ...fakeNetInfo({ isConnected: false }),
+      fetch: () => (calls++ === 0 ? new Promise<{ isConnected: boolean }>((r) => (answer = r)) : Promise.reject(new Error("no NetInfo"))),
+    };
+    const { events, source, stop } = record({ appState: null, netInfo });
+    expect(source.isOnline!()).toBe(true);
+    answer({ isConnected: false });
+    await vi.waitFor(() => expect(events).toEqual(["offline"]));
+    expect(source.isOnline!()).toBe(false);
+    stop();
+
+    // Unsubscribed before the answer: nothing for it.
+    let answer2!: (s: { isConnected: boolean }) => void;
+    const net2 = { ...fakeNetInfo({ isConnected: false }), fetch: () => new Promise<{ isConnected: boolean }>((r) => (answer2 = r)) };
+    const r2 = record({ appState: null, netInfo: net2 });
+    r2.stop();
+    answer2({ isConnected: false });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(r2.events).toEqual([]);
+  });
+
   it("works without any native module (Infinity grace never closes)", () => {
     vi.useFakeTimers();
     const appState = fakeAppState();

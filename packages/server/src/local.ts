@@ -18,7 +18,7 @@ import {
   validate,
   type ObjectShape, withDefaults } from "@freecorps/ember-values";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { docKey, dbIndexesOf, indexFields, readSetFields } from "./ddl.ts";
+import { docKey, dbIndexesOf, indexFields, indexKey, readSetFields, readSetSparse } from "./ddl.ts";
 import { passes } from "./filter.ts";
 import { EmberError } from "./errors.ts";
 import { authApi, failApi, flattenFunctions, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
@@ -271,7 +271,8 @@ export function localReadSetMatches(schema: LocalSchema, readSet: ReadSet, chang
         if (!fields) return true;
         let keys = keyCache.get(entry.index);
         if (!keys) {
-          keys = [change.before && docKey(change.before, fields), change.after && docKey(change.after, fields)];
+          const sparse = readSetSparse(m, entry.table, entry.index);
+          keys = [change.before ? indexKey(change.before, fields, sparse) : null, change.after ? indexKey(change.after, fields, sparse) : null];
           keyCache.set(entry.index, keys);
         }
         const [kb, ka] = keys;
@@ -391,12 +392,12 @@ export function sqlLocalReader(driver: SqlDriver, schema: LocalSchema): LocalRea
  */
 export function sqlReplicaWriter(driver: SqlDriver, schema: LocalSchema) {
   const { tables } = runtimesOf(schema.manifest);
-  const keyed = new Map<string, Array<{ name: string; fields: string[] }>>();
+  const keyed = new Map<string, Array<{ name: string; fields: string[]; sparse: boolean }>>();
   const keysOf = (name: string) => {
     let k = keyed.get(name);
     if (!k) {
       const tm = schema.manifest.tables[name]!;
-      k = dbIndexesOf(tm).map((i) => ({ name: i.name, fields: indexFields(tm, i.name)! }));
+      k = dbIndexesOf(tm).map((i) => ({ name: i.name, fields: indexFields(tm, i.name)!, sparse: i.sparse === true }));
       keyed.set(name, k);
     }
     return k;
@@ -407,7 +408,7 @@ export function sqlReplicaWriter(driver: SqlDriver, schema: LocalSchema) {
       const t = tables.get(table);
       if (!t) throw new EmberError("ValidationError", `Unknown table ${JSON.stringify(table)}`);
       const values: Array<[string, SqlValue]> = [["_creationTime", doc._creationTime], ...Object.entries(encodeFields(t.layout, doc))];
-      for (const i of keysOf(table)) values.push([keyColumn(i.name), docKey(doc, i.fields)]);
+      for (const i of keysOf(table)) values.push([keyColumn(i.name), indexKey(doc, i.fields, i.sparse)]);
       const cur = driver.exec(`SELECT "_rowid" FROM ${q(table)} WHERE "_id" = ?`, doc._id).rows[0];
       let rowid: number;
       let rest = values;

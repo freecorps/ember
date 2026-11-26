@@ -63,6 +63,11 @@ export interface CurrentState {
   activeVersions: Array<{ version_id: string; percentage: number }>;
   /** Names of the Worker's secrets (values are never readable). Kept across uploads by `keep_bindings`. */
   secrets?: string[];
+  /**
+   * The Worker's workers.dev route (`GET .../subdomain`); absent when not read (no Worker, a read that failed): the
+   * deploy then sets it as always.
+   */
+  subdomain?: { enabled: boolean; previews_enabled: boolean };
 }
 
 export interface MetadataInput {

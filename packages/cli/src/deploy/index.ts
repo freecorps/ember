@@ -45,8 +45,11 @@ export interface DeployOptions {
   /** Registry database name (default EMBER_REGISTRY_NAME or `ember-registry`). */
   registryName?: string;
   log?: (line: string) => void;
-  /** Skip codegen + bundling (tests). `schema`: the manifest (external indexes); default none. */
-  prebuilt?: { build: WorkerBuild; hasCrons: boolean; crons?: ReadonlyArray<{ schedule: string; tz?: string }>; schemaVersion: string; schema?: SchemaManifestLike };
+  /**
+   * Skip codegen + bundling (tests). `schema`: the manifest (external indexes); default none. `env`: the manifest's
+   * declared env vars (`defineApp({ env })`); default none.
+   */
+  prebuilt?: { build: WorkerBuild; hasCrons: boolean; crons?: ReadonlyArray<{ schedule: string; tz?: string }>; schemaVersion: string; schema?: SchemaManifestLike; env?: ReadonlyArray<DeclaredEnv> };
   sleep?: (ms: number) => Promise<void>;
   /**
    * Admin token: uploaded as the `EMBER_ADMIN_TOKEN` secret (enables `GET /api/_ember/status`) and used by
@@ -73,6 +76,36 @@ export interface DeployOptions {
    * deploy throws SchemaRollbackError before anything is uploaded (schema-history.ts).
    */
   allowSchemaRollback?: boolean;
+  /**
+   * Deploy even when a var the app declares as required (`defineApp({ env })`) is neither a secret on the Worker nor a
+   * var in ember.json (`--allow-missing-env`): actions reading it throw `EnvMissing` until it is set. Without it such a
+   * redeploy throws `MissingEnvError` before anything is uploaded; a first deploy (no Worker yet, so no secrets can
+   * exist) only warns.
+   */
+  allowMissingEnv?: boolean;
+}
+
+/** A var of `defineApp({ env })`, as the manifest lists it. */
+export type DeclaredEnv = { name: string; optional: boolean };
+
+/** A redeploy whose required env vars are not all set (`missing`, sorted). */
+export class MissingEnvError extends Error {
+  override readonly name = "MissingEnvError";
+  readonly missing: string[];
+  constructor(missing: string[], worker: string, env: string) {
+    super(
+      `${missing.length === 1 ? "env var" : "env vars"} declared in defineApp({ env }) but not set on ${worker}: ${missing.join(", ")}.\n` +
+        `  Set ${missing.length === 1 ? "it" : "each"} as a secret (\`ember env set ${missing[0]} --env ${env}\`) or as a var in ember.json (\`ember env set ${missing[0]} <value> --var --env ${env}\`),\n` +
+        `  or deploy anyway with --allow-missing-env (actions that read ${missing.length === 1 ? "it" : "them"} throw EnvMissing until then).`,
+    );
+    this.missing = missing;
+  }
+}
+
+/** Required declared vars that are neither a Worker secret, nor a var or secret this deploy sends (sorted). */
+export function missingEnv(declared: ReadonlyArray<DeclaredEnv>, configured: Iterable<string>): string[] {
+  const have = new Set(configured);
+  return declared.filter((e) => !e.optional && !have.has(e.name)).map((e) => e.name).sort();
 }
 
 export interface DeployResult {
@@ -129,23 +162,38 @@ async function activeVersion(client: CfClient, worker: string): Promise<string |
   return versions.length === 1 ? versions[0]!.version_id : null;
 }
 
-/** `versionsOnly`: existence and active versions only (one GET; a dry run reads nothing else). */
+/**
+ * The Worker as it is now. `versionsOnly`: existence and active versions only (one GET; a dry run reads nothing else).
+ * Otherwise the deployments, DO namespaces, secrets and workers.dev route are read at once (they do not depend on each
+ * other); a Worker that turns out not to exist ignores the other three.
+ */
 export async function fetchCurrentState(client: CfClient, worker: string, o: { versionsOnly?: boolean } = {}): Promise<CurrentState> {
-  const d = await client.request<{ deployments: Array<{ versions: Array<{ version_id: string; percentage: number }> }> }>(
-    "GET",
-    `/workers/scripts/${worker}/deployments`,
-  );
+  const deployments = client.request<{ deployments: Array<{ versions: Array<{ version_id: string; percentage: number }> }> }>("GET", `/workers/scripts/${worker}/deployments`);
+  if (o.versionsOnly) {
+    const d = await deployments;
+    if (d.status === 404 || d.errors.some((e) => e.code === 10007)) return { exists: false, provisionedClasses: [], activeVersions: [] };
+    if (!d.success) throw new CloudflareApiError(`GET /workers/scripts/${worker}/deployments`, d.status, d.errors);
+    return { exists: true, provisionedClasses: [], activeVersions: d.result?.deployments?.[0]?.versions ?? [] };
+  }
+  const [d, ns, secrets, sub] = await Promise.all([
+    deployments,
+    client.request<Array<{ script?: string; class?: string }>>("GET", "/workers/durable_objects/namespaces?per_page=1000"),
+    client.request<Array<{ name: string; type: string }>>("GET", `/workers/scripts/${worker}/secrets`),
+    // Best effort: unreadable → the deploy sets the route as always.
+    client.request<{ enabled?: boolean; previews_enabled?: boolean }>("GET", `/workers/scripts/${worker}/subdomain`).catch(() => null),
+  ]);
   if (d.status === 404 || d.errors.some((e) => e.code === 10007)) return { exists: false, provisionedClasses: [], activeVersions: [] };
   if (!d.success) throw new CloudflareApiError(`GET /workers/scripts/${worker}/deployments`, d.status, d.errors);
-  if (o.versionsOnly) return { exists: true, provisionedClasses: [], activeVersions: d.result?.deployments?.[0]?.versions ?? [] };
-  const ns = await client.call<Array<{ script?: string; class?: string }>>("GET", "/workers/durable_objects/namespaces?per_page=1000");
-  const provisionedClasses = (ns ?? []).filter((n) => n.script === worker && n.class).map((n) => n.class!);
-  const secrets = await client.call<Array<{ name: string; type: string }>>("GET", `/workers/scripts/${worker}/secrets`);
+  if (!ns.success) throw new CloudflareApiError("GET /workers/durable_objects/namespaces?per_page=1000", ns.status, ns.errors);
+  if (!secrets.success) throw new CloudflareApiError(`GET /workers/scripts/${worker}/secrets`, secrets.status, secrets.errors);
+  const provisionedClasses = (ns.result ?? []).filter((n) => n.script === worker && n.class).map((n) => n.class!);
+  const s = sub?.success ? sub.result : null;
   return {
     exists: true,
     provisionedClasses,
     activeVersions: d.result?.deployments?.[0]?.versions ?? [],
-    secrets: (secrets ?? []).map((x) => x.name),
+    secrets: (secrets.result ?? []).map((x) => x.name),
+    ...(s && typeof s.enabled === "boolean" ? { subdomain: { enabled: s.enabled, previews_enabled: s.previews_enabled === true } } : {}),
   };
 }
 
@@ -180,7 +228,7 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const gen = await codegen(project);
     for (const w of gen.warnings) log(`warning: ${w}`);
     const build = await buildWorker(project, { outDir: join(project.stateDir, "build", env.name), env: env.name, loaded: gen.loaded, minify: true });
-    prepared = { build, hasCrons: gen.manifest.crons.length > 0, crons: gen.manifest.crons, schemaVersion: gen.manifest.schema.version, schema: gen.manifest.schema as unknown as SchemaManifestLike };
+    prepared = { build, hasCrons: gen.manifest.crons.length > 0, crons: gen.manifest.crons, schemaVersion: gen.manifest.schema.version, schema: gen.manifest.schema as unknown as SchemaManifestLike, env: gen.manifest.env ?? [] };
   }
   const { build, hasCrons, schemaVersion } = prepared;
   // External indexes: resources derived from the schema; prune when this env had (or has) some.
@@ -335,6 +383,8 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
     const { metadata, createdClasses } = buildMetadata({ ...input, provisionedClasses: [] });
     const plan = planDeploy({ worker, current: none, metadata, createdClasses, hasCrons, ...(prepared.crons ? { crons: prepared.crons } : {}), authJwks: localAuth, ...(filesNames ? { files: filesNames } : {}), ...(hasAi ? { ai } : {}), aiPrune, ...queuePlan, ...(opts.gradual !== undefined ? { gradual: opts.gradual } : {}) });
     printPlan(plan, build, log, true);
+    const notVars = missingEnv(prepared.env ?? [], Object.keys(metaInput.vars ?? {}));
+    if (notVars.length) log(`  env: ${notVars.join(", ")} (defineApp({ env })) not in ember.json vars; a real deploy checks the Worker's secrets for ${notVars.length === 1 ? "it" : "them"}`);
     const schemaHistory = await dryRunSchemaHistory();
     reportSchemaHistory(schemaHistory, true);
     return { plan, versionId: null, url: null, dryRun: true, ...(schemaHistory ? { schemaHistory } : {}) };
@@ -382,6 +432,15 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
   // `ember env`: a name is a secret (on the Worker) or a var (ember.json), never both.
   const clash = Object.keys(env.config.vars ?? {}).filter((n) => (current.secrets ?? []).includes(n));
   if (clash.length) throw new Error(`${clash.join(", ")}: set both as a secret on ${worker} and as a var in ember.json (environments.${env.name}.vars); remove one (\`ember env rm <name>\` or \`ember env rm <name> --var\`)`);
+  // Declared env vars (`defineApp({ env })`): a Worker secret, an ember.json var or one this deploy sends. Checked before
+  // anything is created or uploaded. A first deploy cannot have secrets yet (they live on the Worker): it warns.
+  const unset = missingEnv(prepared.env ?? [], [...(current.secrets ?? []), ...Object.keys(metaInput.vars ?? {}), ...Object.keys(("secrets" in metaInput ? metaInput.secrets : undefined) ?? {})]);
+  if (unset.length) {
+    if (current.exists && !opts.allowMissingEnv) throw new MissingEnvError(unset, worker, env.name);
+    log(
+      `  warning: ${unset.join(", ")} (defineApp({ env })) ${unset.length === 1 ? "is" : "are"} not set on ${worker}${current.exists ? " (--allow-missing-env)" : " (a first deploy: set them right after it with `ember env set <NAME> --env " + env.name + "`)"}; actions reading ${unset.length === 1 ? "it" : "them"} throw EnvMissing`,
+    );
+  }
   // Before anything is created or uploaded (R2 credentials, queues, the Worker): a schema rollback stops here.
   const schemaHistory = await schemaCheck(registry, { exists: current.exists, split: current.activeVersions.length > 1 });
   reportSchemaHistory(schemaHistory, false);
@@ -471,7 +530,9 @@ export async function deploy(project: Project, opts: DeployOptions = {}): Promis
           if (step.body.length && plan.strategy === "create") log("  note: a new Worker's Cron Trigger can take ~10+ minutes to fire for the first time; crons.ts starts after that");
           break;
         case "subdomain": {
-          await client.call(step.method, step.path, step.body);
+          // A redeploy whose workers.dev route already is what this step sets skips the POST.
+          const same = current.subdomain?.enabled === step.body.enabled && current.subdomain.previews_enabled === step.body.previews_enabled;
+          if (!same) await client.call(step.method, step.path, step.body);
           url = workersDev ?? (await subdomain());
           break;
         }

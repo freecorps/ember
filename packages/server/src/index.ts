@@ -12,6 +12,7 @@ export * from "./crons.ts";
 export * from "./triggers.ts";
 export * from "./components.ts";
 export * from "./http.ts";
+export { MAX_HTTP_BODY_BYTES, readLimited, readLimitedText } from "./body.ts";
 export { createMatchIndex, IntervalSet, type MatchIndex, type MatchResult } from "./matchIndex.ts";
 export * from "./query.ts";
 export {
@@ -27,7 +28,7 @@ export {
 } from "./aggregate.ts";
 export { sqlId, compileSql, tokenize as tokenizeSql, type SqlReader, type SqlTag, type SqlIdentifier, type CompiledSql } from "./sqlQuery.ts";
 export { evalExpr, filterBuilder } from "./filter.ts";
-export { compileSchema, createTableDdl, indexFields, docKey, dbIndexesOf, CREATION_INDEX, SYSTEM_DDL } from "./ddl.ts";
+export { compileSchema, createTableDdl, indexFields, docKey, indexKey, isSparseIndex, dbIndexesOf, CREATION_INDEX, SYSTEM_DDL } from "./ddl.ts";
 export { layoutOf, keyColumn, encodeFields, decodeRow, fieldOf, MAX_USER_COLUMNS, type Layout } from "./layout.ts";
 export {
   introspect,
