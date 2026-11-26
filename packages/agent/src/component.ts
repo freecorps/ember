@@ -102,8 +102,11 @@ const schema = defineSchema({
       .index("by_thread_status", ["thread", "status"])
       // Only for an install with `{ search: true }` (`omitIndexes` below): FTS5 rows on every message write otherwise.
       .searchIndex("search_text", { searchField: "text", filterFields: ["thread", "userId"] }),
-    /** Text of messages being streamed, in batches; deleted when the step finishes, fails or is aborted. */
-    deltas: defineTable({ thread: v.id("threads"), message: v.id("messages"), seq: v.number(), text: v.string() })
+    /**
+     * Text of messages being streamed, in batches; deleted when the step finishes, fails or is aborted. `reasoning`:
+     * the model's reasoning streamed in the same batch (absent when there was none).
+     */
+    deltas: defineTable({ thread: v.id("threads"), message: v.id("messages"), seq: v.number(), text: v.string(), reasoning: v.optional(v.string()) })
       // One index serves both a message's deltas (thread + message) and a thread's purge (thread alone).
       .index("by_thread", ["thread", "message", "seq"]),
   },
@@ -177,8 +180,11 @@ export type AgentThread = {
   updatedAt: number;
 };
 
-/** A batch of streamed text: `text` of the deltas of a message, in `seq` order, is what has streamed so far. */
-export type StreamDelta = { _id: string; message: string; seq: number; text: string };
+/**
+ * A batch of streamed text: `text` of the deltas of a message, in `seq` order, is what has streamed so far (and
+ * `reasoning`, the model's reasoning so far, when it streams one).
+ */
+export type StreamDelta = { _id: string; message: string; seq: number; text: string; reasoning?: string };
 
 /** A message as the model sees it (context window). */
 export type ContextMessage = { _id: string; role: MessageRole; parts: MessagePart[]; order: number; stepOrder: number };
@@ -219,7 +225,7 @@ function publicThread(t: ThreadDoc): AgentThread {
   return out;
 }
 
-const publicDelta = (d: DeltaDoc): StreamDelta => ({ _id: d._id, message: d.message, seq: d.seq, text: d.text });
+const publicDelta = (d: DeltaDoc): StreamDelta => (d.reasoning ? { _id: d._id, message: d.message, seq: d.seq, text: d.text, reasoning: d.reasoning } : { _id: d._id, message: d.message, seq: d.seq, text: d.text });
 
 function thread(ctx: ReadCtx, id: string): ThreadDoc | null {
   const tid = ctx.db.normalizeId("threads", id);
@@ -238,33 +244,37 @@ const isHandle = (s: string | undefined) => s === undefined || s.startsWith("&")
 
 const deltasOf = (ctx: ReadCtx, m: { _id: MId; thread: GenericId<"threads"> }) =>
   ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", m.thread).eq("message", m._id)).collect();
-/** Deletes the deltas of `m` and returns their text (in seq order): one read for both. */
-function takeDeltas(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }): string {
+/** Deletes the deltas of `m` and returns their text and reasoning (in seq order): one read for both. */
+function takeDeltas(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }): { text: string; reasoning: string } {
   let text = "";
+  let reasoning = "";
   for (const d of deltasOf(ctx, m)) {
     text += d.text;
+    if (d.reasoning) reasoning += d.reasoning;
     ctx.db.delete(d._id);
   }
-  return text;
+  return { text, reasoning };
 }
 const clearDeltas = (ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }) => void takeDeltas(ctx, m);
 
 /** Writes batch `seq` of `m`, merging it with the batches before it on a compaction boundary (DELTA_FANOUT). */
-function writeDelta(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }, seq: number, text: string) {
+function writeDelta(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }, seq: number, text: string, reasoning?: string) {
   let span = 1;
   while (Number.isSafeInteger(seq) && seq >= 0 && (seq + 1) % (span * DELTA_FANOUT) === 0) span *= DELTA_FANOUT;
+  const row = { thread: m.thread, message: m._id, seq, text, ...(reasoning ? { reasoning } : {}) };
   if (span === 1) {
-    ctx.db.insert("deltas", { thread: m.thread, message: m._id, seq, text });
+    ctx.db.insert("deltas", row);
     return;
   }
   // The rows of [seq + 1 - span, seq): already merged into at most 15 per level below `span`.
   const rows = ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", m.thread).eq("message", m._id).gte("seq", seq + 1 - span).lt("seq", seq)).collect();
   const [first, ...rest] = rows;
   if (!first) {
-    ctx.db.insert("deltas", { thread: m.thread, message: m._id, seq, text });
+    ctx.db.insert("deltas", row);
     return;
   }
-  ctx.db.patch(first._id, { text: rows.map((d) => d.text).join("") + text });
+  const merged = rows.map((d) => d.reasoning ?? "").join("") + (reasoning ?? "");
+  ctx.db.patch(first._id, { text: rows.map((d) => d.text).join("") + text, ...(merged ? { reasoning: merged } : {}) });
   for (const d of rest) ctx.db.delete(d._id);
 }
 
@@ -358,9 +368,13 @@ function deleteSome(ctx: Ctx, t: TId): boolean {
 function stop(ctx: Ctx, m: MessageDoc, reason: string) {
   if (m.job) ctx.scheduler.cancel(m.job);
   const patch: MessagePatch = { status: "aborted", error: reason, job: undefined };
-  const text = takeDeltas(ctx, m);
-  if (text && m.status === "streaming" && m.role === "assistant") {
-    patch.parts = [...m.parts.filter((p) => p.type !== "text"), { type: "text", text }];
+  const { text, reasoning } = takeDeltas(ctx, m);
+  if ((text || reasoning) && m.status === "streaming" && m.role === "assistant") {
+    patch.parts = [
+      ...(reasoning ? [{ type: "reasoning" as const, text: reasoning }] : []),
+      ...m.parts.filter((p) => p.type !== "text" && (!reasoning || p.type !== "reasoning")),
+      ...(text ? [{ type: "text" as const, text }] : []),
+    ];
     patch.text = text;
   }
   ctx.db.patch(m._id, patch);
@@ -630,12 +644,12 @@ export const functions = {
 
     /** A batch of streamed text. False once the message was aborted (or another run owns it): the action stops. */
     appendDelta: mutation({
-      args: { messageId: v.string(), runId: v.string(), seq: v.number(), text: v.string() },
+      args: { messageId: v.string(), runId: v.string(), seq: v.number(), text: v.string(), reasoning: v.optional(v.string()) },
       returns: v.boolean(),
       handler: (ctx, a) => {
         const m = owned(ctx, a.messageId, a.runId);
         if (!m) return false;
-        writeDelta(ctx, m, a.seq, a.text);
+        writeDelta(ctx, m, a.seq, a.text, a.reasoning);
         return true;
       },
     }),
@@ -712,8 +726,9 @@ export const functions = {
       handler: (ctx, a) => {
         const m = owned(ctx, a.messageId, a.runId);
         if (!m) return false;
-        const text = takeDeltas(ctx, m);
-        const patch: MessagePatch = { status: "failed", error: a.error, runId: undefined, parts: text ? [{ type: "text", text }] : [], text };
+        const { text, reasoning } = takeDeltas(ctx, m);
+        const parts: MessagePart[] = [...(reasoning ? [{ type: "reasoning" as const, text: reasoning }] : []), ...(text ? [{ type: "text" as const, text }] : [])];
+        const patch: MessagePatch = { status: "failed", error: a.error, runId: undefined, parts, text };
         if (a.usage) patch.usage = a.usage;
         if (a.model !== undefined) patch.model = a.model;
         if (a.provider !== undefined) patch.provider = a.provider;

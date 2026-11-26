@@ -6,7 +6,8 @@ import { createFunctionHandle, internalActionGeneric, v, type ActionCtx, type Ar
 import { isValidator, toJsonSchema, withDefaults, type GenericValidator, type Visibility } from "@freecorps/ember-values";
 import { aiSdk, isLanguageModel, type LanguageModelLike } from "./ai-sdk.ts";
 import type { AgentMessage, AgentThread, ContextMessage, MessagePart, StreamDelta, Usage } from "./component.ts";
-import type { AgentModel, ModelMessage, ModelPart, ModelToolSpec } from "./model.ts";
+import { withRetry, type AgentModel, type ModelMessage, type ModelPart, type ModelToolSpec, type RetryOptions } from "./model.ts";
+import { generateObject, type GenerateObjectOptions, type GenerateObjectResult, type ObjectSchema, type SchemaType } from "./object.ts";
 
 // ------------------------------------------------------------------------------------------------ component api
 
@@ -109,6 +110,13 @@ export interface AgentOptions {
    */
   streaming?: false | { throttleMs?: number; maxChars?: number };
   callSettings?: { temperature?: number; maxOutputTokens?: number };
+  /**
+   * Retries of a model call that fails before its first delta with 429 / 5xx (or an error marked `isRetryable`),
+   * waiting `Retry-After` when the error has one. Once text, reasoning or a tool call streamed, an error fails the
+   * step as before (no repeated text). Default `{ maxAttempts: 3, initialBackoffMs: 500, maxBackoffMs: 20_000 }`;
+   * `false`: no retries.
+   */
+  retry?: RetryOptions | false;
 }
 
 export type SendMessageArgs = {
@@ -133,13 +141,17 @@ type PreparedTool = { name: string; spec: ModelToolSpec; validator: GenericValid
 
 export class Agent {
   readonly model: AgentModel;
+  /** `model` with the retries of `options.retry` (what a step calls). */
+  private readonly streamModel: AgentModel;
   private readonly tools: Map<string, PreparedTool>;
 
   constructor(
     readonly component: AgentComponentApi,
     readonly options: AgentOptions,
   ) {
-    this.model = isLanguageModel(options.model) ? aiSdk(options.model) : options.model;
+    const model = isLanguageModel(options.model) ? aiSdk(options.model) : options.model;
+    this.model = model;
+    this.streamModel = options.retry === false ? model : withRetry(model, options.retry ?? {});
     this.tools = new Map(
       Object.entries(options.tools ?? {}).map(([name, t]) => {
         const validator: GenericValidator = isValidator(t.args) ? t.args : (v.object(t.args as Record<string, GenericValidator>) as GenericValidator);
@@ -291,7 +303,7 @@ export class Agent {
     });
     if (!started) return; // aborted before it ran, or a duplicate delivery
     const { runId } = started;
-    const model = this.model;
+    const model = this.streamModel;
     const meta = { model: model.modelId, provider: model.provider };
     const history: ModelMessage[] = await Promise.all(started.context.map(async (m) => ({ role: m.role, content: await this.modelParts(ctx, m.parts) })));
     const streaming = this.options.streaming === false ? null : { throttleMs: this.options.streaming?.throttleMs ?? 200, maxChars: this.options.streaming?.maxChars ?? DEFAULT_MAX_CHARS };
@@ -303,6 +315,8 @@ export class Agent {
       let text = "";
       let reasoning = "";
       let pending = "";
+      /** Reasoning not written yet (it goes in the same delta rows as the text). */
+      let pendingReasoning = "";
       let seq = 0;
       let last = Date.now();
       let usage: Usage | undefined;
@@ -314,19 +328,22 @@ export class Agent {
       let inflight: Promise<void> | null = null;
       /** `aborted`: an `appendDelta` returned false (the message was aborted). `failure`: one threw (rethrown by the stream loop, as when it was awaited inline). */
       const writes: { aborted: boolean; failure: { error: unknown } | null } = { aborted: false, failure: null };
-      const due = () => streaming !== null && (pending.length >= streaming.maxChars || Date.now() - last >= streaming.throttleMs);
-      /** Starts writing the buffered text as one delta row (none may be in flight). */
+      const buffered = () => pending.length + pendingReasoning.length;
+      const due = () => streaming !== null && (buffered() >= streaming.maxChars || Date.now() - last >= streaming.throttleMs);
+      /** Starts writing the buffered text (and reasoning) as one delta row (none may be in flight). */
       const send = (): void => {
         last = Date.now();
         const chunk = pending;
+        const thought = pendingReasoning;
         pending = "";
-        inflight = ctx.runMutation(lib.appendDelta, { messageId: current, runId, seq: seq++, text: chunk }).then(
+        pendingReasoning = "";
+        inflight = ctx.runMutation(lib.appendDelta, { messageId: current, runId, seq: seq++, text: chunk, ...(thought ? { reasoning: thought } : {}) }).then(
           (ok) => {
             inflight = null;
             if (!ok) {
               writes.aborted = true;
               abort.abort();
-            } else if (pending && due()) send();
+            } else if (buffered() && due()) send();
           },
           (error: unknown) => {
             inflight = null;
@@ -350,7 +367,7 @@ export class Agent {
        */
       const flushForFail = async () => {
         await idle();
-        if (writes.aborted || !pending) return;
+        if (writes.aborted || !buffered()) return;
         send();
         await idle();
       };
@@ -364,7 +381,13 @@ export class Agent {
             if (!streaming) continue;
             pending += ev.text;
             if (!inflight && due()) send();
-          } else if (ev.type === "reasoning-delta") reasoning += ev.text;
+          } else if (ev.type === "reasoning-delta") {
+            // Streamed like the text (models that expose their reasoning): the UI shows it while it is written.
+            reasoning += ev.text;
+            if (!streaming) continue;
+            pendingReasoning += ev.text;
+            if (!inflight && due()) send();
+          }
           else if (ev.type === "tool-call") calls.push({ toolCallId: ev.toolCallId, toolName: ev.toolName, args: ev.args });
           else if (ev.type === "finish") {
             usage = ev.usage;
@@ -400,6 +423,22 @@ export class Agent {
       history.push({ role: "tool", content: results.map((p) => p as ModelPart) });
       current = r.nextMessageId;
     }
+  }
+
+  /**
+   * One model call for an object matching `schema` (a `v.*` validator, or an object of validators): the schema goes
+   * to the model as JSON Schema (response format) and the answer is parsed and validated (`ObjectGenerationError`
+   * otherwise). Uses the agent's model, instructions, call settings and retries; nothing is saved to a thread.
+   */
+  generateObject<S extends ObjectSchema>(ctx: { env: Record<string, unknown> }, opts: Omit<GenerateObjectOptions<S>, "env">): Promise<GenerateObjectResult<SchemaType<S>>> {
+    const system = [this.options.instructions, opts.system].filter(Boolean).join("\n\n");
+    return generateObject(this.model, {
+      ...this.options.callSettings,
+      ...opts,
+      ...(system ? { system } : {}),
+      env: ctx.env,
+      retry: opts.retry ?? this.options.retry ?? {},
+    });
   }
 
   private async callTool(ctx: ActionCtx, run: Started, messageId: string, c: { toolCallId: string; toolName: string; args: unknown }): Promise<MessagePart> {

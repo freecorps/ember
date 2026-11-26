@@ -1,12 +1,19 @@
 import { describe, expect, test } from "vitest";
+import { makeFunctionReference } from "@freecorps/ember-values";
 import { replay, StepFailed, type JournalEntry, type WorkflowStep } from "../src/replay.ts";
 
+const math = {
+  double: makeFunctionReference<"query", { n: number }, number>("math:double"),
+  save: makeFunctionReference<"mutation", { v: number }, number>("math:save"),
+  remote: makeFunctionReference<"action", { v: number }, number>("math:remote"),
+};
+
 const flow = async (step: WorkflowStep, args: { n: number }) => {
-  const a = await step.runQuery<number>("math:double", { n: args.n });
-  const b = await step.runMutation<number>("math:save", { v: a }, { name: "save" });
+  const a = await step.runQuery(math.double, { n: args.n });
+  const b = await step.runMutation(math.save, { v: a }, { name: "save" });
   await step.sleep(1000);
   const ev = await step.waitForEvent<{ x: number }>("go", { timeoutMs: 5000 });
-  const c = await step.runAction<number>("math:remote", { v: b + ev.x }, { retry: { maxAttempts: 3 } });
+  const c = await step.runAction(math.remote, { v: b + ev.x }, { retry: { maxAttempts: 3 } });
   return c * 10;
 };
 
@@ -65,7 +72,7 @@ describe("replay", () => {
   });
 
   test("references: api objects and names become handles; handler errors fail the workflow", async () => {
-    const ref = { [Symbol.for("ember.functionName")]: "dir/mod:fn" };
+    const ref = makeFunctionReference<"mutation">("dir/mod:fn");
     expect(await run([], async (step: WorkflowStep) => step.runMutation(ref))).toMatchObject({ step: { fn: "&dir/mod:fn", name: "dir/mod:fn" } });
     expect(await run([], async () => {
       throw new Error("bad input");
@@ -80,5 +87,103 @@ describe("replay", () => {
     };
     expect(await run([], fireAndForget)).toMatchObject({ type: "step", index: 0 });
     expect(await run([done(0, "mutation", "a:b", null)], fireAndForget)).toEqual({ type: "done", result: 1 });
+  });
+
+  test("steps started together are one batch, by call order; the handler goes on once all settled", async () => {
+    const par = async (step: WorkflowStep) => {
+      const [a, b] = await Promise.all([step.runAction(math.remote, { v: 1 }), step.runAction(math.remote, { v: 2 }, { name: "second" })]);
+      return step.runMutation(math.save, { v: a + b });
+    };
+    const req = (v: number, name = "math:remote") => ({ kind: "action", name, fn: "&math:remote", args: { v } });
+    expect(await run([], par)).toEqual({ type: "steps", index: 0, steps: [req(1), req(2, "second")] });
+    // One settled, the other still running: wait (never ask for the next step while a sibling runs).
+    expect(await run([done(0, "action", "math:remote", 10), { index: 1, kind: "action", name: "second", status: "pending" }], par)).toEqual({ type: "waiting" });
+    expect(await run([{ index: 0, kind: "action", name: "math:remote", status: "pending" }, done(1, "action", "second", 20)], par)).toEqual({ type: "waiting" });
+    const both = [done(0, "action", "math:remote", 10), done(1, "action", "second", 20)];
+    expect(await run(both, par)).toEqual({ type: "step", index: 2, step: { kind: "mutation", name: "math:save", fn: "&math:save", args: { v: 30 } } });
+    expect(await run([...both, done(2, "mutation", "math:save", 30)], par)).toEqual({ type: "done", result: 30 });
+  });
+
+  test("branches that continue after their own steps: each round is one batch, the same on every replay", async () => {
+    const branch = async (step: WorkflowStep, n: number) => step.runQuery(math.double, { n: (await step.runQuery(math.double, { n })) + 1 });
+    const par = async (step: WorkflowStep) => Promise.all([branch(step, 1), branch(step, 5)]);
+    const q = (n: number) => ({ kind: "query", name: "math:double", fn: "&math:double", args: { n } });
+    expect(await run([], par)).toEqual({ type: "steps", index: 0, steps: [q(1), q(5)] });
+    const j = [done(0, "query", "math:double", 2), done(1, "query", "math:double", 10)];
+    for (let i = 0; i < 3; i++) expect(await run(j, par)).toEqual({ type: "steps", index: 2, steps: [q(3), q(11)] });
+    j.push(done(2, "query", "math:double", 6), done(3, "query", "math:double", 22));
+    expect(await run(j, par)).toEqual({ type: "done", result: [6, 22] });
+  });
+
+  test("a parallel step that failed rejects in Promise.all (caught), after the batch settled", async () => {
+    const par = async (step: WorkflowStep) => {
+      try {
+        await Promise.all([step.runAction(math.remote, { v: 1 }), step.sleep(10)]);
+      } catch (e) {
+        return `caught ${(e as Error).message}`;
+      }
+    };
+    const failed: JournalEntry = { index: 0, kind: "action", name: "math:remote", status: "failed", error: "boom" };
+    expect(await run([failed, { index: 1, kind: "sleep", name: "sleep", status: "pending" }], par)).toEqual({ type: "waiting" });
+    expect(await run([failed, done(1, "sleep", "sleep", null)], par)).toEqual({ type: "done", result: "caught boom" });
+  });
+
+  test("a batch whose journal no longer matches the code is a NonDeterminism failure", async () => {
+    const par = async (step: WorkflowStep) => Promise.all([step.runQuery(math.double, { n: 1 }), step.runAction(math.remote, { v: 1 })]);
+    const out = await run([done(0, "query", "math:double", 2), done(1, "query", "math:double", 2)], par);
+    expect(out).toMatchObject({ type: "failed" });
+    expect((out as { error: string }).error).toMatch(/^NonDeterminism: step 1/);
+  });
+  test("branches at different microtask depths: journaled batches are released as they ran, so replays agree", async () => {
+    const q = (name: string) => ({ kind: "query", name, fn: "&math:double", args: {} });
+    const par = async (step: WorkflowStep) =>
+      Promise.all([
+        (async () => {
+          await step.runQuery("math:double", {}, { name: "A1" });
+          await step.runQuery("math:double", {}, { name: "A2" });
+          return step.runQuery("math:double", {}, { name: "A3" });
+        })(),
+        (async () => {
+          await step.runQuery("math:double", {}, { name: "B1" });
+          await Promise.resolve();
+          return step.runQuery("math:double", {}, { name: "B2" });
+        })(),
+      ]);
+    const rec = (index: number, name: string, batchEnd: number): JournalEntry => ({ ...done(index, "query", name, index), batchEnd });
+    expect(await run([], par)).toEqual({ type: "steps", index: 0, steps: [q("A1"), q("B1")] });
+    const j = [rec(0, "A1", 2), rec(1, "B1", 2)];
+    expect(await run(j, par)).toEqual({ type: "steps", index: 2, steps: [q("A2"), q("B2")] });
+    j.push(rec(2, "A2", 4), rec(3, "B2", 4));
+    // Without the batches, A2 would resolve at once and A3 would claim index 3 (B2's): NonDeterminism.
+    expect(await run(j, par)).toEqual({ type: "step", index: 4, step: q("A3") });
+    j.push(done(4, "query", "A3", 4));
+    expect(await run(j, par)).toEqual({ type: "done", result: [4, 3] });
+  });
+
+  test("a batch replays the same whatever order its steps finished in (and with one journaled, one new)", async () => {
+    const par = async (step: WorkflowStep) => {
+      const [a, b] = await Promise.all([step.runAction(math.remote, { v: 1 }, { name: "a" }), step.runAction(math.remote, { v: 2 }, { name: "b" })]);
+      const [c, d] = await Promise.all([step.runQuery(math.double, { n: a }, { name: "c" }), step.runQuery(math.double, { n: b }, { name: "d" })]);
+      return c + d;
+    };
+    const act = (index: number, name: string, result: number, completedAt: number): JournalEntry => ({ ...done(index, "action", name, result), batchEnd: 2, completedAt } as JournalEntry);
+    // The rows come in whatever order (and with whatever completion time) the steps settled: replay goes by index.
+    const settledAFirst = [act(0, "a", 10, 1), act(1, "b", 20, 2)];
+    const settledBFirst = [act(1, "b", 20, 1), act(0, "a", 10, 2)];
+    const want = { type: "steps", index: 2, steps: [
+      { kind: "query", name: "c", fn: "&math:double", args: { n: 10 } },
+      { kind: "query", name: "d", fn: "&math:double", args: { n: 20 } },
+    ] };
+    expect(await run(settledAFirst, par)).toEqual(want);
+    expect(await run(settledBFirst, par)).toEqual(want);
+    const full = [...settledAFirst, { ...done(2, "query", "c", 20), batchEnd: 4 }, { ...done(3, "query", "d", 40), batchEnd: 4 }];
+    expect(await run(full, par)).toEqual({ type: "done", result: 60 });
+  });
+
+  test("asking for fewer steps of a journaled batch than it recorded is a NonDeterminism failure", async () => {
+    const one = async (step: WorkflowStep) => step.runAction(math.remote, { v: 1 }, { name: "a" });
+    const out = await run([{ ...done(0, "action", "a", 1), batchEnd: 2 }, { ...done(1, "action", "b", 2), batchEnd: 2 }], one);
+    expect(out).toMatchObject({ type: "failed" });
+    expect((out as { error: string }).error).toMatch(/^NonDeterminism: step 0: the journal has a batch of 2/);
   });
 });
