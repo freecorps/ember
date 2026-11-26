@@ -327,9 +327,17 @@ describe("dashboard → runtime (workerd)", () => {
     // Admin: a declared mutation, then the declared query (read role) sees it.
     const set = await write("/api/dash/run", { ...target, fn: "rates:setRate", args: { base: "USD", quote: "BRL", rate: 5.4 } });
     expect([set.status, set.body.ok]).toEqual([200, true]);
-    const look = await read<{ value: Array<{ base: string; quote: string; rate: number }> }>(`/api/dash/query?${q}&shard=global:main&dashboard=&fn=rates:all&args=${encodeURIComponent(JSON.stringify({ base: "USD" }))}`);
+    await write("/api/dash/run", { ...target, fn: "rates:setRate", args: { base: "EUR", quote: "BRL", rate: 6.1 } });
+    type Page = { value: { page: Array<{ base: string; quote: string; rate: number }>; isDone: boolean; continueCursor: string } };
+    const page = (args: unknown) => read<Page>(`/api/dash/query?${q}&shard=global:main&dashboard=&fn=rates:all&args=${encodeURIComponent(JSON.stringify(args))}`);
+    // The table pages through the index (its screen sends paginationOpts); the base filter is a range of it.
+    const look = await page({ base: "USD", paginationOpts: { numItems: 25, cursor: null } });
     expect(look.status).toBe(200);
-    expect(look.body.value.map((r) => [r.base, r.quote, r.rate])).toEqual([["USD", "BRL", 5.4]]);
+    expect(look.body.value.page.map((r) => [r.base, r.quote, r.rate])).toEqual([["USD", "BRL", 5.4]]);
+    const first = await page({ paginationOpts: { numItems: 1, cursor: null } });
+    expect([first.body.value.page.map((r) => r.base), first.body.value.isDone]).toEqual([["EUR"], false]);
+    const second = await page({ paginationOpts: { numItems: 1, cursor: first.body.value.continueCursor } });
+    expect(second.body.value.page.map((r) => r.base)).toEqual(["USD"]);
     // The function's validators run first.
     const bad = await write("/api/dash/run", { ...target, fn: "rates:setRate", args: { base: "USD", quote: "BRL", rate: "high" } });
     expect([bad.status, bad.body.error?.code]).toEqual([400, "ValidationError"]);
