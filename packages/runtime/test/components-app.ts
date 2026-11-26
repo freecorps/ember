@@ -20,6 +20,8 @@ import {
   actionGeneric,
   makeFunctionReference,
   v,
+  type AppDefinition,
+  type DashboardSpecInput,
 } from "@freecorps/ember-server";
 import { MINUTE, rateLimit, RateLimiter } from "@freecorps/ember-rate-limit";
 import { WorkflowManager, workflows, type WorkflowStep } from "@freecorps/ember-workflows";
@@ -173,19 +175,21 @@ export const hooksComponent = defineComponent({
 });
 
 // Project limits (PLAN §3, L6): documents raised above the default, so metrics.test.ts sees them reach the shard.
-export const app = defineApp({
-  limits: { documentsRead: 20_000 },
-  // The app's own screen (dashboards.test.ts): global, so always on global:main.
-  dashboard: {
-    label: "Runs",
-    scope: "global",
-    tabs: [{ id: "tally", label: "Tally", blocks: [{ kind: "detail", query: makeFunctionReference<"query">("components:count"), sections: [{ kind: "json" }] }, { kind: "actions", actions: [{ label: "Bump", fn: makeFunctionReference<"mutation">("components:bump") }] }] }],
-  },
-})
-  .use(tally, { config: { label: "tallies" } })
-  .use(rateLimit)
-  .use(workflows)
-  .use(hooksComponent, { config: { domain: "hooks.test", shard: "hooks:main" } });
+/** The app's own screen (dashboards.test.ts): global, so always on global:main. Names the app's `components:*`. */
+const appScreens: DashboardSpecInput = {
+  label: "Runs",
+  scope: "global",
+  tabs: [{ id: "tally", label: "Tally", blocks: [{ kind: "detail", query: makeFunctionReference<"query">("components:count"), sections: [{ kind: "json" }] }, { kind: "actions", actions: [{ label: "Bump", fn: makeFunctionReference<"mutation">("components:bump") }] }] }],
+};
+const installs = (base: AppDefinition) =>
+  base
+    .use(tally, { config: { label: "tallies" } })
+    .use(rateLimit)
+    .use(workflows)
+    .use(hooksComponent, { config: { domain: "hooks.test", shard: "hooks:main" } });
+export const app = installs(defineApp({ limits: { documentsRead: 20_000 }, dashboard: appScreens }));
+/** The same installs without the app's screen: for configs with other app functions (ai-indexes.test.ts). */
+export const appWithoutScreens = installs(defineApp({ limits: { documentsRead: 20_000 } }));
 
 // ------------------------------------------------------------------ official components (rateLimit, workflows)
 
