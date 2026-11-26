@@ -4009,6 +4009,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           this.stats.authRenewals++;
           return;
         }
+        // Not a renewal: a frame still being compressed for this socket (feature "zframe") holds values of the identity
+        // before; its `snap`/`patch` are dropped unsent (as on a revocation), and the fresh snaps below replace them.
+        if (this.zsending.has(ws)) this.zcut.set(ws, (this.zcut.get(ws) ?? 0) + 1);
         // Identity changed: every subscription of this socket is re-evaluated under the new identity (the dormant ones
         // run first, so each has its entry to re-bind from).
         this.warmDormant(Infinity, att.sid);

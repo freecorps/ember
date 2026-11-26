@@ -158,4 +158,26 @@ describe("zframe: compressed server frames", () => {
     expect(c.wire.slice(before).some((f) => f.binary)).toBe(false);
     c.close();
   });
+
+  it("an auth for another identity on the socket drops the subscription values of a frame still being compressed", async () => {
+    const shard = "auth:z-switch";
+    const iat = Math.floor(Date.now() / 1000) - 60;
+    const c = await connect(shard);
+    await hello(c, "c", `sess:ana:s1:${iat}`, ["batch", "zframe"]);
+    const big = JSON.stringify([
+      { t: "patch", version: 77, changes: [{ qid: 1, value: "x".repeat(20_000) }], mids: [] },
+      { t: "mres", mid: "before_auth", ok: true, value: null },
+    ]);
+    await runInDurableObject(shardStub(shard), async (instance) => {
+      const self = instance as unknown as { ctx: DurableObjectState; sendFrame(ws: WebSocket, f: string): void; webSocketMessage(ws: WebSocket, m: string): Promise<void> };
+      const [ws] = self.ctx.getWebSockets();
+      self.sendFrame(ws!, big);
+      await self.webSocketMessage(ws!, JSON.stringify({ t: "auth", token: `sess:bob:s9:${iat}` }));
+    });
+    for (let i = 0; i < 40 && !c.frames.some((f) => f.t === "mres" && f.mid === "before_auth"); i++) await sleep(25);
+    await sleep(50);
+    expect(c.frames.some((f) => f.t === "mres" && f.mid === "before_auth")).toBe(true);
+    expect(c.frames.some((f) => f.t === "patch" && f.version === 77)).toBe(false);
+    c.close();
+  });
 });
