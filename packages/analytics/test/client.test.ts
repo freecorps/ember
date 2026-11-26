@@ -1,7 +1,7 @@
 // The browser client: batches, flushes on an interval and when a batch is full, beacons on pagehide (text/plain, no
 // preflight), retries what failed, keeps the anonymous id in storage.
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { ANONYMOUS_ID_KEY, createAnalytics, type AnalyticsClient } from "../src/client.ts";
+import { ANONYMOUS_ID_KEY, BEACON_BUDGET_BYTES, createAnalytics, type AnalyticsClient } from "../src/client.ts";
 
 type Sent = { url: string; headers: Record<string, string>; body: { events: Array<{ name: string; props?: unknown; anonymousId: string; ts: number }> }; keepalive?: boolean };
 
@@ -85,6 +85,62 @@ describe("analytics client", () => {
     expect(throwing.pending).toBe(1);
   });
 
+  test("a redirect is not a delivery: the batch stays queued (only 2xx is delivered)", async () => {
+    let status = 301;
+    const { sent, fetch } = fakeFetch(() => status);
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    a.track("first");
+    await a.flush();
+    expect(a.pending).toBe(1);
+    status = 308;
+    await a.flush();
+    expect(a.pending).toBe(1);
+    status = 202;
+    await a.flush();
+    expect(a.pending).toBe(0);
+    expect(sent).toHaveLength(3);
+  });
+
+  test("one request at a time: the timer and flush() never post while a batch is in flight", async () => {
+    const pending: Array<(r: Response) => void> = [];
+    const bodies: string[][] = [];
+    const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      bodies.push((JSON.parse(String(init.body)) as Sent["body"]).events.map((e) => e.name));
+      return new Promise<Response>((resolve) => pending.push(resolve));
+    }) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 1000 });
+    a.track("a");
+    const first = a.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    a.track("b");
+    // Ticks of the timer and more flush() calls while "a" is out: no second request.
+    await vi.advanceTimersByTimeAsync(5000);
+    const again = a.flush();
+    expect(again).toBe(first);
+    expect(bodies).toEqual([["a"]]);
+    // "a" fails: it comes back in front of "b", and the same flush stops (the next tick retries, in order).
+    pending.shift()!(new Response(null, { status: 503 }));
+    await first;
+    expect(a.pending).toBe(2);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(bodies).toEqual([["a"], ["a", "b"]]);
+    pending.shift()!(new Response(null, { status: 204 }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(a.pending).toBe(0);
+  });
+
+  test("the prop cap counts the props kept: invalid keys do not use a slot", async () => {
+    const { sent, fetch } = fakeFetch();
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    const props: Record<string, unknown> = {};
+    for (let i = 0; i < 5; i++) props[`bad key ${i}`] = 1;
+    props.obj = { nested: 1 };
+    for (let i = 0; i < 25; i++) props[`k${i}`] = i;
+    a.track("e", props as never);
+    await a.flush();
+    expect(Object.keys(sent[0]!.body.events[0]!.props as object)).toEqual(Array.from({ length: 20 }, (_, i) => `k${i}`));
+  });
+
   test("the queue is capped (oldest dropped); invalid names and props never leave the client", async () => {
     const { sent, fetch } = fakeFetch();
     const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 50, maxQueue: 50, flushIntervalMs: 60_000 });
@@ -135,6 +191,45 @@ describe("analytics client", () => {
     expect(a.pending).toBe(0);
     a.close();
     expect(listeners.has("pagehide")).toBe(false);
+  });
+
+  test("pagehide: the beacons stay within the keepalive budget (the fetch in flight counts); the rest stays queued", async () => {
+    const beacons: number[] = [];
+    const listeners = new Map<string, () => void>();
+    let accept = true;
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    vi.stubGlobal("navigator", { sendBeacon: (_url: string, data: Blob) => (accept ? (beacons.push(data.size), true) : false) });
+    const fetch = (async () => new Promise<Response>(() => {})) as unknown as typeof globalThis.fetch;
+    // 20 events × ~5 KiB of props per batch ≈ 100 KiB queued: more than one page may have in flight.
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 2, maxQueue: 500, flushIntervalMs: 60_000 });
+    const big = (i: number) => Object.fromEntries(Array.from({ length: 20 }, (_, j) => [`p${j}`, `${i}`.padEnd(256, "x")]));
+    for (let i = 0; i < 40; i++) a.track("e", big(i));
+    await vi.advanceTimersByTimeAsync(0); // the first batch is out by fetch (and hangs)
+    const left = a.pending;
+    listeners.get("pagehide")!();
+    expect(beacons.length).toBeGreaterThan(0);
+    const inFlight = 2 * 20 * 256; // at least the props of the fetched batch
+    expect(beacons.reduce((x, y) => x + y, 0)).toBeLessThanOrEqual(BEACON_BUDGET_BYTES - inFlight);
+    expect(a.pending).toBe(left - 2 * beacons.length);
+    expect(a.pending).toBeGreaterThan(0);
+    // A beacon the browser refuses (its own quota) keeps the batch.
+    accept = false;
+    const before = a.pending;
+    listeners.get("pagehide")!();
+    expect(a.pending).toBe(before);
+  });
+
+  test("no pagehide listener without a navigator to beacon with (SSR, a stubbed document)", () => {
+    const added: string[] = [];
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("navigator", undefined);
+    vi.stubGlobal("addEventListener", (t: string) => void added.push(t));
+    vi.stubGlobal("removeEventListener", () => {});
+    const { fetch } = fakeFetch();
+    make({ url: "https://app.test", fetch, storage: null }).close();
+    expect(added).toEqual([]);
   });
 
   test("the anonymous id: kept in storage across clients, a new one after reset", () => {

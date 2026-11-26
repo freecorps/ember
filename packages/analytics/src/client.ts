@@ -1,8 +1,11 @@
 // `@freecorps/ember-analytics/client`: a tiny batching tracker for browsers and apps (no dependency, no Ember client
 // needed). Events wait in memory and go to `POST <url><path>` every `flushIntervalMs`, when a batch is full, on
 // `pagehide` (`navigator.sendBeacon`) and on `close()`. Bodies are `text/plain` JSON, a "simple" request with no CORS
-// preflight (like the RUM client). A batch that fails (network, 429, 5xx) goes back to the queue; one the server
-// refuses (other 4xx) is dropped. The anonymous id lives in localStorage when there is one.
+// preflight (like the RUM client). One request at a time; a batch that is not delivered (network, 3xx, 429, 5xx) goes
+// back to the queue; one the server refuses (other 4xx) is dropped. On `pagehide` the beacons stay within the
+// browser's keepalive budget (64 KiB in flight per page, shared with the pending fetch): what does not fit stays
+// queued (a page restored from the back/forward cache sends it). The anonymous id lives in localStorage when there is
+// one.
 //
 //   const analytics = createAnalytics({ url: "https://my-app.example.com" });
 //   analytics.track("viewed_pricing", { plan: "pro" });
@@ -40,6 +43,15 @@ interface QueuedEvent {
 
 export const ANONYMOUS_ID_KEY = "ember.analytics.anonymousId";
 const NAME = /^[A-Za-z](?:[A-Za-z0-9 _.:/-]{0,62}[A-Za-z0-9_.:/-])?$/;
+/** Props per event (what the server takes). */
+const MAX_PROPS = 20;
+/**
+ * Bytes of keepalive bodies in flight on `pagehide`. Browsers refuse a beacon (or keepalive fetch) once the page's
+ * pending keepalive bodies pass 64 KiB (Fetch "keepalive" quota); a little under it, for the headers.
+ */
+export const BEACON_BUDGET_BYTES = 60 * 1024;
+
+const byteLength = (s: string) => (typeof TextEncoder !== "undefined" ? new TextEncoder().encode(s).length : s.length * 3);
 
 function newId(): string {
   const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
@@ -65,7 +77,10 @@ export class AnalyticsClient {
   private readonly onHide: (() => void) | null = null;
   private readonly storage: Pick<Storage, "getItem" | "setItem"> | null;
   private aid: string;
-  private inFlight = 0;
+  /** The flush running now: one request at a time (the timer, a full batch and `flush()` share it). */
+  private flushing: Promise<void> | null = null;
+  /** Bytes of the keepalive fetch in flight (they count against the beacon budget). */
+  private inFlightBytes = 0;
   /** Requests sent (tests). */
   sent = 0;
 
@@ -75,11 +90,11 @@ export class AnalyticsClient {
     this.maxQueue = Math.max(this.batchSize, Math.floor(o.maxQueue ?? 500));
     this.storage = o.storage === undefined ? defaultStorage() : o.storage;
     this.aid = this.loadId();
-    const t = setInterval(() => void this.flush(), o.flushIntervalMs ?? 10_000);
-    (t as { unref?: () => void }).unref?.();
-    this.timer = t;
-    const g = globalThis as { addEventListener?: (t: string, f: () => void) => void; document?: unknown };
-    if (g.document !== undefined && typeof g.addEventListener === "function") {
+    this.timer = setInterval(() => void this.flush(), o.flushIntervalMs ?? 10_000);
+    (this.timer as { unref?: () => void }).unref?.();
+    // A page (a document to hide and a navigator to beacon with): not a worker, not Node/SSR with a stubbed document.
+    const g = globalThis as { addEventListener?: (t: string, f: () => void) => void; removeEventListener?: unknown; document?: unknown; navigator?: unknown };
+    if (g.document !== undefined && g.navigator !== undefined && typeof g.addEventListener === "function" && typeof g.removeEventListener === "function") {
       this.onHide = () => this.flushBeacon();
       g.addEventListener("pagehide", this.onHide);
     }
@@ -122,15 +137,20 @@ export class AnalyticsClient {
     let p: Record<string, PropValue> | undefined;
     if (props) {
       p = {};
-      for (const [k, v] of Object.entries(props).slice(0, 20)) {
+      let kept = 0;
+      // The cap counts the props kept, not the keys looked at (an invalid one does not use a slot).
+      for (const [k, v] of Object.entries(props)) {
+        if (kept >= MAX_PROPS) break;
         if (!/^[A-Za-z_][A-Za-z0-9_]{0,39}$/.test(k)) continue;
         if (typeof v === "string") p[k] = v.slice(0, 256);
         else if ((typeof v === "number" && Number.isFinite(v)) || typeof v === "boolean") p[k] = v;
+        else continue;
+        kept++;
       }
     }
     this.queue.push({ name, ...(p && Object.keys(p).length ? { props: p } : {}), ts: Date.now(), anonymousId: this.aid });
     if (this.queue.length > this.maxQueue) this.queue.splice(0, this.queue.length - this.maxQueue);
-    if (this.queue.length >= this.batchSize && !this.inFlight) void this.flush();
+    if (this.queue.length >= this.batchSize && !this.flushing) void this.flush();
   }
 
   /** Events waiting to be sent. */
@@ -138,8 +158,13 @@ export class AnalyticsClient {
     return this.queue.length;
   }
 
-  /** Posts what is queued, a batch at a time. Never throws. */
-  async flush(): Promise<void> {
+  /** Posts what is queued, a batch at a time. Never throws. While one runs, a call waits for it (no second request). */
+  flush(): Promise<void> {
+    if (!this.flushing) this.flushing = this.drain().finally(() => (this.flushing = null));
+    return this.flushing;
+  }
+
+  private async drain(): Promise<void> {
     while (this.queue.length) {
       const batch = this.queue.splice(0, this.batchSize);
       const ok = await this.post(batch);
@@ -156,35 +181,56 @@ export class AnalyticsClient {
   private async post(batch: QueuedEvent[]): Promise<boolean> {
     const f = this.o.fetch ?? (globalThis as { fetch?: typeof fetch }).fetch;
     if (!f) return true;
-    this.inFlight++;
     this.sent++;
+    const body = JSON.stringify({ events: batch });
+    const bytes = byteLength(body);
     try {
       const headers: Record<string, string> = { "content-type": "text/plain" };
       const token = this.o.getToken ? await this.o.getToken() : null;
       if (token) headers.authorization = `Bearer ${token}`;
-      const r = await f(this.endpoint, { method: "POST", headers, body: JSON.stringify({ events: batch }), keepalive: true });
-      return !(r.status === 429 || r.status >= 500);
+      this.inFlightBytes += bytes;
+      try {
+        const r = await f(this.endpoint, { method: "POST", headers, body, keepalive: true });
+        // Delivered: 2xx. Refused (a 4xx other than 429): dropped, sending it again would not change the answer.
+        // Anything else (a redirect not followed, 429, 5xx) was not taken: retried.
+        if (r.status >= 200 && r.status < 300) return true;
+        return r.status >= 400 && r.status < 500 && r.status !== 429;
+      } finally {
+        this.inFlightBytes -= bytes;
+      }
     } catch {
       return false;
-    } finally {
-      this.inFlight--;
     }
   }
 
-  /** The page is going away: everything queued, as beacons (fetch with keepalive when there is no sendBeacon). */
+  /**
+   * The page is going away: what is queued, as beacons (fetch with keepalive when there is no sendBeacon), while they
+   * fit in the keepalive budget (`BEACON_BUDGET_BYTES`, less the fetch in flight). A batch that does not fit, or that
+   * the browser refuses, stays queued with the rest. A fetch already in flight is not waited for: its events are not
+   * in the queue, and each event carries its own `ts`, so the order the server gets them in does not matter.
+   */
   flushBeacon(): void {
     const nav = (globalThis as { navigator?: { sendBeacon?: (url: string, data: Blob | string) => boolean } }).navigator;
+    let budget = BEACON_BUDGET_BYTES - this.inFlightBytes;
     while (this.queue.length) {
-      const batch = this.queue.splice(0, this.batchSize);
+      const batch = this.queue.slice(0, this.batchSize);
       const body = JSON.stringify({ events: batch });
-      this.sent++;
+      const bytes = byteLength(body);
+      if (bytes > budget) return;
       try {
-        if (typeof nav?.sendBeacon === "function" && typeof Blob !== "undefined" && nav.sendBeacon(this.endpoint, new Blob([body], { type: "text/plain" }))) continue;
-        const f = this.o.fetch ?? (globalThis as { fetch?: typeof fetch }).fetch;
-        void f?.(this.endpoint, { method: "POST", headers: { "content-type": "text/plain" }, body, keepalive: true }).catch(() => undefined);
+        if (typeof nav?.sendBeacon === "function" && typeof Blob !== "undefined") {
+          if (!nav.sendBeacon(this.endpoint, new Blob([body], { type: "text/plain" }))) return; // over the browser's quota
+        } else {
+          const f = this.o.fetch ?? (globalThis as { fetch?: typeof fetch }).fetch;
+          if (!f) return;
+          void f(this.endpoint, { method: "POST", headers: { "content-type": "text/plain" }, body, keepalive: true }).catch(() => undefined);
+        }
       } catch {
-        // tracking must never break the app
+        return; // tracking must never break the app
       }
+      this.queue.splice(0, batch.length);
+      this.sent++;
+      budget -= bytes;
     }
   }
 
