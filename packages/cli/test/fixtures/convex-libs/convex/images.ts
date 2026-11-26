@@ -3,6 +3,8 @@ import { action } from "./_generated/server";
 import { v } from "convex/values";
 import sharp from "sharp";
 import { readFile } from "node:fs/promises";
+// Type-only on purpose: it never reaches the bundle, so the check must not count it (exceljs is imported for real
+// by node/report.ts).
 import type { Workbook } from "exceljs";
 
 export const thumbnail = action({

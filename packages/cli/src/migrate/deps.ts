@@ -6,6 +6,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import ts from "typescript";
 import { LIBRARIES, type Verdict } from "./libraries.ts";
 
 export interface LibraryFinding {
@@ -35,15 +36,45 @@ const BUILTINS = new Set(builtinModules.filter((m) => !m.startsWith("_")));
 // Rewritten by the codemod (or replaced by Ember's own packages): not runtime dependencies of the converted code.
 const REWRITTEN = /^(convex|convex-helpers|@convex-dev\/[^/]+)(\/|$)/;
 
-/** `import x from "m"`, `import "m"`, `export … from "m"`, `import("m")`, `require("m")` (string literals only). */
-export function importSpecifiers(text: string): string[] {
+/**
+ * The modules a file loads at run time, parsed (TypeScript's parser, so comments and string contents never count and a
+ * comment inside a declaration does not hide it): `import x from "m"`, `import "m"`, `export … from "m"`,
+ * `import x = require("m")`, `import("m")`, `require("m")` with a string literal. Type-only imports and exports
+ * (`import type`, `export type … from`, `import("m").T` in a type) never reach the bundle and are left out.
+ */
+export function importSpecifiers(text: string, fileName = "x.tsx"): string[] {
   const out = new Set<string>();
-  const re = /(?:\bimport\s*(?:type\s+)?(?:[\w*${}\s,]+\s+from\s*)?|\bexport\s+(?:type\s+)?[\w*${}\s,]*\s+from\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["']([^"'\n]+)["']/g;
-  for (const m of text.matchAll(re)) {
-    // `import type` never reaches the bundle.
-    if (/^import\s+type\b|^export\s+type\b/.test(m[0])) continue;
-    out.add(m[1]!);
-  }
+  const sf = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, false, /\.(c|m)?jsx?$/.test(fileName) ? ts.ScriptKind.JSX : ts.ScriptKind.TSX);
+  const literal = (n: ts.Node | undefined) => (n && (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) ? n.text : null);
+  const visit = (n: ts.Node): void => {
+    if (ts.isImportDeclaration(n)) {
+      const m = literal(n.moduleSpecifier);
+      if (m && !n.importClause?.isTypeOnly) out.add(m);
+      return;
+    }
+    if (ts.isExportDeclaration(n)) {
+      const m = literal(n.moduleSpecifier);
+      if (m && !n.isTypeOnly) out.add(m);
+      return;
+    }
+    if (ts.isImportEqualsDeclaration(n)) {
+      if (!n.isTypeOnly && ts.isExternalModuleReference(n.moduleReference)) {
+        const m = literal(n.moduleReference.expression);
+        if (m) out.add(m);
+      }
+      return;
+    }
+    if (ts.isCallExpression(n) && n.arguments.length >= 1) {
+      const isImport = n.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const isRequire = ts.isIdentifier(n.expression) && n.expression.text === "require";
+      const m = literal(n.arguments[0]);
+      if ((isImport || isRequire) && m) out.add(m);
+    }
+    // Types (`import("m").T`, `typeof import("m")`) are never loaded.
+    if (ts.isTypeNode(n)) return;
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
   return [...out];
 }
 
@@ -98,7 +129,7 @@ export function checkLibraries(src: string): LibraryCheck {
   if (!existsSync(root) || !statSync(root).isDirectory()) return { packageJson: null, findings: [], blocking: [] };
   const byModule = new Map<string, LibraryFinding>();
   for (const f of walk(root)) {
-    for (const spec of importSpecifiers(readFileSync(join(root, f), "utf8"))) {
+    for (const spec of importSpecifiers(readFileSync(join(root, f), "utf8"), f)) {
       if (REWRITTEN.test(spec)) continue;
       const pkg = packageOf(spec);
       if (!pkg) continue;

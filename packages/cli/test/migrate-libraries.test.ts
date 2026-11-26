@@ -1,5 +1,5 @@
 // `ember migrate convex`: the library check against the node-actions spike's verdicts (fixture test/fixtures/convex-libs).
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +25,21 @@ describe("migrate convex: libraries", () => {
   it("finds import specifiers (not type-only ones) and matches them, longest key first", () => {
     const text = `import a from "a";\nimport { b,\n c } from '@s/b/sub';\nimport "side";\nexport * from "re";\nexport { x } from "rx";\nimport type { T } from "types-only";\nexport type { U } from "types-too";\nconst l = await import("lazy");\nconst r = require("req");\nimport * as fs from "fs";\nimport x from "./rel";`;
     expect(importSpecifiers(text).sort()).toEqual(["./rel", "@s/b/sub", "a", "fs", "lazy", "re", "req", "rx", "side"]);
+    // Parsed, not matched as text: comments and strings never count; a comment inside a declaration does not hide it.
+    const tricky = [
+      `// import sharp from "sharp";`,
+      `/* const b = require("bcrypt"); */`,
+      `const msg = "import x from 'in-a-string'";`,
+      "const tpl = `require(\"in-a-template\")`;",
+      `import img /* image processing */ from "inline-comment";`,
+      `import {\n  a, // the first\n  b,\n} from "multiline-comment";`,
+      `import eq = require("import-equals");`,
+      `type Lazy = typeof import("type-position");`,
+      `import { type OnlyType } from "mixed-but-loaded";`,
+    ].join("\n");
+    expect(importSpecifiers(tricky).sort()).toEqual(["import-equals", "inline-comment", "mixed-but-loaded", "multiline-comment"]);
+    // Plain JavaScript (JSX allowed) parses too.
+    expect(importSpecifiers(`const a = require("cjs"); export default () => <div/>;`, "x.jsx")).toEqual(["cjs"]);
     expect([packageOf("@s/b/sub"), packageOf("fs"), packageOf("fs/promises"), packageOf("node:zlib"), packageOf("./x"), packageOf("lodash/fp")]).toEqual(["@s/b", "node:fs", "node:fs/promises", "node:zlib", null, "lodash"]);
     expect(lookup("sharp")).toMatchObject({ matched: "sharp", verdict: "no" });
     expect(lookup("crypto")).toMatchObject({ matched: "node:crypto", verdict: "works" });
@@ -41,7 +56,7 @@ describe("migrate convex: libraries", () => {
     expect(c.packageJson).toBe(join(FIXTURE, "..", "package.json"));
     const by = Object.fromEntries(c.findings.map((f) => [f.module, f]));
     // Imported by a function, cannot run: blocking (what --strict fails on).
-    expect(by.sharp).toMatchObject({ verdict: "no", files: ["images.ts"], version: "^0.33.5" });
+    expect(by.sharp).toMatchObject({ verdict: "no", files: ["images.ts"], version: "^0.35.5" });
     expect(c.blocking.map((f) => f.module)).toEqual(["sharp"]);
     // A dependency nobody under convex/ imports: listed, never blocking.
     expect(by.bcrypt).toMatchObject({ verdict: "no", files: [] });
@@ -55,7 +70,7 @@ describe("migrate convex: libraries", () => {
     // Sorted worst first.
     expect(c.findings.map((f) => f.verdict)).toEqual([...c.findings.map((f) => f.verdict)].sort((a, b) => ["no", "partial", "unknown", "works"].indexOf(a) - ["no", "partial", "unknown", "works"].indexOf(b)));
     const lines = libraryLines(c).join("\n");
-    expect(lines).toMatch(/does not run\s+sharp@\^0\.33\.5 \(imported by images\.ts\)/);
+    expect(lines).toMatch(/does not run\s+sharp@\^0\.35\.5 \(imported by images\.ts\)/);
     expect(lines).toMatch(/does not run\s+bcrypt@\^5\.1\.1 \(a dependency the functions do not import\)/);
     expect(lines).toMatch(/unknown\s+left-pad-pro/);
     expect(lines).not.toMatch(/openai/);
@@ -66,7 +81,17 @@ describe("migrate convex: libraries", () => {
     const r = migrateConvex({ src: FIXTURE, dryRun: true });
     expect(r.libraries.blocking.map((f) => f.module)).toEqual(["sharp"]);
     expect(r.report).toMatch(/## Libraries \(workerd \+ nodejs_compat\)/);
-    expect(r.report).toMatch(/\| `sharp` \^0\.33\.5 \| \*\*does not run\*\* \| `images\.ts` \|/);
+    expect(r.report).toMatch(/\| `sharp` \^0\.35\.5 \| \*\*does not run\*\* \| `images\.ts` \|/);
+  });
+
+  it("--in-place: the check reads the original sources, not the files the conversion writes into them", () => {
+    const dir = join(out, "in-place");
+    cpSync(join(FIXTURE, ".."), dir, { recursive: true });
+    const r = migrateConvex({ src: join(dir, "convex"), inPlace: true, force: true });
+    expect(r.written.length).toBeGreaterThan(0);
+    const listed = r.libraries.findings.map((f) => f.module);
+    expect(listed.filter((m) => m.startsWith("@freecorps/"))).toEqual([]);
+    expect(r.libraries.findings).toEqual(checkLibraries(FIXTURE).findings);
   });
 
   it("warns before converting; --strict fails on a blocking library and writes nothing", async () => {

@@ -108,6 +108,9 @@ export function migrateConvex(options: MigrateOptions): MigrateResult {
     if (!options.dryRun && !options.force && existsSync(outDir) && readdirSync(outDir).length) throw new Error(`${outDir} is not empty (pass --force to write into it)`);
   }
 
+  // The original sources' libraries, before anything is written (with --in-place the output lands in src, and its
+  // generated files import Ember's own packages).
+  const libraries = options.libraries ?? checkLibraries(src);
   const all = walk(src);
   const files: FileResult[] = [];
   const skipped = new Map<string, string>();
@@ -215,7 +218,7 @@ export function migrateConvex(options: MigrateOptions): MigrateResult {
     written,
     outputs: Object.fromEntries([...outputs].sort(([x], [y]) => x.localeCompare(y))),
     manual: a.findings.filter((x) => x.severity === "manual").length,
-    libraries: options.libraries ?? checkLibraries(src),
+    libraries,
   };
   return { ...result, report: renderReport(result, options) };
 }
