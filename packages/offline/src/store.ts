@@ -101,6 +101,13 @@ export interface OfflineOptions {
    * data pass the map.
    */
   foreignIds?: ForeignIds;
+  /**
+   * Replicated rows kept decoded in memory (least recently written or read first out; default 50 000): written ones
+   * and read ones, so a re-run reads them without a backend round trip (IndexedDB) or a decode, gets the very objects
+   * it got before (cheap to fingerprint and diff), and an unchanged row the server sends again is not rewritten. A row
+   * out of it is read from the backend again when needed, and rewritten if the server sends it again.
+   */
+  maxCachedRows?: number;
   now?: () => number;
 }
 
@@ -207,8 +214,7 @@ export class OfflineStore implements StorageAdapter {
   /** `${shard}\0${id}` → number of records owning the row. */
   private readonly refs = new Map<string, number>();
   /** `${shard}\0${id}` → the row as last written / read (unknown after a restart until needed). */
-  private readonly rowDoc = new Map<string, Doc>();
-  private readonly rowSig = new Map<string, string>();
+  private readonly rows: RowCache;
   private readonly watches = new Set<Watch>();
   private rerunQueued = false;
   /** The burst of `applyPatch` calls still accepting more (closed by any other queued operation). */
@@ -229,6 +235,7 @@ export class OfflineStore implements StorageAdapter {
     this.registry = localQueryRegistry(options.queries ?? {});
     this.sync = options.sync ?? [];
     this.now = options.now ?? Date.now;
+    this.rows = new RowCache(Math.max(1, options.maxCachedRows ?? 50_000));
     this.replicated = new Set([...this.registry.keys(), ...this.sync.map((s) => getFunctionName(s.query))]);
     // Through the same write queue as results, so `flush()` covers the pending queue too.
     this.persistPending = {
@@ -529,21 +536,40 @@ export class OfflineStore implements StorageAdapter {
   }
 
   /**
-   * The backend's reader for `shard`, answering `get` from the rows this store already knows (written or read since
-   * open): an async backend (IndexedDB) needs no round trip for them, a SQLite one no decode.
+   * The backend's reader for `shard` through the rows this store already knows (written or read since open): `get` is
+   * answered from them (an async backend, IndexedDB, needs no round trip; a SQLite one no decode), a scanned row known
+   * already comes back as the known object (a re-run returns the objects of the previous one: identity diffs and
+   * memoized fingerprints), and what the backend reads is remembered. The known rows always hold what storage holds:
+   * every write goes through `setRow`, every drop forgets them, an external writer's change forgets its shard's.
    */
   private reader(shard: string): BackendReader {
     const inner = this.backend.reader(shard);
     const m = this.options.schema.manifest;
+    const rows = this.rows;
+    const known = (table: string, doc: Doc): Doc => {
+      const k = `${shard}\u0000${doc._id}`;
+      const cached = rows.get(k);
+      if (cached) return cached;
+      if (localTableOfId(m, doc._id, this.options.foreignIds) === table) rows.set(k, doc);
+      return doc;
+    };
     const out: BackendReader = {
       get misses() {
         return inner.misses ?? 0;
       },
-      scan: (...a) => inner.scan(...a),
+      scan: (table, index, lo, hi, asc, limit) => {
+        const r = inner.scan(table, index, lo, hi, asc, limit);
+        for (let i = 0; i < r.length; i++) {
+          const doc = known(table, r[i]!.doc);
+          if (doc !== r[i]!.doc) r[i] = { key: r[i]!.key, doc };
+        }
+        return r;
+      },
       get: (table, id) => {
-        const doc = this.rowDoc.get(`${shard}\u0000${id}`);
+        const doc = rows.get(`${shard}\u0000${id}`);
         if (doc && localTableOfId(m, id, this.options.foreignIds) === table) return doc;
-        return inner.get(table, id);
+        const got = inner.get(table, id);
+        return got ? known(table, got) : got;
       },
     };
     if (inner.pluginQuery) out.pluginQuery = (...a) => inner.pluginQuery!(...a);
@@ -582,14 +608,22 @@ export class OfflineStore implements StorageAdapter {
   /** The full value of a record (resolving its row references from the replica). */
   private async valueOf(rec: Rec): Promise<unknown> {
     if (rec.materialized) return rec.value;
-    const missing = [...new Set(refsIn(rec.skel))].filter((id) => !this.rowDoc.has(`${rec.shard}\u0000${id}`));
+    // Resolved from a map of its own: the known rows may drop some of these meanwhile (their LRU).
+    const got = new Map<string, Doc>();
+    const missing: string[] = [];
+    for (const id of new Set(refsIn(rec.skel))) {
+      const doc = this.rows.get(`${rec.shard}\u0000${id}`);
+      if (doc) got.set(id, doc);
+      else missing.push(id);
+    }
     if (missing.length) {
       for (const [id, doc] of await this.readRows(rec.shard, missing)) {
         if (!doc) throw new Error(`offline store: replicated row ${id} of ${rec.fn} is missing`);
         this.know(rec.shard, doc);
+        got.set(id, doc);
       }
     }
-    rec.value = resolveRefs(rec.skel, (id) => this.rowDoc.get(`${rec.shard}\u0000${id}`)!);
+    rec.value = resolveRefs(rec.skel, (id) => got.get(id)!);
     rec.materialized = true;
     rec.json = undefined;
     return rec.value;
@@ -603,28 +637,17 @@ export class OfflineStore implements StorageAdapter {
 
   /** Knows / forgets a row inside a burst, recording how to put the previous state back. */
   private setRow(tx: ShardTx, k: string, doc: Doc | null, sig?: string): void {
-    const had = this.rowDoc.has(k);
-    const prevDoc = this.rowDoc.get(k);
-    const prevSig = this.rowSig.get(k);
+    const prev = this.rows.entry(k);
     tx.undo.push(() => {
-      if (had) this.rowDoc.set(k, prevDoc!);
-      else this.rowDoc.delete(k);
-      if (prevSig !== undefined) this.rowSig.set(k, prevSig);
-      else this.rowSig.delete(k);
+      if (prev) this.rows.set(k, prev.doc, prev.sig);
+      else this.rows.delete(k);
     });
-    if (doc) {
-      this.rowDoc.set(k, doc);
-      this.rowSig.set(k, sig ?? stableStringify(doc));
-    } else {
-      this.rowDoc.delete(k);
-      this.rowSig.delete(k);
-    }
+    if (doc) this.rows.set(k, doc, sig);
+    else this.rows.delete(k);
   }
 
   private know(shard: string, doc: Doc, sig?: string): void {
-    const k = `${shard}\u0000${doc._id}`;
-    this.rowDoc.set(k, doc);
-    this.rowSig.set(k, sig ?? stableStringify(doc));
+    this.rows.set(`${shard}\u0000${doc._id}`, doc, sig);
   }
 
   /**
@@ -686,7 +709,7 @@ export class OfflineStore implements StorageAdapter {
     const newIds = new Set<string>();
     const c: Commit = { upsert: [], delete: [] };
     const changes: LocalRowChange[] = [];
-    const written: Array<{ doc: Doc; sig: string }> = [];
+    const written: Array<{ doc: Doc; sig: string | undefined }> = [];
     const removed: string[] = [];
     // Refcount changes are applied as computed and undone if the commit fails, so memory never runs ahead of storage.
     const deltas: Array<[string, number]> = [];
@@ -694,7 +717,7 @@ export class OfflineStore implements StorageAdapter {
       deltas.push([id, d]);
       return this.ref(u.shard, id, d);
     };
-    const before = (k: string): Doc | null | undefined => (this.rowDoc.has(k) ? this.rowDoc.get(k)! : this.refs.has(k) ? undefined : null);
+    const before = (k: string): Doc | null | undefined => this.rows.get(k) ?? (this.refs.has(k) ? undefined : null);
     const docSet = new Set<object>(found.map((f) => f.doc));
     const diffs = this.options.persistDiffs !== false;
     const now = this.now();
@@ -707,10 +730,12 @@ export class OfflineStore implements StorageAdapter {
       for (const { table, doc } of found) {
         const k = `${u.shard}\u0000${doc._id}`;
         newIds.add(doc._id);
-        // The very object already stored (an unchanged row the client reused): no signature to compute.
-        const same = this.rowDoc.get(k) === doc && this.rowSig.has(k);
-        const sig = same ? this.rowSig.get(k)! : stableStringify(doc);
-        if (!same && this.rowSig.get(k) !== sig) {
+        // The very object already stored (an unchanged row the client reused, or one read back): unchanged. Else its
+        // signature against the known row's (computed now for a row only read so far: not rewritten after a restart).
+        const known = this.rows.entry(k);
+        const same = known !== undefined && known.doc === doc;
+        const sig = same ? undefined : stableStringify(doc);
+        if (!same && (known === undefined || this.rows.sigOf(k, known) !== sig)) {
           c.upsert!.push({ table, doc });
           changes.push({ table, id: doc._id, before: before(k), after: doc });
           written.push({ doc, sig });
@@ -861,15 +886,14 @@ export class OfflineStore implements StorageAdapter {
         const table = localTableOfId(m, id, this.options.foreignIds);
         if (table) {
           c.delete!.push({ table, id });
-          changes.push({ table, id, before: this.rowDoc.has(k) ? this.rowDoc.get(k)! : undefined, after: null });
+          changes.push({ table, id, before: this.rows.get(k), after: null });
         }
       }
       await this.backend.commit(shard, c);
       for (const r of records) this.records.delete(r.key);
       for (const [id, n] of dec) {
         if (this.ref(shard, id, -n) > 0) continue;
-        this.rowDoc.delete(`${shard}\u0000${id}`);
-        this.rowSig.delete(`${shard}\u0000${id}`);
+        this.rows.delete(`${shard}\u0000${id}`);
       }
       this.notify(shard, changes, records.map((r) => r.key));
       this.emitSaved({ put: [], drop: records.map((r) => r.key) });
@@ -1038,12 +1062,7 @@ export class OfflineStore implements StorageAdapter {
   /** Someone else wrote rows (a shared TinyBase store): what we knew about them is stale; re-run what reads them. */
   private onExternal(c: ExternalChange): void {
     const prefix = `${c.shard}\u0000`;
-    // Deleting the entry just visited while iterating a Map is safe: no copy of every key.
-    for (const k of this.rowDoc.keys()) {
-      if (!k.startsWith(prefix)) continue;
-      this.rowDoc.delete(k);
-      this.rowSig.delete(k);
-    }
+    this.rows.forgetPrefix(prefix);
     for (const r of this.records.values()) {
       if (r.shard === c.shard && r.refs) {
         r.materialized = false;
@@ -1080,6 +1099,37 @@ export class OfflineStore implements StorageAdapter {
     this.stopExternal?.();
     this.stopExternal = null;
     await this.backend.close();
+  }
+}
+
+/**
+ * Replicated rows known decoded, by `${shard}\0${id}`, least recently set first; their `stableStringify` once computed
+ * (a row read back has none until a server value compares against it).
+ */
+class RowCache {
+  private readonly m = new Map<string, { doc: Doc; sig: string | undefined }>();
+  constructor(private readonly max: number) {}
+  entry(k: string): { doc: Doc; sig: string | undefined } | undefined {
+    return this.m.get(k);
+  }
+  get(k: string): Doc | undefined {
+    return this.m.get(k)?.doc;
+  }
+  /** The row's signature (computed now from the known doc if it has none yet). */
+  sigOf(_k: string, e: { doc: Doc; sig: string | undefined }): string {
+    return (e.sig ??= stableStringify(e.doc));
+  }
+  set(k: string, doc: Doc, sig?: string): void {
+    this.m.delete(k);
+    this.m.set(k, { doc, sig });
+    if (this.m.size > this.max) this.m.delete(this.m.keys().next().value!);
+  }
+  delete(k: string): void {
+    this.m.delete(k);
+  }
+  forgetPrefix(prefix: string): void {
+    // Deleting the entry just visited while iterating a Map is safe: no copy of every key.
+    for (const k of this.m.keys()) if (k.startsWith(prefix)) this.m.delete(k);
   }
 }
 

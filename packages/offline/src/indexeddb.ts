@@ -231,6 +231,12 @@ export class IndexedDbBackend implements OfflineBackend {
           const key = keyProp(index);
           const map = (rows: StoredRow[]) => rows.map((r) => ({ key: new Uint8Array(r[key] as ArrayBuffer), doc: r.doc }));
           if (asc) return req(idx.getAll(range, limit)).then((rows) => map(rows as StoredRow[]));
+          // Descending in one request where the browser has it (`getAllRecords` with a direction: Chrome 141+), else a
+          // cursor, one round trip per row.
+          const withRecords = idx as IDBIndex & { getAllRecords?(o: { query?: IDBKeyRange; count?: number; direction?: IDBCursorDirection }): IDBRequest<Array<{ value: unknown }>> };
+          if (typeof withRecords.getAllRecords === "function") {
+            return req(withRecords.getAllRecords({ query: range, count: limit, direction: "prev" })).then((recs) => map(recs.map((r) => r.value as StoredRow)));
+          }
           return new Promise((resolve, reject) => {
             const out: StoredRow[] = [];
             const c = idx.openCursor(range, "prev");
