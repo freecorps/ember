@@ -1,5 +1,6 @@
 import { browserConnectivity, type ConnectivityEvent, type ConnectivitySource } from "./connectivity.ts";
 import { EmberError, errorFromWire, type WireErrorLike } from "./errors.ts";
+import { Channels, type Channel, type ChannelOptions } from "./channels.ts";
 import type { ClientFiles, UploadData, UploadedFile, UploadFileOptions } from "./files.ts";
 import {
   getFunctionName,
@@ -381,6 +382,8 @@ interface Conn {
    * and `ackAuth` the `authGen` it ran as: a socket that drops keeps them for the next one of the same identity.
    */
   ack?: boolean;
+  /** The server confirmed feature "ephemeral" on the current socket: channels join on it. */
+  ephemeral?: boolean;
   /**
    * The server confirmed feature "batch" on the current socket: what one turn sends goes out as one frame (a JSON
    * array), at the end of the turn. `out` waits for that flush.
@@ -734,6 +737,25 @@ export class EmberClient {
   private qidCounter = 0;
 
   private readonly conns = new Map<string, Conn>();
+  /** Ephemeral channels (`channel()`, feature "ephemeral"): joined again on every socket of their shard. */
+  private readonly chans = new Channels({
+    shardOf: (shard) => {
+      const s = shard ?? this.options.defaultShard;
+      if (!s) throw new EmberError("no_shard", "channel(): no shard given and no defaultShard configured");
+      return s;
+    },
+    ensure: (shard) => void this.ensure(shard),
+    release: (shard) => this.release(shard),
+    ready: (shard) => {
+      const c = this.conns.get(shard);
+      return c?.ready && c.ws ? { ephemeral: c.ephemeral === true } : null;
+    },
+    send: (shard, m) => {
+      const c = this.conns.get(shard);
+      if (c) this.send(c, m);
+    },
+    report: (e, shard) => this.report(e, { shard }),
+  });
   private readonly subs = new Map<string, Sub>();
   /** `subs` by shard and by function: a socket's own (`needed`, `hello`, `ready`) and `getAllQueries` walk only theirs. */
   private readonly subsByShard = new Map<string, Set<Sub>>();
@@ -892,10 +914,22 @@ export class EmberClient {
     return this.tabs?.role ?? (this.tabsLoading ? "starting" : null);
   }
 
+  /**
+   * An ephemeral channel of a shard (feature "ephemeral", contracts.md): a room of that shard's sockets with a member
+   * list, whose messages the shard broadcasts in memory (no row, no version, nothing persisted or replayed). Who may
+   * join is the app's `defineApp({ channels })`. The same name on the same shard returns handles of one channel; it is
+   * left once every handle called `leave()`. With `multiTab`, tabs of the same identity share the socket and its member.
+   */
+  channel<T = unknown, S = unknown>(name: string, opts: ChannelOptions<S> = {}): Channel<T, S> {
+    if (this.closed) throw new EmberError("closed", "client closed");
+    return this.chans.open<T, S>(name, opts);
+  }
+
   /** Close every socket and stop reconnecting. Pending in-memory callers are rejected; storage is kept. */
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.chans.closeAll();
     this.stopConnectivity?.();
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     for (const conn of this.conns.values()) {
@@ -1282,6 +1316,8 @@ export class EmberClient {
     conn.identity = token ? jwtIdentity(token) : null;
     conn.opaque = !!token && !conn.identity;
     this.send(conn, { t: "auth", token });
+    // Channels the shard refused (another identity may be let in) try again after it.
+    this.chans.onAuth(conn.shard);
     // Subscriptions refused as expired while no fresh token was available: they run under this `auth` (a fresh token,
     // or signed out: no token never expires; a later sign-in re-evaluates them like every registered subscription).
     const refused = conn.authRefused;
@@ -2535,6 +2571,7 @@ export class EmberClient {
 
   private needed(conn: Conn): boolean {
     if (conn.queries.size) return true;
+    if (this.chans.has(conn.shard)) return true;
     if (this.subsByShard.get(conn.shard)?.size) return true;
     for (const p of this.pending) if (p.record.shard === conn.shard) return true;
     // Acks waiting for their timer do not keep the socket: they go out before it closes (`release`).
@@ -2671,7 +2708,7 @@ export class EmberClient {
       conn.lastToken = t;
       conn.identity = t ? jwtIdentity(t) : null;
       conn.opaque = !!t && !conn.identity;
-      m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch"] : ["ident", "query", "ack", "batch", "qbatch"];
+      m.features = this.options.rowDiff !== false ? ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "ephemeral"] : ["ident", "query", "ack", "batch", "qbatch", "ephemeral"];
       if (this.options.zframe && zframeSupported()) m.features.push("zframe");
       this.send(conn, m);
       conn.helloSent = true;
@@ -2768,6 +2805,8 @@ export class EmberClient {
     conn.authGen = -1;
     conn.ack = false;
     conn.batch = false;
+    if (conn.ephemeral) this.chans.onGone(conn.shard);
+    conn.ephemeral = false;
     // The turn's frame is never sent: the acks it carries wait again with the others (the rest goes out again from
     // the subscriptions and pending mutations on the next socket).
     if (conn.out) this.restoreAcks(conn, conn.out.acks, conn.out.ackVersion);
@@ -3090,7 +3129,9 @@ export class EmberClient {
       conn.pingTimer = null;
       const heardAt = conn.heardAt ?? 0;
       const since = Date.now() - heardAt;
-      if (heardAt > armedAt && since < quiet) return this.pingAfter(conn, quiet, quiet - since);
+      // Joined channels: the shard drops a member whose socket sent nothing for a while (EPHEMERAL_TTL_MS), so a socket
+      // that only listens to a busy channel still pings every interval.
+      if (heardAt > armedAt && since < quiet && !this.chans.joined(conn.shard)) return this.pingAfter(conn, quiet, quiet - since);
       this.ping(conn);
     }, ms);
   }
@@ -3206,6 +3247,8 @@ export class EmberClient {
   }
 
   private onMessage(conn: Conn, m: ServerMessage): void {
+    // Feature "ephemeral": channel frames (and an `err` about a channel).
+    if ((m.t === "joined" || m.t === "members" || m.t === "msg" || m.t === "left" || (m.t === "err" && m.ch !== undefined)) && this.chans.onMessage(conn.shard, m)) return;
     switch (m.t) {
       case "ready":
         return this.onReady(conn, m);
@@ -3415,6 +3458,7 @@ export class EmberClient {
     conn.query = m.features?.includes("query") === true;
     conn.ack = m.features?.includes("ack") === true;
     conn.batch = m.features?.includes("batch") === true;
+    conn.ephemeral = m.features?.includes("ephemeral") === true;
     conn.serverBatch = conn.batch;
     // The deployment's runtime (every shard's): whether `httpFirst` batches its fetches from now on.
     this.queryBatch = m.features?.includes("qbatch") === true;
@@ -3459,6 +3503,8 @@ export class EmberClient {
     for (const sub of this.shardSubs(conn.shard)) if (!conn.qids.has(sub.qid) && !sub.localPending && !sub.httpFirst) this.sendSub(conn, sub);
     // Over a copy: sending can drop a mutation (another identity's), which would skip the next one in a live walk.
     for (const p of [...this.pending]) if (p.record.shard === conn.shard) this.sendMut(conn, p);
+    // Channels join (again) on this socket.
+    this.chans.onReady(conn.shard);
     this.armPing(conn);
     this.emitState();
     if (!this.needed(conn)) this.release(conn.shard);

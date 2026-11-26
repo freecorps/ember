@@ -9,7 +9,7 @@ export const PROTOCOL_VERSION = 1;
  * Optional features (v1.1–v1.5) this client can speak; sent in `hello{features}`, confirmed by `ready{features}`.
  * "zframe" only with the client's option `zframe` (and where the platform decodes it).
  */
-export const CLIENT_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "zframe"] as const;
+export const CLIENT_FEATURES = ["rowdiff", "vdiff", "ident", "query", "ack", "batch", "qbatch", "zframe", "ephemeral"] as const;
 /** Feature "batch": most messages in one array frame (the server's MAX_BATCH_MESSAGES). */
 export const MAX_BATCH_MESSAGES = 512;
 /** Feature "batch": a batch frame stays well under the server's 1 MiB frame limit (UTF-16 units). */
@@ -26,7 +26,15 @@ export type ClientMessage =
   | { t: "ack"; mids: Id[] }
   | { t: "mut"; mid: Id; fn: string; args: Record<string, unknown> }
   /** `token: null` signs the socket out (anonymous); its subscriptions are re-evaluated (new `snap`s). */
-  | { t: "auth"; token: string | null };
+  | { t: "auth"; token: string | null }
+  /** Feature "ephemeral" (v1.6): join a channel (again: update the member state; without `state`, keep it). */
+  | { t: "join"; ch: string; state?: unknown }
+  | { t: "leave"; ch: string }
+  /** Feature "ephemeral": broadcast to the channel's other members. */
+  | { t: "pub"; ch: string; data: unknown };
+
+/** A channel member on the wire (feature "ephemeral"): one per socket. */
+export type WireChannelMember = { id: string; user: string | null; state?: unknown };
 
 export type ServerMessage =
   | { t: "ready"; shard: string; version: number; epoch: string; features?: string[] }
@@ -40,8 +48,15 @@ export type ServerMessage =
   | { t: "qres"; qid: Id; ok: false; error: WireError }
   | { t: "mres"; mid: Id; ok: true; value: unknown; version: number }
   | { t: "mres"; mid: Id; ok: false; error: WireError }
-  | { t: "err"; code: string; message: string; data?: unknown; kind?: "app"; qid?: Id }
-  | { t: "authExpired" };
+  /** `ch` (feature "ephemeral"): a refused `pub`, or a refused update of a channel the socket stays in. */
+  | { t: "err"; code: string; message: string; data?: unknown; kind?: "app"; qid?: Id; ch?: string }
+  | { t: "authExpired" }
+  /** Feature "ephemeral": the answer to `join`, every member (`self` included). */
+  | { t: "joined"; ch: string; self: string; members: WireChannelMember[] }
+  | { t: "members"; ch: string; join?: WireChannelMember[]; leave?: string[] }
+  | { t: "msg"; ch: string; from: string; user: string | null; data: unknown }
+  /** Feature "ephemeral": not (or no longer) in the channel. */
+  | { t: "left"; ch: string; code: string; message: string };
 
 /**
  * A query's new value, or (feature "rowdiff") the per-row diff from the value this socket last received, or (feature
