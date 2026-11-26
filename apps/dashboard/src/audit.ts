@@ -58,6 +58,12 @@ export interface AuditEntry {
   shard?: string | null;
   target?: string | null;
   args?: unknown;
+  /**
+   * Args already serialized by the route, instead of `summarizeArgs(args)` (whose strings stop at 120 characters): the
+   * SQL Explorer keeps the query's first 2048 characters (worker.ts `sqlForAudit`, which keeps the JSON under
+   * `MAX_ARGS_TEXT`). At most `MAX_ARGS_TEXT` characters are stored.
+   */
+  argsText?: string;
 }
 
 export interface AuditRow {
@@ -81,6 +87,8 @@ export interface AuditRow {
 /** Argument names whose values never reach the log. */
 const SECRET_KEY = /secret|token|passw|pwd|api[-_]?key|private|authorization|cookie|jwt|credential|^value$/i;
 const MAX_ARGS_JSON = 2000;
+/** Largest `AuditEntry.argsText` stored. */
+export const MAX_ARGS_TEXT = 4096;
 
 /** A bounded, secret-free copy of `v` for the audit log. */
 export function summarizeArgs(v: unknown, depth = 0): unknown {
@@ -103,7 +111,8 @@ export function summarizeArgs(v: unknown, depth = 0): unknown {
   return String(typeof v);
 }
 
-function argsJson(args: unknown): string | null {
+function argsJson(args: unknown, text?: string): string | null {
+  if (text !== undefined) return text.length > MAX_ARGS_TEXT ? `${text.slice(0, MAX_ARGS_TEXT)}…` : text;
   if (args === undefined) return null;
   const s = JSON.stringify(summarizeArgs(args));
   return s.length > MAX_ARGS_JSON ? `${s.slice(0, MAX_ARGS_JSON)}…` : s;
@@ -115,7 +124,7 @@ export async function auditBegin(db: D1Like, who: Principal, e: AuditEntry, now 
   await ensureTables(db);
   const r = await db
     .prepare("INSERT INTO audit_log (at, actor, via, role, project, env, shard, action, target, args, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started') RETURNING id")
-    .bind(now, who.actor, who.via, who.role, e.project ?? null, e.env ?? null, e.shard ?? null, e.action, clip(e.target, 300), argsJson(e.args))
+    .bind(now, who.actor, who.via, who.role, e.project ?? null, e.env ?? null, e.shard ?? null, e.action, clip(e.target, 300), argsJson(e.args, e.argsText))
     .all<{ id: number }>();
   const id = Number(r.results[0]?.id);
   if (!Number.isSafeInteger(id)) throw new Error("audit insert returned no id");
@@ -133,7 +142,7 @@ export async function auditDenied(db: D1Like | undefined, who: Principal, e: Aud
     await ensureTables(db);
     await db
       .prepare("INSERT INTO audit_log (at, actor, via, role, project, env, shard, action, target, args, outcome, status, error, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'denied', ?, ?, ?)")
-      .bind(now, who.actor, who.via, who.role, e.project ?? null, e.env ?? null, e.shard ?? null, e.action, clip(e.target, 300), argsJson(e.args), status, code, now)
+      .bind(now, who.actor, who.via, who.role, e.project ?? null, e.env ?? null, e.shard ?? null, e.action, clip(e.target, 300), argsJson(e.args, e.argsText), status, code, now)
       .all();
   } catch {
     // the refusal stands either way

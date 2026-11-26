@@ -56,6 +56,7 @@ import {
   usageFractions,
 } from "@freecorps/ember-server";
 import type { ShardPreflight } from "./admin-api.ts";
+import { runReadOnlySql, type SqlQueryInput, type SqlQueryOutcome } from "./admin-sql.ts";
 import {
   deliverIndexBatch,
   INDEXING_QUEUE_BINDING,
@@ -5069,6 +5070,25 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     // The same format choice as the engine's `migrate()`, so the plan shows the tables it would create.
     const result = preflightMigration(this.driver, schema, this.cfg.schema.indexKinds, { compact: true, shard: this.shardName ?? shard, ...this.compactFormatOpt() });
     return { shard, schemaVersion: this.getMeta("schema_version"), refused: this.refused, result };
+  }
+
+  /**
+   * `POST /api/_ember/sql` (the dashboard's SQL Explorer, admin-sql.ts): one read-only query on this shard's SQLite, in
+   * a transaction that is always aborted. Also on a refused shard (it reads the tables as they are, nothing decodes
+   * them). Its rows read count in the shard's metrics like any other statement's.
+   */
+  async sqlQuery(_shard: string, input: SqlQueryInput): Promise<SqlQueryOutcome> {
+    // Nothing is persisted for it (not even the shard's name, as `preflight`): the caller picked the shard, and the
+    // runner does not use the name.
+    const r = runReadOnlySql(this.ctx.storage, input);
+    // A statement that ran counts, failed or not (its reads are billed); a refused text never ran.
+    if (r.ok || r.code !== "SqlRefused") {
+      const read = r.ok ? r.value.rowsRead : (r.rowsRead ?? 0);
+      this.driver.rowsRead += read;
+      this.driver.counters.select[0]++;
+      this.driver.counters.select[1] += read;
+    }
+    return r;
   }
 
   // ------------------------------------------------------------------ files (RPC from the Worker / actions)

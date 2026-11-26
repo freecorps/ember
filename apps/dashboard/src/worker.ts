@@ -9,7 +9,7 @@
 //     before it runs (audit.ts), and a typed confirmation for destructive ones on protected environments;
 //   - an admin endpoint the project's runtime does not have answers 501 `runtime_outdated` (projects.ts).
 
-import { allOf, auditBegin, auditDenied, auditFinish, ensureTables, listAudit, type AuditEntry, type D1Like } from "./audit.ts";
+import { allOf, auditBegin, auditDenied, auditFinish, ensureTables, listAudit, MAX_ARGS_TEXT, type AuditEntry, type D1Like } from "./audit.ts";
 import { accessConfigured, authenticate, type AuthEnv, type Principal, type Role } from "./auth.ts";
 import { b64url, err, json, MAX_BODY_BYTES, readJsonObject, readLimited } from "./http.ts";
 import {
@@ -91,6 +91,14 @@ const FN = /^[A-Za-z0-9_$@./:-]{1,200}$/;
 const EMBED_AT = /^([a-z][A-Za-z0-9_-]{0,39})\/([a-z][A-Za-z0-9_-]{0,39})$/;
 /** Largest `args` of a dashboard query (JSON in the query string), as the runtime's. */
 const DASH_ARGS_MAX = 8192;
+/** The SQL Explorer: the text kept in the audit log, the row cap, the bound parameters (the runtime's limits). */
+const SQL_AUDIT_CHARS = 2048;
+/** Largest SQL text (the runtime's SQL_TEXT_MAX): a longer one is refused here, before the project is called. */
+const SQL_TEXT_MAX = 100_000;
+const SQL_ROWS_MAX = 5000;
+const SQL_PARAMS_MAX = 100;
+/** `data/list` arguments of admin API level 16 (`id`, range bounds, `search`): older runtimes would ignore them. */
+const ROWS_V2 = ["id", "gt", "gte", "lt", "lte", "search"];
 
 interface Ctx {
   request: Request;
@@ -126,6 +134,8 @@ interface WritePlan {
   shard?: string;
   target: string;
   args: unknown;
+  /** The audit row's args already serialized (instead of the summary of `args`): see `AuditEntry.argsText`. */
+  argsText?: string;
   /** Text the caller types to confirm (destructive actions on protected environments). */
   confirm: string;
   /**
@@ -174,6 +184,22 @@ function bodyScope(b: Record<string, unknown>, needShard: boolean): { project: s
 }
 
 /** Resolves ?project&env to its registry entry (404 when unknown) and checks the runtime has `feature`. */
+/**
+ * The SQL text kept in the audit log: its first SQL_AUDIT_CHARS characters (`…` when cut), fewer when JSON escapes
+ * (quotes, backslashes, control characters: up to 6 characters each) would push the entry past MAX_ARGS_TEXT, so
+ * the stored `args` is always whole JSON, never cut by the log.
+ */
+export function sqlForAudit(sql: string): string {
+  // Room for the other fields: {"sql":"…","chars":100000,"params":100,"explain":false,"limit":5000}.
+  const budget = MAX_ARGS_TEXT - 96;
+  let end = Math.min(sql.length, SQL_AUDIT_CHARS);
+  while (end > 0 && JSON.stringify(sql.slice(0, end)).length > budget) end = Math.floor(end * 0.9);
+  if (end === sql.length) return sql;
+  // A surrogate pair is not split.
+  if (/[\uD800-\uDBFF]/.test(sql[end - 1] ?? "")) end--;
+  return `${sql.slice(0, end)}…`;
+}
+
 async function targetOf(c: Ctx, feature: string): Promise<{ target: Target } | Response> {
   const s = scope(c.q);
   if (s instanceof Response) return s;
@@ -867,7 +893,69 @@ export const ROUTES: Route[] = [
       };
     },
   },
-  adminGet("/api/rows", "data/list", ["shard", "table", "index", "eq", "order", "cursor", "limit"], "a page of an app table through an index (eq on a prefix of its fields), asc or desc"),
+  {
+    method: "GET",
+    path: "/api/rows",
+    role: "read",
+    feature: "data/list",
+    summary: "a page of an app table through an index (eq on a prefix of its fields, then gt/gte/lt/lte on the next), asc or desc; `id` gets one document, `search` runs a searchIndex",
+    async run(c) {
+      // Bounds, a direct get and full-text search are level 16 (feature `sql` marks it): an older runtime would ignore
+      // them and answer the unfiltered page, so it is refused as outdated instead.
+      const v2 = ROWS_V2.some((k) => c.q.has(k));
+      const t = await targetOf(c, v2 ? "sql" : "data/list");
+      if (t instanceof Response) return t;
+      if (v2) {
+        // A runtime whose capabilities could not be read is not sent filters it might ignore (the unfiltered page
+        // would read as the answer, an `id` lookup would open another document): its refusal or 502.
+        const probe = await probeCapabilities(c.env, t.target, c.fetch);
+        if ("error" in probe) return probe.error;
+        const old = await requireFeature(c.env, t.target, "data/list", c.fetch);
+        if (old) return old;
+      }
+      const id = c.q.get("id");
+      if (id !== null && !DOC_ID.test(id)) return err(400, "bad_request", "id: a document id");
+      if ((c.q.get("search") ?? "").length > 1000) return err(400, "bad_request", "search: up to 1000 characters");
+      const fwd = new URLSearchParams();
+      for (const k of ["shard", "table", "index", "eq", "order", "cursor", "limit", ...ROWS_V2]) for (const v of c.q.getAll(k)) fwd.append(k, v);
+      return pass(await projectAdmin(c.env, t.target, `/api/_ember/data/list?${fwd}`, c.fetch), t.target, "data/list");
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/sql",
+    role: "admin",
+    action: "sql.run",
+    // Read-only (the project refuses anything else, and runs it in a transaction it always aborts): no confirmation.
+    destructive: false,
+    feature: "sql",
+    summary: "one read-only query on a shard's SQLite (SELECT, WITH ... SELECT, EXPLAIN QUERY PLAN), up to 5000 rows; audited with its text (first 2048 characters)",
+    plan(b) {
+      const s = bodyScope(b, true);
+      if (s instanceof Response) return s;
+      const sql = typeof b.sql === "string" ? b.sql : "";
+      if (!sql.trim()) return err(400, "bad_request", "sql: the query's text");
+      if (sql.length > SQL_TEXT_MAX) return err(413, "too_large", `sql: up to ${SQL_TEXT_MAX} characters`);
+      if (b.explain !== undefined && typeof b.explain !== "boolean") return err(400, "bad_request", "explain must be a boolean");
+      if (b.limit !== undefined && (!Number.isInteger(b.limit) || (b.limit as number) < 1 || (b.limit as number) > SQL_ROWS_MAX)) return err(400, "bad_request", `limit: an integer in 1..${SQL_ROWS_MAX}`);
+      const params = b.params === undefined || b.params === null ? [] : b.params;
+      if (!Array.isArray(params) || params.length > SQL_PARAMS_MAX || !params.every((p) => p === null || ["string", "number", "boolean"].includes(typeof p))) {
+        return err(400, "bad_request", `params: up to ${SQL_PARAMS_MAX} strings, numbers, booleans or nulls`);
+      }
+      const explain = b.explain === true;
+      const limit = b.limit as number | undefined;
+      // The text is what was run (the point of the log); parameter values are user data: only their count.
+      const text = sqlForAudit(sql);
+      return {
+        ...s,
+        target: s.shard,
+        args: { sql: text, params: params.length, explain, limit: limit ?? null },
+        argsText: JSON.stringify({ sql: text, ...(text !== sql ? { chars: sql.length } : {}), params: params.length, explain, limit: limit ?? null }),
+        confirm: s.shard,
+        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/sql", c.fetch, { method: "POST", body: { shard: s.shard, sql, params, ...(explain ? { explain } : {}), ...(limit !== undefined ? { limit } : {}) } }), t, "sql"),
+      };
+    },
+  },
   docWrite("insert", "doc.insert", false, "insert a document (validated by the engine)"),
   docWrite("patch", "doc.patch", false, "change fields of a document"),
   docWrite("replace", "doc.replace", false, "replace a document"),
@@ -1069,7 +1157,7 @@ async function write(route: WriteRoute, c: Ctx): Promise<Response> {
   }
   const unconfirmed = checkConfirmation({ destructive, envName: plan.env, protectedEnvs: protectedEnvs(c.env), expected: confirm, sent: body.confirm });
   if (unconfirmed) return unconfirmed;
-  const entry: AuditEntry = { action: plan.action ?? route.action, project: plan.project, env: plan.env, shard: plan.shard || null, target: plan.target, args: plan.args };
+  const entry: AuditEntry = { action: plan.action ?? route.action, project: plan.project, env: plan.env, shard: plan.shard || null, target: plan.target, args: plan.args, ...(plan.argsText !== undefined ? { argsText: plan.argsText } : {}) };
   let id: number;
   try {
     id = await auditBegin(db, c.who, entry);

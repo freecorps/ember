@@ -176,11 +176,17 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
         }
         if (p === "dashboards/run" && (body.args as { label?: unknown } | undefined)?.label === "slow") await new Promise<void>((r) => held.push(r));
         if (p === "dashboards/run") return json({ ok: true, value: body.fn === "@pool/lib:cancelAll" ? 3 : body.fn === "@lab/lib:add" ? "it_2" : true, ms: 1, type: "mutation", shard: body.shard });
+        if (p === "sql") {
+          const text = String(body.sql);
+          if (/^\s*delete/i.test(text)) return json({ ok: false, error: { code: "SqlRefused", message: "read-only queries only (SELECT, WITH ... SELECT, VALUES, EXPLAIN QUERY PLAN): DELETE is refused", data: { at: 0 } } }, 400);
+          if (body.explain === true) return json({ ok: true, value: { columns: ["id", "parent", "notused", "detail"], rows: [[2, 0, 0, "SCAN messages"]], rowsRead: 0, rowsWritten: 0, truncated: false, ms: 0.2, explain: true, plan: [{ id: 2, detail: "SCAN messages", children: [] }] } });
+          return json({ ok: true, value: { columns: ["_id", "author", "body"], rows: [["messages_1", "ana", `a, "quoted" ${XSS}`], ["messages_2", "=cmd()", null]], rowsRead: 2, rowsWritten: 0, truncated: true, ms: 0.4, explain: false } });
+        }
         if (p === "restore") return json({ ok: true, shard: body.shard, restoredTo: body.bookmark, undo: "0000000a-0000000b-0000000c-feedfacefeedface", version: 9, epoch: "e2", schemaVersion: "abc" });
       }
       if (p === "capabilities") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
-        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run", "dashboards/embed"], auth: !state.authFrom, ...(state.authFrom ? { authFrom: state.authFrom } : {}), files: true, system: true });
+        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run", "sql", "dashboards/embed"], auth: !state.authFrom, ...(state.authFrom ? { authFrom: state.authFrom } : {}), files: true, system: true });
       }
       if (p === "dashboards") return json({ ok: true, dashboards: o.legacy ? [] : [POOL_SPEC, LAB_SPEC] });
       if (p === "dashboards/embed") {
@@ -281,21 +287,38 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           tables: [
             {
               name: "messages",
-              document: { kind: "object", fields: { author: { shape: { kind: "string" }, optional: false }, body: { shape: { kind: "any" }, optional: false }, pinned: { shape: { kind: "boolean" }, optional: true } } },
-              indexes: [{ name: "by_author", kind: "db", fields: ["author"] }, { name: "search_body", kind: "search", fields: ["body"] }],
+              document: {
+                kind: "object",
+                fields: {
+                  author: { shape: { kind: "string" }, optional: false },
+                  body: { shape: { kind: "any" }, optional: false },
+                  pinned: { shape: { kind: "boolean" }, optional: true },
+                  replyTo: { shape: { kind: "id", table: "messages" }, optional: true },
+                  attachment: { shape: { kind: "file" }, optional: true },
+                },
+              },
+              indexes: [{ name: "by_author", kind: "db", fields: ["author"] }, { name: "search_body", kind: "search", fields: ["body"], searchField: "body", filterFields: [] }],
               shard: null,
+              replicated: { to: ["org"] },
+              sql: { table: "messages", columns: ["_rowid", "_id", "_creationTime", "author", "pinned", "replyTo", "attachment", "_json", "_k_by_author"] },
             },
           ],
-          componentTables: [],
+          componentTables: ["pool$work"],
+          internalTables: ["_jobs", "_files"],
         });
       }
       if (p === "data/list") {
         lists.push(Object.fromEntries(url.searchParams));
-        const rows = [
+        const rows: Array<Record<string, unknown>> = [
           { _id: "messages_1", _creationTime: 1, author: "ana", body: XSS },
-          { _id: "messages_2", _creationTime: 2, author: XSS, body: { nested: XSS } },
+          { _id: "messages_2", _creationTime: 2, author: XSS, body: { nested: XSS }, replyTo: "messages_1", attachment: "_storage_png" },
+          { _id: "messages_3", _creationTime: 3, author: "bo", body: "deploy finished" },
         ];
         const eq = url.searchParams.get("eq");
+        const id = url.searchParams.get("id");
+        const search = url.searchParams.get("search");
+        if (id !== null) return json({ ok: true, value: { page: rows.filter((r) => r._id === id), isDone: true, continueCursor: "" } });
+        if (search !== null) return json({ ok: true, value: { page: rows.filter((r) => typeof r.body === "string" && r.body.includes(search)), isDone: true, continueCursor: "" } });
         const page = eq ? rows.filter((r) => r.author === (JSON.parse(eq) as string[])[0]) : rows;
         return json({ ok: true, value: { page: url.searchParams.get("order") === "desc" ? [...page].reverse() : page, isDone: true, continueCursor: "" } });
       }
