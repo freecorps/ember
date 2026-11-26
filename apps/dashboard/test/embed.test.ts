@@ -30,7 +30,7 @@ function project(o: { page?: () => Response; features?: string[] } = {}) {
       const url = new URL(req.url);
       calls.push(`${req.method} ${url.pathname}${url.search} ${req.headers.get("authorization")}`);
       const p = url.pathname.replace("/api/_ember/", "");
-      if (p === "capabilities") return Response.json({ ok: true, level: 14, features: o.features ?? ["capabilities", "dashboards", "dashboards/query", "dashboards/run", "dashboards/embed"] });
+      if (p === "capabilities") return Response.json({ ok: true, level: 15, features: o.features ?? ["capabilities", "dashboards", "dashboards/query", "dashboards/run", "dashboards/embed"] });
       if (p === "dashboards") return Response.json({ ok: true, dashboards: [SPEC] });
       if (p === "dashboards/run") {
         posts.push(await req.json());

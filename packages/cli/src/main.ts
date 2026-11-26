@@ -4,7 +4,7 @@ import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { limitWarnings, queryFunctionStats } from "@freecorps/ember-dashboard/metrics-sql";
 import { codegen } from "./codegen/index.ts";
-import { findProjectRoot, loadProject, resolveEnv, workerName, type Project } from "./config.ts";
+import { envConfig, findProjectRoot, loadProject, previewEnvName, resolveEnv, workerName, type Project } from "./config.ts";
 import { DEFAULT_DASHBOARD_NAME, deployDashboard } from "./dashboard.ts";
 import { deployWithDashboard, destroyDashboard, revealOnce, rotateDashboardToken, type DashboardIo } from "./dashboard-link.ts";
 import { interactive, terminalPrompter } from "./prompt.ts";
@@ -28,6 +28,7 @@ import { exportEmber, importEmber } from "./export.ts";
 import { rotateKeys, type RotateKind } from "./keys.ts";
 import { filesOrphans, parseDuration } from "./files.ts";
 import { destroy } from "./destroy.ts";
+import { catalogShards, CatalogUnavailableError, formatShardList, formatShardReport, inspectShard, type CatalogShard } from "./shards.ts";
 import { checkEnvArgs, DEV_VARS_FILE, envGet, envList, envRm, envSet, loadDevVars, readSecretValue, type EnvTarget } from "./env.ts";
 
 const HELP = `ember <command> [options]
@@ -43,10 +44,20 @@ Commands:
   openapi [--out file] [--url URL]        OpenAPI 3.1 of the public functions (POST /api/<kind>/<fn>) and the typed
                                           routes of ember/http.ts (stdout without --out)
   migrate convex [--src convex] [--out ember | --in-place] [--dry-run] [--force] [--report file.md] [--check] [--verify]
+                 [--strict]
                                           Port a Convex functions folder: queries, mutations and their helpers become
                                           synchronous, imports/validators/ConvexError/crons/convex-helpers triggers are
                                           rewritten, and a report lists what needs a decision. --check fails while
-                                          manual items remain (CI); --verify runs codegen + tsc --noEmit on the result
+                                          manual items remain (CI); --verify runs codegen + tsc --noEmit on the result.
+                                          First checks the libraries the functions import (and package.json) against
+                                          what runs in an Ember action (workerd + nodejs_compat) and warns; --strict
+                                          fails, converting nothing, when a function imports one that does not run
+  mcp [--allow-env name ...] [--allow-run name ...]
+                                          MCP server on stdio for coding agents: tools schema, functions, types,
+                                          codegen (the code on disk), run, data, shards (the running \`ember dev\` by
+                                          default), logs, metrics. --allow-env lets the read tools reach a deployed
+                                          environment; --allow-run lets run execute there (each mutation/action also
+                                          needs confirm: "<env>"). Admin calls use EMBER_ADMIN_TOKEN
   dev [--port 8787] [--no-persist] [--remote [--env dev]] [--dashboard [--dashboard-port 8788]]
                                           Run locally (Miniflare/workerd), rebuild on change. --remote binds the
                                           env's real Workers AI, Vectorize, Browser Rendering and Images (AI Search
@@ -71,8 +82,16 @@ Commands:
                                           Stops when a var declared in defineApp({ env }) is neither a secret on
                                           the Worker nor a var in ember.json, unless --allow-missing-env
                                           The first deploy in a terminal asks whether to add the Ember Dashboard
-                                          and saves the answer ("dashboard" in ember.json); CI never asks
-  destroy [--env name] --yes              Delete ember-<project>-<env>: its dashboard link, the Worker and its Durable Object data, this
+                                          and saves the answer ("dashboard" in ember.json); CI never asks.
+                                          ember.json "limits": { "cpuMs" } and "placement": "smart" go up with a
+                                          Script PUT only when the Worker does not have them yet
+  deploy --preview <branch> [--destroy] [options]
+                                          Ephemeral environment preview-<slug> (Worker ember-<project>-preview-<slug>)
+                                          derived from environments.preview: its vars and settings, its own Durable
+                                          Objects, bucket, queues and indexes. Same branch → same environment.
+                                          --destroy deletes it. Other commands take --env preview-<slug>
+  destroy [--env name | --preview branch] --yes
+                                          Delete ember-<project>-<env>: its dashboard link, the Worker and its Durable Object data, this
                                           env's Vectorize indexes / AI Search instances / indexing queue, the files
                                           queue and (if empty) bucket
   run <fn> ['<json args>'] [--shard kind:key] [--env name | --url URL] [--token T] [--query|--mutation|--action]
@@ -81,6 +100,13 @@ Commands:
                                           Stream the Worker's logs (tail API). --fn/--shard filter per execution
                                           (needs the Worker var EMBER_TRACE=1; else they match log text)
   projects ls [--json]                    Projects and environments in the account registry (D1 ember-registry)
+  shards ls [--env name] [--kind k] [--json]
+                                          The environment's shards from the registry catalog: size, schema version,
+                                          last write (what each shard last reported)
+  shards inspect <kind:key> [--env name | --url URL] [--json] [--admin-token T]
+                                          One shard, live (admin endpoints): size, schema and commit version,
+                                          tables with row counts, open jobs, subscriptions, files, outbox. Without
+                                          --env/--url: the running \`ember dev\`
   domains add <host> [--env name] [--dry-run]
                                           Attach a Custom Domain after checking the zone's routes, custom domains and
                                           the registry for conflicts
@@ -186,7 +212,7 @@ function maybeProject(): Project | null {
 /** Cloudflare client for the project's (or --account / CLOUDFLARE_ACCOUNT_ID) account. */
 function accountClient(project: Project | null, account?: string, env?: string): CfClient {
   const accountId =
-    account ?? (project && env ? project.config.environments[env]?.account : undefined) ?? project?.config.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
+    account ?? (project && env ? envConfig(project, env)?.account : undefined) ?? project?.config.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
   if (!accountId) throw new Error(`No Cloudflare account: pass --account, set "account" in ember.json or CLOUDFLARE_ACCOUNT_ID.`);
   return new CfClient({ accountId, token: resolveToken() });
 }
@@ -257,6 +283,16 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       console.log(`${fn.name} (${fn.visibility} ${fn.type}${fn.errors?.length ? `, throws ${fn.errors.join(" | ")}` : ""})\n${contract}`);
       return 0;
     }
+    case "mcp": {
+      const { values } = parseArgs({ args: rest, options: { "allow-env": { type: "string", multiple: true }, "allow-run": { type: "string", multiple: true } } });
+      const project = loadProject();
+      // Checked now (a typo fails at startup, not on the agent's first call).
+      const allowEnv = (values["allow-env"] ?? []).map((e) => resolveEnv(project, e).name);
+      const allowRun = (values["allow-run"] ?? []).map((e) => resolveEnv(project, e).name);
+      const { mcpCommand } = await import("./mcp/index.ts");
+      await mcpCommand(project, { allowEnv, allowRun });
+      return 0;
+    }
     case "migrate": {
       const { migrateCommand } = await import("./migrate/command.ts");
       return migrateCommand(rest);
@@ -302,9 +338,27 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           preflight: { type: "boolean" },
           "allow-schema-rollback": { type: "boolean" },
           "allow-missing-env": { type: "boolean" },
+          preview: { type: "string" },
+          destroy: { type: "boolean" },
         },
       });
       const allowSchemaRollback = !!values["allow-schema-rollback"];
+      if (values.destroy && values.preview === undefined) throw new Error("--destroy needs --preview <branch> (`ember destroy --env name --yes` deletes a declared environment)");
+      if (values.preview !== undefined) {
+        if (values.env) throw new Error("--preview <branch> names the environment itself (preview-<slug>): drop --env");
+        if (values.preflight) throw new Error("--preview and --preflight are exclusive");
+        const project = loadProject();
+        const name = previewOf(project, values.preview);
+        if (values.destroy) {
+          const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "no-dashboard", "allow-schema-rollback", "allow-missing-env", "url", "admin-token", "shard"] as const).filter((k) => values[k] !== undefined);
+          if (clash.length) throw new Error(`--destroy deletes the preview: it does not take ${clash.map((k) => `--${k}`).join(", ")}`);
+          // --destroy is the explicit ask: a preview's data is disposable by definition (no --yes, CI runs it on branch delete).
+          const r = await destroy(project, { env: name, yes: true, ...(values.registry ? { registryName: values.registry } : {}) });
+          return r.warnings.length ? 1 : 0;
+        }
+        console.log(`preview: ${values.preview} → environment ${name} (${workerName(project.config.project, name)}, from environments.preview)`);
+        values.env = name;
+      }
       if (values.preflight && values["allow-missing-env"]) throw new Error("--preflight uploads nothing: it does not take --allow-missing-env");
       if (values.preflight) {
         const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "no-dashboard"] as const).filter((k) => values[k] !== undefined);
@@ -354,6 +408,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const dryRun = !!values["dry-run"];
       // The Ember Dashboard (dashboard-link.ts): decided before the upload, which carries this project's token for it.
       const io = cliIo();
+      // A derived preview (by --preview or --env preview-<slug>) is not linked unless asked for (deployWithDashboard).
       const result = await deployWithDashboard(project, {
         flag: values.dashboard ? true : values["no-dashboard"] ? false : undefined,
         env: resolveEnv(project, values.env).name,
@@ -414,8 +469,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return r.status < 400 ? 0 : 1;
     }
     case "destroy": {
-      const { values } = parseArgs({ args: rest, options: { env: { type: "string" }, yes: { type: "boolean" }, registry: { type: "string" } } });
-      const r = await destroy(loadProject(), { ...(values.env ? { env: values.env } : {}), ...(values.yes ? { yes: true } : {}), ...(values.registry ? { registryName: values.registry } : {}) });
+      const { values } = parseArgs({ args: rest, options: { env: { type: "string" }, yes: { type: "boolean" }, registry: { type: "string" }, preview: { type: "string" } } });
+      if (values.preview !== undefined && values.env) throw new Error("--preview <branch> names the environment itself: drop --env");
+      const project = loadProject();
+      const env = values.preview !== undefined ? previewOf(project, values.preview) : values.env;
+      // As `ember deploy --preview <branch> --destroy`: naming the branch is the confirmation (a preview's data is
+      // disposable). A declared environment still needs --yes.
+      const yes = !!values.yes || values.preview !== undefined;
+      const r = await destroy(project, { ...(env ? { env } : {}), ...(yes ? { yes: true } : {}), ...(values.registry ? { registryName: values.registry } : {}) });
       return r.warnings.length ? 1 : 0;
     }
     case "logs": {
@@ -444,6 +505,40 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           console.log(`${p.name}${p.repo ? `  (${p.repo})` : ""}  fingerprint ${p.fingerprint.slice(0, 8)}…`);
           for (const e of p.envs) console.log(`  ${e.env.padEnd(10)} ${e.worker.padEnd(36)} ${e.url ?? "-"}  schema ${e.schemaVersion?.slice(0, 12) ?? "-"}  ${e.lastDeploy ? new Date(e.lastDeploy).toISOString() : ""}`);
         }
+      return 0;
+    }
+    case "shards": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: { env: { type: "string" }, url: { type: "string" }, "admin-token": { type: "string" }, kind: { type: "string" }, json: { type: "boolean" }, registry: { type: "string" } },
+      });
+      const [sub, shard] = positionals;
+      const project = loadProject();
+      if ((sub ?? "ls") === "ls") {
+        if (values.url) throw new Error("shards ls reads the registry catalog of an environment: pass --env, not --url");
+        const env = resolveEnv(project, values.env);
+        let shards: CatalogShard[];
+        try {
+          shards = await catalogShards(() => D1Registry.open(accountClient(project, undefined, env.name), registryName(values.registry), { create: false, ddl: false }), project.config.project, env.name, {
+            registry: registryName(values.registry),
+            ...(values.kind ? { kind: values.kind } : {}),
+          });
+        } catch (e) {
+          if (!(e instanceof CatalogUnavailableError)) throw e;
+          console.error(`ember shards ls: ${e.message}`);
+          return 1;
+        }
+        console.log(values.json ? JSON.stringify(shards, null, 2) : formatShardList(shards));
+        return 0;
+      }
+      if (sub !== "inspect" || !shard || positionals.length > 2) throw new Error("usage: ember shards ls [--env name] [--kind k] [--json] | ember shards inspect <kind:key> [--env name | --url URL] [--json]");
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("shards inspect reads the shard through the admin endpoints: set EMBER_ADMIN_TOKEN (or pass --admin-token)");
+      // Without --env and --url: the local `ember dev`.
+      const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(values.env ? { env: resolveEnv(project, values.env).name } : {}) });
+      const r = await inspectShard({ url, adminToken }, shard);
+      console.log(values.json ? JSON.stringify(r, null, 2) : formatShardReport(r));
       return 0;
     }
     case "domains": {
@@ -918,6 +1013,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       console.error(`Unknown command "${cmd}".\n\n${HELP}`);
       return 2;
   }
+}
+
+/** The preview environment of a branch (`preview-<slug>`), checked: needs `environments.preview`, never a declared name. */
+function previewOf(project: Project, branch: string): string {
+  if (!project.config.environments.preview) throw new Error(`--preview derives an environment from "environments.preview" in ember.json: add one (it may be {}), with the vars and settings every preview shares`);
+  const name = previewEnvName(project.config.project, branch);
+  if (Object.hasOwn(project.config.environments, name)) throw new Error(`${name} is declared in ember.json: --preview only deploys derived environments (use --env ${name})`);
+  return name;
 }
 
 /** A positive number of seconds from a CLI option, or a clear error (`Number("30m")` is NaN). */

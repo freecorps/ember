@@ -19,7 +19,7 @@ import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { adminTokenKey } from "@freecorps/ember-dashboard/projects";
 import { ensureAccessApp } from "./access.ts";
-import { writeConfigKey, workerName, type Project } from "./config.ts";
+import { isDerivedPreview, writeConfigKey, workerName, type Project } from "./config.ts";
 import { DEFAULT_DASHBOARD_NAME, deployDashboard, type DashboardDeployResult } from "./dashboard.ts";
 import type { CfClient } from "./deploy/cf.ts";
 import type { Prompter } from "./prompt.ts";
@@ -179,7 +179,7 @@ export function revealOnce(label: string, value: string, o: { io: DashboardIo; d
 export async function finishDashboardLink(client: CfClient, link: DashboardLink, registry: D1Registry, o: { io: DashboardIo; project: Project | null; dir: string }): Promise<DashboardDeployResult> {
   const extraSecrets = link.token ? { [adminTokenKey(link.worker)]: link.token } : {};
   if (link.exists) {
-    const r = await deployDashboard(client, { registry, name: link.name, extraSecrets, skipUnchanged: true, noToken: true, log: o.io.log });
+    const r = await deployDashboard(client, { registry, name: link.name, extraSecrets, include: [link.worker], skipUnchanged: true, noToken: true, log: o.io.log });
     o.io.log(r.skipped ? `  dashboard: ${link.name} already up to date` : `  dashboard: ${link.worker} linked`);
     return r;
   }
@@ -188,6 +188,7 @@ export async function finishDashboardLink(client: CfClient, link: DashboardLink,
     registry,
     name: link.name,
     extraSecrets,
+    include: [link.worker],
     ...(login.access ? { accessTeam: login.access.team, accessAud: login.access.aud, noToken: true } : {}),
     ...(login.admins ? { admins: login.admins } : {}),
     log: o.io.log,
@@ -256,6 +257,12 @@ export async function deployWithDashboard<T>(
   project: Project,
   o: {
     flag: boolean | undefined;
+    /**
+     * Not linked this time, and nothing saved: `flag` and the saved choice are not consulted. Default: a derived preview
+     * environment (`preview-<slug>`, by `--preview` or `--env`) without `flag` is skipped (one service binding per
+     * branch otherwise); ember.json's "dashboard" is the project's choice for its declared environments.
+     */
+    skip?: boolean;
     env: string;
     dryRun: boolean;
     io: DashboardIo;
@@ -267,7 +274,8 @@ export async function deployWithDashboard<T>(
 ): Promise<T> {
   let link: DashboardLink | null = null;
   let client: CfClient | null = null;
-  if (!o.dryRun) {
+  const skip = o.skip ?? (o.flag === undefined && isDerivedPreview(project, o.env));
+  if (!o.dryRun && !skip) {
     const choice = await dashboardChoice(project, o.flag, o.io);
     if (choice.enabled) {
       client = o.client();

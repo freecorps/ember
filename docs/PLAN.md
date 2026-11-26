@@ -43,6 +43,7 @@ ember/                     (monorepo, MIT)
     react-native  adaptador de reconexão (AppState/NetInfo), helpers Expo, registro de push (token Expo ou nativo)
     expo-push     lado do aparelho do push E2E: plugin Expo (NSE no iOS), chave do aparelho, tarefa Android (✅)
     offline       StorageAdapter: memory, indexeddb, sqlite, expo-sqlite (✅ Fase 5a); opfs (SQLite-Wasm), tinybase, abas (✅ Fase 5c)
+    presence      presença (online por sala), digitando e cursores sobre o canal efêmero do Shard; /react: usePresence, useTyping, useCursors (✅ 0.10)
     plugins/
       search-fts5   vector-vectorize   ai-search
     components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, migrations, workpool, push, email, agent — files e auth embutidos)
@@ -53,7 +54,7 @@ ember/                     (monorepo, MIT)
     examples/     chat, todo, files-auth-jobs, email-lite   (✅ todos existem; tests no workerd, `bun run check` os cobre)
 ```
 
-**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-workpool`, `ember-email`, `ember-agent`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
+**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-workpool`, `ember-email`, `ember-agent`, `ember-presence`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
 
 ---
 
@@ -149,6 +150,7 @@ export default defineSchema({
 **Protocolo v1** (JSON sobre WebSocket com hibernação ✅; o binário msgpack vem depois):
 - Do cliente: `hello{clientId, auth}`, `subscribe{qid, fn, args, shard, resume?{version,epoch}}`, `unsubscribe`, `mutate{mid, fn, args, shard}`, `action`, `ping`.
 - Do servidor: `snapshot`, `patch{shard, version, changes}` (um por versão), `mutationResult{mid, ok|error, version}`, `authExpired`, `error`, `pong`.
+- ✅ **Canal efêmero** (feature `ephemeral`, 0.10): `join`/`leave`/`pub` de canais declarados em `defineApp({ channels })` (`authorize` síncrono e puro com a identidade verificada), broadcast em memória no Shard: zero linha escrita, nenhuma versão, nada no change log; inscrições no anexo (sobrevivem à hibernação), TTL por heartbeat. Base do `@freecorps/ember-presence`. Contrato em contracts.md ("Feature `ephemeral`").
 - Dedup de mutation por `(identity, clientId, mid)`, guardado por 7 a 14 dias (tabelas de geração, `docs/spikes/rows-written.md`).
 - Ping/pong por auto-response, sem acordar o DO ✅.
 - Sockets e anexos sobrevivem à hibernação ✅. Anexo de socket tem limite de 16 KB ✅: guarda `identity`, `clientId` e as subscriptions do socket (as que não cabem vão para `_ember_subs`), então assinar não grava linha.
@@ -390,14 +392,15 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 | `ember logs` | `wrangler tail` via API |
 | `ember data` | Navega e edita os dados de um shard (✅ no painel: filtro por índice e edição pelo engine) |
 | `ember env` | ✅🌐 `list/set/get/rm [--env] [--var] [--reveal]`: secrets de Worker (vivos na hora, mantidos pelo deploy), vars no `ember.json`; valor nunca impresso sem `--reveal` (lido pela própria Worker, admin token) nem gravado em disco. Secrets Store avaliado e adiado (1 store e 100 secrets por conta no beta) |
-| `ember shards ls/inspect` | Lista e inspeciona shards |
+| `ember shards ls/inspect` | ✅ `ls [--env] [--kind] [--json]`: os shards do env pelo catálogo do registro (tamanho, versão de schema, última escrita, o que cada shard reportou). `inspect <kind:key> [--env \| --url] [--json]`: um shard ao vivo pelos endpoints de admin que já existem (`status`, `data` sem tabela, `inspect`): tamanho, versão de schema e de commit, tabelas com contagem, jobs abertos, subscriptions, arquivos, outbox (contracts.md "Deploy: limits, placement, previews e `ember shards`") |
+| `ember mcp` | ✅ Servidor MCP em stdio para agentes (JSON-RPC 2.0, implementação própria, sem SDK): `schema`, `functions`, `types`, `codegen` (código em disco), `run`, `data`, `shards` (o `ember dev` rodando por padrão), `logs`, `metrics`. Env publicado só com `--allow-env <env>` (leitura) / `--allow-run <env>` (execução), e cada mutation/action fora do dev local pede `confirm: "<env>"` (contracts.md "MCP") |
 | `ember export/import` | NDJSON no R2 |
 | `ember destroy --yes` | Apaga o env: Worker (dados dos DOs), índices Vectorize, instâncias AI Search, filas, bucket vazio ✅; antes, tira o env do painel (service binding e token) |
 | `ember dashboard deploy/token/destroy` | ✅ Painel opcional: o primeiro `ember deploy` num terminal pergunta se quer o painel e grava `"dashboard"` no `ember.json` (`--dashboard`/`--no-dashboard`; CI nunca pergunta nem cria); assistente de login (Access se há Zero Trust, senão token mostrado uma vez); cada projeto ganha um token de admin só do painel (contracts.md "Dashboard") |
 | `ember restore --shard X --to <bookmark>` | Point-in-time recovery. Usa bookmarks que o engine grava a cada deploy, migração e hora; `getBookmarkForTime` é impreciso (R6). Restore por bookmark reverte de forma exata e é desfazível. ✅🌐 `--list`, `--mark <label>`, `--to <bookmark \| deploy:<versão> \| hora ISO \| -2h>` com confirmação/`--yes`, undo impresso, `--all --to deploy:<v>` (catálogo); ~1,1 s por shard; E2E em `docs/spikes/remote/ops-e2e.md`. `--discard-newer`: restaura, a partir do runtime mais antigo, um shard recusado por `RuntimeSchemaTooNew` (rollback de um runtime novo quebrado), perdendo o que foi escrito depois do bookmark; nada é gravado nas tabelas do runtime novo (contracts.md, "Trava das tabelas do runtime") |
 | `ember keys rotate` | ✅🌐 JWT (sem logout), secret de URLs de arquivos e secret do auth, por geração de secret |
 | `ember run fn '{args}'` | Executa uma função |
-| `ember migrate convex` | ✅ Codemod de uma pasta `convex/` para `ember/` (queries, mutations e helpers síncronos, imports, `ConvexError`, crons, triggers do `convex-helpers`) com relatório do que precisa de decisão; `--check`, `--verify` (§22 L9, docs/migrate-from-convex.md) |
+| `ember migrate convex` | ✅ Codemod de uma pasta `convex/` para `ember/` (queries, mutations e helpers síncronos, imports, `ConvexError`, crons, triggers do `convex-helpers`) com relatório do que precisa de decisão; `--check`, `--verify` (§22 L9, docs/migrate-from-convex.md). Antes de converter, checa os imports das funções e as dependências do `package.json` ao lado contra os veredictos do spike `docs/spikes/node-actions/libraries.json` (roda / parcial / não roda no workerd com `nodejs_compat`) e avisa; `--strict` falha (sem escrever nada) quando uma função importa uma lib que não roda |
 
 **`ember deploy`:**
 1. Faz o bundle e calcula o diff do schema contra o catálogo.
@@ -412,6 +415,8 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 6. `ember deploy --wait` acompanha o progresso de todos os shards.
 7. ✅ Env declarado: as vars obrigatórias de `defineApp({ env })` (`manifest.env`) precisam ser secret do Worker ou var do `ember.json` (ou uma que o próprio deploy manda); senão o redeploy para antes de subir, listando as que faltam (`MissingEnvError`), até `--allow-missing-env`. O primeiro deploy só avisa (secrets vivem no Worker, que ainda não existe). O estado atual (deployments, namespaces de DO, secrets, rota workers.dev) é lido em paralelo, e um redeploy só de código não regrava a rota workers.dev nem CORS/lifecycle do bucket quando já estão iguais.
 8. ✅ Volta de schema: antes de subir, o deploy compara o schema com o histórico do env no registro (`deployments`); se é um que o env já deixou por um mais novo, para e explica o custo (shard recusado se um campo novo tem dados, índices apagados e refeitos com backfill na volta para frente) até `--allow-schema-rollback`. Se o histórico não pode ser lido, o deploy avisa e segue sem a checagem. `--dry-run` e `--preflight` mostram o mesmo (contracts.md "Admin / status", "Volta de schema do app").
+9. ✅ `ember.json` `limits: { cpuMs }` (CPU por invocação do Worker, 10–300000 ms) e `placement: "smart"` (Smart Placement), no projeto ou por env. São configurações do script: o PUT do script as leva, o upload de versão não tem esses campos. O redeploy lê `GET .../settings` (só quando o `ember.json` gerencia uma delas) e, se já estão iguais, segue só código, sem escrita a mais; se mudaram (ou não deu para ler), o deploy vira um PUT do script a 100% (`settings-change`; `--gradual` ignorado com aviso). Ausentes: não gerenciadas (o Worker fica com o que tem; tirar a chave do `ember.json` não reseta o Worker).
+10. ✅ `ember deploy --preview <branch>`: ambiente efêmero `preview-<slug>` (Worker `ember-<project>-preview-<slug>`), derivado de `environments.preview` (vars, conta, overrides de auth menos `url`, limits, placement) e nunca declarado no `ember.json`. Todo recurso deriva do nome do env (DOs, bucket, filas, índices), então nada é compartilhado com prod. Mesmo branch → mesmo nome (idempotente; slug cortado com 6 hex do sha256 quando não cabe). Branches que normalizam para o mesmo slug (`feat/x`, `feat-x`) dividem o mesmo preview. `--preview <branch> --destroy` (ou `ember destroy --preview <branch>`) apaga só esse env (prod não é afetado), mas, como o slug é compartilhado, apaga também o preview do outro branch. Sem painel, salvo `--dashboard` (e o default do preview não é gravado no `ember.json`).
 
 **Migração no cliente:** quando a versão de schema muda, o adaptador offline reaplica o DDL. Se a mudança for incompatível, ele faz reset e ressincroniza, preservando a fila de mutations pendentes, que é revalidada.
 ✅ Como ficou (Fase 5a): SQLite/expo-sqlite usam o planner do servidor (`prepareLocalDatabase`: migração compatível mantém a réplica; recusada → reset); IndexedDB, memória e TinyBase resetam a réplica em qualquer versão nova; OPFS usa o planner (é o backend SQLite). A fila sempre fica e a revalidação é a do servidor ao reenviar.
@@ -648,7 +653,7 @@ Detalhes em `docs/spikes/remote/RESULTS.md`. Todos os recursos `ember-spike-*` f
 - Cada projeto e ambiente vira recursos com prefixo `ember-<project>-<env>`:
   - um Worker com as classes `Shard`, `Auth` e `System`;
   - R2, D1 (catálogo) e Queues próprios.
-- Ambientes `prod`, `dev` e `preview-<branch>` ficam isolados. Uma conta pode ter N projetos.
+- Ambientes `prod`, `dev` e `preview-<branch>` ficam isolados. Uma conta pode ter N projetos. ✅ `preview-<slug>` é derivado de `environments.preview` por `ember deploy --preview <branch>` (§11) e apagado por `--destroy`; os outros comandos aceitam `--env preview-<slug>`.
 - O domínio é opcional. Padrão é workers.dev; `ember domains add` adiciona domínio custom ou rota.
 
 **Registro da conta** (D1 `ember-registry`, criado no primeiro `ember init`)

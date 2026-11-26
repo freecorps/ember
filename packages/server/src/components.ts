@@ -33,6 +33,7 @@ import { canonicalJson, manifestHash, SchemaDefinition, type SchemaManifest, typ
 import { assertNotReserved, type HttpRouter, type HttpRoute } from "./http.ts";
 import { cronFunctionName, cronList, type CronDef, type CronsExport } from "./crons.ts";
 import type { ActionCtx } from "./functions.ts";
+import { checkChannels, type ChannelsConfig } from "./channels.ts";
 import { checkDashboardShape, mountDashboard, prefixDashboard, resolveDashboard, type DashboardManifest, type DashboardSpec, type DashboardSpecInput } from "./dashboard.ts";
 
 /** Separator of physical table names: `<component>$<table>`. Never valid in an app table name. */
@@ -280,6 +281,12 @@ export interface AppDefinition<Components extends Record<string, AnyComponentDef
   readonly limits: Readonly<Partial<Limits>>;
   /** Storage choices (`defineApp({ storage })`): `compactFormat` of the tables created from now on (contracts.md "Armazenamento compacto"). */
   readonly storage: Readonly<AppStorage>;
+  /**
+   * Ephemeral channels (`defineApp({ channels })`, contracts.md "Feature `ephemeral`"): name patterns sockets may join,
+   * each with its synchronous `authorize` and optional `payload`/`state` validators. Broadcast in memory by the shard:
+   * no row, no version.
+   */
+  readonly channels: Readonly<ChannelsConfig>;
   /** The app's own dashboard screens (`defineApp({ dashboard })`); its refs are resolved by `composeApp`. */
   readonly dashboard: DashboardSpecInput | undefined;
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
@@ -320,7 +327,8 @@ function checkStorage(storage: unknown): Readonly<AppStorage> {
  * Declared vars are typed in actions' `ctx.env`; reading one that is missing (or invalid) throws `EnvMissing` with the
  * `ember env set` to run, and `ember dev` warns when `.dev.vars` lacks a required one. `limits`: the project's per-transaction
  * limits (`DEFAULT_LIMITS` otherwise; each function may set its own), at most `MAX_LIMITS`. `storage.compactFormat`: 2 makes
- * migrations create format 2 compact tables from now on (the rollback lever for format 3; default 3).
+ * migrations create format 2 compact tables from now on (the rollback lever for format 3; default 3). `channels`: the
+ * ephemeral channels sockets may join (`{ "room:*": { authorize: (identity, { param, shard }) => boolean, payload?, state? } }`).
  */
 export function defineApp<const Env extends PropertyValidators = {}>(
   opts: {
@@ -333,6 +341,8 @@ export function defineApp<const Env extends PropertyValidators = {}>(
      * composed (codegen, the Worker).
      */
     dashboard?: DashboardSpecInput;
+    /** Ephemeral channels sockets may join (contracts.md "Feature `ephemeral`"). */
+    channels?: ChannelsConfig;
   } = {},
 ): AppDefinition<{}, Env> {
   const env = (opts.env ?? {}) as Env;
@@ -340,6 +350,7 @@ export function defineApp<const Env extends PropertyValidators = {}>(
   const dashboard = opts.dashboard;
   const limits = checkLimits(opts.limits, "defineApp");
   const storage = checkStorage(opts.storage);
+  const channels = checkChannels(opts.channels);
   for (const [k, val] of Object.entries(env)) {
     if (!ENV_NAME.test(k)) throw new Error(`defineApp: env ${JSON.stringify(k)} must be UPPER_SNAKE_CASE`);
     if (k.startsWith("EMBER_")) throw new Error(`defineApp: env ${k}: EMBER_* names are managed by ember`);
@@ -353,6 +364,7 @@ export function defineApp<const Env extends PropertyValidators = {}>(
       env,
       limits,
       storage,
+      channels,
       dashboard,
       use(c: AnyComponentDefinition, opts: InstallOptions<unknown> = {}) {
         return make([...components, install(c, opts, components)]);

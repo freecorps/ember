@@ -71,6 +71,7 @@
 // socket of its own.
 
 import type { WebSocketConstructor, WebSocketLike } from "./client.ts";
+import { CHANNEL_KEEPALIVE_MS } from "./channels.ts";
 import { jwtPayload } from "./jwt.ts";
 import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG } from "./protocol.ts";
 import { FrameQueue } from "./zframe.ts";
@@ -752,7 +753,42 @@ interface Member {
   subs: Set<string>;
   /** Its subscriptions to a shared query, by prefixed qid: it leaves them when it goes. */
   keyed: Map<string, Shared>;
+  /** Channels it joined (feature "ephemeral"): it leaves them when it goes. */
+  chans: Set<string>;
+  /** Channels whose member list changed while its token had expired: a fresh `joined` once it renews. */
+  stale: Set<string>;
 }
+
+/**
+ * A channel the members of a group are in (feature "ephemeral"): the shared socket is one member of it on the shard,
+ * joined once for every tab; the last tab out leaves it. `joined` is the shard's member list as the leader follows it.
+ */
+interface GroupChan {
+  /** Tabs answered (`joined`): the shard's channel frames reach them. */
+  in: Set<Member>;
+  /** Tabs whose `join` went to the shard and wait for its `joined`. */
+  waiting: Set<Member>;
+  joined: { self: string; members: Map<string, Record<string, unknown>> } | null;
+  /** The member state the shard holds (JSON, from its last `joined`; undefined: none): never one it has not accepted. */
+  state: string | undefined;
+}
+
+/**
+ * A tab's `join` or `pub` out on the shared socket, under the leader's `ref` (the shard answers each with that `ref`):
+ * its answer goes to that tab, and a `pub` (`msg`, the frame the other tabs get) reaches them only once the shard
+ * says it went out (`published`), never one it refused. The tab's own `ref` (its client's channels send one with every
+ * `join`) goes back on that answer, as the shard would have answered it.
+ */
+interface ChanRef {
+  m: Member;
+  ch: string;
+  c: GroupChan;
+  msg?: Record<string, unknown>;
+  tabRef?: number | undefined;
+}
+
+/** `msg` with the tab's own `ref` (none: as it is). */
+const withRef = (msg: Record<string, unknown>, ref: number | undefined): Record<string, unknown> => (ref === undefined ? msg : { ...msg, ref });
 
 /** A `resume` as a tab's `sub` carries it. */
 type Resume = { version?: unknown; epoch?: unknown; ik?: unknown };
@@ -829,6 +865,13 @@ interface Group {
   patchVersion: number;
   /** The shard said `authExpired` and no renewal went since. */
   expired: boolean;
+  /** Channels its members are in (feature "ephemeral"), by name. */
+  chans: Map<string, GroupChan>;
+  /** When the leader last sent a frame on the shared socket: a channel member must send one every so often. */
+  sentAt: number;
+  /** `join`/`pub` of its tabs waiting for the shard's answer, by `ref`. */
+  refs: Map<number, ChanRef>;
+  nextRef: number;
   /**
    * The shard refused the hello's token (`err unauthenticated` before `ready`): the socket runs anonymous while its
    * members said hello as the identity. No `auth` ever goes to it (a valid one would hand that identity's values to
@@ -933,7 +976,7 @@ class Leader {
     const member = this.members.get(id);
     if (m.k === "open" && typeof m.url === "string") {
       if (!member) {
-        this.members.set(id, { tab: m.from, vid: m.vid, url: m.url, token: null, exp: null, expiredTold: false, group: null, waiting: null, subs: new Set(), keyed: new Map() });
+        this.members.set(id, { tab: m.from, vid: m.vid, url: m.url, token: null, exp: null, expiredTold: false, group: null, waiting: null, subs: new Set(), keyed: new Map(), chans: new Set(), stale: new Set() });
         this.watchTab(m.from);
       }
       this.toTab(m.from, { e: E, k: "opened", vid: m.vid, lid: this.lid });
@@ -987,10 +1030,30 @@ class Leader {
     // Out of every shared query (the last one out unsubscribes it).
     const left: string[] = [];
     for (const mq of [...m.keyed.keys()]) this.leave(g, m, mq, left);
+    // Out of its channels (the last tab out leaves it on the shard).
+    const leaves = [...m.chans].filter((ch) => this.leaveChan(g, m, ch));
+    m.chans.clear();
     if (g.closed) return;
     if (!g.members.size) return this.end(g, 1000, "no tabs left");
     if (unsub) this.unsubShared(g, [...m.subs, ...left]);
+    if (unsub && g.ready && leaves.length) this.flush(g, leaves.map((ch) => ({ t: "leave", ch })), g.batch);
     m.subs.clear();
+  }
+
+  /** `m` out of a channel of its group: true when it was the last tab in it (the shard should hear `leave`). */
+  private leaveChan(g: Group, m: Member, ch: string): boolean {
+    const c = g.chans.get(ch);
+    if (!c) return false;
+    c.in.delete(m);
+    c.waiting.delete(m);
+    if (c.in.size || c.waiting.size) return false;
+    g.chans.delete(ch);
+    return true;
+  }
+
+  /** The leader's own `joined` for a tab joining a channel the shared socket is already in. */
+  private joinedOf(ch: string, c: GroupChan): string {
+    return JSON.stringify({ t: "joined", ch, self: c.joined!.self, members: [...c.joined!.members.values()] });
   }
 
   /**
@@ -1175,6 +1238,10 @@ class Leader {
       sharedSeq: 0,
       patchVersion: 0,
       expired: false,
+      chans: new Map(),
+      sentAt: Date.now(),
+      refs: new Map(),
+      nextRef: 0,
       refused: false,
       closed: false,
       heardAt: Date.now(),
@@ -1241,6 +1308,7 @@ class Leader {
     if (g.closed) return;
     try {
       g.ws.send(frame);
+      g.sentAt = Date.now();
     } catch {
       this.end(g, 1006, "send failed");
     }
@@ -1260,11 +1328,16 @@ class Leader {
         return void (g.timer = setTimeout(beat, hb.timeoutMs - (now - g.pingAt)));
       }
       const quiet = now - g.heardAt;
-      if (quiet >= hb.intervalMs) {
+      // Feature "ephemeral": the shard closes a channel member whose socket sent nothing for a while. Frames coming in
+      // do not count for that, frames going out (any tab's) do: with channels, a ping once nothing went out for an
+      // interval, even while frames keep coming in.
+      const sinceSent = now - g.sentAt;
+      const keep = g.chans.size > 0 ? Math.min(hb.intervalMs, CHANNEL_KEEPALIVE_MS) : Infinity;
+      if (quiet >= hb.intervalMs || sinceSent >= keep) {
         g.pingAt = now;
         this.real(g, PING);
         g.timer = setTimeout(beat, hb.timeoutMs);
-      } else g.timer = setTimeout(beat, hb.intervalMs - quiet);
+      } else g.timer = setTimeout(beat, Math.min(hb.intervalMs - quiet, keep - sinceSent));
     };
     g.timer = setTimeout(beat, hb.intervalMs);
   }
@@ -1335,6 +1408,16 @@ class Leader {
         case "q":
           out.push({ ...msg, qid: prefix(m.vid, msg.qid) });
           continue;
+        case "join":
+        case "leave":
+        case "pub": {
+          if (typeof msg.ch !== "string") {
+            out.push(msg);
+            continue;
+          }
+          this.chanFrame(m, g, msg, msg.ch, out, back);
+          continue;
+        }
         case "mut": {
           // One attempt of a mid out at a time: a later one waits for the answer to the one out (see MidSlot).
           const key = String(msg.mid);
@@ -1365,6 +1448,13 @@ class Leader {
           m.token = token;
           m.exp = exp;
           m.expiredTold = false;
+          // Member lists it missed while expired: the current one of each (the shard sends none when the shared socket
+          // stays valid, and its client sees the channel joined and sends no `join`).
+          for (const ch of m.stale) {
+            const c = g.chans.get(ch);
+            if (c?.joined && c.in.has(m)) back.push(JSON.parse(this.joinedOf(ch, c)));
+          }
+          m.stale.clear();
           if (token !== null && token !== g.token) {
             const cur = jwtExpOf(g.token);
             if (g.expired || (exp !== null && cur !== null && exp > cur)) {
@@ -1381,6 +1471,140 @@ class Leader {
     }
     this.flush(g, out, array);
     this.answer(m, back, array);
+  }
+
+  /**
+   * A tab's channel frame (feature "ephemeral"). The shared socket is one member of the channel for every tab of the
+   * group: a `join` goes to the shard (a tab joining a channel the socket is in with that state already is answered
+   * here), a `leave` only when the last tab leaves. A `join` or `pub` goes out under a `ref` of the leader, so its
+   * answer goes to the tab that sent it; a `pub` reaches the other tabs of the group (the shard never echoes a message
+   * to the socket that sent it) only once the shard answers `published`: what it refuses reaches no tab.
+   */
+  private chanFrame(m: Member, g: Group, msg: Record<string, unknown>, ch: string, out: unknown[], back: unknown[]): void {
+    const tabRef = msg.t !== "leave" && typeof msg.ref === "number" ? msg.ref : undefined;
+    if (msg.t !== "leave" && this.lapsed(m)) {
+      // As the shard with an expired socket: refused, and nothing reaches it until its `auth`.
+      const error = { code: "auth_expired", message: 'the token expired; send {t:"auth"} with a fresh one' };
+      back.push({ t: "authExpired" });
+      back.push(withRef(msg.t === "join" ? { t: "left", ch, ...error } : { t: "err", ...error, ch }, tabRef));
+      return;
+    }
+    if (msg.t === "join") {
+      let c = g.chans.get(ch);
+      if (!c) g.chans.set(ch, (c = { in: new Set(), waiting: new Set(), joined: null, state: undefined }));
+      m.chans.add(ch);
+      const state = "state" in msg ? JSON.stringify(msg.state) : undefined;
+      // Answered here only when no other join of this channel is on its way to the shard: one in flight may still
+      // change the shared state (red, then blue sent, then red again: the cached red would not be the final one).
+      const inFlight = [...g.refs.values()].some((r) => r.c === c && r.msg === undefined);
+      if (c.joined && !inFlight && (state === undefined || state === c.state)) {
+        c.waiting.delete(m);
+        c.in.add(m);
+        back.push(withRef(JSON.parse(this.joinedOf(ch, c)) as Record<string, unknown>, tabRef));
+        return;
+      }
+      // A tab already in stays in (its messages keep coming) while its state update waits for the shard.
+      if (!c.in.has(m)) c.waiting.add(m);
+      out.push({ ...msg, ref: this.chanRef(g, { m, ch, c, tabRef }) });
+      return;
+    }
+    if (msg.t === "leave") {
+      if (!m.chans.delete(ch)) return;
+      if (this.leaveChan(g, m, ch)) out.push(msg);
+      return;
+    }
+    const c = g.chans.get(ch);
+    if (!c?.joined || !c.in.has(m)) {
+      // Not in (yet): as the shard would answer, without asking it.
+      back.push(withRef({ t: "err", code: "not_joined", message: `join ${ch} before publishing to it`, ch }, tabRef));
+      return;
+    }
+    const user = c.joined.members.get(c.joined.self)?.user ?? null;
+    const relay = { t: "msg", ch, from: c.joined.self, user, data: msg.data };
+    out.push({ ...msg, ref: this.chanRef(g, { m, ch, c, msg: relay, tabRef }) });
+  }
+
+  private chanRef(g: Group, r: ChanRef): number {
+    const ref = g.nextRef++;
+    g.refs.set(ref, r);
+    return ref;
+  }
+
+  /**
+   * The shard's channel frame: to the tabs in that channel (`joined` and `left` also to those waiting for it); the
+   * answer to a frame of one tab (its `ref`) to that tab.
+   */
+  private chanReal(g: Group, msg: Record<string, unknown>, to: (m: Member, msg: unknown) => void): void {
+    const ch = msg.ch;
+    let r: ChanRef | undefined;
+    if (typeof msg.ref === "number") {
+      r = g.refs.get(msg.ref);
+      g.refs.delete(msg.ref);
+      const { ref: _ref, ...rest } = msg;
+      msg = rest;
+    }
+    const c = typeof ch === "string" ? g.chans.get(ch) : undefined;
+    if (!c || typeof ch !== "string") return;
+    // The answer to a frame sent before the channel was left (and joined again since): about a membership gone.
+    if (r && r.c !== c) return;
+    switch (msg.t) {
+      case "published": {
+        if (!r?.msg) return;
+        for (const m of c.in) if (m !== r.m) to(m, r.msg);
+        return;
+      }
+      case "joined": {
+        const members = new Map<string, Record<string, unknown>>();
+        for (const x of Array.isArray(msg.members) ? msg.members : []) if (isObj(x) && typeof x.id === "string") members.set(x.id, x);
+        c.joined = { self: String(msg.self), members };
+        const self = members.get(c.joined.self);
+        c.state = self && "state" in self ? JSON.stringify(self.state) : undefined;
+        for (const m of [...c.in, ...c.waiting]) to(m, m === r?.m ? withRef(msg, r.tabRef) : msg);
+        for (const m of c.waiting) c.in.add(m);
+        c.waiting.clear();
+        return;
+      }
+      case "members": {
+        if (c.joined) {
+          for (const id of Array.isArray(msg.leave) ? msg.leave : []) c.joined.members.delete(String(id));
+          for (const x of Array.isArray(msg.join) ? msg.join : []) if (isObj(x) && typeof x.id === "string") c.joined.members.set(x.id, x);
+        }
+        for (const m of c.in) to(m, msg);
+        return;
+      }
+      case "msg":
+        for (const m of c.in) to(m, msg);
+        return;
+      case "left":
+        if (r && !c.joined) {
+          // The shared socket is not in: only this tab's join was refused (the others waiting get their own answer).
+          c.waiting.delete(r.m);
+          r.m.chans.delete(ch);
+          if (!c.in.size && !c.waiting.size) g.chans.delete(ch);
+          to(r.m, withRef(msg, r.tabRef));
+          return;
+        }
+        // Not (or no longer) a member on the shard: every tab in it is out.
+        g.chans.delete(ch);
+        for (const m of [...c.in, ...c.waiting]) {
+          m.chans.delete(ch);
+          to(m, m === r?.m ? withRef(msg, r.tabRef) : msg);
+        }
+        return;
+      default:
+        if (r) {
+          // This tab's own refusal (a `pub`, or a state update: the shared socket stays in, with the state it had).
+          if (!r.m.chans.has(ch)) return;
+          to(r.m, withRef(msg, r.tabRef));
+          if (!r.msg && c.joined && c.waiting.delete(r.m)) {
+            c.in.add(r.m);
+            to(r.m, JSON.parse(this.joinedOf(ch, c)));
+          }
+          return;
+        }
+        // An `err` about the channel: its tabs.
+        for (const m of [...c.in, ...c.waiting]) to(m, msg);
+    }
   }
 
   private answer(m: Member, back: unknown[], array: boolean): void {
@@ -1462,7 +1686,18 @@ class Leader {
           if (r) to(r.m, { ...msg, qid: r.qid });
           continue;
         }
+        case "joined":
+        case "members":
+        case "msg":
+        case "left":
+        case "published":
+          this.chanReal(g, msg, to);
+          continue;
         case "err": {
+          if (msg.ch !== undefined) {
+            this.chanReal(g, msg, to);
+            continue;
+          }
           if (msg.qid !== undefined) {
             const s = typeof msg.qid === "string" ? g.sharedByQid.get(msg.qid) : undefined;
             if (s) {
@@ -1614,6 +1849,16 @@ class Leader {
           continue;
         case "qres":
           refused.push({ t: "qres", qid: msg.qid, ok: false, error });
+          continue;
+        case "joined":
+        case "members":
+          // A channel's frames are for the identity too: nothing reaches it until its `auth`, which brings the member
+          // list it missed.
+          if (typeof msg.ch === "string") m.stale.add(msg.ch);
+          this.tellExpired(m, out);
+          continue;
+        case "msg":
+          this.tellExpired(m, out);
           continue;
         case "authExpired":
           m.expiredTold = true;

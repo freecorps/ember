@@ -20,7 +20,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Project } from "./config.ts";
-import { workerName } from "./config.ts";
+import { envConfig, workerName } from "./config.ts";
 import { ensureAiResources, planAiResources, type SchemaManifestLike } from "./deploy/ai.ts";
 import { CfClient, resolveToken } from "./deploy/cf.ts";
 import { CLI_ROOT } from "./source.ts";
@@ -142,7 +142,7 @@ export async function startRemote(project: Project, env: string, schema: SchemaM
   if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
     throw new Error("ember dev --remote needs Node.js (wrangler's remote bindings do not work under Bun): run it with node / npx");
   }
-  const accountId = project.config.environments[env]?.account ?? project.config.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
+  const accountId = envConfig(project, env)?.account ?? project.config.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
   if (!accountId) throw new Error(`ember dev --remote: no Cloudflare account (set "account" in ember.json or CLOUDFLARE_ACCOUNT_ID)`);
   const token = resolveToken();
   const plan = planRemote(project, env, schema);
