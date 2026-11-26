@@ -25,7 +25,7 @@ const mailer = (queues: string[]) =>
   defineComponent({
     name: "mailer",
     functions: {},
-    bindings: () => [{ type: "send_email", name: "EMAIL" }],
+    bindings: () => [{ type: "send_email", name: "EMAIL" }, { type: "analytics_engine", name: "MAIL_AE", dataset: "mail_events" }],
     queues: Object.fromEntries(queues.map((q) => [q, { consumer: { maxBatchSize: 50, maxRetries: 5 }, handler: async () => {} }])),
     email: { handler: async () => {} },
   });
@@ -122,6 +122,7 @@ describe("deploy: component queues and send_email", () => {
     expect(cf.calls[upload]!.metadata.bindings).toEqual(
       expect.arrayContaining([
         { type: "send_email", name: "EMAIL" },
+        { type: "analytics_engine", name: "MAIL_AE", dataset: "mail_events" },
         { type: "queue", name: "EMBER_Q_EMAIL_EVENTS", queue_name: "ember-mail-prod-email-events" },
         { type: "queue", name: "EMBER_Q_EMAIL_INBOUND", queue_name: "ember-mail-prod-email-inbound" },
       ]),
@@ -156,5 +157,7 @@ describe("deploy: component queues and send_email", () => {
     expect(w).toContain("ember-mail-local-email-events");
     expect(w).toContain("EMBER_Q_EMAIL_EVENTS");
     expect(w).toContain('"EMAIL"');
+    // A component's Analytics Engine binding runs on Miniflare's local dataset.
+    expect(w).toContain('"MAIL_AE":{"type":"analytics-engine-dataset","name":"mail_events"');
   });
 });

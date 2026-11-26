@@ -479,6 +479,15 @@ describe("component hooks (crons, queues, email)", () => {
     expect(() => composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(fixed).use(fixed, { name: "again" }) })).toThrow(/binding MY_Q is declared twice/);
   });
 
+  test("an Analytics Engine binding (type analytics_engine) goes to the manifest per install, and may not clash with a queue's", () => {
+    const ae = defineComponent({ name: "ae", functions: {}, bindings: (_c, install) => [{ type: "analytics_engine", name: `AE_${install.toUpperCase()}`, dataset: "ds" }], queues: { q: { handler: async () => {} } } });
+    const c = composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(ae).use(ae, { name: "two" }) });
+    expect(c.schema.manifest.components!.ae!.bindings).toEqual([{ type: "analytics_engine", name: "AE_AE", dataset: "ds" }]);
+    expect(c.schema.manifest.components!.two!.bindings).toEqual([{ type: "analytics_engine", name: "AE_TWO", dataset: "ds" }]);
+    const clash = defineComponent({ name: "clash", functions: {}, bindings: () => [{ type: "analytics_engine", name: "EMBER_Q_CLASH_Q", dataset: "ds" }], queues: { q: { handler: async () => {} } } });
+    expect(() => composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(clash) })).toThrow(/declared twice/);
+  });
+
   test("validation: queue names, handlers, cron targets, duplicate bindings", () => {
     expect(() => defineComponent({ name: "q", functions: {}, queues: { Bad_Name: { handler: async () => {} } } })).toThrow(/queue name/);
     expect(() => defineComponent({ name: "q", functions: {}, queues: { ok: {} as any } })).toThrow(/needs a handler/);

@@ -14,7 +14,7 @@ export interface LocalOptions {
   persist?: boolean;
   /** Extra plain-text vars. */
   vars?: Record<string, string>;
-  /** `manifest.components` of the composed app: component queues and `send_email` bindings run locally too. */
+  /** `manifest.components` of the composed app: component queues, `send_email` and `analytics_engine` bindings run locally too. */
   components?: Record<string, { queues?: Array<{ queue: string; binding: string }>; bindings?: Array<{ type: string; name: string } & Record<string, unknown>> }>;
   /** `ember dev --remote`: bindings proxied to real Cloudflare resources (remote.ts). */
   remote?: RemoteBindings;
@@ -28,11 +28,12 @@ export interface LocalOptions {
 /** The local D1 of `ember dev --dashboard` (binding → database id). */
 export const DEV_REGISTRY_D1 = { EMBER_REGISTRY: "ember-dev-registry" };
 
-/** Local queues and send_email bindings that installed components declared (hooks, PLAN §12). */
+/** Local queues, send_email and Analytics Engine bindings that installed components declared (hooks, PLAN §12). */
 function componentLocal(project: string, components: LocalOptions["components"]) {
   const producers: Record<string, string> = {};
   const consumers: string[] = [];
   const sendEmail: Array<{ name: string } & Record<string, unknown>> = [];
+  const analytics: Record<string, { dataset: string }> = {};
   for (const c of Object.values(components ?? {})) {
     for (const q of c.queues ?? []) {
       const name = `ember-${project}-local-${q.queue}`;
@@ -42,12 +43,15 @@ function componentLocal(project: string, components: LocalOptions["components"])
     // Miniflare simulates send_email: messages are logged and written under its temp dir (no real mail).
     for (const b of c.bindings ?? []) {
       if (b.type === "send_email") sendEmail.push({ ...(Object.fromEntries(Object.entries(b).filter(([k]) => k !== "type"))), name: b.name });
+      // Miniflare's local Analytics Engine: writes are accepted and dropped (there is no local SQL API).
+      if (b.type === "analytics_engine" && typeof b.dataset === "string") analytics[b.name] = { dataset: b.dataset };
     }
   }
   return {
     ...(consumers.length ? { queueProducers: producers, queueConsumers: consumers } : {}),
     // The shapes come from the component's own `bindings` (validated by componentBindings at deploy).
     ...(sendEmail.length ? { email: { send_email: sendEmail as never } } : {}),
+    ...(Object.keys(analytics).length ? { analyticsEngineDatasets: analytics } : {}),
   };
 }
 
