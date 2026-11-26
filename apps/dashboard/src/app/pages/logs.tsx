@@ -1,23 +1,17 @@
 // Live logs of an environment: the dashboard Worker tails the project's Worker (like `ember logs`) and streams the
 // events here as NDJSON over an authenticated fetch. Everything shown is text from the project: never markup.
+//
+// Workers Tail is live only (no history, no server-side search): text search, the level and function filters and the
+// time range apply here, in the browser, to the last WINDOW events this tab received, and "Export NDJSON" saves what
+// they match (at most EXPORT_MAX lines). The page says so.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, path } from "../api.ts";
+import { download } from "../export.ts";
+import { EXPORT_MAX, RANGES, searchLogs, SHOWN, toNdjson, WINDOW, type Level, type LogRecord } from "../logsearch.ts";
+import { fmtNum } from "../format.ts";
 import { Badge, Empty, Mono, Problem } from "../ui.tsx";
 
-type LogLine =
-  | { t: number; kind: "exec"; fn: string; shard: string; type: string; status: string; errorCode: string; ms: number; rowsRead: number; rowsWritten: number }
-  | { t: number; kind: "log"; level: string; message: string }
-  | { t: number; kind: "exception"; message: string };
-
-interface LogRecord {
-  t: number;
-  outcome: string;
-  head: string;
-  lines: LogLine[];
-}
-
-const MAX_RECORDS = 500;
 const time = (ms: number) => new Date(ms).toLocaleTimeString(undefined, { hour12: false }) + `.${String(ms % 1000).padStart(3, "0")}`;
 
 export function Logs({ project, env }: { project: string; env: string }) {
@@ -29,6 +23,24 @@ export function Logs({ project, env }: { project: string; env: string }) {
   const [ended, setEnded] = useState<string | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
   const [follow, setFollow] = useState(true);
+  const [text, setText] = useState("");
+  const [level, setLevel] = useState<Level>("any");
+  const [fnSearch, setFnSearch] = useState("");
+  const [range, setRange] = useState<(typeof RANGES)[number]["id"]>("all");
+  // Re-evaluated with the records (and each second while a range is on), so "last minute" keeps moving.
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (range === "all") return;
+    const t = setInterval(() => setTick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, [range]);
+  const searching = !!text.trim() || level !== "any" || !!fnSearch.trim() || range !== "all";
+  const matches = useMemo(() => {
+    const ms = RANGES.find((r) => r.id === range)?.ms ?? 0;
+    // `tick` (a dependency) moves the range's start with the clock.
+    return searchLogs(records, { text, level, fn: fnSearch, since: ms ? Date.now() - ms + tick * 0 : 0 });
+  }, [records, text, level, fnSearch, range, tick]);
+  const shown = matches.slice(-SHOWN);
   const abort = useRef<AbortController | null>(null);
   const seq = useRef(0);
   const list = useRef<HTMLDivElement>(null);
@@ -72,7 +84,7 @@ export function Logs({ project, env }: { project: string; env: string }) {
           else if (m.type === "event" && m.record) got.push({ ...m.record, n: ++seq.current });
           else if (m.type === "end") setEnded(m.reason ?? "ended");
         }
-        if (got.length) setRecords((r) => [...r, ...got].slice(-MAX_RECORDS));
+        if (got.length) setRecords((r) => [...r, ...got].slice(-WINDOW));
       }
       setState("ended");
     } catch (e) {
@@ -120,13 +132,42 @@ export function Logs({ project, env }: { project: string; env: string }) {
       <p className="muted small hint">
         Filters by function and shard need <code>EMBER_TRACE=1</code> on the project (one line per execution); without it they match the log text. Changing a filter takes effect on the next Start.
       </p>
+      <div className="toolbar log-search" role="search" aria-label="Search the received logs">
+        <input type="search" placeholder="Search text…" value={text} onChange={(e) => setText(e.target.value)} aria-label="Search logs" />
+        <select value={level} onChange={(e) => setLevel(e.target.value as Level)} aria-label="Level">
+          <option value="any">any level</option>
+          <option value="warn">warnings and errors</option>
+          <option value="error">errors only</option>
+        </select>
+        <input placeholder="function" value={fnSearch} onChange={(e) => setFnSearch(e.target.value)} aria-label="Search by function" className="mono" />
+        <select value={range} onChange={(e) => setRange(e.target.value as typeof range)} aria-label="Time range">
+          {RANGES.map((r) => (
+            <option key={r.id} value={r.id}>
+              {r.label}
+            </option>
+          ))}
+        </select>
+        <span className="muted small" aria-live="polite">
+          {searching ? `${fmtNum(matches.length)} of ${fmtNum(records.length)} events` : `${fmtNum(records.length)} events`}
+        </span>
+        <span className="spacer" />
+        <button type="button" disabled={!matches.length} onClick={() => download(`logs-${project}-${env}-${new Date().toISOString().replace(/[:.]/g, "-")}.ndjson`, "application/x-ndjson", toNdjson(matches))}>
+          Export NDJSON
+        </button>
+      </div>
+      <p className="muted small hint">
+        Workers Tail is live only and cannot be searched server-side: search, filters and export apply in this browser to the last {fmtNum(WINDOW)} events this tab received since Start (export: up to {fmtNum(EXPORT_MAX)} lines), not to stored history.
+      </p>
       {error && <Problem error={error} onRetry={() => void start()} />}
       {ended && <div className="notice info">Stream ended: {ended}.</div>}
+      {matches.length > SHOWN && <p className="muted small">Showing the newest {fmtNum(SHOWN)} of {fmtNum(matches.length)} matching events; the export has all of them.</p>}
       <div className="log-list" ref={list} role="log" aria-live="off" aria-label="Log events">
         {!records.length ? (
           <Empty>{live ? "Waiting for events…" : "Start to stream this environment's logs."}</Empty>
+        ) : !shown.length ? (
+          <Empty>No received event matches the search.</Empty>
         ) : (
-          records.map((r) => (
+          shown.map((r) => (
             <div key={r.n} className={`log-rec${r.outcome !== "ok" ? " bad" : ""}`}>
               <div className="log-head">
                 <span className="log-time">{time(r.t)}</span>

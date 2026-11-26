@@ -1,15 +1,18 @@
 // Functions: the list with their numbers (Analytics Engine), and one function's page — charts over time, recent
 // errors and the runner. The runner calls the project's admin endpoint, which runs the function in the project's
 // Worker; "run as" hands it an identity built there (no token is ever minted or returned). Admin only, audited.
+// The runner keeps the last runs in this browser (localStorage, runner.ts) to run one again, and copies the call as
+// cURL (the admin token as the `$EMBER_ADMIN_TOKEN` placeholder, never a real one) or as TypeScript.
 
 import { useMemo, useState } from "react";
 import { api, ApiError, path } from "../api.ts";
 import { TimeChart } from "../chart.tsx";
 import { ago, fmtBytes, fmtNum, fmtPct, fmtTime, windowLabel, windows } from "../format.ts";
 import { href, useApi, useSession } from "../hooks.ts";
-import { Badge, ConfirmDialog, Empty, JsonView, Loading, Mono, Problem, Section, Table } from "../ui.tsx";
+import { Badge, ConfirmDialog, Dialog, Empty, JsonView, Loading, Mono, Problem, Section, Table } from "../ui.tsx";
 import { limitWarnings, seriesPeaks } from "../../metrics-sql.ts";
-import type { FunctionRow } from "./types.ts";
+import type { FunctionRow, Project } from "./types.ts";
+import { clearHistory, curlFor, loadHistory, saveRun, tsFor, type RunEntry } from "../runner.ts";
 import { argsFromForm, fieldKind, type Shape } from "../forms.ts";
 
 /** What p50/p95 measure per timing label (@freecorps/ember-runtime metrics.ts). */
@@ -128,6 +131,9 @@ function FunctionPage({ project, env, fn }: { project: string; env: string; fn: 
   const [hours, setHours] = useState(24);
   const list = useApi<{ functions: FunctionInfo[] }>(path("/api/fn/list", { project, env }));
   const info = list.data?.functions.find((f) => f.name === fn);
+  // The environment's URL, for "Copy as cURL" (the registry's; null → the command says $EMBER_URL).
+  const projects = useApi<{ projects: Project[] }>(s.isAdmin ? "/api/projects" : null);
+  const url = projects.data?.projects.find((x) => x.name === project)?.envs.find((e) => e.env === env)?.url ?? null;
   const series = useApi<{ points: Array<{ t: number; calls: number; errors: number; p50: number; p95: number; rowsRead: number; rowsWritten: number; limitPeaks?: { rowsRead: number; documentsRead: number; rowsWritten: number } }>; bucketMinutes: number }>(
     s.me.metrics ? path("/api/fn/series", { project, env, fn, hours }) : null,
   );
@@ -200,7 +206,7 @@ function FunctionPage({ project, env, fn }: { project: string; env: string; fn: 
       )}
       <div className="grid2">
         <Section title="Run" id="runner">
-          {!s.isAdmin ? <Empty>Running functions needs the admin role.</Empty> : info ? <Runner project={project} env={env} info={info} /> : list.loading ? <Loading /> : null}
+          {!s.isAdmin ? <Empty>Running functions needs the admin role.</Empty> : info ? <Runner project={project} env={env} info={info} url={url} /> : list.loading ? <Loading /> : null}
         </Section>
         <Section title="Recent errors" id="errors" actions={<span className="muted small">codes from Analytics Engine; messages are in the logs</span>}>
           {!s.me.metrics ? (
@@ -225,7 +231,14 @@ function FunctionPage({ project, env, fn }: { project: string; env: string; fn: 
 
 // ------------------------------------------------------------------------------------------- runner
 
-function Runner({ project, env, info }: { project: string; env: string; info: FunctionInfo }) {
+/** What one run sends (the form's values, or a history entry's). */
+interface RunInput {
+  args: Record<string, unknown>;
+  shard: string;
+  as: { subject: string; claims?: Record<string, unknown> } | null;
+}
+
+function Runner({ project, env, info, url }: { project: string; env: string; info: FunctionInfo; url: string | null }) {
   const s = useSession();
   const fields = Object.entries(info.args.fields ?? {});
   const simple = fields.every(([, f]) => fieldKind(f.shape).kind !== "json") && fields.length <= 12;
@@ -239,6 +252,11 @@ function Runner({ project, env, info }: { project: string; env: string; info: Fu
   const [confirming, setConfirming] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; value?: unknown; error?: unknown; ms?: number; as?: string | null } | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
+  const [history, setHistory] = useState<RunEntry[]>(loadHistory);
+  const mine = history.filter((e) => e.project === project && e.env === env && e.fn === info.name);
+  /** The run waiting for the protected environment's confirmation (the form's, or a history entry's). */
+  const [pending, setPending] = useState<RunInput | null>(null);
+  const [snippet, setSnippet] = useState<{ title: string; text: string } | null>(null);
 
   let args: Record<string, unknown> | null = null;
   let argsError: string | null = null;
@@ -275,8 +293,11 @@ function Runner({ project, env, info }: { project: string; env: string; info: Fu
   const writes = info.type !== "query";
   const refusedAs = !!asUser.trim() && info.sensitive;
 
-  const run = async () => {
-    if (!args) return;
+  const current = (): RunInput | null => (args ? { args, shard: target, as: asUser.trim() ? { subject: asUser.trim(), ...(claimsObj ? { claims: claimsObj } : {}) } : null } : null);
+  const record = (input: RunInput, ok: boolean, value: unknown, ms: number | null) =>
+    setHistory((h) => saveRun(h, { at: Date.now(), project, env, fn: info.name, type: info.type, shard: input.shard, args: input.args, ...(input.as ? { as: input.as.subject, ...(input.as.claims ? { claims: input.as.claims } : {}) } : {}), ok, result: value, ms }));
+
+  const run = async (input: RunInput) => {
     setBusy(true);
     setError(null);
     setResult(null);
@@ -284,20 +305,50 @@ function Runner({ project, env, info }: { project: string; env: string; info: Fu
       const r = await api.post<{ ok: boolean; value?: unknown; ms: number; as: string | null }>("/api/fn/run", {
         project,
         env,
-        shard: target,
+        shard: input.shard,
         fn: info.name,
-        args,
-        ...(asUser.trim() ? { as: { subject: asUser.trim(), ...(claimsObj ? { claims: claimsObj } : {}) } } : {}),
+        args: input.args,
+        ...(input.as ? { as: input.as } : {}),
       });
       setResult(r);
+      record(input, true, r.value, r.ms);
     } catch (e) {
       const x = e as ApiError;
       // A function error is a result, not a failure of the dashboard.
-      if (x.status === 400 && x.code !== "bad_request" && x.code !== "bad_shard") setResult({ ok: false, error: { code: x.code, message: x.message, ...(x.data ? { data: x.data } : {}) } });
-      else setError(x);
+      if (x.status === 400 && x.code !== "bad_request" && x.code !== "bad_shard") {
+        const fnError = { code: x.code, message: x.message, ...(x.data ? { data: x.data } : {}) };
+        setResult({ ok: false, error: fnError });
+        record(input, false, fnError, null);
+      } else setError(x);
     } finally {
       setBusy(false);
       setConfirming(false);
+      setPending(null);
+    }
+  };
+  /** Runs now, or after the confirmation on a protected environment (writes). */
+  const start = (input: RunInput) => {
+    if (writes && s.isProtected(env)) {
+      setPending(input);
+      setConfirming(true);
+    } else void run(input);
+  };
+  /** A history entry back in the form (JSON editor, its shard and identity), and run again when asked. */
+  const load = (e: RunEntry, again: boolean) => {
+    setMode("json");
+    setJson(JSON.stringify(e.args, null, 2));
+    if (!info.shard?.fromArg) setShard(e.shard);
+    setAsUser(e.as ?? "");
+    setClaims(e.claims ? JSON.stringify(e.claims) : "");
+    if (again) start({ args: e.args, shard: e.shard, as: e.as ? { subject: e.as, ...(e.claims ? { claims: e.claims } : {}) } : null });
+  };
+  const copy = async (title: string, text: string) => {
+    setSnippet({ title, text });
+    try {
+      await navigator.clipboard.writeText(text);
+      s.toast({ text: `Copied ${title}` });
+    } catch {
+      // No clipboard access (permissions, an insecure origin): the dialog shows the text to copy by hand.
     }
   };
 
@@ -307,9 +358,9 @@ function Runner({ project, env, info }: { project: string; env: string; info: Fu
       className="runner"
       onSubmit={(e) => {
         e.preventDefault();
-        if (!args || claimsError || refusedAs) return;
-        if (writes && s.isProtected(env)) setConfirming(true);
-        else void run();
+        const input = current();
+        if (!input || claimsError || refusedAs) return;
+        start(input);
       }}
     >
       <div className="tabs-inline" role="tablist" aria-label="Arguments editor">
@@ -393,6 +444,13 @@ function Runner({ project, env, info }: { project: string; env: string; info: Fu
           {busy ? "Running…" : `Run ${info.type}`}
         </button>
         {writes && <span className="muted small">{info.type === "action" ? "Actions can call external services and write." : "Writes to the shard."}</span>}
+        <span className="spacer" />
+        <button type="button" disabled={!args || !!claimsError} onClick={() => args && void copy("cURL", curlFor({ url, shard: target, fn: info.name, args, as: current()?.as ?? null }))}>
+          Copy as cURL
+        </button>
+        <button type="button" disabled={!args} onClick={() => args && void copy("TypeScript", tsFor({ fn: info.name, type: info.type, visibility: info.visibility, args }))}>
+          Copy as TypeScript
+        </button>
       </div>
       {error && <Problem error={error} />}
       {result && (
@@ -406,12 +464,80 @@ function Runner({ project, env, info }: { project: string; env: string; info: Fu
         </div>
       )}
     </form>
+      <RunHistory entries={mine} busy={busy} onLoad={(e) => load(e, false)} onRerun={(e) => load(e, true)} onClear={() => setHistory((h) => clearHistory(h, { project, env, fn: info.name }))} />
       {/* Outside the form: the dialog has its own form, and forms do not nest. */}
-      <ConfirmDialog open={confirming} title={`Run ${info.name} on ${env}?`} confirmLabel={`Run ${info.type}`} busy={busy} onCancel={() => setConfirming(false)} onConfirm={() => void run()}>
+      <ConfirmDialog open={confirming} title={`Run ${info.name} on ${env}?`} confirmLabel={`Run ${info.type}`} busy={busy} onCancel={() => (setConfirming(false), setPending(null))} onConfirm={() => pending && void run(pending)}>
         <p>
-          This {info.type} runs on <Mono>{target}</Mono> in a protected environment{asUser.trim() ? <> as <Mono>{asUser.trim()}</Mono></> : null}. It is recorded in the audit log.
+          This {info.type} runs on <Mono>{pending?.shard ?? target}</Mono> in a protected environment{pending?.as ? <> as <Mono>{pending.as.subject}</Mono></> : null}. It is recorded in the audit log.
         </p>
       </ConfirmDialog>
+      <Dialog open={!!snippet} onClose={() => setSnippet(null)} title={`${info.name} as ${snippet?.title ?? ""}`} wide>
+        <div className="dialog-body">
+          {snippet?.title === "cURL" && (
+            <p className="muted small">
+              Set <code>EMBER_ADMIN_TOKEN</code> to the project's admin token first (the dashboard never shows it). This calls the admin endpoint directly: it is not in the dashboard's audit log.
+            </p>
+          )}
+          <pre className="json" aria-label={`${snippet?.title ?? ""} snippet`}>
+            {snippet?.text}
+          </pre>
+        </div>
+        <footer className="dialog-foot">
+          <span className="spacer" />
+          <button type="button" className="primary" onClick={() => snippet && void copy(snippet.title, snippet.text)}>
+            Copy
+          </button>
+        </footer>
+      </Dialog>
     </>
+  );
+}
+
+// ------------------------------------------------------------------------------------------- history
+
+/** The last runs of this function from this browser (localStorage): load one into the form, or run it again. */
+function RunHistory({ entries, busy, onLoad, onRerun, onClear }: { entries: RunEntry[]; busy: boolean; onLoad: (e: RunEntry) => void; onRerun: (e: RunEntry) => void; onClear: () => void }) {
+  return (
+    <div className="run-history">
+      <div className="toolbar">
+        <strong className="small">History</strong>
+        <span className="muted small">last runs from this browser (kept in its storage, not shared)</span>
+        <span className="spacer" />
+        <button type="button" className="link" disabled={!entries.length} onClick={onClear}>
+          Clear
+        </button>
+      </div>
+      <Table
+        label="Run history"
+        empty="No runs of this function from this browser yet."
+        rowKeys={entries.map((e) => e.id)}
+        cols={[{ h: "When" }, { h: "Args" }, { h: "Shard" }, { h: "Result" }, { h: "ms", num: true }, { h: "" }]}
+        rows={entries.map((e) => [
+          <span title={fmtTime(e.at)}>{ago(e.at)}</span>,
+          <code className="mono small clip" title={JSON.stringify(e.args)}>
+            {JSON.stringify(e.args)}
+          </code>,
+          <span>
+            <Mono>{e.shard}</Mono>
+            {e.as ? <span className="muted small"> as {e.as}</span> : null}
+          </span>,
+          <span>
+            <Badge tone={e.ok ? "ok" : "bad"}>{e.ok ? "ok" : "error"}</Badge>{" "}
+            <code className="mono small clip" title={e.result}>
+              {e.result}
+            </code>
+          </span>,
+          e.ms === null ? "—" : fmtNum(e.ms, 1),
+          <span className="row-actions">
+            <button type="button" className="link" onClick={() => onLoad(e)}>
+              Load
+            </button>
+            <button type="button" disabled={busy} onClick={() => onRerun(e)} aria-label={`Re-run with ${JSON.stringify(e.args)}`}>
+              Re-run
+            </button>
+          </span>,
+        ])}
+      />
+    </div>
   );
 }
