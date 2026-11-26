@@ -80,7 +80,8 @@ the signature is RSASSA-PKCS1-v1_5 with SHA-256 through WebCrypto. Requests that
 - `noUpdateAvailable` (protocol 1) when the client already runs that update, when nothing is published, or when the
   channel is paused, or the branch the install falls on is (the kill switch); `rollBackToEmbedded` after a rollback to the embedded update
   (`noUpdateAvailable` if the client already runs the embedded one). Protocol 0 and the JSON form have no directives:
-  204 for "nothing new", 406 for a rollback; protocol 0 gets the manifest even when it is the current one (the client
+  204 for "nothing new"; a rollback goes as multipart when `accept` also allows it (any q above 0, even below JSON),
+  and is a 406 only when no accepted form can carry it (protocol 0, or multipart excluded); protocol 0 gets the manifest even when it is the current one (the client
   compares the ids). `accept` picks the form by q-value, the most specific range deciding (`multipart/mixed;q=0, */*`
   is JSON); the JSON form answers with the media type chosen (`application/json` or `application/expo+json`).
 

@@ -172,6 +172,8 @@ const releaseOf = (r: { uuid: string; republishOf?: string }) => r.republishOf ?
 /** Live rows a rollback reads per step, and at most in all, looking for the previous release. */
 const ROLLBACK_WINDOW = 50;
 const ROLLBACK_SCAN_MAX = 1000;
+/** Rows one rollback call reads in all (every pair): below the mutation's default `documentsRead` (16 384). */
+const ROLLBACK_READ_BUDGET = 12_000;
 
 /**
  * The head of (branch, platform, runtime version), the newest live row of another release (`prev`, or null: none), and
@@ -179,10 +181,14 @@ const ROLLBACK_SCAN_MAX = 1000;
  * `ROLLBACK_WINDOW` until another release shows up; past `ROLLBACK_SCAN_MAX` copies of the head's release it refuses
  * (a rollback there must say `toEmbedded`, or the copies be rolled back first) rather than guess.
  */
-function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runtimeVersion: string, toEmbedded = false) {
+function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runtimeVersion: string, toEmbedded = false, budget: { rows: number } = { rows: ROLLBACK_READ_BUDGET }) {
   const rows: ReturnType<typeof liveRows> = [];
   for (;;) {
     const last = rows[rows.length - 1];
+    // The first step reads 2 (the head and, as a rule, the release before it), the next ones a window each.
+    const want = rows.length ? ROLLBACK_WINDOW : 2;
+    if (budget.rows < want) throw new EmberError("ValidationError", `${branch}: a branch-wide rollback reads too much at once: name the platform and runtimeVersion (or roll back fewer pairs per call)`);
+    budget.rows -= want;
     const step = ctx.db
       .query("updates")
       .withIndex("by_head", (q) => {
@@ -190,7 +196,7 @@ function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runti
         return last ? live.lt("createdAt", last.createdAt) : live;
       })
       .order("desc")
-      .take(ROLLBACK_WINDOW);
+      .take(want);
     rows.push(...step);
     const head = rows[0];
     if (!head) return null;
@@ -207,7 +213,7 @@ function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runti
       if (r.outRelease) out.add(r.outRelease);
     }
     const prev = at >= 0 ? rows[at]! : null;
-    if (prev || step.length < ROLLBACK_WINDOW) return { head, prev, rows: prev ? rows.slice(0, at) : rows };
+    if (prev || step.length < want) return { head, prev, rows: prev ? rows.slice(0, at) : rows };
     // Past the bound: to the embedded update the copies read so far go (a later rollback takes the rest);
     // otherwise no previous release can be told, and the rollback refuses rather than guess.
     if (rows.length >= ROLLBACK_SCAN_MAX && toEmbedded) return { head, prev: null, rows };
@@ -493,15 +499,22 @@ export const functions = {
       handler: (ctx, a) => {
         if (!branchByName(ctx, a.branch)) throw expoUpdatesErrors.UnknownBranch({ name: a.branch });
         const out: Array<{ platform: Platform; runtimeVersion: string; rolledBack: string; now: string; kind: "update" | "rollBackToEmbedded" }> = [];
+        // One read budget for the whole call (every pair): past it, the call refuses and says how to narrow it.
+        const budget = { rows: ROLLBACK_READ_BUDGET };
         for (const p of pairsOf(ctx, a.branch, a.platform, a.runtimeVersion)) {
           // A rollback takes out the head's release (the head and the live copies of it a rollback republished) and
           // goes back to the newest live row of another release: rolling back B' (a republish of B) reaches A, not B.
           // To the embedded update no previous release is needed: the search stops at its bound instead of refusing.
-          const scan = previousRelease(ctx, a.branch, p.platform, p.runtimeVersion, !!a.toEmbedded);
+          const scan = previousRelease(ctx, a.branch, p.platform, p.runtimeVersion, !!a.toEmbedded, budget);
           if (!scan) continue;
           const { head, prev, rows } = scan;
           const bad = releaseOf(head);
-          if (head.kind === "rollBackToEmbedded" && (a.toEmbedded || !prev)) continue; // already on the embedded update
+          if (head.kind === "rollBackToEmbedded" && (a.toEmbedded || !prev)) {
+            // Already on the embedded update. To it again: the copies of releases taken out read below the directive (a
+            // bounded batch, never the release before them) go too, so an ordinary rollback later reaches that one.
+            if (a.toEmbedded) for (const r of rows.slice(1)) ctx.db.patch(r._id, { rolledBack: true });
+            continue;
+          }
           // Out of service: the head's release and the rows of releases already taken out read on the way.
           for (const r of rows) ctx.db.patch(r._id, { rolledBack: true });
           const uuid = uuidOf(ctx.random);
@@ -559,11 +572,15 @@ export const functions = {
         const c = channelByName(ctx, a.name);
         if (c?.branch !== a.branch && c?.rolloutBranch !== a.branch) checkFanOut(ctx, a.branch, c?._id ?? null);
         if (a.rolloutBranch && c?.branch !== a.rolloutBranch && c?.rolloutBranch !== a.rolloutBranch) checkFanOut(ctx, a.rolloutBranch, c?._id ?? null);
+        // The stored channel keeps distinct branches: a new primary that is the stored rollout branch ends that rollout
+        // (with a rollout percentage given too, it is refused: there would be nothing to roll out to).
+        const sameAsRollout = !clear && !a.rolloutBranch && c?.rolloutBranch === a.branch;
+        if (sameAsRollout && a.rolloutPercent !== undefined) throw new EmberError("ValidationError", `${a.branch} is the channel's rollout branch: a primary and a rollout branch must differ`);
         // undefined removes an optional field (ctx.db.patch), so this clears the rollout.
-        const rollout = clear ? { rolloutBranch: undefined, rolloutPercent: undefined } : a.rolloutBranch ? { rolloutBranch: a.rolloutBranch, rolloutPercent: a.rolloutPercent! } : {};
+        const rollout = clear || sameAsRollout ? { rolloutBranch: undefined, rolloutPercent: undefined } : a.rolloutBranch ? { rolloutBranch: a.rolloutBranch, rolloutPercent: a.rolloutPercent! } : {};
         if (c) {
           if (!clear && !a.rolloutBranch && a.rolloutPercent !== undefined && !c.rolloutBranch) throw new EmberError("ValidationError", "rolloutPercent needs rolloutBranch");
-          ctx.db.patch(c._id, { branch: a.branch, ...rollout, ...(!clear && !a.rolloutBranch && a.rolloutPercent !== undefined ? { rolloutPercent: a.rolloutPercent } : {}), version: c.version + 1, updatedAt: ctx.now });
+          ctx.db.patch(c._id, { branch: a.branch, ...rollout, ...(!clear && !sameAsRollout && !a.rolloutBranch && a.rolloutPercent !== undefined ? { rolloutPercent: a.rolloutPercent } : {}), version: c.version + 1, updatedAt: ctx.now });
         } else {
           if (!a.rolloutBranch && a.rolloutPercent !== undefined) throw new EmberError("ValidationError", "rolloutPercent needs rolloutBranch");
           ctx.db.insert("channels", { name: a.name, branch: a.branch, ...(a.rolloutBranch ? { rolloutBranch: a.rolloutBranch, rolloutPercent: a.rolloutPercent! } : {}), paused: false, version: 0, updatedAt: ctx.now });

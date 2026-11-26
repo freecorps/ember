@@ -285,6 +285,47 @@ describe("expo updates component", () => {
     expect((await ask(t)).manifest.launchAsset.hash).toBe(createHash("sha256").update("A").digest("base64url"));
   }, 180_000);
 
+  test("repeated rollbacks to the embedded update retire the copies left below the directive, until A is reachable", async () => {
+    const t = harness();
+    await publish(t, { bundle: "A" });
+    await publish(t, { bundle: "B" });
+    // Thousands of publishes: ids given (the harness's seeded random repeats one now and then over this many).
+    await upload(t, { bundle: "tmp" });
+    for (let i = 0; i < 1999; i++) {
+      await t.mutation(m("publish"), { branch: "production", updates: [{ id: crypto.randomUUID(), platform: "ios", runtimeVersion: "1.0.0", launchAsset: asset("tmp", "bundle-ios", "application/javascript"), assets: [] }] });
+      await t.mutation(m("rollback"), { branch: "production" });
+    }
+    let reached = false;
+    for (let i = 0; i < 5 && !reached; i++) {
+      try {
+        await t.mutation(m("rollback"), { branch: "production" });
+        reached = true;
+      } catch (e) {
+        expect(String(e)).toMatch(/toEmbedded/);
+        await t.mutation(m("rollback"), { branch: "production", toEmbedded: true });
+      }
+    }
+    expect(reached).toBe(true);
+    expect((await ask(t)).manifest.launchAsset.hash).toBe(createHash("sha256").update("A").digest("base64url"));
+  }, 180_000);
+
+  test("a channel never keeps one branch as both primary and rollout branch", async () => {
+    const t = harness();
+    for (const b of ["A", "B", "C"]) await publish(t, { branch: b, bundle: `bundle-${b}` });
+    const set = (args: Record<string, unknown>) => t.mutation(m("setChannel"), { name: "ch", ...args }) as Promise<{ branch: string; rolloutBranch?: string; rolloutPercent?: number }>;
+    expect(await set({ branch: "A", rolloutBranch: "B", rolloutPercent: 30 })).toMatchObject({ branch: "A", rolloutBranch: "B", rolloutPercent: 30 });
+    // The rollout branch becomes the primary: the rollout ends.
+    const now = await set({ branch: "B" });
+    expect([now.branch, now.rolloutBranch, now.rolloutPercent]).toEqual(["B", undefined, undefined]);
+    // Later primaries do not bring it back.
+    const later = await set({ branch: "C" });
+    expect([later.branch, later.rolloutBranch]).toEqual(["C", undefined]);
+    expect((await ask(t, { "expo-channel-name": "ch" })).manifest.launchAsset.hash).toBe(createHash("sha256").update("bundle-C").digest("base64url"));
+    // With a percentage given for a rollout branch that is now the primary: refused.
+    await set({ branch: "A", rolloutBranch: "B", rolloutPercent: 30 });
+    await expect(set({ branch: "B", rolloutPercent: 50 })).rejects.toThrow(/must differ/);
+  });
+
   test("branch-wide commands find every live platform and runtime version, however many rows other ones have", async () => {
     const t = harness();
     await publish(t, { bundle: "ios-1", platforms: ["ios"] });
