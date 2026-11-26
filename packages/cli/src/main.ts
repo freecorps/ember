@@ -4,7 +4,7 @@ import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { limitWarnings, queryFunctionStats } from "@freecorps/ember-dashboard/metrics-sql";
 import { codegen } from "./codegen/index.ts";
-import { findProjectRoot, loadProject, resolveEnv, workerName, type Project } from "./config.ts";
+import { envConfig, findProjectRoot, loadProject, previewEnvName, resolveEnv, workerName, type Project } from "./config.ts";
 import { DEFAULT_DASHBOARD_NAME, deployDashboard } from "./dashboard.ts";
 import { deployWithDashboard, destroyDashboard, revealOnce, rotateDashboardToken, type DashboardIo } from "./dashboard-link.ts";
 import { interactive, terminalPrompter } from "./prompt.ts";
@@ -184,7 +184,7 @@ function maybeProject(): Project | null {
 /** Cloudflare client for the project's (or --account / CLOUDFLARE_ACCOUNT_ID) account. */
 function accountClient(project: Project | null, account?: string, env?: string): CfClient {
   const accountId =
-    account ?? (project && env ? project.config.environments[env]?.account : undefined) ?? project?.config.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
+    account ?? (project && env ? envConfig(project, env)?.account : undefined) ?? project?.config.account ?? process.env.CLOUDFLARE_ACCOUNT_ID;
   if (!accountId) throw new Error(`No Cloudflare account: pass --account, set "account" in ember.json or CLOUDFLARE_ACCOUNT_ID.`);
   return new CfClient({ accountId, token: resolveToken() });
 }
@@ -289,9 +289,29 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           preflight: { type: "boolean" },
           "allow-schema-rollback": { type: "boolean" },
           "allow-missing-env": { type: "boolean" },
+          preview: { type: "string" },
+          destroy: { type: "boolean" },
         },
       });
       const allowSchemaRollback = !!values["allow-schema-rollback"];
+      if (values.destroy && values.preview === undefined) throw new Error("--destroy needs --preview <branch> (`ember destroy --env name --yes` deletes a declared environment)");
+      if (values.preview !== undefined) {
+        if (values.env) throw new Error("--preview <branch> names the environment itself (preview-<slug>): drop --env");
+        if (values.preflight) throw new Error("--preview and --preflight are exclusive");
+        const project = loadProject();
+        const name = previewOf(project, values.preview);
+        if (values.destroy) {
+          const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "allow-schema-rollback", "allow-missing-env"] as const).filter((k) => values[k] !== undefined);
+          if (clash.length) throw new Error(`--destroy deletes the preview: it does not take ${clash.map((k) => `--${k}`).join(", ")}`);
+          // --destroy is the explicit ask: a preview's data is disposable by definition (no --yes, CI runs it on branch delete).
+          const r = await destroy(project, { env: name, yes: true, ...(values.registry ? { registryName: values.registry } : {}) });
+          return r.warnings.length ? 1 : 0;
+        }
+        console.log(`preview: ${values.preview} → environment ${name} (${workerName(project.config.project, name)}, from environments.preview)`);
+        values.env = name;
+        // A preview is not linked to the Ember Dashboard unless asked for (one service binding per branch otherwise).
+        if (!values.dashboard) values["no-dashboard"] = true;
+      }
       if (values.preflight && values["allow-missing-env"]) throw new Error("--preflight uploads nothing: it does not take --allow-missing-env");
       if (values.preflight) {
         const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "no-dashboard"] as const).filter((k) => values[k] !== undefined);
@@ -401,8 +421,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return r.status < 400 ? 0 : 1;
     }
     case "destroy": {
-      const { values } = parseArgs({ args: rest, options: { env: { type: "string" }, yes: { type: "boolean" }, registry: { type: "string" } } });
-      const r = await destroy(loadProject(), { ...(values.env ? { env: values.env } : {}), ...(values.yes ? { yes: true } : {}), ...(values.registry ? { registryName: values.registry } : {}) });
+      const { values } = parseArgs({ args: rest, options: { env: { type: "string" }, yes: { type: "boolean" }, registry: { type: "string" }, preview: { type: "string" } } });
+      if (values.preview !== undefined && values.env) throw new Error("--preview <branch> names the environment itself: drop --env");
+      const project = loadProject();
+      const env = values.preview !== undefined ? previewOf(project, values.preview) : values.env;
+      const r = await destroy(project, { ...(env ? { env } : {}), ...(values.yes ? { yes: true } : {}), ...(values.registry ? { registryName: values.registry } : {}) });
       return r.warnings.length ? 1 : 0;
     }
     case "logs": {
@@ -905,6 +928,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       console.error(`Unknown command "${cmd}".\n\n${HELP}`);
       return 2;
   }
+}
+
+/** The preview environment of a branch (`preview-<slug>`), checked: needs `environments.preview`, never a declared name. */
+function previewOf(project: Project, branch: string): string {
+  if (!project.config.environments.preview) throw new Error(`--preview derives an environment from "environments.preview" in ember.json: add one (it may be {}), with the vars and settings every preview shares`);
+  const name = previewEnvName(project.config.project, branch);
+  if (Object.hasOwn(project.config.environments, name)) throw new Error(`${name} is declared in ember.json: --preview only deploys derived environments (use --env ${name})`);
+  return name;
 }
 
 /** A positive number of seconds from a CLI option, or a clear error (`Number("30m")` is NaN). */

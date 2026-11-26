@@ -19,7 +19,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CloudflareApiError, type CfClient } from "./deploy/cf.ts";
-import { CONFIG_FILE, ConfigError, type Project } from "./config.ts";
+import { CONFIG_FILE, ConfigError, envConfig, isDerivedPreview, PREVIEW_BASE, type Project } from "./config.ts";
 import { apiUrl, checkCredentialUrl } from "./secure-url.ts";
 
 export const DEV_VARS_FILE = ".dev.vars";
@@ -206,7 +206,7 @@ export async function secretNames(t: EnvTarget): Promise<string[] | null> {
   return (r.result ?? []).map((s) => s.name).sort();
 }
 
-const varsOf = (t: EnvTarget) => t.project.config.environments[t.env]?.vars ?? {};
+const varsOf = (t: EnvTarget) => envConfig(t.project, t.env)?.vars ?? {};
 
 export async function envList(t: EnvTarget): Promise<{ deployed: boolean; entries: EnvEntry[] }> {
   const secrets = await secretNames(t);
@@ -292,6 +292,8 @@ export async function envGet(t: EnvTarget, name: string, opts: { reveal?: boolea
 
 /** Rewrites `environments.<env>.vars` in ember.json, keeping the rest of the file as it is. */
 function writeVars(project: Project, env: string, vars: Record<string, string>) {
+  // A preview environment has no entry of its own: its vars are those of environments.preview.
+  if (isDerivedPreview(project, env)) throw new ConfigError(`${env} is a preview environment: its vars are those of environments.${PREVIEW_BASE} in ${CONFIG_FILE} (set them there, or set a secret on its Worker without --var)`);
   const raw = JSON.parse(readFileSync(project.configPath, "utf8")) as { environments: Record<string, { vars?: Record<string, string> }> };
   const e = (raw.environments[env] ??= {});
   if (Object.keys(vars).length) e.vars = Object.fromEntries(Object.entries(vars).sort(([a], [b]) => a.localeCompare(b)));
