@@ -1,10 +1,10 @@
 // Feature "zframe" (protocol v1.5): a server frame above 2 KiB goes to a client that announced the feature as a binary
 // message of raw-DEFLATE bytes; smaller frames, and every frame to a client without it, stay text. Order is kept, and
 // the feature survives a hibernation (it lives in the socket's attachment).
-import { evictDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ServerMessage } from "../src/protocol.ts";
-import { connect, hello, is, shardStub } from "./helpers.ts";
+import { connect, hello, is, shardStub, sleep } from "./helpers.ts";
 
 type Snap = Extract<ServerMessage, { t: "snap"; value: unknown }>;
 type Patch = Extract<ServerMessage, { t: "patch" }>;
@@ -103,5 +103,33 @@ describe("zframe: compressed server frames", () => {
     expect(big!.binary).toBe(true);
     c.close();
     w.close();
+  });
+  it("a socket closed by a revocation never gets a frame that was still being compressed: closed at once, the frame dropped", async () => {
+    const shard = "revoke:z-close";
+    const iat = Math.floor(Date.now() / 1000) - 60;
+    const c = await connect(shard);
+    await hello(c, "c", `sess:ana:s1:${iat}`, ["batch", "zframe"]);
+    const plain = await connect(shard);
+    await hello(plain, "p", `sess:ana:s2:${iat}`, ["batch", "zframe"]);
+    const closed: number[] = [];
+    for (const x of [c, plain]) x.ws.addEventListener("close", (e: CloseEvent) => closed.push(e.code));
+    const before = c.wire.length;
+    // In one event of the shard: a large frame starts compressing for each socket, then the user's access is revoked
+    // with close. Without the revocation the frame goes out compressed (as it does to `plain`, of another session).
+    const big = JSON.stringify({ t: "err", code: "before_revoke", message: "x".repeat(20_000) });
+    await runInDurableObject(shardStub(shard), (instance) => {
+      const self = instance as unknown as { ctx: DurableObjectState; sendFrame(ws: WebSocket, f: string): void; revokeSockets(s: string, m: unknown, o: unknown): Promise<unknown> };
+      for (const ws of self.ctx.getWebSockets()) self.sendFrame(ws, big);
+      return self.revokeSockets(shard, { claim: "sid", value: "s1" }, { close: true, forMs: 0 });
+    });
+    for (let i = 0; i < 40 && closed.length < 1; i++) await sleep(25);
+    expect(closed).toEqual([4401]);
+    await sleep(100);
+    expect(c.wire.slice(before).some((f) => f.binary)).toBe(false);
+    expect(c.frames.some((f) => f.t === "err" && f.code === "before_revoke")).toBe(false);
+    // The other session's socket was not revoked: its compressed frame arrives.
+    await plain.waitFor(is("err", (m) => m.code === "before_revoke"));
+    expect(plain.wire.some((f) => f.binary)).toBe(true);
+    plain.close();
   });
 });

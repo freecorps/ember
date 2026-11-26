@@ -2467,6 +2467,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     const before = this.zsending.get(ws);
     const sent = (before ?? Promise.resolve()).then(async () => {
       const z = bytes && (await bytes);
+      // Closed meanwhile (revoked, restored): what was being compressed for it is dropped, never sent after the close.
+      if (this.zclosed.has(ws)) return;
       try {
         if (z && z.byteLength < frame.length) {
           ws.send(z);
@@ -2485,20 +2487,32 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.ctx.waitUntil(sent);
   }
 
-  /** Closes `ws` once the frames queued for it went out (compressed ones included: feature "zframe"). */
-  private closeAfterSends(ws: WebSocket, code: number, reason: string): void {
-    this.flushSocket(ws);
-    const close = () => {
-      try {
-        ws.close(code, reason);
-      } catch {
-        // already closing
-      }
-    };
-    const pending = this.zsending.get(ws);
-    if (!pending) return close();
-    this.ctx.waitUntil(pending.then(close));
+  /**
+   * Closes `ws` now (access revoked, restore, import): nothing produced before the close may reach it after. What
+   * waits for the end of the turn goes first, as text (never through an asynchronous compression), unless a frame
+   * is still being compressed (feature "zframe"): then that one, and everything behind it, are dropped, so the order
+   * is never broken either. The client resynchronizes on its next socket (subscriptions anew, mutations resent).
+   */
+  private closeNow(ws: WebSocket, code: number, reason: string): void {
+    const q = this.outbox.get(ws);
+    this.outbox.delete(ws);
+    const compressing = this.zsending.has(ws);
+    this.zsending.delete(ws);
+    this.zclosed.add(ws);
+    try {
+      if (q && !compressing) ws.send(q.frames.length === 1 ? q.frames[0]! : `[${q.frames.join(",")}]`);
+    } catch {
+      // socket already closed
+    }
+    try {
+      ws.close(code, reason);
+    } catch {
+      // already closing
+    }
   }
+
+  /** Sockets closed by the shard or by the client: a compression still running for one is never sent (`closeNow`). */
+  private readonly zclosed = new WeakSet<WebSocket>();
 
   /** Frames waiting for the end of the turn, per batching socket. */
   private readonly outbox = new Map<WebSocket, { frames: string[]; bytes: number }>();
@@ -4108,6 +4122,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.outbox.delete(ws);
     this.unflushed.delete(ws);
     this.zsending.delete(ws);
+    this.zclosed.add(ws);
     try {
       ws.close(code, reason);
     } catch {
@@ -4122,6 +4137,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.outbox.delete(ws);
     this.unflushed.delete(ws);
     this.zsending.delete(ws);
+    this.zclosed.add(ws);
   }
 
   // ------------------------------------------------------------------ RPC (Worker / System)
@@ -4255,7 +4271,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       if (!att?.sid || !att.identity || !revokeMatches(match, att.identity)) continue;
       reached++;
       if (opts.close) {
-        this.closeAfterSends(ws, 4401, "ember: access revoked");
+        this.closeNow(ws, 4401, "ember: access revoked");
         this.dropSocket(att.sid);
         continue;
       }
@@ -4679,7 +4695,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.sid) this.dropSocket(att.sid);
-      this.closeAfterSends(ws, 1012, "ember restore");
+      this.closeNow(ws, 1012, "ember restore");
     }
     // `.replicated()` tables: a restored global:main resends everything (its log went back in time); a restored target
     // asks for a fresh copy (its marks went back).
@@ -4739,7 +4755,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.sid) this.dropSocket(att.sid);
-      this.closeAfterSends(ws, 1012, "ember import");
+      this.closeNow(ws, 1012, "ember import");
     }
   }
 
