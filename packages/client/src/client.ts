@@ -1602,8 +1602,9 @@ export class EmberClient {
     this.subs.delete(s.key);
     unindex(this.subsByShard, s.shard, s);
     unindex(this.subsByFn, s.fn, s);
-    // An optimistic update that listed this function's queries (`getAllQueries`) runs again next time.
-    if (this.overlayCache?.fns.has(s.fn)) this.overlayCache = null;
+    // An optimistic update that read this query (`getQuery`, `updateQuery`) or listed its function's (`getAllQueries`)
+    // runs again next time: what it read is gone now.
+    if (this.overlayCache && (this.overlayCache.fns.has(s.fn) || this.overlayCache.keys.has(s.key))) this.overlayCache = null;
     this.optimisticSubs.delete(s);
     this.deferredSubs.delete(s);
     if (s.localTimer) clearTimeout(s.localTimer);

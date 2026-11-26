@@ -222,6 +222,37 @@ describe("recompute after a server value", () => {
     client.close();
   });
 
+  it("an update that read a query runs again once that query is unsubscribed (its cached run is dropped)", async () => {
+    const server = messagesServer();
+    server.mutateDirect(SHARD, "messages:send", { channel: "b", body: "b1" });
+    server.mutateDirect(SHARD, "messages:send", { channel: "b", body: "b2" });
+    const client = makeClient(server, { unsubscribeGraceMs: 0 });
+    const watch = (channel: string) => {
+      const seen: QuerySnapshot<string[]>[] = [];
+      return { seen, off: client.subscribe(list, { channel }, {}, (s) => seen.push(s as QuerySnapshot<string[]>)) };
+    };
+    const a = watch("a");
+    const b = watch("b");
+    const c = watch("c");
+    await until(() => [a, b, c].every((x) => x.seen.at(-1)?.status === "success"));
+    server.open(SHARD)[0]!.holdIncoming();
+    const p = client.mutation(send, { channel: "a", body: "x" }, {
+      optimisticUpdate: (store) => {
+        const read = store.getQuery(list, { channel: "b" }) as string[] | undefined;
+        store.setQuery(list, { channel: "a" }, [`b:${read?.length ?? "none"}`]);
+      },
+    });
+    expect(a.seen.at(-1)).toMatchObject({ value: ["b:2"], optimistic: true });
+    b.off();
+    await tick(5);
+    // A patch of a query the update does not read: the update runs again (what it read is gone), not the cached run.
+    server.mutateDirect(SHARD, "messages:send", { channel: "c", body: "c1" });
+    await until(() => c.seen.at(-1)!.value!.length === 1);
+    expect(a.seen.at(-1)).toMatchObject({ value: ["b:none"], optimistic: true });
+    p.catch(() => undefined);
+    client.close();
+  });
+
   it("an update listing a function's queries (getAllQueries) runs again when a query of it is subscribed", async () => {
     const server = messagesServer();
     const client = makeClient(server);
