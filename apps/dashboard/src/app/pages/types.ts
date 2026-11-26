@@ -78,3 +78,42 @@ export interface AuditEntry {
   error: string | null;
   finished_at: number | null;
 }
+
+/** A field's shape (`GET /api/schema`, @freecorps/ember-values `Shape`). */
+export type Shape =
+  | { kind: "string" | "number" | "int64" | "boolean" | "null" | "bytes" | "file" | "any" }
+  | { kind: "id"; table: string }
+  | { kind: "literal"; value: unknown }
+  | { kind: "array"; item: Shape }
+  | { kind: "record"; value: Shape }
+  | { kind: "object"; fields: Record<string, { shape: Shape; optional: boolean }> }
+  | { kind: "union"; members: Shape[] };
+
+export interface SchemaIndex {
+  name: string;
+  kind: string;
+  fields: string[];
+  /** Only documents with every field present are in the index (filtering by it leaves the others out). */
+  sparse?: boolean;
+  /** Search indexes (admin API level 16). */
+  searchField?: string;
+  filterFields?: string[];
+}
+
+export interface SchemaTable {
+  name: string;
+  document: Extract<Shape, { kind: "object" }>;
+  indexes: SchemaIndex[];
+  shard?: unknown;
+  /** `.replicated()` (level 16): the shard kinds it goes to (null: every kind). */
+  replicated?: { to: string[] | null };
+  /** Its SQLite table and columns (level 16), for the SQL Explorer. */
+  sql?: { table: string; columns: string[] };
+}
+
+export interface SchemaBody {
+  version: string;
+  tables: SchemaTable[];
+  componentTables: string[];
+  internalTables?: string[];
+}
