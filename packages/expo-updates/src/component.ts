@@ -372,8 +372,13 @@ function pendingUntilOf(fileExpiresAt: number | undefined, pending: ReadonlyArra
   return xs.length ? Math.max(...xs) + CONFIRM_GRACE_MS : undefined;
 }
 
-/** Rows one daily sweep looks at (it goes on the next day for the rest). */
+/** Rows one daily sweep reads at most (it goes on the next day for the rest). */
 const SWEEP_BATCH = 500;
+/**
+ * Writes one sweep may spend (each row it deletes is one write plus one per file it referenced, up to ~80), under the
+ * mutation's default `rowsWritten` (8 192): the batch stops before it, and the rest waits for the next run.
+ */
+export const SWEEP_WRITE_BUDGET = 6000;
 
 /**
  * The daily sweep of abandoned uploads (a hash nobody prepares or publishes again): a row whose uploads all left their
@@ -382,13 +387,20 @@ const SWEEP_BATCH = 500;
  */
 function sweepAbandonedUploads(ctx: Ctx["mutation"]): number {
   const rows = ctx.db.query("assets").withIndex("by_pending_until", (q) => q.lt("pendingUntil", ctx.now)).take(SWEEP_BATCH);
+  let writes = 0;
+  let done = 0;
   for (const row of rows) {
+    // Worst case for this row: its own write plus the release of every file it references.
+    const cost = 2 + (row.pending?.length ?? 0);
+    if (writes + cost > SWEEP_WRITE_BUDGET) break;
+    writes += cost;
+    done++;
     if (promoteReady(ctx, row)) continue;
     const kept = pendingUploads(ctx, row);
     if (!kept.length) ctx.db.delete(row._id);
     else ctx.db.patch(row._id, { pendingUntil: pendingUntilOf(undefined, kept) });
   }
-  return rows.length;
+  return done;
 }
 
 /** The row's pending uploads still referenced: in flight, or expired within `CONFIRM_GRACE_MS`. */

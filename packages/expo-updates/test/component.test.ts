@@ -323,6 +323,25 @@ describe("expo updates component", () => {
     expect(await sweep()).toBe(0);
   });
 
+  test("a sweep stops before the mutation's write budget (rows holding many references); the next runs finish it", async () => {
+    const t = harness();
+    const prep = (body: string) => t.mutation(m("prepareAssets"), { assets: [{ sha256: hex(body), size: body.length, contentType: "image/png" }] });
+    // 110 hashes, each with 16 uploads in flight and 64 more in their grace: ~81 references per row (~8 900 writes to
+    // release them all at once, over the 8 192 of a mutation).
+    for (let round = 0; round < 5; round++) {
+      for (let a = 0; a < 110; a++) for (let i = 0; i < 16; i++) await prep(`heavy-${a}`);
+      await t.advance(2 * 3600_000);
+    }
+    await t.advance(26 * 3600_000); // every ticket past its grace
+    const sweep = () => t.mutation(unsafeRef<"mutation">("@expoUpdates/lib:sweepUploads"), {}) as Promise<number>;
+    const first = await sweep();
+    expect(first).toBeGreaterThan(0);
+    expect(first).toBeLessThan(110);
+    let total = first;
+    for (let n = await sweep(); n > 0; n = await sweep()) total += n;
+    expect(total).toBe(110);
+  }, 300_000);
+
   test("repeated rollbacks to the embedded update retire the copies left below the directive, until A is reachable", async () => {
     const t = harness();
     await publish(t, { bundle: "A" });
