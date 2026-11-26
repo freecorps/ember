@@ -2,13 +2,14 @@
 // and the logs search and NDJSON export (logsearch.ts).
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { clearHistory, curlFor, forgetHistory, HISTORY_KEY, HISTORY_MAX, loadHistory, refFor, RESULT_MAX, saveRun, shellQuote, tsFor, tsLiteral } from "../src/app/runner.ts";
+import { clearHistory, curlFor, forgetHistory, HISTORY_KEY, historyEpoch, HISTORY_MAX, loadHistory, refFor, RESULT_MAX, saveRun, shellQuote, tsFor, tsLiteral } from "../src/app/runner.ts";
 import { EXPORT_MAX, searchLogs, toNdjson, type LogRecord } from "../src/app/logsearch.ts";
 import { fileName } from "../src/app/export.ts";
 import { sameRoute } from "../src/app/hooks.ts";
 
 const g = globalThis as { localStorage?: unknown };
 afterEach(() => {
+  forgetHistory(); // the module's in-memory fallback, between tests
   delete g.localStorage;
 });
 function memoryStorage() {
@@ -64,6 +65,30 @@ describe("run history (localStorage)", () => {
     expect(loadHistory()).toEqual([]);
     m.set(HISTORY_KEY, JSON.stringify([{ id: 1 }, null, "x"]));
     expect(loadHistory()).toEqual([]);
+  });
+
+  it("storage that reads but refuses writes: runs pile up in memory (the second does not drop the first)", () => {
+    const m = new Map<string, string>();
+    g.localStorage = {
+      getItem: (k: string) => m.get(k) ?? null,
+      setItem: () => {
+        throw new Error("QuotaExceeded");
+      },
+      removeItem: (k: string) => void m.delete(k),
+    };
+    saveRun([], run(1));
+    expect(saveRun([], run(2)).map((e) => e.args)).toEqual([{ i: 2 }, { i: 1 }]);
+    // Once writes work again, the stored history is the base again (another tab's runs kept).
+    const ok = memoryStorage();
+    saveRun([], run(3));
+    ok.set(HISTORY_KEY, JSON.stringify([...JSON.parse(ok.get(HISTORY_KEY)!), { ...run(9), id: "other-tab", result: "{}" }]));
+    expect(saveRun([], run(4)).map((e) => e.id).includes("other-tab")).toBe(true);
+  });
+
+  it("signing out moves the epoch: a run answered after it (started before) is not recorded by the page", () => {
+    const before = historyEpoch();
+    forgetHistory();
+    expect(historyEpoch()).toBe(before + 1);
   });
 });
 

@@ -12,7 +12,7 @@ import { href, useApi, useSession } from "../hooks.ts";
 import { Badge, ConfirmDialog, Dialog, Empty, JsonView, Loading, Mono, Problem, Section, Table } from "../ui.tsx";
 import { limitWarnings, seriesPeaks } from "../../metrics-sql.ts";
 import type { FunctionRow, Project } from "./types.ts";
-import { clearHistory, curlFor, HISTORY_KEY, loadHistory, saveRun, tsFor, type RunEntry } from "../runner.ts";
+import { clearHistory, curlFor, HISTORY_KEY, historyEpoch, loadHistory, saveRun, tsFor, type RunEntry } from "../runner.ts";
 import { argsFromForm, fieldKind, type Shape } from "../forms.ts";
 
 /** What p50/p95 measure per timing label (@freecorps/ember-runtime metrics.ts). */
@@ -302,11 +302,14 @@ function Runner({ project, env, info, url }: { project: string; env: string; inf
   const refusedAs = !!asUser.trim() && info.sensitive;
 
   const current = (): RunInput | null => (args ? { args, shard: target, as: asUser.trim() ? { subject: asUser.trim(), ...(claimsObj ? { claims: claimsObj } : {}) } : null } : null);
-  const record = (input: RunInput, ok: boolean, value: unknown, ms: number | null) =>
+  const record = (input: RunInput, ok: boolean, value: unknown, ms: number | null, since: number) =>
+    // Not after a sign-out that came while the run was out (its args and result must not be kept for the next user).
+    since === historyEpoch() &&
     // Written here, not in a state updater (React may call one twice): saveRun reads and writes the stored history.
     setHistory(saveRun(history, { at: Date.now(), project, env, fn: info.name, type: info.type, shard: input.shard, args: input.args, ...(input.as ? { as: input.as.subject, ...(input.as.claims ? { claims: input.as.claims } : {}) } : {}), ok, result: value, ms }));
 
   const run = async (input: RunInput) => {
+    const since = historyEpoch();
     setBusy(true);
     setError(null);
     setResult(null);
@@ -320,14 +323,14 @@ function Runner({ project, env, info, url }: { project: string; env: string; inf
         ...(input.as ? { as: input.as } : {}),
       });
       setResult(r);
-      record(input, true, r.value, r.ms);
+      record(input, true, r.value, r.ms, since);
     } catch (e) {
       const x = e as ApiError;
       // A function error is a result, not a failure of the dashboard.
       if (x.status === 400 && x.code !== "bad_request" && x.code !== "bad_shard") {
         const fnError = { code: x.code, message: x.message, ...(x.data ? { data: x.data } : {}) };
         setResult({ ok: false, error: fnError });
-        record(input, false, fnError, null);
+        record(input, false, fnError, null, since);
       } else setError(x);
     } finally {
       setBusy(false);

@@ -70,20 +70,36 @@ export function saveRun(list: RunEntry[], entry: Omit<RunEntry, "id" | "result">
     text = String(entry.result);
   }
   const e: RunEntry = { ...entry, id: `${entry.at.toString(36)}-${Math.random().toString(36).slice(2, 8)}`, result: text.length > RESULT_MAX ? `${text.slice(0, RESULT_MAX)}…` : text };
-  const next = [e, ...(stored() ?? list)].slice(0, HISTORY_MAX);
-  write(next);
+  const next = [e, ...base(list)].slice(0, HISTORY_MAX);
+  keep(next);
   return next;
 }
 
+/**
+ * The list a change builds on: the stored one (another tab's runs and clears kept), or, while storage refuses writes,
+ * the in-memory one (`unpersisted`: what this page could not store, so a second run does not drop the first).
+ */
+let unpersisted: RunEntry[] | null = null;
+const base = (list: RunEntry[]): RunEntry[] => unpersisted ?? stored() ?? list;
+function keep(next: RunEntry[]): void {
+  unpersisted = write(next) ? null : next;
+}
+
+/** Moves on at every sign-out: a run answered after it (started before) is not recorded. */
+let epoch = 0;
+export const historyEpoch = (): number => epoch;
+
 /** Drops a function's runs (of one project and environment), from the history stored now (as `saveRun`). */
 export function clearHistory(list: RunEntry[], scope: { project: string; env: string; fn: string }): RunEntry[] {
-  const next = (stored() ?? list).filter((e) => e.project !== scope.project || e.env !== scope.env || e.fn !== scope.fn);
-  write(next);
+  const next = base(list).filter((e) => e.project !== scope.project || e.env !== scope.env || e.fn !== scope.fn);
+  keep(next);
   return next;
 }
 
 /** Signing out forgets the history (args, results and act-as subjects of the runs of whoever used this browser). */
 export function forgetHistory(): void {
+  epoch++;
+  unpersisted = null;
   try {
     localStorage.removeItem(HISTORY_KEY);
   } catch {
@@ -91,11 +107,13 @@ export function forgetHistory(): void {
   }
 }
 
-function write(list: RunEntry[]): void {
+function write(list: RunEntry[]): boolean {
   try {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+    return true;
   } catch {
     // storage unavailable or full: the history lasts this page
+    return false;
   }
 }
 
