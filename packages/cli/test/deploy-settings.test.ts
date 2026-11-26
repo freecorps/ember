@@ -10,7 +10,7 @@ import { deploy, planDeploy, settingsChanges, versionMetadata, type DeployOption
 import { indexingQueueName } from "../src/deploy/ai.ts";
 import { filesQueueName } from "../src/deploy/files.ts";
 import { destroy } from "../src/destroy.ts";
-import { envSet } from "../src/env.ts";
+import { envRm, envSet } from "../src/env.ts";
 import { withAuthFrom } from "../src/sso.ts";
 import { fakeAccount } from "./fake-account.ts";
 import { TMP } from "./helpers.ts";
@@ -146,6 +146,18 @@ describe("ember.json limits.cpuMs and placement", () => {
     expect(writes(cf, "ember-chat-prod", from).scriptPuts).toHaveLength(1);
   });
 
+  it("a dry run reads no settings and reports no settings-change (its plan assumes a Worker that does not exist)", async () => {
+    const cf = fakeAccount({ namespaces: true });
+    const p = repo({ limits: { cpuMs: 50 }, placement: "smart" });
+    await run(cf, p);
+    const from = cf.calls.length;
+    const dry = await run(cf, p, { dryRun: true });
+    expect(dry.plan.strategy).toBe("create");
+    expect(dry.plan.settings ?? []).toEqual([]);
+    expect(writes(cf, "ember-chat-prod", from).settingsReads).toHaveLength(0);
+    expect(dry.lines.join("\n")).not.toMatch(/settings-change|unknown →/);
+  });
+
   it("without limits or placement in ember.json nothing is read or sent", async () => {
     const cf = fakeAccount({ namespaces: true });
     const p = repo();
@@ -246,6 +258,13 @@ describe("ember deploy --preview <branch>", () => {
     expect(writes(cf, worker).scriptPuts).toHaveLength(1);
     // Its vars are environments.preview's: `ember env set --var` refuses to invent an entry for it.
     await expect(envSet({ client: cf.client, project: p, env, worker }, "X", "1", { var: true })).rejects.toThrow(/preview environment/);
+    // Nor remove an inherited one: it points at environments.preview.
+    await expect(envRm({ client: cf.client, project: p, env, worker }, "FLAG")).rejects.toThrow(/set or remove them there/);
+    // An environment ember.json does not declare (a typo'd --env) is never added to it.
+    const before = readFileSync(p.configPath, "utf8");
+    await expect(envSet({ client: cf.client, project: p, env: "prd", worker: "ember-chat-prd" }, "X", "1", { var: true })).rejects.toThrow(/prd is not an environment in ember\.json.*declare it under "environments" first/);
+    expect(readFileSync(p.configPath, "utf8")).toBe(before);
+    expect(p.config.environments).not.toHaveProperty("prd");
     expect(cf.workers.has(worker)).toBe(true);
     const d = await destroy(p, { env, yes: true, token: "t", accountId: "acc", fetch: cf.fetchImpl, log: () => {} });
     expect(d.deleted).toContain(`worker ${worker}`);

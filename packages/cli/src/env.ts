@@ -293,7 +293,9 @@ export async function envGet(t: EnvTarget, name: string, opts: { reveal?: boolea
 /** Rewrites `environments.<env>.vars` in ember.json, keeping the rest of the file as it is. */
 function writeVars(project: Project, env: string, vars: Record<string, string>) {
   // A preview environment has no entry of its own: its vars are those of environments.preview.
-  if (isDerivedPreview(project, env)) throw new ConfigError(`${env} is a preview environment: its vars are those of environments.${PREVIEW_BASE} in ${CONFIG_FILE} (set them there, or set a secret on its Worker without --var)`);
+  if (isDerivedPreview(project, env)) throw new ConfigError(`${env} is a preview environment: its vars are those of environments.${PREVIEW_BASE} in ${CONFIG_FILE} (set or remove them there; a secret of its own goes on its Worker, without --var)`);
+  // Only a declared environment's vars: a typo'd --env never becomes a new environment entry.
+  if (!Object.hasOwn(project.config.environments, env)) throw new ConfigError(`${env} is not an environment in ${CONFIG_FILE} (known: ${Object.keys(project.config.environments).join(", ")}): declare it under "environments" first`);
   const raw = JSON.parse(readFileSync(project.configPath, "utf8")) as { environments: Record<string, { vars?: Record<string, string> }> };
   const e = (raw.environments[env] ??= {});
   if (Object.keys(vars).length) e.vars = Object.fromEntries(Object.entries(vars).sort(([a], [b]) => a.localeCompare(b)));
