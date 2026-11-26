@@ -193,6 +193,34 @@ const minBytes = (a: Uint8Array, b: Uint8Array) => (compareBytes(a, b) <= 0 ? a 
 
 type RangeOp = { op: "eq" | "gt" | "gte" | "lt" | "lte"; field: string; value: unknown };
 
+/**
+ * The `q` of `withIndex(name, q => ...)`: records the bounds in order (`withIndex` checks them against the index). One
+ * object per call with its methods on the prototype, not five closures per call (they are called on `q`, chained).
+ */
+class RangeBuilder {
+  readonly ops: RangeOp[] = [];
+  eq(field: string, value: unknown): this {
+    this.ops.push({ op: "eq", field, value });
+    return this;
+  }
+  gt(field: string, value: unknown): this {
+    this.ops.push({ op: "gt", field, value });
+    return this;
+  }
+  gte(field: string, value: unknown): this {
+    this.ops.push({ op: "gte", field, value });
+    return this;
+  }
+  lt(field: string, value: unknown): this {
+    this.ops.push({ op: "lt", field, value });
+    return this;
+  }
+  lte(field: string, value: unknown): this {
+    this.ops.push({ op: "lte", field, value });
+    return this;
+  }
+}
+
 export class QueryImpl {
   private index = "by_creation_time";
   private eqs: unknown[] = [];
@@ -264,18 +292,11 @@ export class QueryImpl {
     if (this.env.isStaged(this.t.name, name)) {
       throw new EmberError("IndexNotReady", `Index ${this.t.name}.${name} is still backfilling and cannot be queried yet`);
     }
-    const ops: RangeOp[] = [];
-    const b: any = {};
-    for (const op of ["eq", "gt", "gte", "lt", "lte"] as const) {
-      b[op] = (field: string, value: unknown) => {
-        ops.push({ op, field, value });
-        return b;
-      };
-    }
+    const b = new RangeBuilder();
     build?.(b);
     this.index = name;
     let i = 0;
-    for (const o of ops) {
+    for (const o of b.ops) {
       const expected = fields[i];
       if (o.field !== expected) throw new EmberError("QueryError", `withIndex(${name}): ${o.op}(${o.field}) must be on ${expected ?? "(no more fields)"}`);
       if (o.op === "eq") {
