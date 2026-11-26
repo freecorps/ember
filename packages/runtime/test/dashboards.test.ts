@@ -98,4 +98,27 @@ describe("dashboards (admin API)", () => {
     expect([elsewhere.status, elsewhere.body.error.code]).toEqual([400, "bad_shard"]);
     expect((await post("dashboards/run", { dashboard: "", fn: "components:bump", args: { key: "g" } })).body).toMatchObject({ ok: true, value: 1, shard: "global:main" });
   });
+
+  it("serves an embed block's page: only a route the spec names, anonymously, with only its type and body", async () => {
+    const caps = await get("capabilities");
+    expect(caps.body.features).toContain("dashboards/embed");
+    const spec = (await get("dashboards")).body.dashboards.find((d: { key: string }) => d.key === "tally");
+    expect(spec.tabs[1].blocks[0]).toEqual({ kind: "embed", id: "page", route: "/dashboard/page", path: "/tally/dashboard/page", height: "auto", functions: { "lib:get": "@tally/lib:get", "lib:bump": "@tally/lib:bump" } });
+    const embed = (dashboard: string, route: string, token = "admin-secret") => SELF.fetch(`http://ember/api/_ember/dashboards/embed?${new URLSearchParams({ dashboard, route })}`, { headers: { authorization: `Bearer ${token}` } });
+    const ok = await embed("tally", "/dashboard/page");
+    expect(ok.status).toBe(200);
+    // Run anonymously: the admin token never reaches the route; its own headers (a cookie) are dropped.
+    expect(await ok.text()).toBe("<!doctype html><p>tally page anonymous</p>");
+    expect(ok.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(ok.headers.get("set-cookie")).toBeNull();
+    expect(ok.headers.get("content-security-policy")).toBe("default-src 'none'; sandbox");
+    // A route no embed block names (even one the component serves), another spec, or no token: refused.
+    const other = await embed("tally", "/hit");
+    expect(other.status).toBe(404);
+    expect(((await other.json()) as { error: { code: string } }).error.code).toBe("unknown_embed");
+    expect((await embed("nope", "/dashboard/page")).status).toBe(404);
+    expect((await embed("", "/dashboard/page")).status).toBe(404);
+    expect((await embed("tally", "/dashboard/page", "wrong")).status).toBe(401);
+    expect((await SELF.fetch("http://ember/api/_ember/dashboards/embed?dashboard=tally&route=%2Fdashboard%2Fpage", { method: "POST", headers: { authorization: "Bearer admin-secret" } })).status).toBe(405);
+  });
 });

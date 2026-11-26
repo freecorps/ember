@@ -105,9 +105,13 @@ export const tally = defineComponent({
           { kind: "actions", actions: [{ id: "bump", label: "Bump", fn: tallyLib.bump, args: { by: 1 } }, { id: "twice", label: "Bump twice", fn: tallyLib.bumpTwice }] },
         ],
       },
+      // An embed block (dashboards.test.ts): the page is a GET route of the component's own router.
+      { id: "lab", label: "Lab", blocks: [{ kind: "embed", id: "page", route: "/dashboard/page", functions: [tallyLib.get, tallyLib.bump] }] },
     ],
   },
-  http: httpRouter().route({ path: "/hit", method: "POST", handler: hooks.hit, shard: (r) => new URL(r.url).searchParams.get("shard") ?? "global:main" }),
+  http: httpRouter()
+    .route({ path: "/hit", method: "POST", handler: hooks.hit, shard: (r) => new URL(r.url).searchParams.get("shard") ?? "global:main" })
+    .route({ path: "/dashboard/page", method: "GET", handler: c.httpAction(async (_ctx, request) => new Response(`<!doctype html><p>tally page ${request.headers.get("authorization") ?? "anonymous"}</p>`, { headers: { "content-type": "text/html; charset=utf-8", "set-cookie": "a=b" } })) }),
 });
 
 // ------------------------------------------------------------------ hooks: crons, own queue, email()
