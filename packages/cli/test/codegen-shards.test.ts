@@ -124,7 +124,8 @@ describe("codegen: typed shards", () => {
     expect(result.contracts.get("chat:mine")).toBe('Query<{}, string, never> & OnClaimShard<"org", "org">');
     expect(gen("api.d.ts")).toContain("@shard org (key: the signed-in identity's org claim, routed automatically)");
     expect(gen("server.js")).toContain("fromAuth,");
-    expect(gen("server.d.ts")).toContain('export { fromAuth } from "@freecorps/ember-server";');
+    // Typed by the app's claims (_generated/claims.d.ts; any name without ember/auth.config.ts).
+    expect(gen("server.d.ts")).toContain("export declare const fromAuth: <const C extends ClaimName<Claims>>(claim: C) => FromAuth<C>;");
   });
 
   it("api.js routes references; shards.js names shards", async () => {

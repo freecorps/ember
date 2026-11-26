@@ -665,14 +665,17 @@ function acceptsBoolean(s: Shape): boolean {
 
 /**
  * A paginated query: `paginationOpts` is `{ numItems, cursor }` (`paginationOptsValidator`). The pager sends
- * `{ numItems: <pageSize>, cursor: null }` and then the string `continueCursor`: both must fit the query's validator.
+ * `{ numItems: <pageSize>, cursor: null }` and then the string `continueCursor`: its cursor field must take both (the
+ * page size, checked against `numItems` with the table's own `pageSize`, is the caller's: a bound on it is not a shape
+ * error).
  */
 function pagination(args: ObjectShape, at: string): boolean {
   const p = args.fields.paginationOpts;
   if (!p) return false;
   const s = p.shape;
-  const fits = (cursor: string | null) => validate(s, { numItems: 1, cursor }).ok;
-  if (s.kind !== "object" || s.fields.numItems?.shape.kind !== "number" || !s.fields.cursor || !fits(null) || !fits("c")) {
+  const cursor = s.kind === "object" ? s.fields.cursor : undefined;
+  const fits = (c: string | null) => !!cursor && validate(cursor.shape, c).ok;
+  if (s.kind !== "object" || s.fields.numItems?.shape.kind !== "number" || !cursor || !fits(null) || !fits("c")) {
     throw new SpecError(`${at}: its paginationOpts argument must be paginationOptsValidator ({ numItems: v.number(), cursor: v.nullable(v.string()) })`);
   }
   return true;

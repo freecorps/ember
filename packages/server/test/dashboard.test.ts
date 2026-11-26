@@ -140,6 +140,13 @@ describe("defineComponent({ dashboard })", () => {
     expect(table()).toThrow(/pageSize: lib:list's paginationOpts\.numItems does not accept 25 \(the default; set pageSize\)/);
     expect(table(20)).toThrow(/does not accept 20/);
     expect(table(10)).not.toThrow();
+    // A lower bound: the table's own page size must meet it (the default 25 does; 5 does not, named as pageSize).
+    const atLeast = { list: b.query({ args: { paginationOpts: v.object({ numItems: v.number().min(10), cursor: v.nullable(v.string()) }) }, handler: () => null }) };
+    const minTable = (pageSize?: number) => () =>
+      defineComponent({ name: "items", schema, functions: { lib: atLeast }, dashboard: spec(oneBlock({ kind: "table", query: atLeast.list, columns: [{ label: "N", path: "name" }], ...(pageSize ? { pageSize } : {}) })) });
+    expect(minTable(10)).not.toThrow();
+    expect(minTable()).not.toThrow();
+    expect(minTable(5)).toThrow(/pageSize: lib:list's paginationOpts\.numItems does not accept 5/);
     refuses({ tabs: new Array(1) }, /tabs\[0\] is missing \(a sparse array\)/);
   });
 
