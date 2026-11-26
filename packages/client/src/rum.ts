@@ -29,6 +29,8 @@ const MAX_HISTOGRAMS = 32;
 const MAX_BUCKETS = 200;
 /** Batches stay small (a beacon is limited, and the server takes 4 KiB). */
 const MAX_BYTES = 2048;
+/** What the server takes in one body (a single histogram may go over MAX_BYTES, never over this). */
+const MAX_BATCH_BYTES = 4096;
 
 const SDK = "0.10.0";
 
@@ -40,11 +42,7 @@ function platform(): "web" | "react-native" | "node" | "other" {
   return "other";
 }
 
-/** Whether a client with these options measures this session (one draw). */
-export function rumSampled(o: RumOptions | undefined, random: () => number): boolean {
-  const r = o?.sampleRate;
-  return typeof r === "number" && r > 0 && random() < Math.min(1, r);
-}
+type Hist = { m: RumMetric; k: string; c: string; b: Array<[number, number]> };
 
 export class RumCollector {
   private readonly hist = new Map<string, { m: RumMetric; k: string; c: string; b: Map<number, number> }>();
@@ -87,36 +85,69 @@ export class RumCollector {
     h.b.set(b, Math.min(100_000, (h.b.get(b) ?? 0) + 1));
   }
 
-  /** The batch to post, or null when there is nothing (what does not fit 2 KB waits for the next one). */
+  /** The next batch to post (taken out of the collector), or null when there is nothing. What does not fit 2 KB
+   *  waits for the next one; a histogram that could never fit a batch on its own is dropped. */
   take(): string | null {
+    return this.takeBatch()?.body ?? null;
+  }
+
+  private takeBatch(): { body: string; taken: Hist[] } | null {
     if (!this.hist.size) return null;
-    const h: Array<{ m: RumMetric; k: string; c: string; b: Array<[number, number]> }> = [];
+    const h: Hist[] = [];
     let buckets = 0;
     const base = { v: 1, r: this.rate, p: platform(), s: SDK };
     for (const [key, x] of this.hist) {
       const b = [...x.b.entries()].sort((a, z) => a[0] - z[0]);
+      const item = { m: x.m, k: x.k, c: x.c, b };
+      const tooBig = b.length > MAX_BUCKETS || JSON.stringify({ ...base, h: [item] }).length > MAX_BATCH_BYTES;
+      if (tooBig) {
+        // The server would refuse any batch with it: it goes, so that it does not block the rest forever.
+        this.hist.delete(key);
+        continue;
+      }
       if (buckets + b.length > MAX_BUCKETS) break;
-      const next = [...h, { m: x.m, k: x.k, c: x.c, b }];
-      if (JSON.stringify({ ...base, h: next }).length > MAX_BYTES && h.length) break;
-      h.push(next[next.length - 1]!);
+      if (h.length && JSON.stringify({ ...base, h: [...h, item] }).length > MAX_BYTES) break;
+      h.push(item);
       buckets += b.length;
       this.hist.delete(key);
     }
-    return h.length ? JSON.stringify({ ...base, h }) : null;
+    return h.length ? { body: JSON.stringify({ ...base, h }), taken: h } : null;
   }
 
-  /** Posts what was measured (a beacon when the page is going away). Never throws. */
+  /** A batch that did not go out comes back (added to what was measured since, never counted twice). */
+  private restore(taken: Hist[]): void {
+    for (const x of taken) {
+      const key = `${x.m}\n${x.k}\n${x.c}`;
+      let h = this.hist.get(key);
+      if (!h) {
+        if (this.hist.size >= MAX_HISTOGRAMS) continue;
+        this.hist.set(key, (h = { m: x.m, k: x.k, c: x.c, b: new Map() }));
+      }
+      for (const [b, n] of x.b) h.b.set(b, Math.min(100_000, (h.b.get(b) ?? 0) + n));
+    }
+  }
+
+  /** Posts what was measured (a beacon when the page is going away). Never throws. A batch that fails (network
+   *  error, 429 or 5xx) goes back for the next flush; one the server refuses (4xx) is dropped. */
   flush(leaving: boolean): void {
-    const body = this.take();
-    if (!body) return;
+    const batch = this.takeBatch();
+    if (!batch) return;
+    const { body, taken } = batch;
     this.sent++;
     try {
       const nav = (globalThis as { navigator?: { sendBeacon?: (url: string, data: Blob | string) => boolean } }).navigator;
       // text/plain: a "simple" request (no CORS preflight); the server reads it as JSON.
       if (leaving && typeof nav?.sendBeacon === "function" && typeof Blob !== "undefined" && nav.sendBeacon(this.endpoint, new Blob([body], { type: "text/plain" }))) return;
-      void this.fetchImpl?.(this.endpoint, { method: "POST", headers: { "content-type": "text/plain" }, body, keepalive: true }).catch(() => undefined);
+      if (!this.fetchImpl) return;
+      void this.fetchImpl(this.endpoint, { method: "POST", headers: { "content-type": "text/plain" }, body, keepalive: true }).then(
+        (r) => {
+          if (r.status === 429 || r.status >= 500) this.restore(taken);
+        },
+        () => this.restore(taken),
+      );
     } catch {
       // measuring must never break the app
+      this.restore(taken);
     }
   }
 

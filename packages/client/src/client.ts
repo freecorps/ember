@@ -559,6 +559,8 @@ const ACK_MAX = 64;
 const ACK_KEEP_MAX = 4_096;
 /** Acks go out at once when the shard's version has moved this far past the oldest one waiting (a busy shard). */
 const ACK_VERSION_SPAN = 64;
+/** RUM: mutations in flight whose `ack` time is measured (a mark is dropped when its mutation settles or is dropped). */
+const RUM_MAX_IN_FLIGHT = 256;
 
 /** Cache key of an identity: who a cached value belongs to. */
 const identityCacheKey = (id: LocalIdentity | null): string => (id ? `u\u0000${id.issuer ?? ""}\u0000${id.subject}` : "anon");
@@ -955,6 +957,7 @@ export class EmberClient {
     }
     for (const p of this.pending.splice(0)) p.reject(new EmberError("closed", "client closed"));
     this.pendingByMid.clear();
+    this.rumMutAt.clear();
     for (const s of this.lingering) clearTimeout(s.graceTimer);
     this.lingering.clear();
     for (const off of this.syncOffs.splice(0)) {
@@ -3070,7 +3073,10 @@ export class EmberClient {
     }
     p.held = false;
     p.sentAuthSeq = conn.authSeq;
-    if (this.rumWanted) this.rumMutAt.set(String(p.record.mid), this.rumMark()!);
+    // RUM: at most one mark per mutation in flight (a resend restarts it); bounded, in case one never settles.
+    if (this.rumWanted && (this.rumMutAt.size < RUM_MAX_IN_FLIGHT || this.rumMutAt.has(String(p.record.mid)))) {
+      this.rumMutAt.set(String(p.record.mid), this.rumMark()!);
+    }
     this.send(conn, { t: "mut", mid: p.record.mid, fn: p.record.fn, args: p.record.args });
   }
 
@@ -3078,6 +3084,7 @@ export class EmberClient {
   private drop(p: Pending, error: EmberError): void {
     if (this.pendingByMid.get(p.record.mid) !== p) return;
     this.pendingByMid.delete(p.record.mid);
+    this.rumMutAt.delete(String(p.record.mid));
     // Still in this turn's frame (not on the socket yet): it never goes out.
     const q = this.conns.get(p.record.shard)?.out;
     const at = q?.muts.get(p.record.mid);
@@ -3308,7 +3315,9 @@ export class EmberClient {
         sub.authGen = this.authGen;
         sub.error = null;
         sub.fromHttp = false;
-        this.rumFirst(conn, sub);
+        // RUM: a resume answered `unchanged` carries no value, so it is no first value (and is not measured).
+        if (m.unchanged) sub.rumAt = undefined;
+        else this.rumFirst(conn, sub);
         if (!m.unchanged || promoted) this.persist([sub]);
         if (same) return;
         return this.recompute([sub]);
@@ -3557,6 +3566,7 @@ export class EmberClient {
   private settle(conn: Conn, p: Pending, m: Extract<ServerMessage, { t: "mres" }>): void {
     if (this.pendingByMid.get(p.record.mid) !== p) return;
     this.pendingByMid.delete(p.record.mid);
+    this.rumMutAt.delete(String(p.record.mid));
     const i = this.pending.indexOf(p);
     if (i >= 0) this.pending.splice(i, 1);
     // Feature "ack": once the mutation is out of pending storage (it will never be resent), tell the shard.
