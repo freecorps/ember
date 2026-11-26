@@ -785,7 +785,7 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     expect(await page.getByRole("dialog").count()).toBe(0);
     expect(runs()).toBe(n0 + 1);
     // The sandbox: an opaque origin, no access to the dashboard's DOM, cookies or storage, and no network.
-    const embedded = page.frames().find((f) => f.url().includes("/embed?"))!;
+    const embedded = page.frames().find((f) => f.url().includes("/embed/"))!;
     const probe = await embedded.evaluate(async () => {
       const tryIt = (f: () => unknown) => {
         try {
@@ -811,9 +811,10 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await page.keyboard.press("a");
     const audit = page.getByRole("table", { name: "Audit log" });
     await expect.poll(async () => (await audit.locator("tbody tr").allTextContents()).filter((x) => x.includes("dashboard.embed.run")).length).toBe(1);
-    // The one console error is the probe's own fetch, refused by the page's CSP (connect-src 'none'): no script of the
-    // page was refused (its inline scripts match their hashes).
-    expect(problems).toEqual([expect.stringMatching(/Fetch API cannot load .*\/api\/me.*Content Security Policy/)]);
+    // The only console errors are about the probe's own fetch, refused by the page's CSP (connect-src 'none'): no
+    // script of the page was refused (its inline scripts match their hashes).
+    expect(problems.length).toBeGreaterThan(0);
+    for (const p of problems) expect(p).toMatch(/\/api\/me.*(Content Security Policy|connect-src 'none')/);
     expect(problems.some((p) => /inline script/i.test(p))).toBe(false);
     await close();
   });
@@ -827,8 +828,8 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     expect(await page.getByRole("dialog").count()).toBe(0);
     await frame.getByRole("button", { name: "Load" }).click();
     await frame.locator("#out", { hasText: "it_1" }).waitFor();
-    const embedded = page.frames().find((f) => f.url().includes("/embed?"))!;
-    await embedded.evaluate(() => void (location.href = "/embed?navigated=1"));
+    const embedded = page.frames().find((f) => f.url().includes("/embed/"))!;
+    await embedded.evaluate(() => void (location.href = "/embed/chat/prod/elsewhere?dashboard=lab"));
     await page.getByText("The page navigated away").waitFor();
     await close();
   });

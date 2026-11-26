@@ -1,7 +1,7 @@
-// The page side of the bridge (protocol.ts). `emberDashboardSdk` is self-contained on purpose: it references nothing
-// outside its own body, so its source (`Function.prototype.toString`) is also the inline script `EMBED_SDK_SCRIPT`
-// that a route serves to its embedded page (the dashboard's CSP allows inline scripts by hash only and no network,
-// so the page cannot load the SDK from anywhere). Keep it that way: no imports, helpers or constants from outside.
+// The page side of the bridge (protocol.ts). `emberDashboardSdk` is also built, on its own, into the inline script
+// `EMBED_SDK_SCRIPT` (scripts/sdk-script.ts → src/script.ts, a committed string: rerun `bun scripts/sdk-script.ts`
+// after changing this file; test/script.test.ts checks it) that a route serves to its embedded page: the dashboard's
+// CSP allows inline scripts by hash only and no network, so the page cannot load the SDK from anywhere.
 
 import type { DashboardTheme, EmbedContext, EmbedErrorInfo } from "./protocol.ts";
 

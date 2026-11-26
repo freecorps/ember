@@ -260,6 +260,9 @@
     "packages/dashboard-sdk": {
       "name": "@freecorps/ember-dashboard-sdk",
       "version": "0.9.0",
+      "devDependencies": {
+        "esbuild": "0.28.2",
+      },
     },
     "packages/email": {
       "name": "@freecorps/ember-email",

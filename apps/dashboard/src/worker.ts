@@ -1153,7 +1153,7 @@ export function createDashboard(assets: Assets, opts: ApiOptions & { fetch?: typ
       const url = new URL(request.url);
       if (url.pathname.startsWith("/api/")) return handleApi(request, env, url, opts.fetch ?? fetch, opts);
       if (request.method !== "GET" && request.method !== "HEAD") return new Response("method not allowed", { status: 405, headers: SECURITY_HEADERS });
-      if (url.pathname === "/embed") return serveEmbed(request, env, url, opts.fetch ?? fetch);
+      if (url.pathname.startsWith("/embed/")) return serveEmbed(request, env, url, opts.fetch ?? fetch);
       if (url.pathname === "/app.js") return js(request);
       if (url.pathname === "/app.css" && css) return css(request);
       return new Response(assets.html, {

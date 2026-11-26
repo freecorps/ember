@@ -73,7 +73,7 @@ describe("embed pages", () => {
     const t = setup();
     const tk = await t.ticket();
     expect(tk.status).toBe(200);
-    expect(tk.body.url).toMatch(/^\/embed\?project=chat&env=prod&dashboard=agent&route=%2Fdashboard%2Fplayground&exp=\d+&sig=[\w-]{43}$/);
+    expect(tk.body.url).toMatch(/^\/embed\/chat\/prod\/dashboard\/playground\?dashboard=agent&exp=\d+&sig=[\w-]{43}$/);
     expect(tk.body.expires).toBeGreaterThan(Date.now());
     // The iframe's request carries no credentials: the ticket is the authorization.
     const res = await t.fetch(tk.body.url);
@@ -107,13 +107,15 @@ describe("embed pages", () => {
     const { url } = (await t.ticket()).body;
     const u = new URL(url, ORIGIN);
     const variant = (k: string, v: string) => {
+      const scope: Record<string, string> = { project: "chat", env: "prod", route: "/dashboard/playground" };
       const q = new URLSearchParams(u.search);
-      q.set(k, v);
-      return `/embed?${q}`;
+      if (k in scope) scope[k] = v;
+      else q.set(k, v);
+      return `/embed/${scope.project}/${scope.env}${scope.route}?${q}`;
     };
     // Another page, project, dashboard, a moved expiry or a changed signature: refused, nothing fetched.
     const before = t.calls.length;
-    for (const path of [variant("route", "/dashboard/other"), variant("dashboard", "workpool"), variant("env", "dev"), variant("exp", String(Number(u.searchParams.get("exp")) + 1000)), variant("sig", "A".repeat(43)), "/embed?project=chat&env=prod&dashboard=agent&route=%2Fdashboard%2Fplayground"]) {
+    for (const path of [variant("route", "/dashboard/other"), variant("dashboard", "workpool"), variant("env", "dev"), variant("exp", String(Number(u.searchParams.get("exp")) + 1000)), variant("sig", "A".repeat(43)), "/embed/chat/prod/dashboard/playground?dashboard=agent"]) {
       const res = await t.fetch(path);
       expect(res.status, path).toBe(403);
       expect(res.headers.get("content-type")).toBe("text/plain; charset=utf-8");
@@ -145,8 +147,18 @@ describe("embed pages", () => {
       expect(r.body.error!.code).toBe("bad_request");
     }
     expect((await t.ticket({ dashboard: "../x", route: "/dashboard/playground" })).status).toBe(400);
-    // A forged /embed with a bad route is refused before the signature is even checked.
-    expect((await t.fetch("/embed?project=chat&env=prod&dashboard=agent&route=%2F..%2Fx&exp=1&sig=x")).status).toBe(400);
+    // A forged /embed/... with an escaped route is refused before the signature is even checked.
+    expect((await t.fetch("/embed/chat/prod/a%2F..%2Fx?dashboard=agent&exp=1&sig=x")).status).toBe(400);
+    // `..` segments (plain or encoded) are resolved by the URL parser into another scope, whose signature fails: a
+    // ticket for one page never serves another.
+    const { url } = (await t.ticket()).body;
+    const sig = new URL(url, ORIGIN).search;
+    for (const p of ["/embed/chat/prod/x/../dashboard/playground", "/embed/chat/prod/dashboard/playground/..", "/embed/chat/prod/%2e%2e/prod/dashboard/playground", "/embed/chat/../chat/prod/dashboard/playground/%2E%2E/playground"]) {
+      const res = await t.fetch(`${p}${sig}`);
+      // The one that resolves back to the same page is that page; every other is refused.
+      if (new URL(p, ORIGIN).pathname === "/embed/chat/prod/dashboard/playground") expect(res.status, p).toBe(200);
+      else expect([400, 403], p).toContain(res.status);
+    }
   });
 
   it("an unknown component or route is a 404 from the project; an older runtime says so; only text/html is served", async () => {

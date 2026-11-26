@@ -42,6 +42,10 @@
     "access": "public"
   },
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "build:script": "bun scripts/sdk-script.ts"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

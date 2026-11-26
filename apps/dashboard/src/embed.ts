@@ -1,8 +1,8 @@
 // Embed blocks (docs/design/contracts.md "Dashboard", "Embeds"): a component's or app's own page, shown in the SPA in
 // an `<iframe sandbox="allow-scripts">`. The iframe cannot carry the SPA's credentials (a dashboard token lives in the
 // SPA's memory, never in a cookie), so the SPA first asks `GET /api/dash/embed` (read role) for a short-lived ticket:
-// a URL `/embed?project&env&dashboard&route&exp&sig`, signed with a key kept in the registry (`dashboard_meta`), valid
-// for that one page for a few minutes. `GET /embed` checks it, fetches the page from the project through the admin
+// a URL `/embed/<project>/<env><route>?dashboard&exp&sig`, signed with a key kept in the registry (`dashboard_meta`),
+// valid for that one page for a few minutes. `GET /embed/...` checks it, fetches the page from the project through the admin
 // channel (`dashboards/embed`: only routes an embed block names), and serves it from the dashboard's origin under:
 //
 //   - CSP `sandbox allow-scripts`: even opened on its own (not in the iframe) the page runs in an opaque origin,
@@ -66,13 +66,24 @@ const ticketText = (s: EmbedScope, exp: number) => `ember-dashboard-embed\n${exp
 export async function embedUrl(db: D1Like, s: EmbedScope, now = Date.now()): Promise<{ url: string; expires: number }> {
   const exp = now + EMBED_TICKET_TTL_MS;
   const mac = new Uint8Array(await crypto.subtle.sign("HMAC", await ticketKey(db), new TextEncoder().encode(ticketText(s, exp))));
-  const q = new URLSearchParams({ project: s.project, env: s.env, dashboard: s.dashboard, route: s.route, exp: String(exp), sig: b64url(mac) });
-  return { url: `/embed?${q}`, expires: exp };
+  const q = new URLSearchParams({ dashboard: s.dashboard, exp: String(exp), sig: b64url(mac) });
+  return { url: `/embed/${s.project}/${s.env}${s.route}?${q}`, expires: exp };
 }
 
-/** The scope a ticket URL's query grants, or why it does not. */
-export async function checkTicket(db: D1Like, q: URLSearchParams, now = Date.now()): Promise<EmbedScope | { problem: string; status: number }> {
-  const s: EmbedScope = { project: q.get("project") ?? "", env: q.get("env") ?? "", dashboard: q.get("dashboard") ?? "", route: q.get("route") ?? "" };
+/**
+ * The scope of an `/embed/<project>/<env><route>` URL (the route is the rest of the path, as the block declares it).
+ * The URL parser has already resolved `.`/`..` segments (encoded ones too), so a path that had them names another
+ * scope, whose signature does not match; anything with an escape left is refused by the route check.
+ */
+function scopeOf(url: URL): EmbedScope {
+  const rest = url.pathname.slice("/embed/".length).split("/");
+  return { project: rest[0] ?? "", env: rest[1] ?? "", dashboard: url.searchParams.get("dashboard") ?? "", route: rest.length >= 2 ? `/${rest.slice(2).join("/")}` : "" };
+}
+
+/** The scope a ticket URL grants, or why it does not. */
+export async function checkTicket(db: D1Like, url: URL, now = Date.now()): Promise<EmbedScope | { problem: string; status: number }> {
+  const s = scopeOf(url);
+  const q = url.searchParams;
   const bad = embedScopeProblem(s);
   if (bad) return { problem: bad, status: 400 };
   const exp = Number(q.get("exp"));
@@ -143,12 +154,12 @@ function refusal(status: number, message: string, ancestors: string[]): Response
   });
 }
 
-/** `GET /embed?project&env&dashboard&route&exp&sig`: an embed block's page (see the top of this file). */
+/** `GET /embed/<project>/<env><route>?dashboard&exp&sig`: an embed block's page (see the top of this file). */
 export async function serveEmbed(request: Request, env: ProjectEnv & { REGISTRY?: D1Like; DASHBOARD_ORIGIN?: unknown }, url: URL, fetchImpl: typeof fetch): Promise<Response> {
   const ancestors = allowedOrigins(env, url);
   if (request.method !== "GET" && request.method !== "HEAD") return refusal(405, "use GET", ancestors);
   if (!env.REGISTRY) return refusal(500, "the REGISTRY binding is missing", ancestors);
-  const s = await checkTicket(env.REGISTRY, url.searchParams);
+  const s = await checkTicket(env.REGISTRY, url);
   if ("problem" in s) return refusal(s.status, s.problem, ancestors);
   const target = await environment(env.REGISTRY, s.project, s.env);
   if (!target) return refusal(404, `${s.project}/${s.env} is not in the registry`, ancestors);

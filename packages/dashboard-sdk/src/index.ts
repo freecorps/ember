@@ -10,6 +10,7 @@
 // The page cannot load this module from anywhere (no network), so a route inlines it: `EMBED_SDK_SCRIPT` (defines
 // `window.EmberDashboard.connect`), or `embedPage()`, which builds the whole document.
 
+import { EMBED_SDK_SCRIPT } from "./script.ts";
 import { emberDashboardSdk, type ConnectOptions, type DashboardBridge, type DashboardErrorLike, type DashboardSdk } from "./sdk.ts";
 
 export * from "./protocol.ts";
@@ -26,11 +27,8 @@ export function connect(options?: ConnectOptions): DashboardBridge {
 /** A request the dashboard refused or that failed: `code` (`not_allowed`, `busy`, `cancelled`, ... or the function's). */
 export const DashboardError = sdk.DashboardError;
 
-/**
- * The SDK as a classic inline script: defines `window.EmberDashboard = { connect, DashboardError }`. Put it in a
- * `<script>` of the page before the page's own script (the dashboard allows inline scripts by their hash).
- */
-export const EMBED_SDK_SCRIPT = `window.EmberDashboard=(${emberDashboardSdk.toString()})();`;
+// The SDK as a classic inline script (`window.EmberDashboard`), generated from sdk.ts and committed as a string.
+export { EMBED_SDK_SCRIPT };
 
 export interface EmbedPageOptions {
   /** The document's `<title>` (escaped). */
