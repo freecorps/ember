@@ -42,7 +42,7 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean; specsDown?
       if (req.headers.get("authorization") !== "Bearer proj-admin") return Response.json({ ok: false, error: { code: "unauthenticated", message: "invalid admin token" } }, { status: 401 });
       if (path === "/api/_ember/capabilities") {
         if (o.features === null) return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
-        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run"], auth: false, files: false, system: true });
+        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run", "sql"], auth: false, files: false, system: true });
       }
       // The specs are read before a dashboard write is audited: they answer even when the project's writes fail.
       if (path === "/api/_ember/dashboards") {
@@ -56,6 +56,8 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean; specsDown?
       if (path === "/api/_ember/auth/revoke") return Response.json({ ok: true, value: { revoked: 1, sockets: 2, shards: (body as { shards: string[] }).shards.length } });
       if (path === "/api/_ember/files/upload") return Response.json({ ok: true, value: { id: "_storage_new", size: 10 } });
       if (path === "/api/_ember/files/delete" || path === "/api/_ember/jobs/cancel" || path === "/api/_ember/jobs/run" || path === "/api/_ember/crons/run") return Response.json({ ok: true, value: "job_2" });
+      if (path === "/api/_ember/sql") return Response.json({ ok: true, value: { columns: ["n"], rows: [[1]], rowsRead: 1, rowsWritten: 0, truncated: false, ms: 1, explain: false } });
+      if (path === "/api/_ember/data/list") return Response.json({ ok: true, value: { page: [], isDone: true, continueCursor: "" } });
       if (path === "/api/_ember/dashboards/run") return Response.json({ ok: true, value: 1, ms: 1, type: "mutation", shard: (body as { shard: string }).shard });
       if (path === "/api/_ember/dashboards/query") return Response.json({ ok: true, value: [{ _id: "w1" }], ms: 1, type: "query", shard: new URL(req.url).searchParams.get("shard") });
       if (path === "/api/_ember/run") return Response.json({ ok: true, value: { who: (body as { as?: { subject: string } }).as?.subject ?? null }, ms: 1, type: "query" });
@@ -126,6 +128,7 @@ const bodies: Record<string, Record<string, unknown>> = {
   "/api/keys/rotate": { project: "chat", env: "dev" },
   "/api/users/revoke": { project: "chat", env: "dev", userId: "user_1", sessionId: "sess_1" },
   "/api/dash/run": { project: "chat", env: "dev", shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancel", args: { id: "secret plans" } },
+  "/api/sql": { project: "chat", env: "dev", shard: "org:acme", sql: "SELECT count(*) FROM messages WHERE channel = ?", params: ["secret plans"] },
 };
 
 describe("roles", () => {
@@ -398,6 +401,64 @@ describe("declarative screens", () => {
     expect([res.status, ((await res.json()) as { error: { code: string; message: string } }).error]).toEqual([502, { code: "project_unreachable", message: "connection reset" }]);
     expect(t.project.calls.filter((c) => c.method === "POST")).toEqual([]);
     expect(t.audit()).toEqual([]);
+  });
+});
+
+describe("SQL Explorer", () => {
+  const base = { project: "chat", env: "prod", shard: "org:acme" };
+  it("admin only, never a typed confirmation (read-only), audited as sql.run with the text and the parameter count", async () => {
+    const t = setup();
+    const r = await t.post("/api/sql", { ...base, sql: "SELECT * FROM messages WHERE author = ? LIMIT 5", params: ["ana@x.test"], explain: true, limit: 50 });
+    expect(r.status).toBe(200);
+    expect((await r.json()) as unknown).toMatchObject({ ok: true, value: { columns: ["n"], rowsWritten: 0 } });
+    expect(t.project.calls.filter((c) => c.method === "POST").map((c) => [new URL(c.url).pathname, c.body])).toEqual([
+      ["/api/_ember/sql", { shard: "org:acme", sql: "SELECT * FROM messages WHERE author = ? LIMIT 5", params: ["ana@x.test"], explain: true, limit: 50 }],
+    ]);
+    const [row] = t.audit();
+    expect(row).toMatchObject({ action: "sql.run", env: "prod", shard: "org:acme", target: "org:acme", outcome: "ok" });
+    expect(JSON.parse(String(row!.args))).toEqual({ sql: "SELECT * FROM messages WHERE author = ? LIMIT 5", params: 1, explain: true, limit: 50 });
+    // Parameter values are user data: never in the log.
+    expect(String(row!.args)).not.toContain("ana@x.test");
+    // The read role is refused (and the refusal logged), before the project.
+    const denied = await t.post("/api/sql", { ...base, sql: "SELECT 1" }, { token: "read-secret" });
+    expect(denied.status).toBe(403);
+    expect(t.audit().at(-1)).toMatchObject({ action: "sql.run", outcome: "denied", actor: "read-token" });
+    expect(t.project.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+
+  it("the log keeps the first 2 KiB of a long query (and its length); bad bodies never reach the project", async () => {
+    const t = setup();
+    const sql = `SELECT ${Array.from({ length: 900 }, (_, i) => `c${i}`).join(", ")} FROM messages`;
+    expect(sql.length).toBeGreaterThan(2048);
+    expect((await t.post("/api/sql", { ...base, sql })).status).toBe(200);
+    const args = JSON.parse(String(t.audit()[0]!.args)) as { sql: string; chars: number };
+    expect(args.sql).toBe(`${sql.slice(0, 2048)}…`);
+    expect(args.chars).toBe(sql.length);
+    for (const bad of [{ sql: "" }, { sql: 5 }, { sql: "SELECT 1", limit: 0 }, { sql: "SELECT 1", limit: 5001 }, { sql: "SELECT 1", explain: "y" }, { sql: "SELECT ?", params: [{ a: 1 }] }, { sql: "SELECT ?", params: "x" }, { sql: "SELECT 1", shard: "no colon" }]) {
+      expect((await t.post("/api/sql", { ...base, ...bad })).status, JSON.stringify(bad)).toBe(400);
+    }
+    expect(t.project.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+
+  it("a runtime before level 14 (no `sql` feature): runtime_outdated for the SQL page and for rows with bounds, id or search", async () => {
+    const level13 = ["capabilities", "status", "data", "schema", "data/list", "data/delete", "dashboards", "dashboards/query", "dashboards/run"];
+    const t = setup({ features: level13 });
+    const res = await t.post("/api/sql", { ...base, sql: "SELECT 1" });
+    expect(res.status).toBe(501);
+    expect((await res.json()) as unknown).toMatchObject({ error: { code: "runtime_outdated", data: { feature: "sql" } } });
+    expect(t.audit()).toEqual([]);
+    const h = { headers: { authorization: "Bearer read-secret" } };
+    const rows = (qs: string) => t.call("GET", `/api/rows?project=chat&env=prod&shard=org:acme&table=messages${qs}`, h);
+    expect((await rows("")).status).toBe(200);
+    for (const qs of ["&id=messages_1", "&index=by_b&gt=1", "&lte=5", "&index=search_body&search=hi"]) expect((await rows(qs)).status, qs).toBe(501);
+    // A level 14 runtime gets them forwarded as given (capabilities are cached per Worker for a minute: forget them).
+    clearCapabilities();
+    const t2 = setup();
+    const ok = await t2.call("GET", `/api/rows?project=chat&env=prod&shard=org:acme&table=messages&index=by_b&eq=${encodeURIComponent("[1]")}&gte=2&lt=9&search=x&id=messages_1`, h);
+    expect(ok.status).toBe(200);
+    const sent = new URL(t2.project.calls.at(-1)!.url);
+    expect(Object.fromEntries(sent.searchParams)).toEqual({ shard: "org:acme", table: "messages", index: "by_b", eq: "[1]", gte: "2", lt: "9", search: "x", id: "messages_1" });
+    expect((await t2.call("GET", "/api/rows?project=chat&env=prod&shard=org:acme&table=messages&id=a%20b", h)).status).toBe(400);
   });
 });
 
