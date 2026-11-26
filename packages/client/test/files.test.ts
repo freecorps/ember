@@ -1,11 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ClientFiles, EmberClient, uploadFile, type UploadTicket } from "../src/index.ts";
 import { makeClient, messagesServer, SHARD } from "./helpers.ts";
 
 type Call = { method: string; url: string; headers: Record<string, string>; body: unknown; raw: unknown };
 
 /** Records storage traffic; answers like the Worker (multipart part size 10 bytes for the test). */
-function storageFetch(opts: { failPart?: number; partUrls?: boolean; partSize?: number } = {}) {
+/** What a part's attempts get, in order (then 200): a status, a status with `Retry-After`, or a lost request. */
+type PartAnswer = number | { status: number; retryAfter: string } | "network";
+
+function storageFetch(opts: { failPart?: number; partUrls?: boolean; partSize?: number; parts?: Record<number, PartAnswer[]> } = {}) {
   const calls: Call[] = [];
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -37,6 +40,12 @@ function storageFetch(opts: { failPart?: number; partUrls?: boolean; partSize?: 
     if (url.startsWith("https://r2.test/part")) {
       const n = Number(new URL(url).searchParams.get("n"));
       if (n === opts.failPart) return new Response("<Error><Code>InternalError</Code><Message>boom</Message></Error>", { status: 500 });
+      const next = opts.parts?.[n]?.shift();
+      if (next === "network") throw new TypeError("fetch failed");
+      if (next !== undefined) {
+        const { status, retryAfter } = typeof next === "number" ? { status: next, retryAfter: undefined } : next;
+        return new Response("<Error><Code>SlowDown</Code><Message>try again</Message></Error>", { status, headers: retryAfter ? { "retry-after": retryAfter } : {} });
+      }
       return new Response(null, { status: 200, headers: { etag: `"etag-${n}"` } });
     }
     if (url.startsWith("https://r2.test/put") || path === "/api/storage/put") return new Response(null, { status: 200, headers: { etag: '"e"' } });
@@ -108,11 +117,60 @@ describe("client.files.upload", () => {
     client.close();
   });
 
-  it("a failed part aborts the multipart upload and rejects with the S3 error", async () => {
+  it("a part that keeps failing aborts the multipart upload after its attempts and rejects with the S3 error", async () => {
     const { client } = setup(() => ({ multipart: { partSize: 10 } }));
     const s = storageFetch({ failPart: 2 });
-    await expect(client.files.upload(new Uint8Array(25), { fetch: s.fetchImpl, multipartThreshold: 8, concurrency: 1 })).rejects.toMatchObject({ code: "InternalError" });
+    await expect(client.files.upload(new Uint8Array(25), { fetch: s.fetchImpl, multipartThreshold: 8, concurrency: 1, retryDelayMs: 1 })).rejects.toMatchObject({ code: "InternalError" });
+    expect(s.calls.filter((c) => c.url === "https://r2.test/part?n=2")).toHaveLength(3);
     expect(s.calls.some((c) => (c.body as any)?.op === "abort")).toBe(true);
+    client.close();
+  });
+
+  it("a part answered 5xx, 429 or lost on the network is sent again (exponential backoff, Retry-After) before the upload gives up", async () => {
+    const { client } = setup(() => ({ multipart: { partSize: 10 } }));
+    const s = storageFetch({ parts: { 1: [503, "network"], 2: [{ status: 429, retryAfter: "2" }], 3: [500] } });
+    // The waits the upload asks for (not the client's own timers), run at once.
+    const waits: number[] = [];
+    const real = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      if (/src\/files\.ts/.test(new Error().stack ?? "")) waits.push(ms!);
+      return real(fn, 0);
+    }) as typeof setTimeout);
+    try {
+      const out = await client.files.upload(new Uint8Array(25), { fetch: s.fetchImpl, multipartThreshold: 8, concurrency: 1 });
+      expect(out).toMatchObject({ state: "ready" });
+    } finally {
+      spy.mockRestore();
+    }
+    const attempts = (n: number) => s.calls.filter((c) => c.url === `https://r2.test/part?n=${n}`).length;
+    expect([attempts(1), attempts(2), attempts(3)]).toEqual([3, 2, 2]);
+    expect(s.calls.some((c) => (c.body as any)?.op === "abort")).toBe(false);
+    // Part 1: 250–500 ms, then 500–1000 ms; part 2: its Retry-After (2 s); part 3: 250–500 ms.
+    expect(waits).toHaveLength(4);
+    expect(waits[0]).toBeGreaterThanOrEqual(250);
+    expect(waits[0]).toBeLessThanOrEqual(500);
+    expect(waits[1]).toBeGreaterThanOrEqual(500);
+    expect(waits[1]).toBeLessThanOrEqual(1000);
+    expect(waits[2]).toBe(2000);
+    expect(waits[3]).toBeLessThanOrEqual(500);
+    client.close();
+  });
+
+  it("a 4xx part is not sent again; the signal cancels a part waiting to be sent again", async () => {
+    const { client } = setup(() => ({ multipart: { partSize: 10 } }));
+    const s = storageFetch({ parts: { 1: [403] } });
+    await expect(client.files.upload(new Uint8Array(25), { fetch: s.fetchImpl, multipartThreshold: 8, concurrency: 1 })).rejects.toMatchObject({ code: "SlowDown" });
+    expect(s.calls.filter((c) => c.url === "https://r2.test/part?n=1")).toHaveLength(1);
+
+    const t = storageFetch({ parts: { 1: [{ status: 503, retryAfter: "20" }] } });
+    const ctl = new AbortController();
+    const up = client.files.upload(new Uint8Array(25), { fetch: t.fetchImpl, multipartThreshold: 8, concurrency: 1, signal: ctl.signal });
+    await vi.waitFor(() => expect(t.calls.filter((c) => c.url === "https://r2.test/part?n=1")).toHaveLength(1));
+    const at = Date.now();
+    ctl.abort();
+    await expect(up).rejects.toMatchObject({ name: "AbortError" });
+    expect(Date.now() - at).toBeLessThan(1000);
+    expect(t.calls.filter((c) => c.url === "https://r2.test/part?n=1")).toHaveLength(1);
     client.close();
   });
 
