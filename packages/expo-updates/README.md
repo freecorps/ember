@@ -101,7 +101,8 @@ the signature is RSASSA-PKCS1-v1_5 with SHA-256 through WebCrypto. Requests that
   never reads an old response.
 
 So an app open is two cache lookups and no Durable Object; each edge location reads the shard once per
-`planTtlSeconds` per (channel, platform, runtime version), and signs once per response key. Measured in
+`planTtlSeconds` per (channel, platform, runtime version), and signs once per response key, except for concurrent
+misses: requests that miss the same key before one of them fills it each read (and sign); misses are not coalesced. Measured in
 `test/workerd`: 50 opens after the first → 0 stubs, 0 RPCs; 200 installs in a 30% rollout → 1 shard read, 2 signed
 responses. The cost is bounded staleness: a publish, rollback or kill switch reaches every location within
 `planTtlSeconds`. Tune it per install:
@@ -139,8 +140,9 @@ ember expo list
   its installs to a second branch.
 - **Pointing a channel elsewhere** (`setChannel`, or clearing its branch rollout) serves the other branch's current
   head as it is: installs only move to a newer `createdAt`, so one already running a newer update from the previous
-  branch keeps it. To bring those back, republish the target update after the switch (`ember expo publish` of the
-  same export, or a `rollback` on the previous branch), which gives it a newer `createdAt`.
+  branch keeps it. To bring those back, republish the target update on the target branch after the switch
+  (`ember expo publish` of the same export there), which gives it a newer `createdAt`. A rollback on the previous
+  branch does not help: it changes that branch (and the other channels still on it), not the target's head.
 - **Rollback** takes the head out (`rolledBack`) and republishes the previous update as a new one (clients only move
   to a newer `createdAt`), or publishes `rollBackToEmbedded` with `--to-embedded` or when there is no previous update.
 - **Kill switch**: a paused channel answers `noUpdateAvailable` to all its installs; a paused branch, to the installs

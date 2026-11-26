@@ -72,8 +72,10 @@ const schema = defineSchema({
     assets: defineTable({
       sha256: v.string(),
       file: v.file(),
+      /** When `file`'s upload ticket expires, while it is pending. */
+      fileExpiresAt: v.optional(v.number()),
       /** Uploads of the same content still in flight besides `file` (concurrent publishers): any confirmed one serves. */
-      pending: v.optional(v.array(v.file())),
+      pending: v.optional(v.array(v.object({ file: v.file(), expiresAt: v.number() }))),
       contentType: v.string(),
       size: v.number(),
       createdAt: v.number(),
@@ -163,6 +165,11 @@ const liveRows = (ctx: ReadCtx, branch: string, platform: Platform, runtimeVersi
     .order("desc")
     .take(n);
 
+/** The release a row serves: its own id, or the one a rollback republished (`republishOf`). */
+const releaseOf = (r: { uuid: string; republishOf?: string }) => r.republishOf ?? r.uuid;
+/** How many live rows a rollback looks at to find the previous release. */
+const ROLLBACK_WINDOW = 50;
+
 /** The channels that serve `branch` (as their branch or their rollout branch): at most `limit` per index. */
 function channelsServing(ctx: ReadCtx, branch: string, limit: number) {
   const out = new Map<string, ReturnType<typeof channelByName> & {}>();
@@ -239,12 +246,14 @@ function checkAsset(ctx: Ctx["mutation"], a: StoredAsset, ready: Map<string, boo
   if (!a.key || a.key.length > 200) throw new EmberError("ValidationError", "asset key must be 1..200 characters");
   if (a.fileExtension !== undefined && !/^\.[A-Za-z0-9]{1,16}$/.test(a.fileExtension)) throw new EmberError("ValidationError", `fileExtension must start with "." (got ${JSON.stringify(a.fileExtension)})`);
   let ok = ready.get(a.sha256);
+  const row = assetBySha(ctx, a.sha256);
   if (ok === undefined) {
-    const row = ctx.db.query("assets").withIndex("by_sha", (q) => q.eq("sha256", a.sha256)).unique();
     ok = !!row && promoteReady(ctx, row);
     ready.set(a.sha256, ok);
   }
   if (!ok) throw expoUpdatesErrors.AssetNotUploaded({ sha256: a.sha256 });
+  // One media type per content: the manifest says what the asset route serves.
+  if (row && row.contentType !== a.contentType) throw new EmberError("ValidationError", `asset ${a.sha256} is stored as ${row.contentType}, not ${a.contentType}`);
 }
 
 const assetBySha = (ctx: ReadCtx, sha256: string) => ctx.db.query("assets").withIndex("by_sha", (q) => q.eq("sha256", sha256)).unique();
@@ -258,12 +267,20 @@ const fileState = (ctx: ReadCtx, id: string) => ctx.storage.getMetadata(id)?.sta
  */
 function promoteReady(ctx: Ctx["mutation"], row: AssetRow): boolean {
   if (fileState(ctx, row.file) === "ready") return true;
-  const candidates = [row.file, ...(row.pending ?? [])];
-  const file = candidates.find((f) => fileState(ctx, f) === "ready");
+  const file = [row.file, ...(row.pending ?? []).map((u) => u.file)].find((f) => fileState(ctx, f) === "ready");
   if (!file) return false;
-  const pending = candidates.filter((f) => f !== file && fileState(ctx, f) === "pending");
-  ctx.db.patch(row._id, { file, pending: pending.length ? pending : undefined });
+  const pending = uploadsInFlight(ctx, row).filter((u) => u.file !== file);
+  ctx.db.patch(row._id, { file, fileExpiresAt: undefined, pending: pending.length ? pending : undefined });
   return true;
+}
+
+/**
+ * The row's uploads still in flight: pending files whose ticket has not expired (an expired one can no longer be
+ * confirmed: it stops counting, and the row lets it go on its next write, so storage collects it).
+ */
+function uploadsInFlight(ctx: ReadCtx, row: AssetRow): Array<{ file: AssetRow["file"]; expiresAt: number }> {
+  const all = [...(row.fileExpiresAt !== undefined ? [{ file: row.file, expiresAt: row.fileExpiresAt }] : []), ...(row.pending ?? [])];
+  return all.filter((u) => u.expiresAt > ctx.now && fileState(ctx, u.file) === "pending");
 }
 
 /** At most this many uploads of one content in flight at once (each keeps its file referenced until it is used). */
@@ -294,22 +311,25 @@ export const functions = {
           if (!Number.isInteger(a.size) || a.size < 0 || a.size > MAX_ASSET_BYTES) throw new EmberError("ValidationError", `asset ${a.sha256}: size must be an integer in 0..${MAX_ASSET_BYTES}`);
           if (seen.has(a.sha256)) continue;
           seen.add(a.sha256);
-          const row = ctx.db.query("assets").withIndex("by_sha", (q) => q.eq("sha256", a.sha256)).unique();
-          if (row && ctx.storage.getMetadata(row.file)?.state === "ready") {
-            out.push({ sha256: a.sha256, exists: true });
-            continue;
-          }
+          const row = assetBySha(ctx, a.sha256);
+          const inFlight = row ? uploadsInFlight(ctx, row) : [];
+          // One media type per content (what the asset route serves): another one is refused while a copy is stored
+          // or on its way.
+          const stored = !!row && (fileState(ctx, row.file) === "ready" || (row.pending ?? []).some((u) => fileState(ctx, u.file) === "ready"));
+          if (row && row.contentType !== a.contentType && (stored || inFlight.length)) throw new EmberError("ValidationError", `asset ${a.sha256} is stored as ${row.contentType}, not ${a.contentType}`);
           if (row && promoteReady(ctx, row)) {
             out.push({ sha256: a.sha256, exists: true });
             continue;
           }
+          if (inFlight.length >= MAX_PENDING_UPLOADS) throw new EmberError("ValidationError", `asset ${a.sha256}: ${MAX_PENDING_UPLOADS} uploads of it are already in flight`);
           const ticket = ctx.storage.generateUploadUrl({ sha256: a.sha256, size: a.size, contentType: a.contentType });
           // The row references the file from now on (refcount): a pending upload is not collected while it is here. An
-          // upload of the same content already in flight keeps its place (its publisher confirms it, and either serves).
-          const inFlight = row ? [row.file, ...(row.pending ?? [])].filter((f) => f !== ticket.storageId && fileState(ctx, f) === "pending") : [];
-          if (inFlight.length >= MAX_PENDING_UPLOADS) throw new EmberError("ValidationError", `asset ${a.sha256}: ${MAX_PENDING_UPLOADS} uploads of it are already in flight`);
-          if (row) ctx.db.patch(row._id, { file: ticket.storageId as never, pending: inFlight.length ? inFlight : undefined, contentType: a.contentType, size: a.size });
-          else ctx.db.insert("assets", { sha256: a.sha256, file: ticket.storageId as never, contentType: a.contentType, size: a.size, createdAt: ctx.now });
+          // upload of the same content already in flight keeps its place (its publisher confirms it, and either serves);
+          // expired tickets are let go.
+          const pending = inFlight.filter((u) => u.file !== ticket.storageId);
+          const fileExpiresAt = ticket.exists ? undefined : ticket.expiresAt;
+          if (row) ctx.db.patch(row._id, { file: ticket.storageId as never, fileExpiresAt, pending: pending.length ? pending : undefined, contentType: a.contentType, size: a.size });
+          else ctx.db.insert("assets", { sha256: a.sha256, file: ticket.storageId as never, ...(fileExpiresAt !== undefined ? { fileExpiresAt } : {}), contentType: a.contentType, size: a.size, createdAt: ctx.now });
           if (ticket.exists || !ticket.url) out.push({ sha256: a.sha256, exists: true });
           else out.push({ sha256: a.sha256, exists: false, upload: { storageId: ticket.storageId, shard: ticket.shard, token: ticket.token, url: ticket.url, method: ticket.method ?? "PUT", headers: ticket.headers ?? {} } });
         }
@@ -402,10 +422,15 @@ export const functions = {
         if (!branchByName(ctx, a.branch)) throw expoUpdatesErrors.UnknownBranch({ name: a.branch });
         const out: Array<{ platform: Platform; runtimeVersion: string; rolledBack: string; now: string; kind: "update" | "rollBackToEmbedded" }> = [];
         for (const p of pairsOf(ctx, a.branch, a.platform, a.runtimeVersion)) {
-          const [head, prev] = liveRows(ctx, a.branch, p.platform, p.runtimeVersion, 2);
+          // A rollback takes out the head's release (the head and the live copies of it a rollback republished) and
+          // goes back to the newest live row of another release: rolling back B' (a republish of B) reaches A, not B.
+          const rows = liveRows(ctx, a.branch, p.platform, p.runtimeVersion, ROLLBACK_WINDOW);
+          const head = rows[0];
           if (!head) continue;
+          const bad = releaseOf(head);
+          const prev = rows.find((r) => releaseOf(r) !== bad);
           if (head.kind === "rollBackToEmbedded" && (a.toEmbedded || !prev)) continue; // already on the embedded update
-          ctx.db.patch(head._id, { rolledBack: true });
+          for (const r of rows) if (releaseOf(r) === bad) ctx.db.patch(r._id, { rolledBack: true });
           const uuid = uuidOf(ctx.random);
           const toEmbedded = !!a.toEmbedded || !prev;
           // What the new head is: the previous row may itself be a directive (a publish after a rollback to embedded).
@@ -415,7 +440,7 @@ export const functions = {
             insertHead(ctx, { ...base, kind: "rollBackToEmbedded", assets: [], metadata: {}, message: a.message ?? `Roll back ${head.uuid} to the embedded update` }, head.createdAt);
           } else {
             const { _id: _x, _creationTime: _y, uuid: prevUuid, group: _g, createdAt: _c, rollbackOf: _r, republishOf: _p, message: _m, ...copy } = prev!;
-            insertHead(ctx, { ...copy, ...base, republishOf: prevUuid, message: a.message ?? `Roll back ${head.uuid} to ${prevUuid}` }, head.createdAt);
+            insertHead(ctx, { ...copy, ...base, republishOf: releaseOf(prev!), message: a.message ?? `Roll back ${head.uuid} to ${prevUuid}` }, head.createdAt);
           }
           out.push({ platform: p.platform, runtimeVersion: p.runtimeVersion, rolledBack: head.uuid, now: uuid, kind });
         }
@@ -667,7 +692,7 @@ const manifestAction = httpAction(async (ctx, request) => {
   const keyId = config.signing?.keyId ?? "main";
   const signedBy = !req.expectSignature ? "0" : pem ? `${keyId}:${await keyDigest(pem)}` : "-";
   const responseKey = new Request(
-    `${base}/response?${q({ ch: req.channel, p: req.platform, rv: req.runtimeVersion, v: String(plan.version), b: sides, o: what, proto: String(req.protocolVersion), fmt: req.mediaType, sig: signedBy, a: assetsBase })}`,
+    `${base}/response?${q({ ch: req.channel, p: req.platform, rv: req.runtimeVersion, v: String(plan.version), b: sides, o: what, proto: String(req.protocolVersion), fmt: req.mediaType, mp: req.multipartAccepted ? "1" : "0", sig: signedBy, a: assetsBase })}`,
   );
   const send = (r: RenderedResponse, state: string) => new Response(r.body, { status: r.status, headers: { ...r.headers, "x-ember-cache": state, "x-ember-plan-cache": planState } });
   if (edge) {

@@ -157,6 +157,47 @@ describe("expo updates component", () => {
     expect(c2.status).toBe(200);
   });
 
+  test("rolling back a republished release reaches the one before it, not the original copy", async () => {
+    const t = harness();
+    await publish(t, { bundle: "A" });
+    await publish(t, { bundle: "B" });
+    await publish(t, { bundle: "C" });
+    const hashOf = async () => (await ask(t)).manifest.launchAsset.hash as string;
+    const h = (b: string) => createHash("sha256").update(b).digest("base64url");
+    await t.mutation(m("rollback"), { branch: "production" });
+    expect(await hashOf()).toBe(h("B"));
+    // B is bad too: back to A (B' and the original B both out of service).
+    await t.mutation(m("rollback"), { branch: "production" });
+    expect(await hashOf()).toBe(h("A"));
+    // And past A: the embedded update.
+    expect(((await t.mutation(m("rollback"), { branch: "production" })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
+  });
+
+  test("one media type per content: another type for stored bytes is refused at prepare and at publish", async () => {
+    const t = harness();
+    await publish(t, { bundle: "x", image: "PNG-Z" });
+    await expect(t.mutation(m("prepareAssets"), { assets: [{ sha256: hex("PNG-Z"), size: 5, contentType: "application/octet-stream" }] })).rejects.toThrow(/stored as image\/png/);
+    await expect(
+      t.mutation(m("publish"), { branch: "production", updates: [{ platform: "ios", runtimeVersion: "1.0.0", launchAsset: asset("x", "b", "application/javascript"), assets: [asset("PNG-Z", "img", "application/octet-stream")] }] }),
+    ).rejects.toThrow(/stored as image\/png/);
+    // While an upload is only in flight, a second type is refused as well.
+    await t.mutation(m("prepareAssets"), { assets: [{ sha256: hex("PNG-Y"), size: 5, contentType: "image/png" }] });
+    await expect(t.mutation(m("prepareAssets"), { assets: [{ sha256: hex("PNG-Y"), size: 5, contentType: "image/webp" }] })).rejects.toThrow(/stored as image\/png/);
+  });
+
+  test("expired upload tickets stop counting and are let go: prepareAssets keeps working for that content", async () => {
+    const t = harness();
+    const body = "never-uploaded";
+    const prep = () => t.mutation(m("prepareAssets"), { assets: [{ sha256: hex(body), size: body.length, contentType: "application/javascript" }] });
+    for (let i = 0; i < 16; i++) await prep();
+    await expect(prep()).rejects.toThrow(/already in flight/);
+    // Every ticket expires (default URL TTL: 1 h): they no longer count, and the row keeps only the new one.
+    await t.advance(2 * 3600_000);
+    await prep();
+    for (let i = 0; i < 15; i++) await prep();
+    await expect(prep()).rejects.toThrow(/already in flight/);
+  });
+
   test("branch-wide commands find every live platform and runtime version, however many rows other ones have", async () => {
     const t = harness();
     await publish(t, { bundle: "ios-1", platforms: ["ios"] });
@@ -224,8 +265,10 @@ describe("expo updates component", () => {
     expect(d.kind).toBe("rollBackToEmbedded");
     expect(await verify(keys.publicKey, d.signature!, d.body!)).toBe(true);
     expect((await ask(t, { "expo-current-update-id": "e0000000-0000-4000-8000-000000000000", "expo-embedded-update-id": "e0000000-0000-4000-8000-000000000000" })).kind).toBe("noUpdateAvailable");
-    // JSON form cannot carry it: 406.
+    // JSON form cannot carry it: 406 when nothing else is accepted, multipart when it is (though ranked lower).
     expect((await ask(t, { accept: "application/json" })).status).toBe(406);
+    expect(await ask(t, { accept: "application/json;q=1, multipart/mixed;q=0.5" })).toMatchObject({ status: 200, kind: "rollBackToEmbedded" });
+    expect((await ask(t, { accept: "application/json;q=1, multipart/mixed;q=0" })).status).toBe(406);
     // Android untouched by the platform-scoped rollback.
     expect((await ask(t, { "expo-platform": "android" })).kind).toBe("update");
     // The first update rolled back with nothing before it goes to the embedded update too.
