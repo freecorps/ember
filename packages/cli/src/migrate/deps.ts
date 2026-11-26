@@ -44,7 +44,9 @@ const REWRITTEN = /^(convex|convex-helpers|@convex-dev\/[^/]+)(\/|$)/;
  */
 export function importSpecifiers(text: string, fileName = "x.tsx"): string[] {
   const out = new Set<string>();
-  const sf = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, false, /\.(c|m)?jsx?$/.test(fileName) ? ts.ScriptKind.JSX : ts.ScriptKind.TSX);
+  // The grammar of the file's extension: in a .ts file `<T>import("m")` is a type assertion, in a .tsx one JSX.
+  const kind = /\.(c|m)?jsx?$/.test(fileName) ? ts.ScriptKind.JSX : /\.(c|m)?ts$/.test(fileName) ? ts.ScriptKind.TS : ts.ScriptKind.TSX;
+  const sf = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, kind);
   const literal = (n: ts.Node | undefined) => (n && (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) ? n.text : null);
   const visit = (n: ts.Node): void => {
     if (ts.isImportDeclaration(n)) {
@@ -69,6 +71,13 @@ export function importSpecifiers(text: string, fileName = "x.tsx"): string[] {
       const isRequire = ts.isIdentifier(n.expression) && n.expression.text === "require";
       const m = literal(n.arguments[0]);
       if ((isImport || isRequire) && m) out.add(m);
+    }
+    // A class's `extends <expression>` runs (`extends require("m").Base`): TypeScript wraps it in an
+    // ExpressionWithTypeArguments, a type node; its type arguments and `implements`/interface heritage are erased.
+    if (ts.isExpressionWithTypeArguments(n)) {
+      const clause = n.parent;
+      if (ts.isHeritageClause(clause) && clause.token === ts.SyntaxKind.ExtendsKeyword && (ts.isClassDeclaration(clause.parent) || ts.isClassExpression(clause.parent))) visit(n.expression);
+      return;
     }
     // Types (`import("m").T`, `typeof import("m")`) are never loaded.
     if (ts.isTypeNode(n)) return;
@@ -106,7 +115,7 @@ function walk(dir: string, root = dir, out: string[] = []): string[] {
     if (name === "node_modules" || name === "_generated" || name.startsWith(".")) continue;
     const p = join(dir, name);
     if (statSync(p).isDirectory()) walk(p, root, out);
-    else if (CODE.test(name) && !name.endsWith(".d.ts")) out.push(relative(root, p).split(sep).join("/"));
+    else if (CODE.test(name) && !/\.d\.(ts|mts|cts)$/.test(name)) out.push(relative(root, p).split(sep).join("/"));
   }
   return out;
 }

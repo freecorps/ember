@@ -1,5 +1,5 @@
 // `ember migrate convex`: the library check against the node-actions spike's verdicts (fixture test/fixtures/convex-libs).
-import { cpSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
@@ -40,6 +40,16 @@ describe("migrate convex: libraries", () => {
     expect(importSpecifiers(tricky).sort()).toEqual(["import-equals", "inline-comment", "mixed-but-loaded", "multiline-comment"]);
     // Plain JavaScript (JSX allowed) parses too.
     expect(importSpecifiers(`const a = require("cjs"); export default () => <div/>;`, "x.jsx")).toEqual(["cjs"]);
+    // Each extension's grammar: in .ts/.mts/.cts `<T>expr` is a type assertion (in .tsx it would be JSX).
+    for (const f of ["x.ts", "x.mts", "x.cts"]) expect(importSpecifiers(`const lib = <unknown>import("sharp");`, f), f).toEqual(["sharp"]);
+    // A class's runtime base expression loads its module; type arguments, implements and interface heritage do not.
+    const heritage = [
+      `class Background extends require("node:worker_threads").Worker {}`,
+      `const C = class extends (require("base-expr") as any).B<import("erased-arg").T> {};`,
+      `interface I extends Ifc<typeof import("erased-iface")> {}`,
+      `class K implements Ifc<import("erased-impl").T> {}`,
+    ].join("\n");
+    expect(importSpecifiers(heritage, "x.ts").sort()).toEqual(["base-expr", "node:worker_threads"]);
     expect([packageOf("@s/b/sub"), packageOf("fs"), packageOf("fs/promises"), packageOf("node:zlib"), packageOf("./x"), packageOf("lodash/fp")]).toEqual(["@s/b", "node:fs", "node:fs/promises", "node:zlib", null, "lodash"]);
     expect(lookup("sharp")).toMatchObject({ matched: "sharp", verdict: "no" });
     expect(lookup("crypto")).toMatchObject({ matched: "node:crypto", verdict: "works" });
@@ -75,6 +85,15 @@ describe("migrate convex: libraries", () => {
     expect(lines).toMatch(/unknown\s+left-pad-pro/);
     expect(lines).not.toMatch(/openai/);
     expect(checkLibraries(join(FIXTURE, "missing")).findings).toEqual([]);
+  });
+
+  it("declaration files (.d.ts, .d.mts, .d.cts) are not run: their imports never block", () => {
+    const src = join(out, "decl", "convex");
+    mkdirSync(src, { recursive: true });
+    for (const ext of ["d.ts", "d.mts", "d.cts"]) writeFileSync(join(src, `types.${ext}`), `import { Sharp } from "sharp";\nexport type Image = Sharp;\n`);
+    writeFileSync(join(src, "run.mts"), `import { Worker } from "node:worker_threads";\nexport const w = Worker;\n`);
+    const c = checkLibraries(src);
+    expect(c.findings.map((f) => [f.module, f.files])).toEqual([["node:worker_threads", ["run.mts"]]]);
   });
 
   it("the report has a Libraries section", () => {
