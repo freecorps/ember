@@ -91,6 +91,8 @@ export class TabCoordinator implements StorageAdapter {
   private stopLifecycle: (() => void) | undefined;
   /** A step-down in progress (flush, close the storage, release the lock): the next lead waits for it. */
   private steppingDown: Promise<void> | null = null;
+  /** `lead()` runs: this tab holds the leader lock (opening the storage, or serving it) until it returns. */
+  private leading = false;
   private readonly saved = new Set<(n: SavedNotice) => void>();
   private stopStoreSaved: (() => void) | null = null;
   /** The leader's `saved` broadcasts (followers: the storage is the leader's). */
@@ -127,7 +129,9 @@ export class TabCoordinator implements StorageAdapter {
     void this.locks
       .request(this.base, { ifAvailable: true }, (lock) => {
         if (lock) return this.lead();
-        this.follow();
+        // Taken: maybe by this tab, whose `lead()` (from before a freeze and resume) is still opening the storage or
+        // already serves it. Then it leads (or fails) as it is; following would report it as a follower.
+        if (!this.leading) this.follow();
         return undefined;
       })
       .catch(() => this.follow());
@@ -238,6 +242,15 @@ export class TabCoordinator implements StorageAdapter {
    */
   private async lead(): Promise<void> {
     if (this.closed || this.suspended) return;
+    this.leading = true;
+    try {
+      await this.leadHeld();
+    } finally {
+      this.leading = false;
+    }
+  }
+
+  private async leadHeld(): Promise<void> {
     let store: ServableStorage | null = null;
     let error: unknown;
     const attempts = Math.max(1, this.options.openAttempts ?? 10);
