@@ -311,7 +311,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
       return deps.error(400, "bad_request", "eq must be a JSON array");
     }
     if (eq !== undefined && !Array.isArray(eq)) return deps.error(400, "bad_request", "eq must be a JSON array");
-    // Level 14: range bounds on the index field after the `eq` prefix (JSON values), a direct get, a full-text search.
+    // Level 15: range bounds on the index field after the `eq` prefix (JSON values), a direct get, a full-text search.
     const bounds: Record<string, unknown> = {};
     for (const op of ["gt", "gte", "lt", "lte"] as const) {
       if (!q.has(op)) continue;

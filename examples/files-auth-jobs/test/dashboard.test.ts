@@ -75,25 +75,6 @@ describe("dashboard → runtime (workerd)", () => {
     expect(crons.body.crons.length).toBeGreaterThan(0);
   });
 
-  it("SQL Explorer: one read-only query on the shard through the dashboard, audited with its text; writes refused by the project", async () => {
-    const target = { project: "files-auth-jobs", env: "test", shard: "global:main" };
-    const r = await write("/api/sql", { ...target, sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", params: ["uploads"] });
-    expect(r.status).toBe(200);
-    expect((r.body as unknown as { value: { columns: string[]; rows: unknown[][]; rowsWritten: number } }).value).toMatchObject({ columns: ["name"], rows: [["uploads"]], rowsWritten: 0 });
-    const plan = await write("/api/sql", { ...target, sql: "SELECT * FROM uploads", explain: true });
-    expect((plan.body as unknown as { value: { plan: Array<{ detail: string }> } }).value.plan[0]!.detail).toMatch(/SCAN|SEARCH/);
-    const refused = await write("/api/sql", { ...target, sql: "DELETE FROM uploads" });
-    expect([refused.status, refused.body.error?.code]).toEqual([400, "SqlRefused"]);
-    expect((await write("/api/sql", { ...target, sql: "SELECT 1" }, "dash-read")).status).toBe(403);
-    const log = await env.REGISTRY.prepare("SELECT outcome, args FROM audit_log WHERE action = 'sql.run' ORDER BY id").all<{ outcome: string; args: string }>();
-    expect(log.results.map((x) => [x.outcome, (JSON.parse(x.args) as { sql: string }).sql])).toEqual([
-      ["ok", "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"],
-      ["ok", "SELECT * FROM uploads"],
-      ["error", "DELETE FROM uploads"],
-      ["denied", null === null ? undefined : undefined],
-    ].map(([o, q]) => [o, q]) as unknown as Array<[string, string]>);
-  });
-
   it("writes: read role refused, typed confirmation on the protected env, every attempt in the audit log", async () => {
     const target = { project: "files-auth-jobs", env: "test", shard: "global:main" };
     // Read role: refused before the project is called.
@@ -387,5 +368,46 @@ describe("dashboard → runtime (workerd)", () => {
     ]);
     // Argument values are user data: names only.
     expect(log.body.entries[4]!.args).toBe(JSON.stringify({ dashboard: "", fn: "rates:setRate", fields: ["base", "quote", "rate"] }));
+  });
+
+  it("SQL Explorer: one read-only query on the shard through the dashboard, audited with its text; writes refused by the project", async () => {
+    const target = { project: "files-auth-jobs", env: "test", shard: "global:main" };
+    type Answer = { value: { columns: string[]; rows: unknown[][]; rowsRead: number; rowsWritten: number; truncated: boolean; ms: number; plan?: Array<{ detail: string }> } };
+    // The rates the declarative-screens test wrote (fxRates lives on global:main), by SQL with a bound parameter.
+    const r = await write("/api/sql", { ...target, sql: "SELECT base, quote, rate FROM fxRates WHERE quote = ? ORDER BY base", params: ["BRL"] });
+    expect(r.status).toBe(200);
+    const answer = (r.body as unknown as Answer).value;
+    expect(answer).toMatchObject({ columns: ["base", "quote", "rate"], rows: [["EUR", "BRL", 6.1], ["USD", "BRL", 5.4]], rowsWritten: 0, truncated: false });
+    expect(answer.rowsRead).toBeGreaterThan(0);
+    // The row cap: one row asked, the query had more.
+    const capped = await write("/api/sql", { ...target, sql: "SELECT _id FROM fxRates", limit: 1 });
+    expect((capped.body as unknown as Answer).value).toMatchObject({ truncated: true, rows: [expect.any(Array)] });
+    // EXPLAIN QUERY PLAN as a tree.
+    const plan = await write("/api/sql", { ...target, sql: "SELECT * FROM fxRates WHERE base = 'USD'", explain: true });
+    expect((plan.body as unknown as Answer).value.plan![0]!.detail).toMatch(/SCAN|SEARCH/);
+    // A write is refused by the project (the dashboard forwards the text; the runtime decides), and nothing changes.
+    const refused = await write("/api/sql", { ...target, sql: "DELETE FROM fxRates" });
+    expect([refused.status, refused.body.error?.code]).toEqual([400, "SqlRefused"]);
+    const chained = await write("/api/sql", { ...target, sql: "SELECT 1; DROP TABLE fxRates" });
+    expect(chained.body.error?.code).toBe("SqlRefused");
+    const count = await write("/api/sql", { ...target, sql: "SELECT count(*) AS n FROM fxRates" });
+    expect((count.body as unknown as Answer).value.rows).toEqual([[2]]);
+    // Read role: refused before the project is called.
+    expect((await write("/api/sql", { ...target, sql: "SELECT 1" }, "dash-read")).status).toBe(403);
+
+    const log = await read<{ entries: Array<{ actor: string; action: string; outcome: string; target: string | null; args: string | null }> }>("/api/audit?project=files-auth-jobs&env=test&limit=7");
+    expect(log.body.entries.map((e) => [e.actor, e.action, e.outcome])).toEqual([
+      ["read-token", "sql.run", "denied"],
+      ["token", "sql.run", "ok"],
+      ["token", "sql.run", "error"],
+      ["token", "sql.run", "error"],
+      ["token", "sql.run", "ok"],
+      ["token", "sql.run", "ok"],
+      ["token", "sql.run", "ok"],
+    ]);
+    // The text is what ran (the point of the log); parameter values are user data, only their count.
+    expect(JSON.parse(log.body.entries[6]!.args!)).toEqual({ sql: "SELECT base, quote, rate FROM fxRates WHERE quote = ? ORDER BY base", params: 1, explain: false, limit: null });
+    expect(JSON.parse(log.body.entries[3]!.args!)).toMatchObject({ sql: "DELETE FROM fxRates" });
+    expect(log.body.entries[6]!.target).toBe("global:main");
   });
 });
