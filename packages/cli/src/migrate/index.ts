@@ -8,10 +8,12 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, join, relative, resolve, sep } from "node:path";
 import ts from "typescript";
 import { Analysis, type Finding } from "./analyze.ts";
+import { checkLibraries, type LibraryCheck } from "./deps.ts";
 import { renderReport } from "./report.ts";
 import { FileRewriter, type ErrorSite, type MigrationState } from "./rewrite.ts";
 
 export type { Finding, Severity } from "./analyze.ts";
+export { checkLibraries, libraryLines, type LibraryCheck, type LibraryFinding } from "./deps.ts";
 export { verifyMigration, type VerifyResult } from "./verify.ts";
 
 export interface MigrateOptions {
@@ -25,6 +27,8 @@ export interface MigrateOptions {
   dryRun?: boolean;
   /** Write into a non-empty `out`. */
   force?: boolean;
+  /** The library check already made (`checkLibraries(src)`); default: made here. */
+  libraries?: LibraryCheck;
 }
 
 export type FileStatus = "converted" | "copied" | "unchanged" | "skipped" | "generated";
@@ -55,6 +59,8 @@ export interface MigrateResult {
   report: string;
   /** "manual" findings (what `--check` fails on). */
   manual: number;
+  /** Which libraries run in an Ember action (deps.ts). */
+  libraries: LibraryCheck;
 }
 
 const CODE = /\.(ts|tsx|mts|js|mjs|jsx)$/;
@@ -209,6 +215,7 @@ export function migrateConvex(options: MigrateOptions): MigrateResult {
     written,
     outputs: Object.fromEntries([...outputs].sort(([x], [y]) => x.localeCompare(y))),
     manual: a.findings.filter((x) => x.severity === "manual").length,
+    libraries: options.libraries ?? checkLibraries(src),
   };
   return { ...result, report: renderReport(result, options) };
 }

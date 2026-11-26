@@ -2,6 +2,7 @@
 // files, generated errors and triggers, then what changed per file and the next steps.
 
 import { relative } from "node:path";
+import { librarySection } from "./deps.ts";
 import type { MigrateOptions, MigrateResult } from "./index.ts";
 
 const esc = (s: string) => s.replace(/\|/g, "\\|");
@@ -30,6 +31,7 @@ export function renderReport(r: Omit<MigrateResult, "report">, options: MigrateO
   out.push(manual.length ? manual.map((f) => item(f, true)).join("\n") : "Nothing: every query and mutation converted.", "");
   if (review.length) out.push("## To review", "", review.map((f) => item(f, false)).join("\n"), "");
   if (useNode.length) out.push('## "use node" files (PLAN §22 L13)', "", "| File | Imports |", "|---|---|", ...useNode.map((f) => `| \`${f.file}\` | ${esc(f.message.replace(/^.*imports: /, ""))} |`), "");
+  out.push(...librarySection(r.libraries));
   if (r.errors.length) {
     out.push("## Errors (`errors.ts`)", "", "| Code | From | Sites |", "|---|---|---|");
     for (const e of r.errors) out.push(`| \`${e.code}\` | ${e.code === "AppError" ? "no code" : [...e.raw].map((x) => `\`${esc(x)}\``).join(", ")} | ${e.sites.length} |`);

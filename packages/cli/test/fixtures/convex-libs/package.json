@@ -1,0 +1,14 @@
+{
+  "name": "convex-libs-fixture",
+  "private": true,
+  "dependencies": {
+    "convex": "^1.17.0",
+    "convex-helpers": "^0.1.60",
+    "sharp": "^0.33.5",
+    "exceljs": "^4.4.0",
+    "openai": "^4.70.0",
+    "left-pad-pro": "^1.0.0",
+    "bcrypt": "^5.1.1",
+    "react": "^19.0.0"
+  }
+}

@@ -3,7 +3,7 @@
 import { writeFileSync } from "node:fs";
 import { relative } from "node:path";
 import { parseArgs } from "node:util";
-import { migrateConvex } from "./index.ts";
+import { checkLibraries, libraryLines, migrateConvex } from "./index.ts";
 import { verifyMigration } from "./verify.ts";
 
 export async function migrateCommand(argv: string[]): Promise<number> {
@@ -19,12 +19,21 @@ export async function migrateCommand(argv: string[]): Promise<number> {
       report: { type: "string" },
       check: { type: "boolean" },
       verify: { type: "boolean" },
+      strict: { type: "boolean" },
     },
   });
-  if (positionals[0] !== "convex") throw new Error("usage: ember migrate convex [--src convex] [--out ember | --in-place] [--dry-run] [--report file.md] [--check] [--verify]");
+  if (positionals[0] !== "convex") throw new Error("usage: ember migrate convex [--src convex] [--out ember | --in-place] [--dry-run] [--report file.md] [--check] [--verify] [--strict]");
   if (values["in-place"] && values.out) throw new Error("--in-place and --out are exclusive");
   if (values.verify && values["dry-run"]) throw new Error("--verify needs the converted files: drop --dry-run");
+  // Before converting anything: what the functions import that may not run in an Ember action.
+  const libraries = checkLibraries(values.src ?? "convex");
+  for (const l of libraryLines(libraries)) console.error(l);
+  if (values.strict && libraries.blocking.length) {
+    console.error(`migrate convex --strict: ${libraries.blocking.map((f) => f.module).join(", ")} cannot run in the Worker; nothing was converted`);
+    return 1;
+  }
   const r = migrateConvex({
+    libraries,
     src: values.src ?? "convex",
     out: values.out ?? "ember",
     ...(values["in-place"] ? { inPlace: true } : {}),
