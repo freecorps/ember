@@ -74,6 +74,18 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
   protocol, for testing client SDKs (it is not a database; app tests belong in `@freecorps/ember-testing`); and
   `FakeBrowser`, fake tabs (BroadcastChannel + Web Locks, with crash and freeze) for testing `multiTab`.
 
+## Real-user latency: `rum`
+
+```ts
+new EmberClient({ url, rum: { sampleRate: 0.05 } });
+```
+
+Opt-in. One draw per client (page load): 5% of sessions measure socket connect, heartbeat RTT, mutation ack and the
+first value of a subscription, per shard kind and the colo the shard runs in, and post small histograms to the
+project's `/api/_ember/rum` every 60 s, on `pagehide` and on `close()`. Nothing personal is sent (no user, client id,
+args, shard key or URL). A session that is not drawn loads and measures nothing. The Ember Dashboard shows it under
+"Real latency" (country × shard colo, p50/p95). Contract: `docs/design/contracts.md`, RUM.
+
 ## Several tabs: `multiTab`
 
 ```ts

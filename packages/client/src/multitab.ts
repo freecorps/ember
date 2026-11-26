@@ -617,6 +617,11 @@ class VirtualSocket implements WebSocketLike {
     this.hub.postToLeader({ e: E, k: "open", from: this.hub.id, vid: this.vid, url: this.url });
   }
 
+  /** @internal Its pings are answered by the leader tab (not a round trip to the shard): RUM does not measure them. */
+  get relayed(): boolean {
+    return this.mode === "attached";
+  }
+
   /** @internal The leader took it. */
   attached(lid: string): void {
     if (this.mode !== "attaching") return;
@@ -1763,6 +1768,11 @@ class Leader {
           g.expired = true;
           all(msg);
           continue;
+        case "colo":
+          // Discovered after `ready` (feature "rum"): a member that joins later gets it in its `ready`.
+          if (g.ready && typeof msg.colo === "string") g.ready = { ...g.ready, colo: msg.colo };
+          all(msg);
+          break;
         default:
           all(msg);
       }

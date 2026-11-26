@@ -86,6 +86,9 @@ export const ADMIN_FEATURES = [
   // says which Worker version answered (`version`: the caller pins its next requests to it)
   "run/read-only",
   "env-check",
+  // level 15: real-user latency (rum.ts). Public (no admin token: what clients post), listed so the dashboard knows the
+  // runtime takes RUM batches and its shards report their colo.
+  "rum",
 ] as const;
 
 /** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`), or null. */
