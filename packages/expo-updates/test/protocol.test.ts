@@ -6,6 +6,7 @@ import {
   assetHash,
   buildManifest,
   finalOutcome,
+  fromBase64,
   importSigningKey,
   multipartMixed,
   negotiate,
@@ -40,7 +41,7 @@ const headers = (h: Record<string, string>) => new Headers({ "expo-protocol-vers
 describe("request headers", () => {
   test("parses the protocol headers; defaults and errors", () => {
     const r = parseUpdateRequest(headers({ "expo-channel-name": "staging", "expo-current-update-id": "ABC", "eas-client-id": "client-1", "expo-expect-signature": 'sig, keyid="main"' }), "production");
-    expect(r).toEqual({ protocolVersion: 1, platform: "ios", runtimeVersion: "1.0.0", channel: "staging", currentUpdateId: "abc", embeddedUpdateId: null, clientId: "client-1", expectSignature: true, format: "multipart" });
+    expect(r).toEqual({ protocolVersion: 1, platform: "ios", runtimeVersion: "1.0.0", channel: "staging", currentUpdateId: "abc", embeddedUpdateId: null, clientId: "client-1", expectSignature: true, format: "multipart", mediaType: "multipart/mixed" });
     expect(parseUpdateRequest(headers({ "expo-protocol-version": "" }), "production")).toMatchObject({ protocolVersion: 0, channel: "production", expectSignature: false });
     expect(parseUpdateRequest(headers({ "expo-eas-client-id": "x" }), null)).toMatchObject({ clientId: "x", channel: null });
     const status = (h: Record<string, string>) => {
@@ -55,16 +56,26 @@ describe("request headers", () => {
     expect(status({ "expo-runtime-version": "" })).toBe(400);
     expect(status({ "expo-protocol-version": "2" })).toBe(406);
     expect(status({ accept: "text/html" })).toBe(406);
+    expect(parseUpdateRequest(headers({ accept: "application/expo+json" }), "p")).toMatchObject({ format: "json", mediaType: "application/expo+json" });
   });
 
-  test("negotiation over accept: multipart preferred, q-values honoured", () => {
-    expect(negotiate(null)).toBe("multipart");
-    expect(negotiate("application/expo+json, application/json, multipart/mixed")).toBe("multipart");
-    expect(negotiate("application/expo+json;q=0.9, application/json;q=0.8, multipart/mixed")).toBe("multipart");
-    expect(negotiate("application/json, multipart/mixed;q=0.5")).toBe("json");
-    expect(negotiate("multipart/mixed;q=0, application/json")).toBe("json");
-    expect(negotiate("*/*")).toBe("multipart");
+  test("negotiation over accept: multipart preferred, q-values honoured, the most specific range decides", () => {
+    expect(negotiate(null)).toBe("multipart/mixed");
+    expect(negotiate("application/expo+json, application/json, multipart/mixed")).toBe("multipart/mixed");
+    expect(negotiate("application/expo+json;q=0.9, application/json;q=0.8, multipart/mixed")).toBe("multipart/mixed");
+    expect(negotiate("application/json, multipart/mixed;q=0.5")).toBe("application/json");
+    expect(negotiate("multipart/mixed;q=0, application/json")).toBe("application/json");
+    expect(negotiate("*/*")).toBe("multipart/mixed");
+    expect(negotiate("multipart/*")).toBe("multipart/mixed");
     expect(negotiate("text/plain")).toBeNull();
+    // Wildcards over application/*: the JSON form (plain JSON on a tie with expo+json).
+    expect(negotiate("application/*")).toBe("application/json");
+    expect(negotiate("application/expo+json")).toBe("application/expo+json");
+    expect(negotiate("application/expo+json, application/json;q=0.5")).toBe("application/expo+json");
+    // An explicit q=0 is not overridden by a wildcard; q=0 everywhere is nothing acceptable.
+    expect(negotiate("multipart/mixed;q=0, */*;q=1")).toBe("application/json");
+    expect(negotiate("application/json;q=0, application/*;q=0.5, multipart/mixed;q=0")).toBe("application/expo+json");
+    expect(negotiate("*/*;q=0")).toBeNull();
   });
 });
 
@@ -76,6 +87,10 @@ describe("Expo SFV dictionaries", () => {
     expect(parseSfvDictionary("a=")).toBeNull();
     expect(parseSfvDictionary('a="unterminated')).toBeNull();
     expect(parseSfvDictionary("a, ")).toBeNull();
+    expect(parseSfvDictionary(", a")).toBeNull();
+    expect(parseSfvDictionary("a,,b")).toBeNull();
+    // Malformed numbers are refused, not truncated.
+    for (const bad of ["sig=1.2.3", "sig=1.", "sig=-", "sig=1abc"]) expect(parseSfvDictionary(bad)).toBeNull();
     const s = serializeSfvDictionary({ sig: 'ab/c+=="', keyid: "main", on: true, off: false, n: 3 });
     expect(s).toBe('sig="ab/c+==\\"", keyid="main", on, off=?0, n=3');
     expect(Object.fromEntries(parseSfvDictionary(s)!)).toEqual({ sig: 'ab/c+=="', keyid: "main", on: true, off: false, n: 3 });
@@ -95,6 +110,24 @@ describe("manifest and multipart", () => {
       extra: { expoClient: { name: "App" } },
     });
     expect(assetHash(sha("x"))).toBe(createHash("sha256").update("x").digest("base64url"));
+  });
+
+  test("multipart: a delimiter only counts at the start of a line; the part bytes stay intact", () => {
+    const json = JSON.stringify({ note: "--BOUND inside a string, and --BOUND-- too" });
+    const body = multipartMixed(
+      [
+        { name: "manifest", contentType: "application/json", body: json },
+        { name: "extensions", contentType: "application/json", body: "{}" },
+      ],
+      "BOUND",
+    );
+    expect(parseMultipart(`preamble\r\n${body}epilogue`, 'multipart/mixed; boundary="BOUND"').map((p) => [p.name, p.body])).toEqual([
+      ["manifest", json],
+      ["extensions", "{}"],
+    ]);
+    // A longer boundary that starts with this one is content, too.
+    const longer = "--BOUND\r\ncontent-disposition: form-data; name=\"a\"\r\n\r\nx\r\n--BOUNDARY2 y\r\n--BOUND--\r\n";
+    expect(parseMultipart(longer, "multipart/mixed; boundary=BOUND")).toEqual([{ name: "a", headers: { "content-disposition": 'form-data; name="a"' }, body: "x\r\n--BOUNDARY2 y" }]);
   });
 
   test("multipart/mixed round trip (RFC 2046 delimiters, CRLF, named parts)", () => {
@@ -135,6 +168,8 @@ describe("signature (RSA-SHA256, WebCrypto)", () => {
   test("the JSON form carries the signature as an HTTP header; no expect-signature, no signature", async () => {
     const r = await renderResponse({ type: "update", update }, { protocolVersion: 1, expectSignature: true, format: "json" }, { assetUrl, signer: rsaSigner(keys.pkcs8) });
     expect(r.headers["content-type"]).toBe("application/json; charset=utf-8");
+    const expo = await renderResponse({ type: "update", update }, { protocolVersion: 1, expectSignature: false, format: "json", mediaType: "application/expo+json" }, { assetUrl, signer: null });
+    expect(expo.headers["content-type"]).toBe("application/expo+json; charset=utf-8");
     expect(await verify(keys.publicKey, parseSfvDictionary(r.headers["expo-signature"]!)!.get("sig") as string, r.body!)).toBe(true);
     const plain = await renderResponse({ type: "update", update }, { protocolVersion: 1, expectSignature: false, format: "multipart" }, { assetUrl, signer: rsaSigner(keys.pkcs8) });
     expect(parseMultipart(plain.body!, plain.headers["content-type"]!)[0]!.headers["expo-signature"]).toBeUndefined();
@@ -143,6 +178,20 @@ describe("signature (RSA-SHA256, WebCrypto)", () => {
   test("a signature expected without a key is an error; a bad PEM is refused", async () => {
     await expect(renderResponse({ type: "update", update }, { protocolVersion: 1, expectSignature: true, format: "multipart" }, { assetUrl, signer: null })).rejects.toBeInstanceOf(SigningKeyMissing);
     expect(() => importSigningKey("not a pem")).toThrow(/PEM private key/);
+    // A truncated body (4n+1 base64 characters) is named as such, not left to WebCrypto.
+    expect(() => importSigningKey("-----BEGIN PRIVATE KEY-----\nAAAAA\n-----END PRIVATE KEY-----")).toThrow(/invalid base64/);
+    expect(() => fromBase64("abcde")).toThrow(/invalid base64/);
+    expect([...fromBase64("YWJj")]).toEqual([97, 98, 99]);
+  });
+
+  test("the isolate's key cache evicts the oldest key, not all of them", async () => {
+    // Distinct PEM strings of the same key (trailing newlines): ten entries in a cache of eight.
+    const pems = Array.from({ length: 10 }, (_, i) => keys.pkcs8 + "\n".repeat(i + 1));
+    const imported = pems.map((p) => importSigningKey(p));
+    await Promise.all(imported);
+    expect(importSigningKey(pems[9]!)).toBe(imported[9]);
+    expect(importSigningKey(pems[8]!)).toBe(imported[8]);
+    expect(importSigningKey(pems[0]!)).not.toBe(imported[0]);
   });
 });
 
@@ -168,6 +217,9 @@ describe("directives", () => {
   test("finalOutcome: the client's current update → noUpdateAvailable; a rollback when it runs the embedded one too", () => {
     const u = { type: "update" as const, update };
     expect(finalOutcome(u, { currentUpdateId: update.uuid, embeddedUpdateId: null })).toEqual({ type: "noUpdateAvailable" });
+    expect(finalOutcome(u, { currentUpdateId: update.uuid, embeddedUpdateId: null, protocolVersion: 1 })).toEqual({ type: "noUpdateAvailable" });
+    // Protocol 0 has no directive: the manifest goes out and the client compares the ids.
+    expect(finalOutcome(u, { currentUpdateId: update.uuid, embeddedUpdateId: null, protocolVersion: 0 })).toBe(u);
     expect(finalOutcome(u, { currentUpdateId: "other", embeddedUpdateId: null })).toBe(u);
     const rb = { type: "rollBackToEmbedded" as const, commitTime: 5 };
     expect(finalOutcome(rb, { currentUpdateId: "e1", embeddedUpdateId: "e1" })).toEqual({ type: "noUpdateAvailable" });

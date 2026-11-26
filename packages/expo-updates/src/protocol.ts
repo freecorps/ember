@@ -76,7 +76,12 @@ export interface UpdateRequest {
   expectSignature: boolean;
   /** Response form from `accept`. */
   format: "multipart" | "json";
+  /** The media type `accept` selected (the JSON form's `content-type`). */
+  mediaType: MediaType;
 }
+
+/** The media types a response can have: multipart, or the manifest alone as JSON. */
+export type MediaType = "multipart/mixed" | "application/json" | "application/expo+json";
 
 export class ProtocolError extends Error {
   constructor(
@@ -107,8 +112,8 @@ export function parseUpdateRequest(headers: Headers, defaultChannel: string | nu
     return x && x.length <= 64 ? x : null;
   };
   const clientRaw = (headers.get("eas-client-id") ?? headers.get("expo-eas-client-id") ?? "").trim();
-  const format = negotiate(headers.get("accept"));
-  if (!format) throw new ProtocolError(406, "accept must allow multipart/mixed, application/expo+json or application/json");
+  const mediaType = negotiate(headers.get("accept"));
+  if (!mediaType) throw new ProtocolError(406, "accept must allow multipart/mixed, application/expo+json or application/json");
   return {
     protocolVersion: proto,
     platform,
@@ -118,36 +123,53 @@ export function parseUpdateRequest(headers: Headers, defaultChannel: string | nu
     embeddedUpdateId: id("expo-embedded-update-id"),
     clientId: clientRaw && clientRaw.length <= 256 ? clientRaw : null,
     expectSignature: headers.has("expo-expect-signature"),
-    format,
+    format: mediaType === "multipart/mixed" ? "multipart" : "json",
+    mediaType,
   };
 }
 
-/** Proactive negotiation over `accept` (RFC 7231 q-values): multipart wins ties, as the protocol prefers it. */
-export function negotiate(accept: string | null): "multipart" | "json" | null {
-  if (accept === null || accept.trim() === "") return "multipart";
-  let multipart = -1;
-  let json = -1;
+/** In the order that breaks ties: multipart first (the protocol prefers it), then plain JSON. */
+const MEDIA_TYPES: readonly MediaType[] = ["multipart/mixed", "application/json", "application/expo+json"];
+
+/**
+ * Proactive negotiation over `accept` (RFC 9110 §12.5.1): each media type takes the q-value of the most specific range
+ * that matches it (`type/subtype` over `type/*` over `*` + `/*`, so `multipart/mixed;q=0` excludes multipart whatever
+ * the wildcards say), and the highest q above 0 wins; ties go to multipart, then `application/json`. Null when nothing
+ * is acceptable.
+ */
+export function negotiate(accept: string | null): MediaType | null {
+  if (accept === null || accept.trim() === "") return "multipart/mixed";
+  const ranges: Array<{ type: string; q: number }> = [];
   for (const item of accept.split(",")) {
     const [type, ...params] = item.split(";").map((s) => s.trim().toLowerCase());
+    if (!type) continue;
     let q = 1;
-    for (const p of params) if (p.startsWith("q=")) q = Number(p.slice(2)) || 0;
-    if (type === "multipart/mixed" || type === "multipart/*") multipart = Math.max(multipart, q);
-    else if (type === "application/expo+json" || type === "application/json") json = Math.max(json, q);
-    else if (type === "*/*") {
-      multipart = Math.max(multipart, q);
-      json = Math.max(json, q);
-    }
+    for (const p of params) if (p.startsWith("q=")) q = Math.min(1, Math.max(0, Number(p.slice(2)) || 0));
+    ranges.push({ type, q });
   }
-  if (multipart <= 0 && json <= 0) return null;
-  return multipart >= json ? "multipart" : "json";
+  let best: MediaType | null = null;
+  let bestQ = 0;
+  for (const t of MEDIA_TYPES) {
+    const wildcard = `${t.slice(0, t.indexOf("/"))}/*`;
+    let specificity = -1;
+    let q = 0;
+    for (const r of ranges) {
+      const s = r.type === t ? 2 : r.type === wildcard ? 1 : r.type === "*/*" ? 0 : -1;
+      if (s > specificity) [specificity, q] = [s, r.q];
+      else if (s === specificity && s >= 0) q = Math.max(q, r.q);
+    }
+    if (specificity >= 0 && q > bestQ) [best, bestQ] = [t, q];
+  }
+  return best;
 }
 
 /**
- * What to send this client: the outcome, then the protocol's rules about what it already runs. An update it already
- * runs, or a rollback when it already runs the embedded update, is `noUpdateAvailable`.
+ * What to send this client: the outcome, then the protocol's rules about what it already runs. In protocol 1 an update
+ * it already runs, or a rollback when it already runs the embedded update, is `noUpdateAvailable`. Protocol 0 has no
+ * directive for it: the manifest is sent and the client compares the ids (`protocolVersion` defaults to 1).
  */
-export function finalOutcome(outcome: Outcome, req: Pick<UpdateRequest, "currentUpdateId" | "embeddedUpdateId">): Outcome {
-  if (outcome.type === "update" && req.currentUpdateId !== null && req.currentUpdateId === outcome.update.uuid.toLowerCase()) return { type: "noUpdateAvailable" };
+export function finalOutcome(outcome: Outcome, req: Pick<UpdateRequest, "currentUpdateId" | "embeddedUpdateId"> & { protocolVersion?: 0 | 1 }): Outcome {
+  if (outcome.type === "update" && req.protocolVersion !== 0 && req.currentUpdateId !== null && req.currentUpdateId === outcome.update.uuid.toLowerCase()) return { type: "noUpdateAvailable" };
   if (outcome.type === "rollBackToEmbedded" && req.currentUpdateId !== null && req.currentUpdateId === req.embeddedUpdateId) return { type: "noUpdateAvailable" };
   return outcome;
 }
@@ -270,6 +292,8 @@ export function base64(bytes: Uint8Array): string {
 export const base64url = (bytes: Uint8Array): string => base64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 export function fromBase64(s: string): Uint8Array {
   const clean = s.replace(/[\s=]/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  // 4n+1 characters cannot come from any byte string: a truncated or corrupted input.
+  if (clean.length % 4 === 1) throw new Error("invalid base64 (truncated)");
   const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
   let bits = 0;
   let acc = 0;
@@ -349,7 +373,8 @@ export function importSigningKey(pem: string): Promise<CryptoKey> {
     const pkcs8 = pkcs1 ? pkcs1ToPkcs8(bytes) : bytes;
     key = crypto.subtle.importKey("pkcs8", pkcs8 as BufferSource, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
     key.catch(() => keyCache.delete(pem));
-    if (keyCache.size > 8) keyCache.clear();
+    // Bounded: the oldest key goes first (a Map keeps insertion order).
+    if (keyCache.size >= 8) keyCache.delete(keyCache.keys().next().value!);
     keyCache.set(pem, key);
   }
   return key;
@@ -431,7 +456,7 @@ export class SigningKeyMissing extends Error {}
  */
 export async function renderResponse(
   outcome: Outcome,
-  req: Pick<UpdateRequest, "protocolVersion" | "expectSignature" | "format">,
+  req: Pick<UpdateRequest, "protocolVersion" | "expectSignature" | "format"> & { mediaType?: MediaType },
   o: { assetUrl: (sha256: string) => string; signer: Signer | null; boundary?: string },
 ): Promise<RenderedResponse> {
   const headers: Record<string, string> = { "expo-protocol-version": String(req.protocolVersion), "expo-sfv-version": "0", "cache-control": "private, max-age=0" };
@@ -450,7 +475,7 @@ export async function renderResponse(
   if (outcome.type === "update") {
     const manifest = JSON.stringify(buildManifest(outcome.update, o.assetUrl));
     const sig = await sign(manifest);
-    if (req.format === "json") return { status: 200, headers: { ...headers, ...sig, "content-type": "application/json; charset=utf-8" }, body: manifest };
+    if (req.format === "json") return { status: 200, headers: { ...headers, ...sig, "content-type": `${req.mediaType === "application/expo+json" ? "application/expo+json" : "application/json"}; charset=utf-8` }, body: manifest };
     const boundary = o.boundary ?? randomBoundary();
     const body = multipartMixed(
       [
@@ -473,17 +498,36 @@ function randomBoundary(): string {
   return `ember-${[...b].map((x) => x.toString(16).padStart(2, "0")).join("")}`;
 }
 
-/** Splits a `multipart/mixed` body into parts (headers lowercased): for tests and clients of this package. */
+/**
+ * Splits a `multipart/mixed` body into parts (headers lowercased): for tests and clients of this package. A delimiter
+ * only counts at the start of a line (RFC 2046 §5.1.1: the CRLF before it belongs to it), so `--boundary` inside a
+ * part's body leaves the part's bytes intact.
+ */
 export function parseMultipart(body: string, contentType: string): Array<{ name: string | null; headers: Record<string, string>; body: string }> {
   const m = /boundary=("?)([^";]+)\1/.exec(contentType);
   if (!m) throw new Error("no boundary in content-type");
-  const delim = `--${m[2]}`;
+  const delim = `\r\n--${m[2]}`;
   const out: Array<{ name: string | null; headers: Record<string, string>; body: string }> = [];
-  const chunks = body.split(delim);
-  for (const chunk of chunks.slice(1)) {
+  // The first delimiter may open the body (no CRLF before it); what precedes it is the preamble. A match whose line
+  // goes on with anything but `--` and transport padding (`--BOUNDARY2` for `BOUNDARY`) is part of the content.
+  const chunks: string[] = [];
+  let inPreamble = true;
+  for (const piece of `\r\n${body}`.split(delim).slice(1)) {
+    const eol = piece.indexOf("\r\n");
+    const isDelimiter = /^(--)?[ \t]*$/.test(eol < 0 ? piece : piece.slice(0, eol));
+    if (isDelimiter) {
+      chunks.push(piece);
+      inPreamble = false;
+    } else if (!inPreamble) chunks[chunks.length - 1] += delim + piece;
+  }
+  for (const chunk of chunks) {
     if (chunk.startsWith("--")) break;
-    const text = chunk.replace(/^\r\n/, "").replace(/\r\n$/, "");
-    const split = text.indexOf("\r\n\r\n");
+    // The rest of the delimiter line (transport padding) and its CRLF.
+    const eol = chunk.indexOf("\r\n");
+    if (eol < 0) continue;
+    const text = chunk.slice(eol + 2);
+    // No headers: the body starts right after the empty line.
+    const split = text.startsWith("\r\n") ? 0 : text.indexOf("\r\n\r\n");
     const head = split < 0 ? text : text.slice(0, split);
     const headers: Record<string, string> = {};
     for (const line of head.split("\r\n")) {
@@ -491,7 +535,7 @@ export function parseMultipart(body: string, contentType: string): Array<{ name:
       if (c > 0) headers[line.slice(0, c).trim().toLowerCase()] = line.slice(c + 1).trim();
     }
     const name = /name="([^"]*)"/.exec(headers["content-disposition"] ?? "")?.[1] ?? null;
-    out.push({ name, headers, body: split < 0 ? "" : text.slice(split + 4) });
+    out.push({ name, headers, body: split < 0 ? "" : text.slice(split === 0 ? 2 : split + 4) });
   }
   return out;
 }
