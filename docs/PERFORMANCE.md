@@ -91,6 +91,56 @@ para o índice esparso, as linhas cobradas pelo DO no workerd (`spikes/rows-writ
   sem índice FTS5 (busca opt-in, `{ search: true }`): nenhuma linha de FTS por mensagem.
 - **Migrations:** `start` 2 → 1 linha escrita. **Workpool:** item sem `key` sem entrada no `by_key`.
 
+## Depois da 0.9.0: hot path do engine e filtros no SQLite (PR 3b da 0.10)
+
+**Como foi medido (2026-11-25):** o mesmo laptop (Apple M3, load ~2 com outro processo pesado), `scripts/bench-hot-path.ts`
+nas duas árvores, `main` em `268a7f63` contra a PR, três rodadas alternando as árvores e o menor tempo de cada linha.
+O bench ganhou linhas de filtro, de lote e de strings (rodadas também no `main`, a mesma API pública).
+
+| Caminho | `main` (ns/op) | PR 3b (ns/op) | |
+|---|---|---|---|
+| `validate` objeto (string com `max`, email, regex) | 505 | **216** | −57% |
+| `validate` string `min`/`max` (40 caracteres) | 56 | **12** | −79% |
+| `validate` string regex | 123 | **42** | −66% |
+| query `db.get` | 5.884 | **5.156** | −12% |
+| query `withIndex().take(10)` | 27.116 | **22.900** | −16% |
+| query `.filter()` `take(10)` (1 em 10 passa; ~540 linhas lidas) | 711.114 | **479.109** | −33% |
+| query `.filter()` `collect()` (1.000 linhas, 12 passam) | 1.231.688 | **764.450** | −38% |
+| query `withIndex` + `.filter()` `collect()` | 358.617 | **265.636** | −26% |
+| mutation `.filter()` `first()` (lê 1.000) | 1.234.880 | **899.574** | −27% |
+| group commit de 1 mutation, como o shard faz | 10.382 | **8.398** | −19% |
+| group commit de 10 mutations | 123.238 | 121.290 | −2% |
+| mutation vazia / query vazia | 1.858 / 568 | 1.806 / 550 | −3% / −3% |
+| `patch` / `increment` / `db.sql` / chaves / JSON | — | — | igual (±1%) |
+
+`valueSize doc` saiu +21% na rodada completa e igual (626 × 633 ns) rodado sozinho nas duas árvores: efeito de JIT da
+ordem do arquivo, o código não mudou. Contador do workerd (`packages/runtime/test/perf-counters.test.ts`): transações
+por mutation **3 → 1**; statements, linhas lidas e escritas iguais (2,17 / 3,88 / 2).
+
+- **Group commit em uma transação** (`engine.commitMutationBatch`, `shard.ts` `commitBatch`): eram a transação do
+  shard, a do `runMutationBatch` e um savepoint (do item, ou do lote). Agora os itens e as linhas do commit (ring,
+  dedup, jobs) dividem uma transação sem savepoint; um item que falha desfaz essa transação e a seguinte faz o commit
+  (sozinho, com o erro dele, sem rodar de novo; num lote, com um savepoint por item, como antes).
+- **`.filter()` no SQLite** (`pushdown.ts`): comparações de campo tipado com literal viram uma coluna calculada do
+  scan (1 / 0 / NULL). A linha que o SQLite rejeita não é decodificada nem avaliada em JS e, numa query, chega sem
+  `_json` e sem colunas de texto. O scan é o mesmo (faixa, `LIMIT`, lotes), então `rowsRead`, `documentsRead`, read
+  set e paginação não mudam: o teste no workerd compara o pushdown ligado e desligado no DO SQLite, com as linhas
+  lidas que o DO conta. Na primeira versão a expressão era repetida por coluna escondida (o SQLite achata a
+  subquery) e o filtro ficou 18% mais lento que o JS; a co-rotina (`LIMIT -1` por fora) e procurar no `_json` só
+  quando a coluna é NULL viraram isso no ganho acima.
+- **Linhas como arrays** (`SqlDriver.execRaw`, `DoSqlDriver` sobre `cursor.raw()`): os scans e o `db.get` de query
+  decodificam do array (`decodeValues`), sem montar um objeto por linha. Medido com o filtro desligado: −24% num
+  `take(10)` filtrado, −29% num `collect()` de 1.000 linhas.
+- **`validate`:** o tamanho de uma string sai do `length` UTF-16 (entre `ceil(L/2)` e `L` code points) sem contar,
+  salvo quando o intervalo cruza um limite; o `RegExp` é criado uma vez por validador, não procurado num cache por
+  chave a cada valor.
+- **Alocações:** `docKey` reusa o array das partes da chave, `withIndex` usa uma classe para o `q` (eram 5 closures por
+  chamada), `deliverFlush` escreve `"mids":[]` sem serializar um array vazio por socket, o `ctx` da mutation monta
+  `storage` e `scheduler` sem spread e o `ctx.db.sql` com um closure só.
+- **Não entrou: `ctx` preguiçoso com getters.** Um objeto literal com `get`/`set` sai pelo caminho lento do V8: ~300 ns
+  o primeiro par, ~50 ns cada um a mais (medido), mais do que construir os membros. Com getters no `ctx` e no `db.sql`, a
+  query vazia ficou 96% mais lenta e a mutation vazia 44%; voltaram a ser propriedades de dados.
+
 ## Reproduzir
 
 ```sh
