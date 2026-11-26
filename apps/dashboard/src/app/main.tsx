@@ -23,6 +23,7 @@ import { Shards } from "./pages/shards.tsx";
 import { Screens } from "./pages/screens.tsx";
 import type { Project, ShardRow } from "./pages/types.ts";
 import { Dialog, Loading, Mono, Problem, Toasts, type ToastItem } from "./ui.tsx";
+import { Palette, usePaletteShortcut } from "./palette.tsx";
 
 const SECTIONS = [
   { id: "health", label: "Health", key: "h" },
@@ -201,6 +202,11 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const projects = useApi<{ projects: Project[] }>("/api/projects");
   const [theme, setTheme] = useTheme();
   const [help, setHelp] = useState(false);
+  const [palette, setPalette] = useState(false);
+  usePaletteShortcut(() => {
+    setHelp(false);
+    setPalette(true);
+  });
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const seq = useRef(0);
   const toast = useCallback<SessionInfo["toast"]>((t) => {
@@ -229,7 +235,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       ) : section.id === "components" || section.id === "app" ? (
         <Screens key={`${p.project}/${p.env}/${section.id}`} {...p} shard={shard} kind={section.id} rest={route.rest ?? []} />
       ) : section.id === "users" ? (
-        <Users key={`${p.project}/${p.env}`} {...p} />
+        <Users key={`${p.project}/${p.env}/${route.user ?? ""}`} {...p} {...(route.user ? { initialQuery: route.user } : {})} />
       ) : section.id === "settings" ? (
         <Settings key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "logs" ? (
@@ -241,7 +247,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       ) : section.id === "shards" ? (
         <Shards {...p} {...(route.shard ? { shard: route.shard } : {})} />
       ) : section.id === "data" ? (
-        <DataBrowser key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
+        <DataBrowser key={`${p.project}/${p.env}/${shard}/${route.rest?.[0] ?? ""}`} {...p} shard={shard} {...(route.rest?.[0] ? { initialTable: route.rest[0] } : {})} />
       ) : section.id === "crons" ? (
         <Crons {...p} shard={shard} />
       ) : section.id === "deployments" ? (
@@ -280,6 +286,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         </div>
         {inEnv && SHARD_SECTIONS.has(section.id) && <ShardPicker project={route.project!} env={route.env!} current={shard} section={section.id} rest={route.rest} />}
         <span className="spacer" />
+        <button type="button" className="palette-open" onClick={() => setPalette(true)} aria-label="Go to… (⌘K or Ctrl+K)" title="Go to… (⌘K or Ctrl+K)">
+          <span>Go to…</span>
+          <kbd>⌘K</kbd>
+        </button>
         <span className="who" title={`Signed in through ${me.via === "access" ? "Cloudflare Access" : "a dashboard token"}`}>
           {me.actor}
           <span className={`role ${me.role}`}>{me.role}</span>
@@ -302,6 +312,14 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           {projects.error && route.page !== "projects" ? <Problem error={projects.error} onRetry={projects.reload} /> : body}
         </main>
       </div>
+      <Palette
+        open={palette}
+        onClose={() => setPalette(false)}
+        projects={projects.data?.projects ?? null}
+        scope={inEnv ? { project: route.project!, env: route.env! } : null}
+        sections={SECTIONS}
+        shard={shard}
+      />
       <Toasts items={toasts} dismiss={(id) => setToasts((x) => x.filter((t) => t.id !== id))} />
       <Dialog open={help} onClose={() => setHelp(false)} title="Keyboard">
         <div className="dialog-body">
@@ -314,6 +332,12 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 <dd>{s.label}</dd>
               </div>
             ))}
+            <div>
+              <dt>
+                <kbd>⌘K</kbd> <kbd>Ctrl+K</kbd>
+              </dt>
+              <dd>Go to an environment, section, screen, shard, table, function or user</dd>
+            </div>
             <div>
               <dt>
                 <kbd>/</kbd>

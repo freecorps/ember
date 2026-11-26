@@ -213,6 +213,75 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await close();
   });
 
+  it("command palette (⌘K / Ctrl+K): environments, sections, screens, shards, tables, functions, users", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/health");
+    await page.getByText("Needs attention").waitFor();
+    const dialog = page.getByRole("dialog", { name: "Command palette" });
+    const box = dialog.getByRole("combobox", { name: "Go to" });
+    const openPalette = async (combo: string) => {
+      await page.keyboard.press(combo);
+      await box.waitFor();
+      await expect.poll(() => box.evaluate((el) => el === document.activeElement)).toBe(true);
+    };
+    // A function, by keyboard only. Typing "s" or "f" in the box is text, not a section shortcut.
+    await openPalette("Control+k");
+    await box.pressSequentially("send");
+    await dialog.getByRole("option", { name: /messages:send/ }).waitFor();
+    expect(await dialog.getByRole("listbox").getAttribute("aria-label")).toBe("Results");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => page.url()).toContain("/functions/messages%3Asend");
+    await dialog.waitFor({ state: "hidden" });
+
+    // A shard, then a table (opened on the route's shard), arrows move the selection.
+    await openPalette("Meta+k");
+    await box.pressSequentially("org:be");
+    const beta = dialog.getByRole("option", { name: /org:beta/ });
+    await beta.waitFor();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => page.url()).toContain("/shards/org%3Abeta");
+    await page.getByRole("complementary", { name: "Shard org:beta" }).waitFor();
+
+    await openPalette("Control+k");
+    await box.pressSequentially("messages");
+    await dialog.getByRole("option", { name: /^messages.*data on/ }).waitFor();
+    // Tables come after sections and screens: move to it with the arrows.
+    const options = dialog.getByRole("option");
+    const names = await options.allTextContents();
+    const at = names.findIndex((n) => n.startsWith("messages") && n.includes("data on"));
+    for (let i = 0; i < at; i++) await page.keyboard.press("ArrowDown");
+    expect(await options.nth(at).getAttribute("aria-selected")).toBe("true");
+    expect(await box.getAttribute("aria-activedescendant")).toBe(`palette-${at}`);
+    await page.keyboard.press("Enter");
+    await expect.poll(() => page.url()).toContain("/data/org%3Abeta/messages");
+    await expect.poll(() => page.locator(".table-list button.active").textContent()).toContain("messages");
+
+    // A declarative screen and a user (searched from 3 characters on).
+    await openPalette("Control+k");
+    await box.pressSequentially("work pool items");
+    await dialog.getByRole("option", { name: /Work pool › Items/ }).click();
+    await expect.poll(() => page.url()).toContain("/components/org%3Abeta/pool/items");
+    await openPalette("Control+k");
+    await box.pressSequentially("ana@");
+    await dialog.getByRole("option", { name: /ana@acme\.test/ }).waitFor();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => page.url()).toContain("/users/ana%40acme.test");
+    await expect.poll(() => page.getByLabel("Search users").inputValue()).toBe("ana@acme.test");
+
+    // An environment from anywhere; Esc closes and hands the keyboard back to the page.
+    await openPalette("Control+k");
+    await box.pressSequentially("chat/dev");
+    await dialog.getByRole("option", { name: /chat\/dev/ }).waitFor();
+    await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "hidden" });
+    await page.keyboard.press("h");
+    await expect.poll(() => page.url()).toContain("/p/chat/prod/health");
+    await shot(page, "palette");
+    expect(problems).toEqual([]);
+    await close();
+    // The screen it opened ran its queries: the declarative screens' tests below count theirs from zero.
+    prod.dashQueries.length = 0;
+  });
+
   it("keyboard: section keys, shard search, row navigation; destructive restore needs the typed name", async () => {
     const { page, problems, close } = await open("#/p/chat/prod/health");
     await page.keyboard.press("s");
