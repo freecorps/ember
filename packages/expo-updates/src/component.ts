@@ -183,6 +183,18 @@ const ROLLBACK_WINDOW = 50;
 const ROLLBACK_SCAN_MAX = 1000;
 /** Rows one rollback call reads in all (every pair): below the mutation's default `documentsRead` (16 384). */
 const ROLLBACK_READ_BUDGET = 12_000;
+/** Writes one rollback call may make: the 8 192 `rowsWritten` of a mutation, less the channels' bump (up to 1000). */
+const ROLLBACK_WRITE_BUDGET = 7000;
+
+/** A new update id that no update has yet (drawn again from `ctx.random` on a collision). */
+function freshUuid(ctx: Ctx["mutation"]): string {
+  for (let i = 0; i < 8; i++) {
+    const id = uuidOf(ctx.random);
+    if (!ctx.db.query("updates").withIndex("by_uuid", (q) => q.eq("uuid", id)).first()) return id;
+  }
+  throw new EmberError("ValidationError", "could not draw an unused update id: try again");
+}
+
 /** Excluded releases one directive can carry (`alsoOut`, ~37 bytes each). */
 const MAX_CARRIED_EXCLUSIONS = 4000;
 
@@ -312,7 +324,8 @@ function checkAsset(ctx: Ctx["mutation"], a: StoredAsset, ready: Map<string, { o
   let seen = ready.get(a.sha256);
   if (seen === undefined) {
     const row = assetBySha(ctx, a.sha256);
-    seen = { ok: !!row && promoteReady(ctx, row), contentType: row?.contentType ?? null };
+    // A ready file serves as is (its stale references are the sweep's, bounded): only a row without one promotes.
+    seen = { ok: !!row && (fileState(ctx, row.file) === "ready" || promoteReady(ctx, row)), contentType: row?.contentType ?? null };
     ready.set(a.sha256, seen);
   }
   if (!seen.ok) throw expoUpdatesErrors.AssetNotUploaded({ sha256: a.sha256 });
@@ -449,7 +462,7 @@ export const functions = {
           // or on its way.
           const stored = !!row && (fileState(ctx, row.file) === "ready" || (row.pending ?? []).some((u) => fileState(ctx, u.file) === "ready"));
           if (row && row.contentType !== a.contentType && (stored || inFlight.length)) throw new EmberError("ValidationError", `asset ${a.sha256} is stored as ${row.contentType}, not ${a.contentType}`);
-          if (row && promoteReady(ctx, row)) {
+          if (row && (fileState(ctx, row.file) === "ready" || promoteReady(ctx, row))) {
             out.push({ sha256: a.sha256, exists: true });
             continue;
           }
@@ -514,6 +527,16 @@ export const functions = {
           if (u.runtimeVersion.trim() !== u.runtimeVersion) throw new EmberError("ValidationError", `runtimeVersion ${JSON.stringify(u.runtimeVersion)} has surrounding whitespace`);
           // Nor NUL, CR, LF or other controls (a header value cannot carry them).
           if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(u.runtimeVersion)) throw new EmberError("ValidationError", `runtimeVersion ${JSON.stringify(u.runtimeVersion)} has control characters`);
+          // Every committed update must render: `extra` goes into the manifest through JSON.stringify.
+          if (u.extra !== undefined) {
+            let json: string | undefined;
+            try {
+              json = JSON.stringify(u.extra);
+            } catch (e) {
+              throw new EmberError("ValidationError", `extra must be JSON (${(e as Error)?.message ?? String(e)})`);
+            }
+            if (json === undefined) throw new EmberError("ValidationError", "extra must be JSON");
+          }
           for (const x of [u.launchAsset, ...u.assets]) checkAsset(ctx, x, ready);
           if (u.assets.length > 2000) throw new EmberError("ValidationError", "at most 2000 assets per update");
           const [head] = liveRows(ctx, a.branch, u.platform, u.runtimeVersion, 1);
@@ -562,6 +585,12 @@ export const functions = {
         // One read budget for the whole call (every pair): past it, the call refuses and says how to narrow it.
         const budget = { rows: ROLLBACK_READ_BUDGET };
         let retired = false;
+        // Writes of the whole call (every pair), with room for the channels' bump: past it, refused before any commit.
+        let writes = 0;
+        const spend = (n: number) => {
+          writes += n;
+          if (writes > ROLLBACK_WRITE_BUDGET) throw new EmberError("ValidationError", `${a.branch}: this rollback writes too much at once: name the platform and runtimeVersion (or roll back fewer pairs per call)`);
+        };
         for (const p of pairsOf(ctx, a.branch, a.platform, a.runtimeVersion)) {
           // A rollback takes out the head's release (the head and the live copies of it a rollback republished) and
           // goes back to the newest live row of another release: rolling back B' (a republish of B) reaches A, not B.
@@ -584,6 +613,7 @@ export const functions = {
               }
               carried.delete(head.outRelease ?? "");
               if (carried.size > MAX_CARRIED_EXCLUSIONS) throw new EmberError("ValidationError", `${a.branch} ${p.platform} ${p.runtimeVersion}: the directive would carry more than ${MAX_CARRIED_EXCLUSIONS} excluded releases; publish a new update to start over`);
+              spend(below.length + 1);
               for (const r of below) ctx.db.patch(r._id, { rolledBack: true });
               ctx.db.patch(head._id, { alsoOut: [...carried] });
               retired = true;
@@ -591,8 +621,10 @@ export const functions = {
             continue;
           }
           // Out of service: the head's release and the rows of releases already taken out read on the way.
+          spend(rows.length + 1);
           for (const r of rows) ctx.db.patch(r._id, { rolledBack: true });
-          const uuid = uuidOf(ctx.random);
+          // A fresh id, never one an update already has (the mutation's random has a 32-bit seed: collisions happen).
+          const uuid = freshUuid(ctx);
           const toEmbedded = !!a.toEmbedded || !prev;
           // What the new head is: the previous row may itself be a directive (a publish after a rollback to embedded).
           const kind = toEmbedded ? "rollBackToEmbedded" : prev!.kind;

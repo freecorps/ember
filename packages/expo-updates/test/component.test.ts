@@ -213,7 +213,7 @@ describe("expo updates component", () => {
     expect(r.updates).toHaveLength(1);
   });
 
-  test("with the newer upload confirmed, the older one still pending is let go once out of its grace", async () => {
+  test("with the newer upload confirmed, the older one still pending is let go by the sweep once out of its grace", async () => {
     const t = harness();
     const body = "two-tickets";
     const prep = async () =>
@@ -227,7 +227,9 @@ describe("expo updates component", () => {
     expect((await prep()).exists).toBe(true); // ready; the first, still in flight, stays referenced
     await t.advance(26 * 3600_000); // past its expiry and its grace
     expect(await stateOf(first.storageId)).toBe("pending");
-    expect((await prep()).exists).toBe(true); // the row lets it go
+    // A prepare or publish of a ready asset spends no writes on it (bounded work is the sweep's): the sweep lets it go.
+    expect((await prep()).exists).toBe(true);
+    expect(await t.mutation(unsafeRef<"mutation">("@expoUpdates/lib:sweepUploads"), {})).toBe(1);
     await t.advance(26 * 3600_000);
     expect(await stateOf(first.storageId)).toBe("gone");
     expect(await stateOf(second.storageId)).toBe("ready");
@@ -317,10 +319,14 @@ describe("expo updates component", () => {
     expect(await sweep()).toBe(1);
     await t.advance(26 * 3600_000);
     expect(await stateOf()).toBe("gone");
-    // A published asset is never swept: its file is ready.
-    await publish(t, { bundle: "kept" });
+    // A published asset is never collected: the sweep only lets go of its expired ticket marks, and it keeps serving.
+    const kept = await publish(t, { bundle: "kept" });
     await t.advance(26 * 3600_000);
-    expect(await sweep()).toBe(0);
+    expect(await sweep()).toBe(1);
+    expect(await sweep()).toBe(0); // done with it
+    const res = await ask(t);
+    expect(res.id).toBe(kept.ids[0]);
+    expect(await (await t.fetch(res.manifest.launchAsset.url)).text()).toBe("kept");
   });
 
   test("a sweep stops before the mutation's write budget (rows holding many references); the next runs finish it", async () => {
@@ -340,6 +346,52 @@ describe("expo updates component", () => {
     let total = first;
     for (let n = await sweep(); n > 0; n = await sweep()) total += n;
     expect(total).toBe(110);
+  }, 300_000);
+
+  test("a publish of ready assets spends no writes on their expired references (the sweep's job)", async () => {
+    const t = harness();
+    const files: string[] = [];
+    for (let a = 0; a < 520; a++) {
+      const body = `ready-${a}`;
+      files.push(body);
+      let last: { url: string; headers: Record<string, string>; storageId: string; shard: string; token: string } | undefined;
+      for (let i = 0; i < 16; i++) last = ((await t.mutation(m("prepareAssets"), { assets: [{ sha256: hex(body), size: body.length, contentType: "image/png" }] })) as Array<{ upload?: typeof last }>)[0]!.upload;
+      expect((await t.fetch(last!.url, { method: "PUT", headers: last!.headers, body })).status).toBe(200);
+      expect((await t.fetch("/api/storage/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shard: last!.shard, storageId: last!.storageId, token: last!.token }) })).status).toBe(200);
+    }
+    await t.advance(26 * 3600_000); // the 15 other tickets of each row expired and out of their grace
+    const updates = Array.from({ length: 8 }, (_, j) => ({
+      platform: (j % 2 ? "android" : "ios") as "ios" | "android",
+      runtimeVersion: `${j}.0.0`,
+      launchAsset: asset(files[j * 65]!, "b", "image/png"),
+      assets: files.slice(j * 65 + 1, (j + 1) * 65).map((f, i) => asset(f, `k${i}`, "image/png")),
+    }));
+    // 520 rows × (15 releases + 1 patch) would be ~8 300 writes, over a mutation's 8 192: none are spent here.
+    expect(((await t.mutation(m("publish"), { branch: "production", updates })) as { updates: unknown[] }).updates).toHaveLength(8);
+  }, 300_000);
+
+  test("extra must be JSON (every committed update renders)", async () => {
+    const t = harness();
+    await upload(t, { bundle: "x" });
+    const pub = (extra: unknown) => t.mutation(m("publish"), { branch: "production", updates: [{ platform: "ios", runtimeVersion: "1.0.0", launchAsset: asset("x", "b", "application/javascript"), assets: [], extra }] });
+    await expect(pub({ counter: 1n })).rejects.toThrow(/extra must be JSON/);
+    expect(((await pub({ ok: true })) as { updates: unknown[] }).updates).toHaveLength(1);
+  });
+
+  test("a branch-wide rollback that would write too much is refused with how to narrow it", async () => {
+    const t = harness();
+    await upload(t, { bundle: "tmp" });
+    for (let r = 0; r < 9; r++) {
+      const rv = `${r}.0.0`;
+      for (let i = 0; i < 1003; i++) {
+        await t.mutation(m("publish"), { branch: "production", updates: [{ id: crypto.randomUUID(), platform: "ios", runtimeVersion: rv, launchAsset: asset("tmp", "bundle-ios", "application/javascript"), assets: [] }] });
+        if (i > 0) await t.mutation(m("rollback"), { branch: "production", platform: "ios", runtimeVersion: rv });
+      }
+    }
+    // Nine pairs of ~1 000 live copies each: ~9 000 retirements in one call.
+    await expect(t.mutation(m("rollback"), { branch: "production", toEmbedded: true })).rejects.toThrow(/writes too much at once: name the platform and runtimeVersion/);
+    // One pair at a time fits.
+    expect(((await t.mutation(m("rollback"), { branch: "production", platform: "ios", runtimeVersion: "0.0.0", toEmbedded: true })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
   }, 300_000);
 
   test("repeated rollbacks to the embedded update retire the copies left below the directive, until A is reachable", async () => {
