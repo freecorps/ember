@@ -61,10 +61,11 @@ const fns = {
   },
 };
 
-function setup(installed = app) {
-  let now = 1_700_000_000_000;
+/** `from`: the shard (driver and clock) of an earlier setup, as a redeploy with another install config finds it. */
+function setup(installed = app, from?: { driver: ReturnType<typeof createNodeSqliteDriver>; now: () => number }) {
+  let now = from?.now() ?? 1_700_000_000_000;
   const composed = composeApp({ schema, functions: fns, app: installed });
-  const driver = createNodeSqliteDriver();
+  const driver = from?.driver ?? createNodeSqliteDriver();
   // A minimal scheduler: jobs from every mutation, run by `runDue` once due; `get` for the GC's liveness check.
   const jobs = new Map<string, { job: Job; state: "pending" | "inProgress" | "success" | "failed" | "canceled" }>();
   const engine = createEngine({
@@ -372,6 +373,48 @@ describe("rateLimit GC (expired buckets)", () => {
     advance(HOUR);
     expect(runDue()).toEqual([1]);
     expect(count("rateLimit$rateLimits")).toBe(0);
+  });
+
+  test("a new row expiring before the pending job moves the job up (never past the row's expiry)", () => {
+    const { mutate, pending, now } = setup(); // intervalMs: 1 h
+    const t0 = now();
+    const gcJobs = () => pending().filter((j) => j.fn === "@rateLimit/lib:gc");
+    mutate("@rateLimit/lib:limit", { name: "slow", key: "a", config: { kind: "token bucket", rate: 1, period: 2 * HOUR } });
+    expect(gcJobs().map((j) => j.runAt)).toEqual([t0 + 2 * HOUR]);
+    // Full again in 10 s: collectable at the interval (1 h), an hour before the pending job.
+    mutate("@rateLimit/lib:limit", { name: "fast", key: "a", config: { kind: "token bucket", rate: 1, period: 10 * SECOND } });
+    expect(gcJobs().map((j) => j.runAt)).toEqual([t0 + HOUR]);
+    // A later expiry leaves the earlier job alone.
+    mutate("@rateLimit/lib:limit", { name: "slow", key: "b", config: { kind: "token bucket", rate: 1, period: 2 * HOUR } });
+    expect(gcJobs().map((j) => j.runAt)).toEqual([t0 + HOUR]);
+  });
+
+  test("a slower named limit after a redeploy: the GC keeps the bucket still in debt under it", () => {
+    const fast = { kind: "token bucket" as const, rate: 1, period: MINUTE, capacity: 1 };
+    const before = setup(defineApp().use(rateLimit, { config: { limits: { slow: fast }, gc: { intervalMs: 1000 } } }));
+    expect(before.mutate("@rateLimit/lib:limit", { name: "slow", key: "k" }).value).toEqual({ ok: true }); // empty until +1 min
+    before.advance(HOUR); // the GC has not run yet
+    const after = setup(defineApp().use(rateLimit, { config: { limits: { slow: { ...fast, period: 24 * HOUR } }, gc: { intervalMs: 1000 } } }), before);
+    expect(after.mutate("@rateLimit/lib:gc").value).toBe(0); // in debt under the new config: kept
+    expect(after.count("rateLimit$rateLimits")).toBe(1);
+    expect(after.mutate("@rateLimit/lib:limit", { name: "slow", key: "k" }).value).toMatchObject({ ok: false });
+    const next = after.pending().filter((j) => j.fn === "@rateLimit/lib:gc");
+    expect(next.map((j) => j.runAt)).toEqual([before.now() - HOUR + 24 * HOUR]); // when it is full under the new one
+    after.advance(24 * HOUR);
+    expect(after.runDue()).toEqual([1]);
+    expect(after.count("rateLimit$rateLimits")).toBe(0);
+  });
+
+  test("turning the GC back on collects the rows written while it was off, from the next write of any key", () => {
+    const off = setup(defineApp().use(rateLimit, { config: { gc: false } }));
+    for (const k of keys(3)) off.mutate("messages:send", { user: k });
+    expect(off.pending()).toEqual([]);
+    const on = setup(defineApp().use(rateLimit, { config: { gc: { intervalMs: 1000 } } }), off);
+    on.mutate("messages:send", { user: "u0" }); // a patch of a tracked row
+    expect(on.pending().filter((j) => j.fn === "@rateLimit/lib:gc")).toHaveLength(1);
+    on.advance(HOUR);
+    expect(on.runDue()).toEqual([3]);
+    expect(on.count("rateLimit$rateLimits")).toBe(0);
   });
 });
 

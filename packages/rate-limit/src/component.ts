@@ -3,8 +3,8 @@
 // tokens are given back (nothing was consumed). Refused calls write nothing.
 //
 // GC: each row records `expiresAt`, when its bucket is full again (the same as no row). A job per shard (`lib:gc`,
-// scheduled by the first write that needs it, at most one pending) deletes expired rows in batches, so a limiter keyed
-// by user or IP does not grow without bound.
+// ensured by every write, at most one pending) deletes expired rows in batches, so a limiter keyed by user or IP does
+// not grow without bound.
 
 import { componentBuilders, defineComponent, defineErrors, defineSchema, defineTable, EmberError, v, type ComponentCtx, type GenericId } from "@freecorps/ember-server";
 import { checkChecked, checkConfig, consumeChecked, fullAt, refill, HOUR, type RateLimitConfig, type RateLimitState } from "./algorithms.ts";
@@ -64,8 +64,9 @@ export const installConfigValidator = v.object({
   bindings: v.optional(v.record(edgeBindingValidator)),
   /**
    * GC of expired buckets (on by default; `false` turns it off). `ttlMs`: how long a bucket is kept after it is full
-   * again (default 0); `batchSize`: rows deleted per job (default 500); `intervalMs`: the least time between two
-   * GC jobs of a shard (default 1 hour), so a busy limiter costs one job per interval, not one per key.
+   * again (default 0); `batchSize`: rows deleted per job (default 500); `intervalMs`: the least time before a GC job
+   * that waits for the next expiry (default 1 hour), so a busy limiter costs one job per interval, not one per key.
+   * A job whose batch was full continues at once: a backlog costs one job per `batchSize` rows.
    */
   gc: v.optional(
     v.union(v.literal(false), v.object({ ttlMs: v.optional(v.number()), batchSize: v.optional(v.number()), intervalMs: v.optional(v.number()) })),
@@ -141,17 +142,31 @@ function gcAlive(ctx: Ctx, row: { at: number; job: string }): boolean {
 }
 
 /**
- * Keeps one GC job in this shard due no later than about when a row expiring at `expiresAt` can go (never sooner
- * than `intervalMs` from now, so a stream of new keys reschedules at most once per interval).
+ * Keeps one GC job in this shard due no later than when a row expiring at `expiresAt` can go (never sooner than
+ * `intervalMs` from now). A job due later is moved up to `want`; one due sooner stays, so once a job is due about
+ * `intervalMs` out, a stream of new keys does not move it again.
  */
 function ensureGc(ctx: Ctx, gc: Gc, expiresAt: number) {
   const want = Math.max(expiresAt + gc.ttlMs, ctx.now + gc.intervalMs);
   const cur = ctx.db.query("gc").first();
-  if (cur && cur.at <= want + gc.intervalMs && gcAlive(ctx, cur)) return;
+  if (cur && cur.at <= want && gcAlive(ctx, cur)) return;
   if (cur) ctx.scheduler.cancel(cur.job);
   const job = ctx.scheduler.runAt(want, "lib:gc", {});
   if (cur) ctx.db.patch(cur._id, { at: want, job });
   else ctx.db.insert("gc", { at: want, job });
+}
+
+/** When `r` is full under the install's config for its name, if that is later than its `expiresAt` (else null). */
+function currentExpiry(ctx: ReadCtx, r: RateLimitState & { name: string; expiresAt?: number }): number | null {
+  const c = ctx.component.config?.limits?.[r.name];
+  if (!c) return null;
+  try {
+    checkConfig(c);
+  } catch {
+    return null;
+  }
+  const at = fullAt(c, r);
+  return r.expiresAt === undefined || at > r.expiresAt ? at : null;
 }
 
 const refused = (name: string, retryAfter: number) => rateLimitErrors.RateLimited({ name, retryAfter });
@@ -187,8 +202,9 @@ export const functions = {
           const expiresAt = fullAt(config, state);
           if (cur) ctx.db.patch(cur._id, { value: state.value, ts: state.ts, expiresAt });
           else ctx.db.insert("rateLimits", { name: a.name, key, value: state.value, ts: state.ts, expiresAt });
-          // A new row (or one from before the GC) needs a GC job in this shard; a patch of a tracked row does not.
-          const gc = !cur || cur.expiresAt === undefined ? gcOf(ctx) : null;
+          // Every write makes sure this shard has a GC job (one row read when it does): rows written while the GC
+          // was off, or before it existed, are collected once it is on.
+          const gc = gcOf(ctx);
           if (gc) ensureGc(ctx, gc, expiresAt);
         }
         return result.retryAfter !== undefined ? { ok: true, retryAfter: result.retryAfter } : { ok: true };
@@ -230,7 +246,9 @@ export const functions = {
       },
     }),
     /**
-     * Deletes up to `batchSize` buckets that are full again (plus `ttlMs`), oldest first, then schedules the next run:
+     * Deletes up to `batchSize` buckets that are full again (plus `ttlMs`), oldest first (a limit named in the install
+   * config is checked with its current config: still in debt under it, the row stays with a later expiry), then
+   * schedules the next run:
      * soon if the batch was full, else when the next row expires (at least `intervalMs` later), none when the table
      * is empty. Returns the rows deleted.
      */
@@ -247,18 +265,29 @@ export const functions = {
         const cutoff = ctx.now - gc.ttlMs;
         // `gte(0)`: rows without `expiresAt` (written before the GC) sort first and are skipped, not deleted.
         const old = ctx.db.query("rateLimits").withIndex("by_expires", (q) => q.gte("expiresAt", 0).lte("expiresAt", cutoff)).take(gc.batchSize);
-        for (const r of old) ctx.db.delete(r._id);
+        let deleted = 0;
+        for (const r of old) {
+          // `expiresAt` is from the config of the row's last write. A limit installed by name is checked again with
+          // the install's config now: after a redeploy with a slower one, a bucket still in debt under it is kept
+          // (its expiry moved), not deleted into a full one. (A config sent per call is only known to its calls.)
+          const later = currentExpiry(ctx, r);
+          if (later !== null && later + gc.ttlMs > ctx.now) ctx.db.patch(r._id, { expiresAt: later });
+          else {
+            ctx.db.delete(r._id);
+            deleted++;
+          }
+        }
         const next = old.length >= gc.batchSize ? ctx.now : ctx.db.query("rateLimits").withIndex("by_expires", (q) => q.gte("expiresAt", 0)).first()?.expiresAt;
         if (next === undefined) {
           if (cur) ctx.db.delete(cur._id);
-          return old.length;
+          return deleted;
         }
         // A full batch continues right away (one job per batch); otherwise wait for the next expiry.
         const at = old.length >= gc.batchSize ? ctx.now : Math.max(next + gc.ttlMs, ctx.now + gc.intervalMs);
         const job = ctx.scheduler.runAt(at, "lib:gc", {});
         if (cur) ctx.db.patch(cur._id, { at, job });
         else ctx.db.insert("gc", { at, job });
-        return old.length;
+        return deleted;
       },
     }),
   },
