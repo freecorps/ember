@@ -1494,7 +1494,10 @@ class Leader {
       if (!c) g.chans.set(ch, (c = { in: new Set(), waiting: new Set(), joined: null, state: undefined }));
       m.chans.add(ch);
       const state = "state" in msg ? JSON.stringify(msg.state) : undefined;
-      if (c.joined && (state === undefined || state === c.state)) {
+      // Answered here only when no other join of this channel is on its way to the shard: one in flight may still
+      // change the shared state (red, then blue sent, then red again: the cached red would not be the final one).
+      const inFlight = [...g.refs.values()].some((r) => r.c === c && r.msg === undefined);
+      if (c.joined && !inFlight && (state === undefined || state === c.state)) {
         c.waiting.delete(m);
         c.in.add(m);
         back.push(withRef(JSON.parse(this.joinedOf(ch, c)) as Record<string, unknown>, tabRef));

@@ -618,6 +618,14 @@ function jwtExp(token: string): number | null {
   return jwtInfo(token).exp;
 }
 
+/** A JWT's claims but its times and id (`exp`, `iat`, `nbf`, `jti`), as a stable string: what a renewal keeps. */
+function authzClaimsKey(token: string): string {
+  const p = jwtPayload(token);
+  if (!p) return "";
+  const keys = Object.keys(p).filter((k) => k !== "exp" && k !== "iat" && k !== "nbf" && k !== "jti").sort();
+  return JSON.stringify(keys.map((k) => [k, (p as Record<string, unknown>)[k]]));
+}
+
 /** `{subject: sub, issuer: iss}` of a JWT payload (not verified: only used to run queries on local data). */
 function jwtIdentity(token: string): LocalIdentity | null {
   const id = jwtInfo(token).identity;
@@ -1355,7 +1363,10 @@ export class EmberClient {
 
   /** Who the socket runs as now (what `sendAuth` / `hello` last set): the tag of the frames that arrive. */
   private connIdentityKey(conn: Conn): string {
-    return conn.opaque ? `opaque:${conn.lastToken ?? ""}` : identityCacheKey(conn.identity ?? null);
+    if (conn.opaque) return `opaque:${conn.lastToken ?? ""}`;
+    // The identity and every claim that may grant access (an `org`, roles): a token for the same user in another
+    // org is another key, so its frames are stale; a renewal (only `exp`/`iat`/`nbf`/`jti` move) keeps the key.
+    return `${identityCacheKey(conn.identity ?? null)}\u0000${conn.lastToken ? authzClaimsKey(conn.lastToken) : ""}`;
   }
 
   private sendAuth(conn: Conn, token: string | null): void {
@@ -3194,7 +3205,12 @@ export class EmberClient {
     if (hb === false || !conn.ready) return;
     this.clearTimer(conn, "pingTimer");
     const interval = hb?.intervalMs ?? 25_000;
-    this.pingAfter(conn, Math.round(interval * (1 - this.random() / 5)));
+    const quiet = Math.round(interval * (1 - this.random() / 5));
+    // A joined channel caps every arm (after a pong too) at the keepalive deadline, from the last frame sent.
+    if (this.chans.joined(conn.shard) && quiet > CHANNEL_KEEPALIVE_MS) {
+      return this.pingAfter(conn, quiet, Math.max(0, Math.min(quiet, CHANNEL_KEEPALIVE_MS - (Date.now() - (conn.sentAt ?? 0)))));
+    }
+    this.pingAfter(conn, quiet);
   }
 
   /**
