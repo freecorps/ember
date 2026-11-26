@@ -210,6 +210,12 @@ await pendingBurst("tinybase");
     watchBytes.push(posted.slice(before).filter((p) => p.dir === "down" && p.k !== "res").reduce((a, p) => a + p.bytes, 0));
   }
   off();
+  // The unwatch `off()` sent, and its answer, settle before the burst is counted.
+  let settled = -1;
+  while (settled !== posted.length) {
+    settled = posted.length;
+    await new Promise((r) => setTimeout(r, 5));
+  }
   const lists = Array.from({ length: 20 }, (_, c) => srv.q("messages:list", { channel: `d${c}` }) as Doc[]);
   const before = posted.length;
   await Promise.all(lists.map((l, c) => remote.applyPatch(upd("s", `d${c}`, l, 1))));

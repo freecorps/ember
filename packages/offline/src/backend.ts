@@ -183,6 +183,7 @@ export function fingerprintOfJson(json: string): string {
 
 /** Whether `value` has fingerprint `fp`, in either format (a record or notice of an older version: `<length>.<hash>`). */
 export function hasFingerprint(value: unknown, fp: string): boolean {
+  // By the dot, not the `s` prefix: an older one starts with its length in base 36, which can be `s` too (28).
   return fp.includes(".") ? fingerprintOfJson(encodeJson(value)) === fp : valueFingerprint(value) === fp;
 }
 
@@ -231,8 +232,11 @@ export function hashValue(x: unknown): number {
     case "number": {
       // Object.is semantics, as the encoding: -0 is not 0, every NaN is one value.
       if (x !== x) return 0x2f1a3;
+      // The two words read right after the write, before anything else could use the shared buffer.
       f64[0] = x;
-      return finish(Math.imul(0x51ed27 ^ u32[0]!, 2654435761), Math.imul(0x2b3d ^ u32[1]!, 1597334677));
+      const lo = u32[0]!;
+      const hi = u32[1]!;
+      return finish(Math.imul(0x51ed27 ^ lo, 2654435761), Math.imul(0x2b3d ^ hi, 1597334677));
     }
     case "boolean":
       return x ? 0x3a11 : 0x3a12;
@@ -254,6 +258,7 @@ export function hashValue(x: unknown): number {
           h2 = Math.imul(h2 ^ x[i]!, 1597334677);
         }
         h1 = Math.imul(h1 ^ x.length, 2654435761);
+        h2 = Math.imul(h2 ^ x.length, 1597334677);
       } else if (Array.isArray(x)) {
         h1 = 0x3c6ef372;
         h2 = 0xa54ff53a;
