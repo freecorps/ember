@@ -84,7 +84,7 @@ describe("embed pages", () => {
     // The two inline scripts (CRLF hashed as LF, as the browser does), never the external one.
     const hashes = await inlineScriptHashes(PAGE);
     expect(hashes).toHaveLength(2);
-    expect(hashes[0]).toBe(`'sha256-${Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("window.a = 1;\n"))).toString("base64")}'`);
+    expect(hashes![0]).toBe(`'sha256-${Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("window.a = 1;\n"))).toString("base64")}'`);
     expect(csp).toBe(embedCsp(hashes!, [ORIGIN]));
     expect(csp).toContain("sandbox allow-scripts;");
     expect(csp).not.toContain("allow-same-origin");

@@ -19,6 +19,7 @@
   --shadow: 0 8px 28px rgb(30 25 15 / 0.14);
   --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --radius: 5px;
   color-scheme: light;
 }
 
@@ -346,3 +347,6 @@ dialog.palette { width: min(640px, calc(100vw - 32px)); margin-top: 12vh; }
 .timeline-detail { flex-basis: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
 .screen-detail { display: grid; gap: 14px; }
 pre.stacktrace { color: var(--bad); white-space: pre-wrap; }
+
+/* Embed blocks: a component's own page in a sandboxed iframe (embed.tsx). */
+.embed-frame { display: block; width: 100%; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }

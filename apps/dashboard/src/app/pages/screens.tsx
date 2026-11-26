@@ -11,6 +11,7 @@ import { argsFromForm, fieldKind, type ObjectShape, type Shape } from "../forms.
 import { ago, fmtBytes, fmtNum, fmtPct, fmtTime, text } from "../format.ts";
 import { href, useApi, useSession } from "../hooks.ts";
 import { Badge, ConfirmDialog, Dialog, Empty, JsonView, Loading, Mono, Problem, Section, Stat, Table } from "../ui.tsx";
+import { EmbedBlock, type EmbedSpec } from "../embed.tsx";
 
 // ------------------------------------------------------------------------------------------- spec (as the runtime lists it)
 
@@ -51,6 +52,7 @@ type Block = { id: string; label?: string; description?: string } & (
   | ({ kind: "detail" } & Detail)
   | { kind: "toggle"; label: string; query: string; args?: Record<string, unknown>; path: string; mutation: string; arg: string; mutationArgs?: Record<string, unknown> }
   | { kind: "actions"; actions: Action[] }
+  | Omit<EmbedSpec, "id" | "label" | "description">
 );
 export interface Spec {
   key: string;
@@ -233,7 +235,22 @@ function Screen({ project, env, shard: picked, spec, tab, link }: { project: str
 function BlockView({ c, b }: { c: ScreenCtx; b: Block }) {
   const id = `blk-${b.id}`;
   const body =
-    b.kind === "stats" ? <StatsBlock c={c} b={b} /> : b.kind === "table" ? <TableBlock c={c} b={b} /> : b.kind === "detail" ? <DetailBlock c={c} b={b} /> : b.kind === "toggle" ? <ToggleBlock c={c} b={b} /> : <ActionsBlock c={c} actions={b.actions} />;
+    b.kind === "stats" ? (
+      <StatsBlock c={c} b={b} />
+    ) : b.kind === "table" ? (
+      <TableBlock c={c} b={b} />
+    ) : b.kind === "detail" ? (
+      <DetailBlock c={c} b={b} />
+    ) : b.kind === "toggle" ? (
+      <ToggleBlock c={c} b={b} />
+    ) : b.kind === "embed" ? (
+      <EmbedBlock c={c} b={b} />
+    ) : b.kind === "actions" ? (
+      <ActionsBlock c={c} actions={b.actions} />
+    ) : (
+      // A block kind from a newer runtime: shown as data, never guessed at.
+      <JsonView value={b} />
+    );
   if (!b.label && !b.description) return <div className="section">{body}</div>;
   return (
     <Section title={b.label ?? ""} id={id}>

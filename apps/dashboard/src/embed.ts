@@ -180,7 +180,7 @@ export async function serveEmbed(request: Request, env: ProjectEnv & { REGISTRY?
   const html = new TextDecoder().decode(bytes);
   const hashes = await inlineScriptHashes(html);
   if (!hashes) return refusal(502, `the embed page has more than ${MAX_SCRIPTS} inline scripts`, ancestors);
-  return new Response(request.method === "HEAD" ? null : bytes, {
+  return new Response(request.method === "HEAD" ? null : (bytes as Uint8Array<ArrayBuffer>), {
     headers: { "content-type": "text/html; charset=utf-8", "content-security-policy": embedCsp(hashes, ancestors), ...EMBED_HEADERS },
   });
 }

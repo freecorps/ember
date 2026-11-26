@@ -1,6 +1,8 @@
 // A project Worker's admin API (@freecorps/ember-runtime `/api/_ember/*`) for the browser test, with user data that
 // tries to inject markup.
 
+import { embedPage } from "@freecorps/ember-dashboard-sdk";
+
 export const XSS = `<img src=x onerror="window.__xss=1">`;
 export const BOOKMARK = "00000000-00000008-00005119-0123456789abcdef";
 
@@ -61,6 +63,48 @@ export const POOL_SPEC = {
     "@pool/lib:enqueueTest": { type: "action", args: { kind: "object", fields: { label: str } } },
   },
 };
+
+/**
+ * A component with an embed block (contracts.md "Embeds"): its page lists items (a query the block allows), adds one
+ * (a mutation it allows, confirmed in the dashboard), and tries a query of the spec the block does not list.
+ */
+export const LAB_SPEC = {
+  key: "lab",
+  component: "lab",
+  label: "Lab",
+  icon: "flag",
+  scope: "shard",
+  tabs: [{ id: "page", label: "Page", blocks: [{ kind: "embed", id: "play", label: "Playground", route: "/dashboard/page", path: "/lab/dashboard/page", height: "auto", functions: { "lib:list": "@lab/lib:list", "lib:add": "@lab/lib:add" } }] }],
+  functions: {
+    "@lab/lib:list": { type: "query", args: { kind: "object", fields: {} } },
+    "@lab/lib:add": { type: "mutation", args: { kind: "object", fields: { label: str } } },
+    "@lab/lib:secret": { type: "query", args: { kind: "object", fields: {} } },
+  },
+};
+
+/** The lab's page: buttons that call through the SDK and show what came back (as text). */
+export const LAB_PAGE = embedPage({
+  title: "Lab",
+  body: `<h1>Lab page</h1><p id="ctx">…</p><p id="theme">…</p><button id="load">Load</button> <button id="add">Add</button> <button id="secret">Secret</button> <button id="twice">Add twice</button> <button id="action">As action</button><pre id="out">idle</pre><pre id="out2"></pre>`,
+  style: "pre{white-space:pre-wrap}",
+  script: `
+const dash = EmberDashboard.connect();
+const $ = (id) => document.getElementById(id);
+const show = (el) => (x) => { $(el).textContent = typeof x === "string" ? x : JSON.stringify(x); };
+const fail = (el) => (e) => { $(el).textContent = "error " + e.code; };
+$("load").addEventListener("click", () => dash.query("lib:list").then(show("out"), fail("out")));
+$("add").addEventListener("click", () => dash.mutate("lib:add", { label: "from embed" }).then((v) => show("out")("added " + JSON.stringify(v)), fail("out")));
+$("secret").addEventListener("click", () => dash.query("lib:secret").then(show("out"), fail("out")));
+$("action").addEventListener("click", () => dash.action("lib:add", { label: "x" }).then(show("out"), fail("out")));
+$("twice").addEventListener("click", () => {
+  dash.mutate("lib:add", { label: "first" }).then((v) => show("out")("added " + JSON.stringify(v)), fail("out"));
+  dash.mutate("lib:add", { label: "second" }).then(show("out2"), fail("out2"));
+});
+dash.context.then((c) => { $("ctx").textContent = c.dashboard + "/" + c.block + " on " + c.shard + " as " + c.role; });
+dash.onTheme((t) => { $("theme").textContent = t.mode + " " + (t.vars["--accent"] || ""); });
+dash.ready();
+`,
+});
 
 const WORK = [
   { _id: "work_1", fnName: XSS, status: "pending", paused: false, attempts: 0, history: [], lastError: null },
@@ -127,18 +171,23 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           if (body.fn === "messages:send" && typeof (body.args as { channel?: unknown }).channel !== "string") return json({ ok: false, error: { code: "ValidationError", message: "channel: expected string" }, ms: 0.4, type: "mutation", as: null }, 400);
           return json({ ok: true, value: { who: as?.subject ?? null, args: body.args }, ms: 1.5, type: body.fn === "messages:send" ? "mutation" : "query", as: as?.subject ?? null });
         }
-        if (p === "dashboards/run") return json({ ok: true, value: body.fn === "@pool/lib:cancelAll" ? 3 : true, ms: 1, type: "mutation", shard: body.shard });
+        if (p === "dashboards/run") return json({ ok: true, value: body.fn === "@pool/lib:cancelAll" ? 3 : body.fn === "@lab/lib:add" ? "it_2" : true, ms: 1, type: "mutation", shard: body.shard });
         if (p === "restore") return json({ ok: true, shard: body.shard, restoredTo: body.bookmark, undo: "0000000a-0000000b-0000000c-feedfacefeedface", version: 9, epoch: "e2", schemaVersion: "abc" });
       }
       if (p === "capabilities") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
-        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run"], auth: !state.authFrom, ...(state.authFrom ? { authFrom: state.authFrom } : {}), files: true, system: true });
+        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run", "dashboards/embed"], auth: !state.authFrom, ...(state.authFrom ? { authFrom: state.authFrom } : {}), files: true, system: true });
       }
-      if (p === "dashboards") return json({ ok: true, dashboards: o.legacy ? [] : [POOL_SPEC] });
+      if (p === "dashboards") return json({ ok: true, dashboards: o.legacy ? [] : [POOL_SPEC, LAB_SPEC] });
+      if (p === "dashboards/embed") {
+        if (url.searchParams.get("dashboard") !== "lab" || url.searchParams.get("route") !== "/dashboard/page") return json({ ok: false, error: { code: "unknown_embed", message: "no such embed" } }, 404);
+        return new Response(LAB_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
+      }
       if (p === "dashboards/query") {
         const fn = url.searchParams.get("fn")!;
         const args = JSON.parse(url.searchParams.get("args") ?? "{}") as { status?: string; id?: string; paginationOpts?: { numItems: number; cursor: string | null } };
         dashQueries.push({ fn, args, shard: url.searchParams.get("shard") });
+        if (fn === "@lab/lib:list") return json({ ok: true, value: [{ _id: "it_1", label: XSS }], ms: 1, type: "query" });
         if (fn === "@pool/lib:stats") return json({ ok: true, value: { pending: 1, running: 1, totals: { succeeded: 12 } }, ms: 1, type: "query" });
         if (fn === "@pool/lib:item") return json({ ok: true, value: WORK.find((w) => w._id === args.id) ?? null, ms: 1, type: "query" });
         if (fn === "@pool/lib:listWork") {

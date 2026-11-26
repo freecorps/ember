@@ -804,7 +804,7 @@ export const ROUTES: Route[] = [
       const t = await targetOf(c, "dashboards/embed");
       if (t instanceof Response) return t;
       if (!c.env.REGISTRY) return err(500, "no_registry", "the REGISTRY binding is missing");
-      const s = { project: t.target.project, env: t.target.env, dashboard: c.q.get("dashboard") ?? "", route: c.q.get("route") ?? "" };
+      const s = { project: c.q.get("project") ?? "", env: c.q.get("env") ?? "", dashboard: c.q.get("dashboard") ?? "", route: c.q.get("route") ?? "" };
       const bad = embedScopeProblem(s);
       if (bad) return err(400, "bad_request", bad);
       return json({ ok: true, ...(await embedUrl(c.env.REGISTRY, s)) });
