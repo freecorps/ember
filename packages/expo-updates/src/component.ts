@@ -62,6 +62,11 @@ const schema = defineSchema({
       rollbackOf: v.optional(v.string()),
       /** The release a rollback row took out of service: its copies below this row are never served again. */
       outRelease: v.optional(v.string()),
+      /**
+       * Releases a cleanup took the rows of (repeated `toEmbedded` on this directive): their exclusions, carried here so
+       * live copies of them below are still never served. At most `MAX_CARRIED_EXCLUSIONS`.
+       */
+      alsoOut: v.optional(v.array(v.string())),
       /** The update this row republishes (a rollback to a previous update). */
       republishOf: v.optional(v.string()),
       createdAt: v.number(),
@@ -174,6 +179,8 @@ const ROLLBACK_WINDOW = 50;
 const ROLLBACK_SCAN_MAX = 1000;
 /** Rows one rollback call reads in all (every pair): below the mutation's default `documentsRead` (16 384). */
 const ROLLBACK_READ_BUDGET = 12_000;
+/** Excluded releases one directive can carry (`alsoOut`, ~37 bytes each). */
+const MAX_CARRIED_EXCLUSIONS = 4000;
 
 /**
  * The head of (branch, platform, runtime version), the newest live row of another release (`prev`, or null: none), and
@@ -211,12 +218,13 @@ function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runti
         break;
       }
       if (r.outRelease) out.add(r.outRelease);
+      for (const x of r.alsoOut ?? []) out.add(x);
     }
     const prev = at >= 0 ? rows[at]! : null;
-    if (prev || step.length < want) return { head, prev, rows: prev ? rows.slice(0, at) : rows };
+    if (prev || step.length < want) return { head, prev, rows: prev ? rows.slice(0, at) : rows, out };
     // Past the bound: to the embedded update the copies read so far go (a later rollback takes the rest);
     // otherwise no previous release can be told, and the rollback refuses rather than guess.
-    if (rows.length >= ROLLBACK_SCAN_MAX && toEmbedded) return { head, prev: null, rows };
+    if (rows.length >= ROLLBACK_SCAN_MAX && toEmbedded) return { head, prev: null, rows, out };
     if (rows.length >= ROLLBACK_SCAN_MAX) throw new EmberError("ValidationError", `${branch} ${platform} ${runtimeVersion}: more than ${ROLLBACK_SCAN_MAX} live copies of ${releaseOf(head)}; roll back with toEmbedded`);
   }
 }
@@ -501,18 +509,33 @@ export const functions = {
         const out: Array<{ platform: Platform; runtimeVersion: string; rolledBack: string; now: string; kind: "update" | "rollBackToEmbedded" }> = [];
         // One read budget for the whole call (every pair): past it, the call refuses and says how to narrow it.
         const budget = { rows: ROLLBACK_READ_BUDGET };
+        let retired = false;
         for (const p of pairsOf(ctx, a.branch, a.platform, a.runtimeVersion)) {
           // A rollback takes out the head's release (the head and the live copies of it a rollback republished) and
           // goes back to the newest live row of another release: rolling back B' (a republish of B) reaches A, not B.
           // To the embedded update no previous release is needed: the search stops at its bound instead of refusing.
           const scan = previousRelease(ctx, a.branch, p.platform, p.runtimeVersion, !!a.toEmbedded, budget);
           if (!scan) continue;
-          const { head, prev, rows } = scan;
+          const { head, prev, rows, out: excluded } = scan;
           const bad = releaseOf(head);
           if (head.kind === "rollBackToEmbedded" && (a.toEmbedded || !prev)) {
             // Already on the embedded update. To it again: the copies of releases taken out read below the directive (a
             // bounded batch, never the release before them) go too, so an ordinary rollback later reaches that one.
-            if (a.toEmbedded) for (const r of rows.slice(1)) ctx.db.patch(r._id, { rolledBack: true });
+            const below = a.toEmbedded ? rows.slice(1) : [];
+            if (below.length) {
+              // The exclusions the retired rows held (their own `outRelease`/`alsoOut`) move to the directive: a copy of
+              // one of those releases left live further down is still never picked.
+              const carried = new Set(head.alsoOut ?? []);
+              for (const r of below) {
+                if (r.outRelease) carried.add(r.outRelease);
+                for (const x of r.alsoOut ?? []) carried.add(x);
+              }
+              carried.delete(head.outRelease ?? "");
+              if (carried.size > MAX_CARRIED_EXCLUSIONS) throw new EmberError("ValidationError", `${a.branch} ${p.platform} ${p.runtimeVersion}: the directive would carry more than ${MAX_CARRIED_EXCLUSIONS} excluded releases; publish a new update to start over`);
+              for (const r of below) ctx.db.patch(r._id, { rolledBack: true });
+              ctx.db.patch(head._id, { alsoOut: [...carried] });
+              retired = true;
+            }
             continue;
           }
           // Out of service: the head's release and the rows of releases already taken out read on the way.
@@ -521,16 +544,22 @@ export const functions = {
           const toEmbedded = !!a.toEmbedded || !prev;
           // What the new head is: the previous row may itself be a directive (a publish after a rollback to embedded).
           const kind = toEmbedded ? "rollBackToEmbedded" : prev!.kind;
-          const base = { uuid, group: uuid, branch: a.branch, platform: p.platform, runtimeVersion: p.runtimeVersion, rolloutPercent: 100, rolledBack: false, rollbackOf: head.uuid, outRelease: bad };
+          // The new head carries the exclusions of the rows it takes out of service (copies of those releases left live
+          // below stay excluded), besides its own `outRelease`.
+          const carry = new Set(excluded);
+          carry.delete(bad);
+          if (carry.size > MAX_CARRIED_EXCLUSIONS) throw new EmberError("ValidationError", `${a.branch} ${p.platform} ${p.runtimeVersion}: the rollback would carry more than ${MAX_CARRIED_EXCLUSIONS} excluded releases; publish a new update to start over`);
+          const base = { uuid, group: uuid, branch: a.branch, platform: p.platform, runtimeVersion: p.runtimeVersion, rolloutPercent: 100, rolledBack: false, rollbackOf: head.uuid, outRelease: bad, ...(carry.size ? { alsoOut: [...carry] } : {}) };
           if (toEmbedded) {
             insertHead(ctx, { ...base, kind: "rollBackToEmbedded", assets: [], metadata: {}, message: a.message ?? `Roll back ${head.uuid} to the embedded update` }, head.createdAt);
           } else {
-            const { _id: _x, _creationTime: _y, uuid: prevUuid, group: _g, createdAt: _c, rollbackOf: _r, republishOf: _p, outRelease: _o, message: _m, ...copy } = prev!;
+            const { _id: _x, _creationTime: _y, uuid: prevUuid, group: _g, createdAt: _c, rollbackOf: _r, republishOf: _p, outRelease: _o, alsoOut: _ao, message: _m, ...copy } = prev!;
             insertHead(ctx, { ...copy, ...base, republishOf: releaseOf(prev!), message: a.message ?? `Roll back ${head.uuid} to ${prevUuid}` }, head.createdAt);
           }
           out.push({ platform: p.platform, runtimeVersion: p.runtimeVersion, rolledBack: head.uuid, now: uuid, kind });
         }
-        if (out.length) bumpChannelsOf(ctx, a.branch);
+        // A cleanup changes the rows the plan reads (the head's control): the channels' version moves with it too.
+        if (out.length || retired) bumpChannelsOf(ctx, a.branch);
         return out;
       },
     }),

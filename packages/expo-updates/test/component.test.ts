@@ -291,20 +291,28 @@ describe("expo updates component", () => {
     await publish(t, { bundle: "B" });
     // Thousands of publishes: ids given (the harness's seeded random repeats one now and then over this many).
     await upload(t, { bundle: "tmp" });
-    for (let i = 0; i < 1999; i++) {
+    for (let i = 0; i < 2600; i++) {
       await t.mutation(m("publish"), { branch: "production", updates: [{ id: crypto.randomUUID(), platform: "ios", runtimeVersion: "1.0.0", launchAsset: asset("tmp", "bundle-ios", "application/javascript"), assets: [] }] });
       await t.mutation(m("rollback"), { branch: "production" });
     }
+    const plan = () => t.query(unsafeRef<"query">("@expoUpdates/http:plan"), { channel: "production", platform: "ios", runtimeVersion: "1.0.0" }) as Promise<{ version: number }>;
     let reached = false;
+    let cleanups = 0;
     for (let i = 0; i < 5 && !reached; i++) {
       try {
         await t.mutation(m("rollback"), { branch: "production" });
         reached = true;
       } catch (e) {
         expect(String(e)).toMatch(/toEmbedded/);
+        const before = (await plan()).version;
         await t.mutation(m("rollback"), { branch: "production", toEmbedded: true });
+        // The first one writes the directive; the next ones only retire rows under it: the channel's version moves
+        // either way (the edge cache's plan is never kept over rows that changed).
+        expect((await plan()).version).toBe(before + 1);
+        cleanups++;
       }
     }
+    expect(cleanups).toBeGreaterThanOrEqual(2);
     expect(reached).toBe(true);
     expect((await ask(t)).manifest.launchAsset.hash).toBe(createHash("sha256").update("A").digest("base64url"));
   }, 180_000);
