@@ -768,7 +768,7 @@ export const functions = {
         const s = settings(ctx);
         // The attempt did not go: it gets its number back (it used no retry) and waits, or goes now if the endpoint
         // can take it again by now (`release` ran before it was held, so it would not see it).
-        if ("held" in report) return dispatch(ctx, { ...d, attempt: d.attempt - 1, workId: undefined }, e, s);
+        if ("held" in report) return dispatch(ctx, { ...d, attempt: d.attempt - 1 }, e, s);
         const outcome = report.error !== undefined ? classify(undefined) : classify(report.status, report.retryAfterMs);
         const wasProbe = e.probing === d._id;
         const base = {
