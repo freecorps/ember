@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, test } from "vitest";
 import {
   cachedSql,
+  checkBase,
   clearSqlCache,
   countsSql,
   funnelSql,
@@ -15,6 +16,8 @@ import {
   retentionSql,
   retentionStart,
   runSql,
+  sqlCacheSize,
+  SQL_API_BASE,
   SqlApiError,
   SqlInputError,
   topEventsSql,
@@ -76,8 +79,8 @@ describe("SQL inputs are checked, never interpolated raw", () => {
   });
 
   test("numbers are clamped integers; a non-number is refused", () => {
-    expect(countsSql(scope, { sinceHours: 1e9 })).toContain("INTERVAL '2160' HOUR");
-    expect(countsSql(scope, { sinceHours: -5 })).toContain("INTERVAL '1' HOUR");
+    expect(countsSql(scope, { sinceHours: 1e9 })).toContain(`toUnixTimestamp(NOW()) - ${2160 * 3600}`);
+    expect(countsSql(scope, { sinceHours: -5 })).toContain("toUnixTimestamp(NOW()) - 3600");
     expect(topEventsSql(scope, { limit: 3.9 })).toContain("LIMIT 3");
     expect(() => topEventsSql(scope, { limit: "1; DROP" as unknown as number })).toThrow(SqlInputError);
     expect(() => funnelSql(scope, { steps: ["a", "b"], windowSeconds: Number.NaN })).toThrow(SqlInputError);
@@ -115,12 +118,28 @@ describe("SQL inputs are checked, never interpolated raw", () => {
 });
 
 describe("statement shapes", () => {
+  test("event time, not arrival time: double1 (the batch's ts) orders funnels, buckets counts, places cohorts", () => {
+    // A batch sent late (offline, beacons) arrives with one `timestamp` for every event: only double1 keeps the order.
+    for (const sql of [funnelSql(scope, { steps: ["a", "b"] }), retentionSql(scope, {}), countsSql(scope), topEventsSql(scope), overviewSql(scope)]) {
+      expect(sql).toContain(ET);
+      expect(sql).not.toMatch(/toUnixTimestamp\(timestamp\) -|toStartOfInterval\(timestamp|if\(blob1 = [^,]+, toUnixTimestamp\(timestamp\)/);
+    }
+    // The arrival range is wider than the event range by the 1 h an event may be ahead of its arrival.
+    expect(overviewSql(scope)).toContain("timestamp >= toStartOfDay(NOW()) - INTERVAL '1' HOUR AND " + ET + " >= toUnixTimestamp(toStartOfDay(NOW()))");
+  });
+
+  test("users: rows with neither userId nor anonymousId are not one more user (they still count as events)", () => {
+    const users = "count(DISTINCT if(blob2 != '', blob2, blob3)) - if(countIf(NOT (blob2 != '' OR blob3 != '')) > 0, 1, 0) AS users";
+    expect(topEventsSql(scope)).toContain(`SUM(_sample_interval) AS events, ${users}`);
+    expect(overviewSql(scope)).toContain(`SUM(_sample_interval) AS events, ${users}`);
+  });
+
   test("counts: buckets per name, scoped to the install, names on the sampling index", () => {
     expect(countsSql(scope, { names: ["a", "b"], sinceHours: 48, bucket: "day" })).toBe(
       [
-        "SELECT toStartOfInterval(timestamp, INTERVAL '1' DAY) AS t, blob1 AS name, SUM(_sample_interval) AS events",
+        "SELECT toStartOfInterval(toDateTime(double1 / 1000), INTERVAL '1' DAY) AS t, blob1 AS name, SUM(_sample_interval) AS events",
         "FROM ember_analytics",
-        "WHERE blob6 = 'analytics' AND timestamp > NOW() - INTERVAL '48' HOUR AND index1 IN ('a', 'b')",
+        `WHERE blob6 = 'analytics' AND timestamp > NOW() - INTERVAL '49' HOUR AND ${ET} > toUnixTimestamp(NOW()) - 172800 AND index1 IN ('a', 'b')`,
         "GROUP BY t, name",
         "ORDER BY t, name",
         "LIMIT 10000",
@@ -138,11 +157,11 @@ describe("statement shapes", () => {
         `  countIf(t0 < ${NEVER} AND t1 >= t0 AND t2 >= t1 AND t2 - t0 <= 3600) AS step2`,
         "FROM (",
         "  SELECT if(blob2 != '', blob2, blob3) AS uid,",
-        `    min(if(blob1 = 'view', toUnixTimestamp(timestamp), ${NEVER})) AS t0,`,
-        `    min(if(blob1 = 'cart', toUnixTimestamp(timestamp), ${NEVER})) AS t1,`,
-        `    min(if(blob1 = 'paid', toUnixTimestamp(timestamp), ${NEVER})) AS t2`,
+        `    min(if(blob1 = 'view', ${ET}, ${NEVER})) AS t0,`,
+        `    min(if(blob1 = 'cart', ${ET}, ${NEVER})) AS t1,`,
+        `    min(if(blob1 = 'paid', ${ET}, ${NEVER})) AS t2`,
         "  FROM ember_analytics",
-        "  WHERE blob6 = 'analytics' AND timestamp > NOW() - INTERVAL '14' DAY AND index1 IN ('view', 'cart', 'paid') AND (blob2 != '' OR blob3 != '')",
+        `  WHERE blob6 = 'analytics' AND timestamp > NOW() - INTERVAL '337' HOUR AND ${ET} > toUnixTimestamp(NOW()) - 1209600 AND index1 IN ('view', 'cart', 'paid') AND (blob2 != '' OR blob3 != '')`,
         "  GROUP BY uid",
         ")",
       ].join("\n"),
@@ -156,7 +175,7 @@ describe("statement shapes", () => {
     expect(new Date(start * 1000).toISOString()).toBe("2026-11-09T00:00:00.000Z"); // the Monday two weeks before
     expect(new Date(retentionStart({ period: "day", periods: 2, now }) * 1000).toISOString()).toBe("2026-11-25T00:00:00.000Z");
     const sql = retentionSql(scope, { period: "week", periods: 3, event: "session", now });
-    const idx = `intDiv(toUnixTimestamp(timestamp) - ${start}, 604800)`;
+    const idx = `intDiv(${ET} - ${start}, 604800)`;
     expect(sql).toBe(
       [
         "SELECT cohort, count() AS users,",
@@ -169,7 +188,7 @@ describe("statement shapes", () => {
         `    countIf(${idx} = 1) AS a1,`,
         `    countIf(${idx} = 2) AS a2`,
         "  FROM ember_analytics",
-        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) >= ${start} AND (blob2 != '' OR blob3 != '') AND index1 = 'session'`,
+        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) >= ${start - 3600} AND ${ET} >= ${start} AND (blob2 != '' OR blob3 != '') AND index1 = 'session'`,
         "  GROUP BY uid",
         ")",
         "GROUP BY cohort",
@@ -181,6 +200,8 @@ describe("statement shapes", () => {
     expect(retentionSql(scope, { periods: 99 })).not.toContain("a13");
   });
 });
+
+const ET = "toUnixTimestamp(toDateTime(double1 / 1000))";
 
 /** A recorded SQL API exchange: the fetch sees the URL, the token and the statement; answers what was recorded. */
 function recorded(answer: unknown, status = 200) {
@@ -253,6 +274,28 @@ describe("the SQL API and results", () => {
     await cachedSql(api, "SELECT 1", { ttlSeconds: 0, cache });
     await cachedSql(api, "SELECT 1", { ttlSeconds: 0, cache });
     expect(calls).toHaveLength(4);
+  });
+
+  test("cachedSql: the memory stays within its cap, also when the answers come from the Cache API", async () => {
+    const { api } = recorded({ data: [] });
+    const store = new Map<string, Response>();
+    const cache: CacheLike = { match: async (k) => store.get(k)?.clone(), put: async (k, r) => void store.set(k, r) };
+    for (let i = 0; i < 250; i++) await cachedSql(api, `SELECT ${i}`, { ttlSeconds: 60, now: 1000, cache });
+    clearSqlCache();
+    // Another isolate: every answer is a Cache API hit, each one remembered in memory.
+    for (let i = 0; i < 250; i++) expect(await cachedSql(api, `SELECT ${i}`, { ttlSeconds: 60, now: 2000, cache })).toMatchObject({ cached: true });
+    expect(sqlCacheSize()).toBe(200);
+  });
+
+  test("the SQL API base: https only (plain http only to the loopback); the token never goes in the clear", async () => {
+    const { calls, api } = recorded({ data: [] });
+    for (const base of ["http://api.example.com/client/v4", "ftp://x/", "not a url", "http://localhost.evil.example/v4"]) {
+      await expect(runSql({ ...api, base }, "SELECT 1")).rejects.toBeInstanceOf(SqlApiError);
+    }
+    expect(calls).toHaveLength(0);
+    for (const base of ["https://api.example.com/client/v4", "http://localhost:8787/v4", "http://127.0.0.1:9/v4", "http://[::1]:9/v4"]) await runSql({ ...api, base }, "SELECT 1");
+    expect(calls.map((c) => new URL(c.url).host)).toEqual(["api.example.com", "localhost:8787", "127.0.0.1:9", "[::1]:9"]);
+    expect(checkBase(SQL_API_BASE)).toBe(SQL_API_BASE);
   });
 
   test("cachedSql: a rotated token or another base URL never reads the cached answer", async () => {

@@ -47,6 +47,7 @@ export {
 export * from "./events.ts";
 export {
   cachedSql,
+  checkBase,
   clearSqlCache,
   countsSql,
   funnelSql,
@@ -58,6 +59,7 @@ export {
   retentionSql,
   retentionStart,
   runSql,
+  sqlCacheSize,
   topEventsSql,
   DATASET,
   INSTALL,

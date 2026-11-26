@@ -2,7 +2,8 @@
 // needed). Events wait in memory and go to `POST <url><path>` every `flushIntervalMs`, when a batch is full, on
 // `pagehide` (`navigator.sendBeacon`) and on `close()`. Bodies are `text/plain` JSON, a "simple" request with no CORS
 // preflight (like the RUM client). One request at a time; a batch that is not delivered (network, 3xx, 429, 5xx) goes
-// back to the queue; one the server refuses (other 4xx) is dropped. On `pagehide` the beacons stay within the
+// back to the queue; one the server refuses whole (400, 413) is sent again in halves, and only an event refused on
+// its own (or a batch refused with another 4xx) is dropped. On `pagehide` the beacons stay within the
 // browser's keepalive budget (64 KiB in flight per page, shared with the pending fetch): what does not fit stays
 // queued (a page restored from the back/forward cache sends it). The anonymous id lives in localStorage when there is
 // one.
@@ -165,10 +166,18 @@ export class AnalyticsClient {
   }
 
   private async drain(): Promise<void> {
+    // A batch the server refuses whole (400: more events than the install's `maxEvents`, or one bad event; 413: over
+    // 32 KiB) goes back in halves, for the rest of this flush: only an event refused on its own is dropped.
+    let size = this.batchSize;
     while (this.queue.length) {
-      const batch = this.queue.splice(0, this.batchSize);
-      const ok = await this.post(batch);
-      if (!ok) {
+      const batch = this.queue.splice(0, size);
+      const r = await this.post(batch);
+      if (r === "split" && batch.length > 1) {
+        this.queue.unshift(...batch);
+        size = Math.ceil(batch.length / 2);
+        continue;
+      }
+      if (r === "retry") {
         // Back to the front, for the next flush (keeping the cap).
         this.queue.unshift(...batch);
         if (this.queue.length > this.maxQueue) this.queue.splice(0, this.queue.length - this.maxQueue);
@@ -177,10 +186,10 @@ export class AnalyticsClient {
     }
   }
 
-  /** false: retry later. */
-  private async post(batch: QueuedEvent[]): Promise<boolean> {
+  /** "ok": delivered or dropped for good; "retry": later, as is; "split": refused whole, smaller batches may pass. */
+  private async post(batch: QueuedEvent[]): Promise<"ok" | "retry" | "split"> {
     const f = this.o.fetch ?? (globalThis as { fetch?: typeof fetch }).fetch;
-    if (!f) return true;
+    if (!f) return "ok";
     this.sent++;
     const body = JSON.stringify({ events: batch });
     const bytes = byteLength(body);
@@ -191,15 +200,17 @@ export class AnalyticsClient {
       this.inFlightBytes += bytes;
       try {
         const r = await f(this.endpoint, { method: "POST", headers, body, keepalive: true });
-        // Delivered: 2xx. Refused (a 4xx other than 429): dropped, sending it again would not change the answer.
-        // Anything else (a redirect not followed, 429, 5xx) was not taken: retried.
-        if (r.status >= 200 && r.status < 300) return true;
-        return r.status >= 400 && r.status < 500 && r.status !== 429;
+        // Delivered: 2xx. Refused whole (400 bad_batch, 413 too_large): smaller batches. Another 4xx (but 429):
+        // dropped, sending it again would not change the answer. Anything else (a redirect not followed, 429, 5xx)
+        // was not taken: retried.
+        if (r.status >= 200 && r.status < 300) return "ok";
+        if (r.status === 400 || r.status === 413) return "split";
+        return r.status >= 400 && r.status < 500 && r.status !== 429 ? "ok" : "retry";
       } finally {
         this.inFlightBytes -= bytes;
       }
     } catch {
-      return false;
+      return "retry";
     }
   }
 

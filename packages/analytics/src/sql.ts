@@ -11,7 +11,7 @@
 //   sampling); distinct users and per-user funnels/retention count the users of the rows kept by sampling, so on a
 //   sampled dataset they are estimates.
 
-import { EVENT_NAME } from "./events.ts";
+import { EVENT_NAME, MAX_FUTURE_MS } from "./events.ts";
 
 export class SqlInputError extends Error {
   constructor(message: string) {
@@ -53,6 +53,26 @@ function from(s: Scope): { table: string; where: string[] } {
 /** The user a row counts for: its userId, else its anonymous id. */
 const UID = "if(blob2 != '', blob2, blob3)";
 const HAS_UID = "(blob2 != '' OR blob3 != '')";
+/**
+ * Distinct users. Rows with neither id have UID '': `count(DISTINCT)` would count them as one more user, and the SQL
+ * has no conditional distinct count, so that one value is taken off when there is such a row.
+ */
+const USERS = `count(DISTINCT ${UID}) - if(countIf(NOT ${HAS_UID}) > 0, 1, 0)`;
+/**
+ * When the event happened (unix seconds): `double1`, the `ts` the batch carried (checked by the server), not
+ * `timestamp`, which is when the point was written. Funnel order, windows, buckets and cohorts all use it.
+ */
+const ET = "toUnixTimestamp(toDateTime(double1 / 1000))";
+/** An event may be up to this far ahead of its arrival (`MAX_FUTURE_MS`): the arrival range starts this much earlier. */
+const AHEAD_HOURS = Math.ceil(MAX_FUTURE_MS / 3_600_000);
+
+/**
+ * Events that happened in the last `seconds`: by event time, with an arrival range (`timestamp`, what Analytics
+ * Engine orders and prunes by) wide enough to never drop one (an event arrives at most `AHEAD_HOURS` before its `ts`).
+ */
+function lastSeconds(where: string[], seconds: number): void {
+  where.push(`timestamp > NOW() - INTERVAL '${Math.ceil(seconds / 3600) + AHEAD_HOURS}' HOUR`, `${ET} > toUnixTimestamp(NOW()) - ${seconds}`);
+}
 /** Sentinel time past any event (2100-01-01): "the user never did this step". */
 export const NEVER = 4102444800;
 
@@ -86,13 +106,13 @@ export function countsSql(s: Scope, o: CountsOptions = {}): string {
   const since = int(o.sinceHours ?? 24, 1, 2160, "sinceHours");
   const bucket = o.bucket ?? "hour";
   if (typeof bucket !== "string" || !Object.hasOwn(BUCKET_UNIT, bucket)) throw new SqlInputError(`bucket must be minute, hour or day`);
-  where.push(`timestamp > NOW() - INTERVAL '${since}' HOUR`);
+  lastSeconds(where, since * 3600);
   if (o.names !== undefined) {
     const ns = uniqueNames(o.names, "names", 1, 20);
     where.push(`index1 IN (${names(ns)})`);
   }
   return [
-    `SELECT toStartOfInterval(timestamp, INTERVAL '1' ${BUCKET_UNIT[bucket]}) AS t, blob1 AS name, SUM(_sample_interval) AS events`,
+    `SELECT toStartOfInterval(toDateTime(double1 / 1000), INTERVAL '1' ${BUCKET_UNIT[bucket]}) AS t, blob1 AS name, SUM(_sample_interval) AS events`,
     `FROM ${table}`,
     `WHERE ${where.join(" AND ")}`,
     "GROUP BY t, name",
@@ -104,9 +124,9 @@ export function countsSql(s: Scope, o: CountsOptions = {}): string {
 /** The most frequent events: `name`, `events`, `users`. */
 export function topEventsSql(s: Scope, o: { sinceHours?: number; limit?: number } = {}): string {
   const { table, where } = from(s);
-  where.push(`timestamp > NOW() - INTERVAL '${int(o.sinceHours ?? 24, 1, 2160, "sinceHours")}' HOUR`);
+  lastSeconds(where, int(o.sinceHours ?? 24, 1, 2160, "sinceHours") * 3600);
   return [
-    `SELECT blob1 AS name, SUM(_sample_interval) AS events, count(DISTINCT ${UID}) AS users`,
+    `SELECT blob1 AS name, SUM(_sample_interval) AS events, ${USERS} AS users`,
     `FROM ${table}`,
     `WHERE ${where.join(" AND ")}`,
     "GROUP BY name",
@@ -118,8 +138,8 @@ export function topEventsSql(s: Scope, o: { sinceHours?: number; limit?: number 
 /** Events and distinct users since the start of today (UTC): `events`, `users`. */
 export function overviewSql(s: Scope): string {
   const { table, where } = from(s);
-  where.push("timestamp >= toStartOfDay(NOW())");
-  return [`SELECT SUM(_sample_interval) AS events, count(DISTINCT ${UID}) AS users`, `FROM ${table}`, `WHERE ${where.join(" AND ")}`].join("\n");
+  where.push(`timestamp >= toStartOfDay(NOW()) - INTERVAL '${AHEAD_HOURS}' HOUR`, `${ET} >= toUnixTimestamp(toStartOfDay(NOW()))`);
+  return [`SELECT SUM(_sample_interval) AS events, ${USERS} AS users`, `FROM ${table}`, `WHERE ${where.join(" AND ")}`].join("\n");
 }
 
 // ------------------------------------------------------------------------------------------------ funnel
@@ -146,8 +166,9 @@ export function funnelSql(s: Scope, o: FunnelOptions): string {
   const steps = uniqueNames(o.steps, "steps", 2, 8);
   const win = int(o.windowSeconds ?? 86400, 60, 30 * 86400, "windowSeconds");
   const days = int(o.sinceDays ?? 7, 1, 90, "sinceDays");
-  where.push(`timestamp > NOW() - INTERVAL '${days}' DAY`, `index1 IN (${names(steps)})`, HAS_UID);
-  const inner = steps.map((n, i) => `    min(if(blob1 = ${lit(n)}, toUnixTimestamp(timestamp), ${NEVER})) AS t${i}`);
+  lastSeconds(where, days * 86400);
+  where.push(`index1 IN (${names(steps)})`, HAS_UID);
+  const inner = steps.map((n, i) => `    min(if(blob1 = ${lit(n)}, ${ET}, ${NEVER})) AS t${i}`);
   const outer = steps.map((_, k) => {
     if (k === 0) return `  countIf(t0 < ${NEVER}) AS step0`;
     const conds = [`t0 < ${NEVER}`];
@@ -251,9 +272,9 @@ export function retentionSql(s: Scope, o: RetentionOptions = {}): string {
   const n = int(o.periods ?? 8, 2, 13, "periods");
   const p = PERIOD_SECONDS[period];
   const start = retentionStart(o);
-  where.push(`toUnixTimestamp(timestamp) >= ${start}`, HAS_UID);
+  where.push(`toUnixTimestamp(timestamp) >= ${start - AHEAD_HOURS * 3600}`, `${ET} >= ${start}`, HAS_UID);
   if (o.event !== undefined) where.push(`index1 = ${lit(eventName(o.event))}`);
-  const idx = `intDiv(toUnixTimestamp(timestamp) - ${start}, ${p})`;
+  const idx = `intDiv(${ET} - ${start}, ${p})`;
   const actives = Array.from({ length: n }, (_, j) => `    countIf(${idx} = ${j}) AS a${j}`);
   const returns = Array.from({ length: n - 1 }, (_, i) => {
     const k = i + 1;
@@ -338,10 +359,29 @@ export class SqlApiError extends Error {
 
 export const SQL_API_BASE = "https://api.cloudflare.com/client/v4";
 
+/**
+ * The SQL API base: `https:` only (the bearer token goes with every call). Plain `http:` only to the loopback
+ * (`localhost`, `127.0.0.1`, `[::1]`: a local test server), never to another host.
+ */
+export function checkBase(base: string): string {
+  let u: URL;
+  try {
+    u = new URL(base);
+  } catch {
+    throw new SqlApiError(`analytics: the SQL API base ${JSON.stringify(base.slice(0, 100))} is not a URL`, 500);
+  }
+  const loopback = u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]";
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && loopback)) {
+    throw new SqlApiError(`analytics: the SQL API base must be https (got ${u.protocol}//${u.host}); the token is never sent in the clear`, 500);
+  }
+  return base;
+}
+
 /** Runs one statement. Throws `SqlApiError` on a non-2xx (with the API's text, cut) or a body that is not JSON. */
 export async function runSql(api: SqlApi, sql: string): Promise<SqlResponse> {
   const f = api.fetch ?? fetch;
-  const url = `${(api.base ?? SQL_API_BASE).replace(/\/$/, "")}/accounts/${encodeURIComponent(api.accountId)}/analytics_engine/sql`;
+  const base = checkBase(api.base ?? SQL_API_BASE);
+  const url = `${base.replace(/\/$/, "")}/accounts/${encodeURIComponent(api.accountId)}/analytics_engine/sql`;
   const res = await f(url, { method: "POST", headers: { authorization: `Bearer ${api.token}`, "content-type": "text/plain" }, body: sql });
   const text = await res.text();
   if (!res.ok) throw new SqlApiError(`Analytics Engine SQL API: ${res.status} ${text.slice(0, 300)}`, res.status);
@@ -362,6 +402,18 @@ export interface CacheLike {
 
 const memo = new Map<string, { at: number; body: SqlResponse }>();
 const MEMO_MAX = 200;
+
+/** Every insert into the memo goes through here: never more than `MEMO_MAX` (the oldest go first). */
+function remember(key: string, v: { at: number; body: SqlResponse }): void {
+  memo.delete(key);
+  while (memo.size >= MEMO_MAX) memo.delete(memo.keys().next().value!);
+  memo.set(key, v);
+}
+
+/** Entries in the in-isolate cache (tests). */
+export function sqlCacheSize(): number {
+  return memo.size;
+}
 
 async function sha256Hex(s: string): Promise<string> {
   const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
@@ -392,7 +444,7 @@ export async function cachedSql(api: SqlApi, sql: string, o: { ttlSeconds: numbe
       const at = Number(r?.headers.get("x-ember-cached-at"));
       if (r && Number.isFinite(at) && now - at < ttl * 1000) {
         const body = (await r.json()) as SqlResponse;
-        memo.set(key, { at, body });
+        remember(key, { at, body });
         return { ...body, cached: true };
       }
     } catch {
@@ -400,8 +452,7 @@ export async function cachedSql(api: SqlApi, sql: string, o: { ttlSeconds: numbe
     }
   }
   const body = await runSql(api, sql);
-  if (memo.size >= MEMO_MAX) memo.delete(memo.keys().next().value!);
-  memo.set(key, { at: now, body });
+  remember(key, { at: now, body });
   if (cache) {
     try {
       await cache.put(key, new Response(JSON.stringify(body), { headers: { "content-type": "application/json", "cache-control": `max-age=${ttl}`, "x-ember-cached-at": String(now) } }));

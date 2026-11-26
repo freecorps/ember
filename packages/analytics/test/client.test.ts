@@ -64,7 +64,7 @@ describe("analytics client", () => {
     expect(sent.flatMap((s) => s.body.events.map((e) => (e.props as { i: number }).i))).toEqual([0, 1, 2, 3, 4, 5, 6]);
   });
 
-  test("a failed batch (network, 429, 5xx) comes back in order; a refused one (400) is dropped", async () => {
+  test("a failed batch (network, 429, 5xx) comes back in order; one refused event by event (400) is dropped", async () => {
     let status = 503;
     const { sent, fetch } = fakeFetch(() => status);
     const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
@@ -78,11 +78,48 @@ describe("analytics client", () => {
     status = 400;
     await a.flush();
     expect(a.pending).toBe(0);
-    expect(sent).toHaveLength(3);
+    // The pair, then each event on its own (refused too: dropped).
+    expect(sent.map((x) => x.body.events.map((e) => e.name))).toEqual([["first", "second"], ["first", "second"], ["first", "second"], ["first"], ["second"]]);
     const throwing = make({ url: "https://app.test", fetch: (async () => Promise.reject(new TypeError("offline"))) as unknown as typeof fetch, storage: null });
     throwing.track("x");
     await throwing.flush();
     expect(throwing.pending).toBe(1);
+  });
+
+  test("a batch refused whole (400 over the install's maxEvents, 413 over 32 KiB) goes again in halves; a lone bad event is dropped", async () => {
+    // A server with maxEvents 5 that refuses any batch holding the event "bad" (as it would an invalid one).
+    const got: string[][] = [];
+    const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      const names = (JSON.parse(String(init.body)) as Sent["body"]).events.map((e) => e.name);
+      if (names.length > 5 || names.includes("bad")) return new Response(null, { status: 400 });
+      got.push(names);
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 20, flushIntervalMs: 60_000 });
+    for (let i = 0; i < 12; i++) a.track(i === 7 ? "bad" : `e${i}`);
+    await a.flush();
+    expect(a.pending).toBe(0);
+    expect(got.flat()).toEqual(Array.from({ length: 12 }, (_, i) => `e${i}`).filter((n) => n !== "e7"));
+    expect(got.every((b) => b.length <= 5)).toBe(true);
+    // 413 too: the halves pass.
+    const sizes: number[] = [];
+    const tooBig = vi.fn(async (_url: string, init: RequestInit) => {
+      const n = (JSON.parse(String(init.body)) as Sent["body"]).events.length;
+      sizes.push(n);
+      return new Response(null, { status: n > 4 ? 413 : 204 });
+    }) as unknown as typeof globalThis.fetch;
+    const b = make({ url: "https://app.test", fetch: tooBig, storage: null, batchSize: 16, flushIntervalMs: 60_000 });
+    for (let i = 0; i < 16; i++) b.track("e");
+    await b.flush();
+    expect(b.pending).toBe(0);
+    expect(sizes).toEqual([16, 8, 4, 4, 4, 4]);
+    // Another 4xx (403): dropped whole, as before.
+    const { fetch: forbidden } = fakeFetch(403);
+    const c = make({ url: "https://app.test", fetch: forbidden, storage: null, flushIntervalMs: 60_000 });
+    c.track("x");
+    c.track("y");
+    await c.flush();
+    expect(c.pending).toBe(0);
   });
 
   test("a redirect is not a delivery: the batch stays queued (only 2xx is delivered)", async () => {
