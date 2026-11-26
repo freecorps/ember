@@ -187,16 +187,20 @@ function list(ctx: QCtx, a: ListArgs) {
     q = t.withIndex("by_at", (r) => atRange(r, a));
   }
   let o = q.order("desc");
-  // The filters the index range did not take (each `true` when absent).
+  // Every filter the index range did not take (each `true` when absent): a filter given is always applied.
   const op = a.op;
   const table = used === "actor" ? a.table : undefined;
+  const docId = used !== "doc" ? a.docId : undefined;
+  const actor = used !== "actor" ? a.actor : undefined;
   const from = used === "table" ? a.from : undefined;
   const to = used === "table" ? a.to : undefined;
-  if (op !== undefined || table !== undefined || from !== undefined || to !== undefined) {
+  if (op !== undefined || table !== undefined || docId !== undefined || actor !== undefined || from !== undefined || to !== undefined) {
     o = o.filter((f) =>
       f.and(
         op !== undefined ? f.eq(f.field("op"), op) : true,
         table !== undefined ? f.eq(f.field("table"), table) : true,
+        docId !== undefined ? f.eq(f.field("docId"), docId) : true,
+        actor !== undefined ? f.eq(f.field("actor"), actor) : true,
         from !== undefined ? f.gte(f.field("at"), from) : true,
         to !== undefined ? f.lt(f.field("at"), to) : true,
       ),
@@ -231,7 +235,13 @@ async function archiveOnce(ctx: ActCtx): Promise<ArchiveRunResult> {
       bytes = there.size;
       archived = Number(there.customMetadata?.count ?? batch.count);
     } else {
-      const rows = (await ctx.runQuery(rowsRef, { id: batch._id })) as AuditEntry[];
+      const rows = (await ctx.runQuery(rowsRef, { id: batch._id })) as AuditEntry[] | null;
+      if (rows === null) {
+        // Another run (the cron's job and the dashboard's "archive now", or a job recovered while the first one was
+        // still alive) archived this batch between our `head` and now: its object is written and its rows are gone.
+        // Writing now would replace that object with an empty one.
+        return { batch: batch._id, key: batch.key, archived: 0, deleted: 0, more: false, skippedPut: true };
+      }
       const body = await gzipNdjson(rows);
       await bucket.put(batch.key, body, {
         httpMetadata: { contentType: "application/x-ndjson", contentEncoding: "gzip" },
@@ -340,12 +350,12 @@ export const functions = {
         return { _id: id, key, count: rows.length, firstAt: first.at, lastAt: last.at };
       },
     }),
-    /** The rows of a pending batch, oldest first. */
+    /** The rows of a pending batch, oldest first; null once it is archived (or gone): there is nothing to write. */
     batchRows: internalQuery({
       args: { id: v.id("batches") },
       handler: (ctx, a) => {
         const b = ctx.db.get(a.id);
-        if (!b || b.state !== "pending") return [];
+        if (!b || b.state !== "pending") return null;
         return (b.ids ?? []).map((id) => ctx.db.get(id as GenericId<"entries">)).filter((r) => r !== null);
       },
     }),

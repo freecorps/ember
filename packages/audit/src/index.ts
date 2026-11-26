@@ -61,6 +61,8 @@ type ActionRef = FunctionReference<"action", "public">;
 // Method syntax: any ctx's typed `runQuery`/`runMutation` fits (parameters are compared bivariantly).
 /** A mutation's ctx (also a trigger's): calls run in its transaction and return values. */
 export interface SyncWriteCtx {
+  /** What tells it from an action's ctx (no `db`, and its `runMutation` returns a Promise, which `unknown` also takes). */
+  db: object;
   runMutation(fn: MutationRef, args: Record<string, unknown>): unknown;
 }
 /** A query's (or mutation's) ctx. */

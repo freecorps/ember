@@ -2,10 +2,10 @@
 // the diff and the actor, app-level log entries, filtered listing, and the archive: rows go to R2 and are deleted
 // after, a crash between the two re-runs idempotently, nothing lost or duplicated, continuation through the scheduler.
 import { anyComponents, componentsOf, composeApp, defineApp, defineSchema, defineTable, defineTriggers, internalMutationGeneric, mutationGeneric, queryGeneric, unsafeRef, v, type DataModelFromSchema } from "@freecorps/ember-server";
-import type { TriggersInput } from "@freecorps/ember-server";
+import type { ActionCtx, MutationCtx, TriggersInput } from "@freecorps/ember-server";
 import { emberTest } from "@freecorps/ember-testing";
 import { describe, expect, test } from "vitest";
-import { Audit, audit, auditTriggers, gunzipNdjson, readArchive, REDACTED, type AuditComponentApi, type AuditEntry, type AuditInstallConfig } from "../src/index.ts";
+import { Audit, audit, auditTriggers, gunzipNdjson, readArchive, REDACTED, type AsyncCtx, type AuditComponentApi, type AuditEntry, type AuditInstallConfig, type SyncWriteCtx } from "../src/index.ts";
 import { memoryBucket } from "./fakes.ts";
 
 const DAY = 86_400_000;
@@ -69,6 +69,9 @@ const modules = {
 const appWith = (config?: AuditInstallConfig) => defineApp().use(audit, config ? { config } : {});
 const typedComponents: { audit: AuditComponentApi } = componentsOf(appWith());
 void typedComponents;
+// Types: `log` from an action is a Promise (an action's ctx also fits the mutation overload), from a mutation a string.
+const typedLog: [(ctx: ActionCtx) => Promise<string>, (ctx: MutationCtx) => string, (ctx: SyncWriteCtx) => string, (ctx: AsyncCtx) => Promise<string>] = [(ctx) => log.log(ctx, { action: "a" }), (ctx) => log.log(ctx, { action: "a" }), (ctx) => log.log(ctx, { action: "a" }), (ctx) => log.log(ctx, { action: "a" })];
+void typedLog;
 
 function setup(config?: AuditInstallConfig, bucket = memoryBucket()) {
   const t = emberTest({ schema, modules, app: appWith(config), triggers, env: { EMBER_FILES: bucket } });
@@ -155,6 +158,11 @@ describe("listing", () => {
     expect((await entries({ table: "users", docId: u1 })).map((r) => r.op)).toEqual(["update", "insert"]);
     expect((await entries({ actor: "bob" })).map((r) => [r.op, r.docId])).toEqual([["update", u1], ["insert", u2]]);
     expect((await entries({ actor: "bob", op: "insert" })).map((r) => r.docId)).toEqual([u2]);
+    // Every filter given applies, whichever index the range used: (table, docId) + actor, and docId alone.
+    expect((await entries({ table: "users", docId: u1, actor: "bob" })).map((r) => r.op)).toEqual(["update"]);
+    expect((await entries({ table: "users", docId: u1, actor: "alice" })).map((r) => r.op)).toEqual(["insert"]);
+    expect((await entries({ docId: u2 })).map((r) => [r.op, r.docId])).toEqual([["insert", u2]]);
+    expect((await entries({ actor: "bob", docId: u1 })).map((r) => r.op)).toEqual(["update"]);
     const all = await entries();
     const t1 = all[1]!.at;
     expect((await entries({ from: t1 })).length).toBe(2);
@@ -235,6 +243,36 @@ describe("archive", () => {
     // A late duplicate of the delete (a retried job) does nothing.
     const [batch] = ((await t.query(unsafeRef<"query">("@audit/dashboard:batches"), { paginationOpts: { numItems: 1, cursor: null } })) as { page: Array<{ _id: string }> }).page;
     expect(await t.mutation(unsafeRef<"mutation">("@audit/lib:commit"), { id: batch!._id, bytes: 0 })).toEqual({ deleted: 0, more: false });
+  });
+
+  test("two overlapping runs of one batch: the late one never replaces the archive with an empty object", async () => {
+    const bucket = memoryBucket();
+    let other: (() => Promise<unknown>) | null = null;
+    const racing = {
+      ...bucket,
+      get: bucket.get.bind(bucket),
+      list: bucket.list.bind(bucket),
+      put: bucket.put.bind(bucket),
+      // Run A looks for the object, finds none, and before it reads the rows run B archives the whole batch.
+      head: async (k: string) => {
+        const there = await bucket.head(k);
+        const b = other;
+        other = null;
+        if (b) await b();
+        return there;
+      },
+    };
+    const { t, entries, internal } = setup({ retainDays: 1 }, racing as never);
+    await seed(t, 3);
+    await t.advance(2 * DAY);
+    const before = (await entries()).map((e) => e._id).sort();
+    other = () => internal("archive");
+    const a = (await internal("archive")) as { key: string; skippedPut: boolean; deleted: number };
+    expect(a).toMatchObject({ skippedPut: true, deleted: 0 });
+    expect(bucket.puts).toBe(1);
+    const archived = ((await gunzipNdjson(bucket.objects.get(a.key)!.body)) as AuditEntry[]).map((e) => e._id).sort();
+    expect(archived).toEqual(before);
+    expect(await entries()).toEqual([]);
   });
 
   test("a crash before the write: the re-run writes the same batch once", async () => {
