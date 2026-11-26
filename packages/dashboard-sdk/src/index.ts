@@ -35,7 +35,11 @@ export interface EmbedPageOptions {
   title: string;
   /** CSS for a `<style>` (inline styles are allowed). Use the theme's variables: `var(--fg)`, `var(--surface)`. */
   style?: string;
-  /** The `<body>`'s markup, as is: escape anything that comes from data. */
+  /**
+   * The `<body>`'s markup, as is: escape anything that comes from data. No `<script>` here (the page's code goes in
+   * `script`): the dashboard allows every inline script the page serves by its hash, so a script element that data
+   * slipped into the body would run.
+   */
   body?: string;
   /** The page's script (runs after the SDK: `const dash = EmberDashboard.connect()`). */
   script: string;
@@ -45,11 +49,13 @@ const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt
 
 /**
  * A complete HTML document for an embed route: the SDK and the page's script inline, a base style using the
- * dashboard's theme variables. Throws when `script` or `style` would end their element early (`</script`, `</style`).
+ * dashboard's theme variables. Throws when `script` or `style` would end their element early (`</script`, `</style`),
+ * or when `body` has a script element (`<script`, `</script`).
  */
 export function embedPage(o: EmbedPageOptions): string {
   if (/<\/script/i.test(o.script)) throw new Error("embedPage: script must not contain </script (split the string: '<\\/script')");
   if (o.style && /<\/style/i.test(o.style)) throw new Error("embedPage: style must not contain </style");
+  if (o.body && /<\/?script/i.test(o.body)) throw new Error("embedPage: body must not contain <script or </script (the page's code goes in `script`; escape markup that comes from data)");
   const base =
     ":root{color-scheme:light dark}body{margin:0;padding:12px;font:13px/1.45 var(--sans,system-ui,sans-serif);color:var(--fg,#1d1b18);background:var(--surface,#fff)}" +
     "button{font:inherit;color:var(--accent-fg,#fff);background:var(--accent,#c2410c);border:0;border-radius:var(--radius,6px);padding:4px 10px;cursor:pointer}" +

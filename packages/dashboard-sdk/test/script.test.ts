@@ -17,13 +17,41 @@ describe("EMBED_SDK_SCRIPT", () => {
     expect(/^[\x20-\x7e\n]*$/.test(EMBED_SDK_SCRIPT)).toBe(true);
     const sent: Array<{ msg: unknown; target: string }> = [];
     const parent = { postMessage: (msg: unknown, target: string) => void sent.push({ msg, target }) };
-    const fakeWindow: Record<string, unknown> = { parent, addEventListener() {}, removeEventListener() {}, setTimeout: () => 0, clearTimeout() {} };
+    // Timers the test runs by hand: the hello repeats on each, and close() clears the one pending.
+    const timers = new Map<number, { fn: () => void; ms: number }>();
+    let nextTimer = 0;
+    const fire = () => {
+      const [h, t] = [...timers][0] ?? [];
+      if (h === undefined || !t) return false;
+      timers.delete(h);
+      t.fn();
+      return true;
+    };
+    const fakeWindow: Record<string, unknown> = {
+      parent,
+      addEventListener() {},
+      removeEventListener() {},
+      setTimeout: (fn: () => void, ms: number) => (timers.set(++nextTimer, { fn, ms }), nextTimer),
+      clearTimeout: (h: number) => void timers.delete(h),
+    };
     fakeWindow.window = fakeWindow;
     // Runs with nothing but `window` (and `globalThis`, which is it in a page) in scope (no module helpers, no `__name`).
     new Function("window", "globalThis", EMBED_SDK_SCRIPT)(fakeWindow, fakeWindow);
     const sdk = fakeWindow.EmberDashboard as { connect(): { close(): void }; DashboardError: unknown };
     expect(typeof sdk.DashboardError).toBe("function");
-    sdk.connect().close();
-    expect(sent).toEqual([{ msg: { ember: EMBED_PROTOCOL, v: 1, type: "hello" }, target: "*" }]);
+    const hello = { msg: { ember: EMBED_PROTOCOL, v: 1, type: "hello" }, target: "*" };
+    const dash = sdk.connect();
+    expect(sent).toEqual([hello]);
+    expect([...timers.values()].map((t) => t.ms)).toEqual([200]);
+    // Each timer sends the hello again and arms the next one.
+    expect(fire()).toBe(true);
+    expect(fire()).toBe(true);
+    expect(sent).toEqual([hello, hello, hello]);
+    expect(timers.size).toBe(1);
+    // close() clears the pending timer: no more hellos.
+    dash.close();
+    expect(timers.size).toBe(0);
+    expect(fire()).toBe(false);
+    expect(sent).toHaveLength(3);
   });
 });

@@ -7,13 +7,19 @@ import { connect, DashboardError, EMBED_PROTOCOL, EMBED_PROTOCOL_VERSION, EMBED_
 const HOST = "https://dash.example";
 type Listener = (e: { data: unknown; origin: string; source: unknown }) => void;
 
-function pair(o: { resizeObserver?: boolean } = {}) {
+function pair(o: { resizeObserver?: boolean; failOn?: string } = {}) {
   const listeners = new Set<Listener>();
   const sent: Array<{ msg: Record<string, unknown>; target: string }> = [];
-  const parent = { postMessage: (msg: unknown, target: string) => void sent.push({ msg: structuredClone(msg) as Record<string, unknown>, target }) };
+  const parent = {
+    postMessage: (msg: unknown, target: string) => {
+      // As a browser's postMessage: it throws synchronously (DataCloneError) on what it cannot send.
+      if (o.failOn && (msg as { name?: unknown }).name === o.failOn) throw new Error("DataCloneError: could not be cloned");
+      sent.push({ msg: structuredClone(msg) as Record<string, unknown>, target });
+    },
+  };
   const style = new Map<string, string>();
   const attrs = new Map<string, string>();
-  const root = { style: { setProperty: (k: string, v: string) => void style.set(k, v), colorScheme: "" }, setAttribute: (k: string, v: string) => void attrs.set(k, v), scrollHeight: 321 };
+  const root = { style: { setProperty: (k: string, v: string) => void style.set(k, v), removeProperty: (k: string) => style.delete(k), colorScheme: "" }, setAttribute: (k: string, v: string) => void attrs.set(k, v), scrollHeight: 321 };
   let observed: (() => void) | null = null;
   const win: SdkWindow = {
     parent,
@@ -154,7 +160,8 @@ describe("connect()", () => {
     expect(p.root.style.colorScheme).toBe("dark");
     p.deliver({ type: "theme", theme: { mode: "light", vars: { "--fg": "#111" } } });
     expect(seen).toEqual(["dark", "light"]);
-    expect(p.style.get("--fg")).toBe("#111");
+    // The new theme replaces the old one: a variable only the old one had is removed, not left behind.
+    expect([...p.style]).toEqual([["--fg", "#111"]]);
     expect(p.attrs.get("data-theme")).toBe("light");
     // A late subscriber gets the current theme at once.
     const late: string[] = [];
@@ -202,6 +209,82 @@ describe("connect()", () => {
     await expect(dash.query("q:a")).rejects.toMatchObject({ code: "disconnected" });
   });
 
+  test("a query's timeout starts when it reaches the dashboard, not while it waits for the handshake", async () => {
+    vi.useFakeTimers();
+    const p = pair();
+    const dash = connect({ window: p.win, queryTimeoutMs: 1000 });
+    let settled = false;
+    const q = dash.query("q:early");
+    void q.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    // Longer than the timeout before the welcome: still waiting, nothing sent.
+    vi.advanceTimersByTime(5000);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    p.welcome();
+    expect(requests(p.sent).map((s) => s.msg.name)).toEqual(["q:early"]);
+    // Then the timeout runs from the send.
+    vi.advanceTimersByTime(999);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    vi.advanceTimersByTime(2);
+    await expect(q).rejects.toMatchObject({ code: "timeout" });
+    dash.close();
+  });
+
+  test("no welcome after the hellos (about 20 s): the bridge closes, queued requests and context reject", async () => {
+    vi.useFakeTimers();
+    const p = pair();
+    const dash = connect({ window: p.win });
+    const q = dash.query("q:a");
+    const w = dash.mutate("q:w");
+    vi.advanceTimersByTime(19_000);
+    expect(p.listeners.size).toBe(1);
+    vi.advanceTimersByTime(2_000);
+    expect(p.sent.filter((s) => s.msg.type === "hello")).toHaveLength(100);
+    await expect(q).rejects.toMatchObject({ code: "disconnected", message: expect.stringMatching(/no dashboard answered/) });
+    await expect(w).rejects.toMatchObject({ code: "disconnected" });
+    await expect(dash.context).rejects.toMatchObject({ code: "disconnected" });
+    expect(p.listeners.size).toBe(0);
+    // Nothing queued is sent by a late welcome, and new requests are refused.
+    p.welcome();
+    expect(requests(p.sent)).toEqual([]);
+    await expect(dash.query("q:b")).rejects.toMatchObject({ code: "disconnected" });
+    // close() before the handshake rejects context too.
+    const o = pair();
+    const other = connect({ window: o.win });
+    other.close();
+    await expect(other.context).rejects.toMatchObject({ code: "disconnected" });
+  });
+
+  test("one request that cannot be sent rejects alone: the others queued with it still go", async () => {
+    const p = pair({ failOn: "q:boom" });
+    const dash = connect({ window: p.win });
+    // Args that cannot cross postMessage are refused at the call (a snapshot), before anything is queued.
+    await expect(dash.query("q:fn", { f: () => 1 })).rejects.toMatchObject({ code: "bad_request", message: expect.stringMatching(/plain data/) });
+    // The snapshot is what is sent: a later change to the object does not leak into the queued request.
+    const args = { n: 1 };
+    const a = dash.query("q:a", args);
+    args.n = 2;
+    const boom = dash.query("q:boom");
+    const w = dash.mutate("q:w", { x: 1 });
+    p.welcome();
+    await expect(boom).rejects.toMatchObject({ code: "bad_request", message: expect.stringMatching(/could not be sent/) });
+    expect(requests(p.sent).map((s) => [s.msg.name, s.msg.args])).toEqual([["q:a", { n: 1 }], ["q:w", { x: 1 }]]);
+    p.deliver({ type: "response", id: requests(p.sent)[0]!.msg.id, ok: true, value: "A" });
+    p.deliver({ type: "response", id: requests(p.sent)[1]!.msg.id, ok: true, value: "W" });
+    expect(await a).toBe("A");
+    expect(await w).toBe("W");
+    // After the handshake too: a send that throws rejects that request only.
+    await expect(dash.query("q:boom")).rejects.toMatchObject({ code: "bad_request" });
+    const b = dash.query("q:b");
+    p.deliver({ type: "response", id: requests(p.sent).at(-1)!.msg.id, ok: true, value: "B" });
+    expect(await b).toBe("B");
+    dash.close();
+  });
+
   test("outside a browser, connect() says where it runs", () => {
     expect(() => connect()).toThrow(/runs in the browser/);
   });
@@ -230,5 +313,8 @@ describe("EMBED_SDK_SCRIPT and embedPage()", () => {
     expect(html).toContain("main{gap:4px}");
     expect(() => embedPage({ title: "x", script: "'</script>'" })).toThrow(/must not contain <\/script/);
     expect(() => embedPage({ title: "x", script: "", style: "</STYLE>" })).toThrow(/<\/style/);
+    // A script element in the body would run (the dashboard hashes every inline script): refused, any case.
+    expect(() => embedPage({ title: "x", script: "", body: "<p>hi</p><SCRIPT>steal()</script>" })).toThrow(/body must not contain <script/);
+    expect(() => embedPage({ title: "x", script: "", body: "<p></script></p>" })).toThrow(/body must not contain/);
   });
 });

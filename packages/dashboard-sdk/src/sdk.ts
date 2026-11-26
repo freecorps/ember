@@ -13,7 +13,7 @@ export interface SdkWindow {
   setTimeout(fn: () => void, ms: number): unknown;
   clearTimeout(handle: unknown): void;
   readonly document?: {
-    readonly documentElement: { readonly style: { setProperty(name: string, value: string): void; colorScheme?: string }; setAttribute(name: string, value: string): void; readonly scrollHeight: number };
+    readonly documentElement: { readonly style: { setProperty(name: string, value: string): void; removeProperty(name: string): unknown; colorScheme?: string }; setAttribute(name: string, value: string): void; readonly scrollHeight: number };
     readonly body?: unknown;
   };
   readonly ResizeObserver?: new (cb: () => void) => { observe(target: unknown): void; disconnect(): void };
@@ -24,7 +24,10 @@ export interface ConnectOptions {
   applyTheme?: boolean;
   /** Sends the page's height whenever it changes (a block with height "auto"; uses ResizeObserver). Default true. */
   autoResize?: boolean;
-  /** How long a query may take, in ms (default 30 s). Writes wait for the person's confirmation: no timeout. */
+  /**
+   * How long a query may take once it reached the dashboard, in ms (default 30 s; a request made before the handshake
+   * waits for it first). Writes wait for the person's confirmation: no timeout.
+   */
   queryTimeoutMs?: number;
   /** The window to run in (default: the global one). */
   window?: SdkWindow;
@@ -48,7 +51,10 @@ export interface DashboardBridge {
   resize(height?: number): void;
   /** Tells the dashboard the page has drawn. */
   ready(): void;
-  /** Stops listening; pending requests reject with `disconnected`. */
+  /**
+   * Stops listening; pending requests (and `context`, before the handshake) reject with `disconnected`. Also what
+   * happens when no dashboard answers the hellos (about 20 s).
+   */
   close(): void;
 }
 
@@ -92,17 +98,50 @@ export function emberDashboardSdk(): DashboardSdk {
     let theme: DashboardTheme | null = null;
     let seq = 0;
     let lastHeight = -1;
-    const queue: unknown[] = [];
-    const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: unknown }>();
+    const queue: Array<Record<string, unknown>> = [];
+    const pending = new Map<string, { op: "query" | "mutate" | "action"; name: string; resolve: (v: unknown) => void; reject: (e: Error) => void; timer: unknown }>();
     const themeListeners = new Set<(t: DashboardTheme) => void>();
+    /** Theme variables this SDK set on `<html>` (a new theme removes the ones it no longer has). */
+    let applied: string[] = [];
     let resolveContext: (c: EmbedContext) => void = () => undefined;
-    const context = new Promise<EmbedContext>((r) => (resolveContext = r));
+    let rejectContext: (e: Error) => void = () => undefined;
+    const context = new Promise<EmbedContext>((res, rej) => {
+      resolveContext = res;
+      rejectContext = rej;
+    });
+    // Rejected only by close() (or a handshake nobody answered): not an unhandled rejection when no one awaits it.
+    context.catch(() => undefined);
+
+    const settle = (id: string) => {
+      const p = pending.get(id);
+      if (!p) return null;
+      pending.delete(id);
+      if (p.timer !== undefined) win.clearTimeout(p.timer);
+      return p;
+    };
+
+    // One message to the dashboard (its origin is known). Each send stands alone: a request that cannot be sent
+    // rejects by itself, and a query's timeout starts only now, when the dashboard has it.
+    const deliver = (m: Record<string, unknown>) => {
+      const id = m.type === "request" ? (m.id as string) : null;
+      if (id !== null && !pending.has(id)) return;
+      try {
+        parent.postMessage(m, hostOrigin as string);
+      } catch (e) {
+        if (id !== null) settle(id)?.reject(new DashboardError({ code: "bad_request", message: `the request could not be sent (${(e as Error)?.message ?? String(e)})` }));
+        return;
+      }
+      const p = id !== null ? pending.get(id) : undefined;
+      if (p && p.op === "query") {
+        p.timer = win.setTimeout(() => settle(id!)?.reject(new DashboardError({ code: "timeout", message: `${p.name}: no answer in ${queryTimeout} ms` })), queryTimeout);
+      }
+    };
 
     const post = (msg: Record<string, unknown>) => {
       const m = { ember: PROTOCOL, v: V, ...msg };
       // Before the handshake the dashboard's origin is unknown: everything but the hello waits for it.
       if (hostOrigin === null) queue.push(m);
-      else parent.postMessage(m, hostOrigin);
+      else deliver(m);
     };
 
     const setTheme = (t: DashboardTheme) => {
@@ -111,6 +150,9 @@ export function emberDashboardSdk(): DashboardSdk {
       theme = { mode: t.mode === "dark" ? "dark" : "light", vars };
       const root = win.document?.documentElement;
       if (applyTheme && root) {
+        // A variable the previous theme set and this one does not have goes back to the page's own value.
+        for (const k of applied) if (!Object.hasOwn(vars, k)) root.style.removeProperty(k);
+        applied = Object.keys(vars);
         for (const [k, val] of Object.entries(vars)) root.style.setProperty(k, val);
         root.style.colorScheme = theme.mode;
         root.setAttribute("data-theme", theme.mode);
@@ -129,16 +171,14 @@ export function emberDashboardSdk(): DashboardSdk {
         hostOrigin = e.origin;
         if (d.theme && typeof d.theme === "object") setTheme(d.theme as DashboardTheme);
         resolveContext(d.context as EmbedContext);
-        for (const m of queue.splice(0)) parent.postMessage(m, hostOrigin);
+        for (const m of queue.splice(0)) deliver(m);
         return;
       }
       if (e.origin !== hostOrigin) return;
       if (d.type === "theme" && d.theme && typeof d.theme === "object") setTheme(d.theme as DashboardTheme);
       else if (d.type === "response" && typeof d.id === "string") {
-        const p = pending.get(d.id);
+        const p = settle(d.id);
         if (!p) return;
-        pending.delete(d.id);
-        if (p.timer !== undefined) win.clearTimeout(p.timer);
         if (d.ok === true) p.resolve(d.value);
         else {
           const err = (d.error ?? {}) as Partial<EmbedErrorInfo>;
@@ -149,29 +189,51 @@ export function emberDashboardSdk(): DashboardSdk {
     win.addEventListener("message", onMessage);
 
     // Hello until the welcome: the dashboard may attach its listener after this script ran. It carries nothing, so
-    // "*" leaks nothing (the parent's origin is not known yet).
+    // "*" leaks nothing (the parent's origin is not known yet). No welcome after HELLO_TRIES: no dashboard is there
+    // (the page was opened on its own, or the block is gone), so the bridge closes and what waits rejects.
     let tries = 0;
     let helloTimer: unknown;
     const hello = () => {
-      if (closed || hostOrigin !== null || tries++ >= HELLO_TRIES) return;
+      helloTimer = undefined;
+      if (closed || hostOrigin !== null) return;
+      if (tries++ >= HELLO_TRIES) return shut(`no dashboard answered the handshake in ${(HELLO_TRIES * HELLO_EVERY_MS) / 1000} s (is the page inside an embed block?)`);
       parent.postMessage({ ember: PROTOCOL, v: V, type: "hello" }, "*");
       helloTimer = win.setTimeout(hello, HELLO_EVERY_MS);
     };
-    hello();
 
     const request = <T>(op: "query" | "mutate" | "action", name: string, args: Record<string, unknown> = {}): Promise<T> =>
       new Promise<T>((resolve, reject) => {
         if (closed) return reject(new DashboardError({ code: "disconnected", message: "the bridge is closed" }));
         if (typeof name !== "string" || !name) return reject(new DashboardError({ code: "bad_request", message: "name: a function name (dashboard:threads)" }));
         if (!args || typeof args !== "object" || Array.isArray(args)) return reject(new DashboardError({ code: "bad_request", message: "args must be an object" }));
+        // A snapshot now: what is sent is the args as they were at the call (a request may wait for the handshake),
+        // and args that cannot cross postMessage (a function, a DOM node) are refused here, not when sent.
+        let copy: Record<string, unknown> = args;
+        const clone = (globalThis as { structuredClone?: <X>(x: X) => X }).structuredClone;
+        if (typeof clone === "function") {
+          try {
+            copy = clone(args);
+          } catch (e) {
+            return reject(new DashboardError({ code: "bad_request", message: `args must be plain data (${(e as Error)?.message ?? String(e)})` }));
+          }
+        }
         const id = `r${++seq}`;
-        const timer = op === "query" ? win.setTimeout(() => {
-          if (!pending.delete(id)) return;
-          reject(new DashboardError({ code: "timeout", message: `${name}: no answer in ${queryTimeout} ms` }));
-        }, queryTimeout) : undefined;
-        pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
-        post({ type: "request", id, op, name, args });
+        pending.set(id, { op, name, resolve: resolve as (v: unknown) => void, reject, timer: undefined });
+        post({ type: "request", id, op, name, args: copy });
       });
+
+    let observer: { disconnect(): void } | null = null;
+    function shut(why: string) {
+      if (closed) return;
+      closed = true;
+      win.removeEventListener("message", onMessage);
+      if (helloTimer !== undefined) win.clearTimeout(helloTimer);
+      observer?.disconnect();
+      queue.length = 0;
+      for (const id of [...pending.keys()]) settle(id)?.reject(new DashboardError({ code: "disconnected", message: why }));
+      rejectContext(new DashboardError({ code: "disconnected", message: why }));
+    }
+    hello();
 
     const height = (h?: number) => {
       const root = win.document?.documentElement;
@@ -180,7 +242,6 @@ export function emberDashboardSdk(): DashboardSdk {
       lastHeight = n;
       post({ type: "resize", height: n });
     };
-    let observer: { disconnect(): void } | null = null;
     if (options.autoResize !== false && win.ResizeObserver && win.document?.documentElement) {
       const o = new win.ResizeObserver(() => height());
       o.observe(win.document.body ?? win.document.documentElement);
@@ -202,18 +263,7 @@ export function emberDashboardSdk(): DashboardSdk {
       },
       resize: (h) => height(h),
       ready: () => post({ type: "ready" }),
-      close() {
-        if (closed) return;
-        closed = true;
-        win.removeEventListener("message", onMessage);
-        if (helloTimer !== undefined) win.clearTimeout(helloTimer);
-        observer?.disconnect();
-        for (const [id, p] of pending) {
-          pending.delete(id);
-          if (p.timer !== undefined) win.clearTimeout(p.timer);
-          p.reject(new DashboardError({ code: "disconnected", message: "the bridge is closed" }));
-        }
-      },
+      close: () => shut("the bridge is closed"),
     };
   }
 

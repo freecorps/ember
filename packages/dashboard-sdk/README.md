@@ -47,7 +47,7 @@ import { embedPage } from "@freecorps/ember-dashboard-sdk";
 
 export const PAGE = embedPage({
   title: "Email preview",
-  body: `<button id="reload">Reload</button><ul id="list"></ul>`,
+  body: `<button id="reload">Reload</button><ul id="list"></ul>`,   // no <script> here (refused): code goes in `script`
   style: `ul { padding: 0 }`,                         // inline styles are allowed; use the theme's variables
   // A classic script (no top-level await, no imports): it runs after the SDK.
   script: `
@@ -78,8 +78,12 @@ await dash.context;                                // { project, env, shard, das
 const off = dash.onTheme((t) => { ... });          // on the handshake and on every change
 dash.resize(height?);                              // a block with height "auto" (automatic with ResizeObserver)
 dash.ready();                                      // the page has drawn
-dash.close();
+dash.close();                                      // pending requests (and context) reject `disconnected`
 ```
+
+Requests made before the handshake wait for it (with a copy of their args taken at the call); a query's timeout
+counts from when the dashboard receives it. With no dashboard around the page (no `welcome` after about 20 s of
+hellos), the bridge closes the same way.
 
 Names are the component's local names (`dashboard:threads`, `lib:send`). A failure rejects with a `DashboardError`
 whose `code` is `not_allowed` (the block does not list it, or another kind), `busy` (another write is waiting for

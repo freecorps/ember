@@ -21,7 +21,9 @@ export async function buildSdkScript(): Promise<string> {
     charset: "ascii",
     write: false,
   });
-  return out.outputFiles[0]!.text.trim();
+  const file = out.outputFiles?.[0];
+  if (!file) throw new Error("scripts/sdk-script.ts: esbuild built no output for the inline SDK script (EMBED_SDK_SCRIPT)");
+  return file.text.trim();
 }
 
 export function scriptModule(script: string): string {
