@@ -133,6 +133,16 @@ describe("defineComponent({ dashboard })", () => {
     expect(withCursor(v.nullable(v.string()))).not.toThrow();
   });
 
+  test("the page size must fit the query's numItems; sparse lists are refused", () => {
+    const pager = { list: b.query({ args: { paginationOpts: v.object({ numItems: v.number().max(10), cursor: v.nullable(v.string()) }) }, handler: () => null }) };
+    const table = (pageSize?: number) => () =>
+      defineComponent({ name: "items", schema, functions: { lib: pager }, dashboard: spec(oneBlock({ kind: "table", query: pager.list, columns: [{ label: "N", path: "name" }], ...(pageSize ? { pageSize } : {}) })) });
+    expect(table()).toThrow(/pageSize: lib:list's paginationOpts\.numItems does not accept 25 \(the default; set pageSize\)/);
+    expect(table(20)).toThrow(/does not accept 20/);
+    expect(table(10)).not.toThrow();
+    refuses({ tabs: new Array(1) }, /tabs\[0\] is missing \(a sparse array\)/);
+  });
+
   test("refuses malformed specs: unknown keys and kinds, bad paths, ids, icons, duplicates", () => {
     refuses({ icon: "rocket" as never }, /icon "rocket": one of box/);
     refuses({ scope: "everywhere" as never }, /scope must be/);
