@@ -172,6 +172,21 @@ Medido em 2026-11-25, mesmo laptop (Apple M3), "antes" = `main` em `6a0b8e20`.
 - `zframe` é opt-in no cliente (`zframe: true`): a compressão gasta CPU do shard, que é cobrada, para economizar bytes
   de saída, que não são; vale em link lento ou medido. Sem efeito em React Native (sem `DecompressionStream`).
 
+## Workflows: uma leitura por passo de action (PR 5c da 0.10)
+
+`packages/workflows/test/component.test.ts` (node:sqlite, linhas devolvidas): workflow `actions` com 10 passos de
+action e 10 de mutation. O job `lib:runAction` lê o passo e o diário numa query só (`lib:actionStep`) antes da action,
+em vez de `lib:pendingStep` antes e `lib:load` depois:
+
+| | antes | depois |
+| --- | --- | --- |
+| linhas lidas (o workflow inteiro) | 165 | **145** |
+| leituras (queries internas) | 21 | **11** |
+| linhas escritas / jobs | 62 / 10 | 62 / 10 |
+
+Passos paralelos (`Promise.all`) não custam jobs a mais: um job por action do lote e, no fim, nenhum `lib:drive`
+(o último a terminar faz o replay e avança), salvo quando dois terminam juntos (um `lib:drive`).
+
 ## Offline e actions fora do cold start do Shard (PR 4b da 0.10)
 
 `packages/offline/bench/cold.ts` (node:sqlite, fake-indexeddb, TinyBase em memória; antes = `main` em 268a7f63, na

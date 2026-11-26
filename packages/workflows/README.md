@@ -30,6 +30,8 @@ export const onboard = workflow.define({
   args: { domain: v.string() },
   handler: async (step, { domain }) => {
     const zone = await step.runAction(internal.domains.createZone, { domain }, { retry: { maxAttempts: 5 } });
+    // Parallel steps: one batch in the journal; the handler goes on once both settled.
+    await Promise.all([step.runAction(internal.dns.addRecords, { zone }), step.runAction(internal.email.notify, { domain })]);
     await step.sleep(10 * MINUTE);
     const dns = await step.waitForEvent<{ ok: boolean }>("dns-verified", { timeoutMs: DAY });
     await step.runMutation(internal.domains.activate, { zone, ok: dns.ok });
@@ -49,11 +51,20 @@ export const progress = query({ args: { id: v.string() }, handler: (ctx, { id })
 
 - `new WorkflowManager(components.workflows, { defaultRetry? })`; `define({ args, handler })` returns the driver, an
   internal action you export from an `ember/` module.
-- Steps: `step.runQuery`, `step.runMutation`, `step.runAction` (each `(ref, args, { name?, retry? })`),
-  `step.sleep(ms)`, `step.sleepUntil(time)`, `step.waitForEvent(event, { timeoutMs? })`.
-- `workflow.start(ctx, ref, args, { onComplete?, context? })`, `status`, `steps` (the journal), `sendEvent` (buffered
-  if the workflow is not waiting yet), `cancel`, `cleanup`. In a mutation these are synchronous; in an action,
-  Promises.
+- Steps: `step.runQuery`, `step.runMutation`, `step.runAction` (each `(ref, args, { name?, retry? })`, with args and
+  result typed by the reference; a `"mod:fn"` name or `unsafeRef` is untyped), `step.sleep(ms)`,
+  `step.sleepUntil(time)`, `step.waitForEvent(event, { timeoutMs? })`.
+- Parallel steps: steps started together (`Promise.all([...])`, or several branches) are one batch in the journal,
+  numbered in call order; on replay, journaled results come back batch by batch, as they ran (so branches of
+  different depths always get the same indexes). Each runs as it would alone (queries and mutations in one transaction, one job per action,
+  sleep or event); the handler goes on once the whole batch settled (a `Promise.race` waits for all of them).
+- `workflow.start(ctx, ref, args, { onComplete?, context? })`, `status` (`current` step; `parallel`: every step of a
+  batch still running), `list(ctx, { status?, paginationOpts })` (newest first), `steps` (the journal), `sendEvent`
+  (buffered if the workflow is not waiting yet), `cancel`, `cleanup`. In a mutation these are synchronous; in an
+  action, Promises.
+- Retention: `defineApp().use(workflows, { config: { retentionMs: 7 * DAY, failedRetentionMs: 30 * DAY } })` deletes a
+  finished workflow (and its journal) that long after it finished, with one scheduled job per workflow. Default:
+  kept until `cleanup`.
 - `onComplete` is a mutation run in the transaction that finishes the workflow (`completed`, `failed` or
   `canceled`); if it throws, its writes are undone and the error is logged.
 - `cleanup` removes the workflow at once (`status` → null); a journal of more than 200 rows is deleted by follow-up
@@ -68,10 +79,9 @@ export const progress = query({ args: { id: v.string() }, handler: (ctx, { id })
   steps; `maxSteps` defaults to 1000). One drive run loads the journal once and runs up to 16 query, mutation and
   buffered-event steps in a row before it hands over to a new job. Each new job reloads the whole journal, so rows
   read are still O(n²) in steps, but the journal is reloaded once per 16 steps instead of once per step. An action
-  step is one job: the job that runs the action also replays the handler and records the next step in the
-  transaction that settles the action. A journal
+  step is one job: the job that runs the action reads the step and the journal once, then replays the handler and
+  records the next step in the transaction that settles the action. A journal
   that no longer matches the code fails with `NonDeterminism`.
-- Parallel steps (`Promise.all`) are not supported yet: the first new step suspends the handler.
 - The workflow lives in the caller's shard; throughput is that shard's.
 - Built on the shard scheduler rather than Cloudflare Workflows; contracts.md explains why.
 

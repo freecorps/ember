@@ -1,10 +1,12 @@
 // React bindings for @freecorps/ember-client. No DOM APIs: works in React DOM and React Native.
 import {
+  Fragment,
   createContext,
   createElement,
   useCallback,
   useContext,
   useEffect,
+  useInsertionEffect,
   useMemo,
   useRef,
   useState,
@@ -12,9 +14,11 @@ import {
   type ReactNode,
 } from "react";
 import {
+  decodeJson,
   getFunctionName,
   stableStringify,
   toResult,
+  unsafeRef,
   watchPaginatedQuery,
   type ArgsAndOptions,
   type ArgsOrSkipAndOptions,
@@ -22,6 +26,7 @@ import {
   type EmberClient,
   type EmberErrorOf,
   type FunctionReference,
+  type HydratedQuery,
   type MutationReference,
   type ActionReference,
   type AnyFunctionReference,
@@ -70,6 +75,18 @@ const splitRest = (rest: readonly unknown[]) => ({ args: rest[0] as Record<strin
  * reused by the hooks built on it (`useSuspenseQuery` keys its promise by it).
  */
 function useWatched<Q extends QueryReference>(ref: Q, rest: readonly unknown[]): { snap: QuerySnapshot<ReturnOf<Q>>; argsKey: string | null; args: Record<string, unknown> | undefined; opts: ShardOptions | undefined } {
+  const w = useWatchHandle(ref, rest);
+  const { handle } = w;
+  const snap = useSyncExternalStore(
+    handle?.subscribe ?? noopSubscribe,
+    handle?.getSnapshot ?? getLoading,
+    handle?.getSnapshot ?? getLoading,
+  ) as QuerySnapshot<ReturnOf<Q>>;
+  return { snap, argsKey: w.argsKey, args: w.args, opts: w.opts };
+}
+
+/** The live query handle of (ref, args, shard): one per distinct value of them (args compared by value). */
+function useWatchHandle<Q extends QueryReference>(ref: Q, rest: readonly unknown[]) {
   const client = useEmberClient();
   const { args, opts } = splitRest(rest);
   const name = getFunctionName(ref);
@@ -82,13 +99,71 @@ function useWatched<Q extends QueryReference>(ref: Q, rest: readonly unknown[]):
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [client, name, argsKey, shard],
   );
-  const snap = useSyncExternalStore(
-    handle?.subscribe ?? noopSubscribe,
-    handle?.getSnapshot ?? getLoading,
-    handle?.getSnapshot ?? getLoading,
-  ) as QuerySnapshot<ReturnOf<Q>>;
-  return { snap, argsKey, args: skip ? undefined : args, opts };
+  return { handle, argsKey, args: skip ? undefined : args, opts };
 }
+
+// ------------------------------------------------------------------------------------------------ selectors
+
+/**
+ * `Object.is`, or, for two arrays / plain objects, the same length / keys with `Object.is` values (one level): a
+ * selector that builds a new array or object from rows the client kept (unchanged rows keep their identity) compares
+ * equal when nothing it picked changed.
+ */
+export function shallowEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+    return true;
+  }
+  if (Array.isArray(b) || Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+  const pa = Object.getPrototypeOf(a);
+  if (pa !== Object.prototype && pa !== null) return false;
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  for (const k of ka) if (!Object.prototype.hasOwnProperty.call(b, k) || !Object.is((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false;
+  return true;
+}
+
+/**
+ * `useSyncExternalStore` of `select(getSnapshot())`: re-renders only when the selection changes by `equals` (the
+ * previous selection is returned, same object, when it is equal). An inline `select` is fine: it runs again on a new
+ * snapshot or when it changes, and the comparison keeps the rendered value stable.
+ */
+function useSelected<T, S>(subscribe: (l: () => void) => () => void, getSnapshot: () => T, select: (t: T) => S, equals: (a: S, b: S) => boolean): S {
+  const last = useRef<{ value: S } | null>(null);
+  const getSelection = useMemo(() => {
+    let memo: { snap: T; sel: S } | null = null;
+    return () => {
+      const snap = getSnapshot();
+      if (memo && Object.is(memo.snap, snap)) return memo.sel;
+      const next = select(snap);
+      const prev = last.current;
+      const sel = prev && equals(prev.value, next) ? prev.value : next;
+      memo = { snap, sel };
+      return sel;
+    };
+  }, [getSnapshot, select, equals]);
+  const value = useSyncExternalStore(subscribe, getSelection, getSelection);
+  useEffect(() => {
+    last.current = { value };
+  }, [value]);
+  return value;
+}
+
+/** `select` / `equals` of `useQuery`. */
+export interface SelectOptions<T, S> {
+  /** Picks what the component renders from the value: it re-renders only when the pick changes (by `equals`). */
+  select?: (value: T) => S;
+  /** How two picks compare. Default `shallowEqual`. */
+  equals?: (a: S, b: S) => boolean;
+}
+
+/** `useQuery` options: the shard, and an optional selector. */
+export type QueryHookOptions<T, S> = ShardOptions & SelectOptions<T, S>;
+
+type Picked<S> = { readonly status: QuerySnapshot["status"]; readonly value: S | undefined; readonly error: unknown };
 
 /**
  * The full snapshot of a live query (`status`, `value`, `error`, `optimistic`, and `source` — `"local"` or `"cache"`
@@ -106,9 +181,26 @@ export function useQuerySnapshot<Q extends QueryReference>(ref: Q, ...rest: Rest
 /**
  * Live query value: `undefined` while loading (or skipped). Errors are thrown to the nearest error boundary,
  * like `convex/react`. Use `useQueryState` to handle them inline.
+ *
+ * `{ select }` renders a part of the value: `useQuery(api.todos.list, { list }, { select: (t) => t.filter((x) =>
+ * x.done).length })` re-renders only when the count changes, not on every change of the list (`equals`, default
+ * `shallowEqual`, compares two selections; the client keeps unchanged rows' identity, so a filtered array of rows
+ * compares equal when none of its rows changed).
  */
-export function useQuery<Q extends QueryReference>(ref: Q, ...rest: Rest<Q>): ReturnOf<Q> | undefined {
-  const s = useQuerySnapshot(ref, ...rest);
+export function useQuery<Q extends QueryReference, S = ReturnOf<Q>>(ref: Q, ...rest: ArgsOrSkipAndOptions<Q, QueryHookOptions<ReturnOf<Q>, S>>): S | undefined {
+  const { handle, opts } = useWatchHandle(ref, rest);
+  const o = opts as QueryHookOptions<ReturnOf<Q>, S> | undefined;
+  const pick = o?.select;
+  const eq = o?.equals ?? shallowEqual;
+  const select = useCallback(
+    (s: QuerySnapshot<ReturnOf<Q>>): Picked<S> => (pick && s.status === "success" ? { status: s.status, value: pick(s.value as ReturnOf<Q>), error: undefined } : (s as Picked<S>)),
+    [pick],
+  );
+  const equals = useCallback(
+    (a: Picked<S>, b: Picked<S>) => (pick ? a.status === b.status && (a.status === "success" ? eq(a.value as S, b.value as S) : a.error === b.error) : Object.is(a, b)),
+    [pick, eq],
+  );
+  const s = useSelected((handle?.subscribe ?? noopSubscribe) as (l: () => void) => () => void, (handle?.getSnapshot ?? getLoading) as () => QuerySnapshot<ReturnOf<Q>>, select, equals);
   if (s.status === "error") throw s.error;
   return s.value;
 }
@@ -263,7 +355,16 @@ export function useSuspenseQuery<Q extends QueryReference>(ref: Q, ...rest: Args
 }
 
 /** `[options?]`, or `[options]` with a typed `shard` when the function's shard must be named (`shard: "org"`). */
-type HookOptions<F> = [NamedShardKind<F>] extends [never] ? [options?: OptionsFor<F, ShardOptions>] : [options: OptionsFor<F, ShardOptions>];
+type HookOptions<F, O = ShardOptions> = [NamedShardKind<F>] extends [never] ? [options?: OptionsFor<F, O>] : [options: OptionsFor<F, O>];
+
+/** `useMutation` / `useMutationState` options: the shard, and an optimistic update applied on every call. */
+export type MutationHookOptions<M extends MutationReference> = ShardOptions & {
+  /**
+   * Applied on every call (as `.withOptimisticUpdate`). An inline function is fine: the latest one runs, and the
+   * mutation function stays the same object across renders.
+   */
+  optimisticUpdate?: OptimisticUpdate<ArgsOf<M>>;
+};
 
 export interface ReactMutation<M extends MutationReference> {
   (...args: OptionalRestArgs<M>): Promise<ReturnOf<M>>;
@@ -286,14 +387,29 @@ function makeMutation<M extends MutationReference>(client: EmberClient, ref: M, 
   return f;
 }
 
-/** A stable function that runs the mutation. `.withOptimisticUpdate(fn)` adds an optimistic update; `.safe()` returns a Result. */
-export function useMutation<M extends MutationReference>(ref: M, ...options: HookOptions<M>): ReactMutation<M> {
-  const opts = options[0] as ShardOptions | undefined;
+/**
+ * A stable function that runs the mutation. `.withOptimisticUpdate(fn)` adds an optimistic update (or pass
+ * `{ optimisticUpdate }`); `.safe()` returns a Result.
+ */
+export function useMutation<M extends MutationReference>(ref: M, ...options: HookOptions<M, MutationHookOptions<M>>): ReactMutation<M> {
+  const opts = options[0] as MutationHookOptions<M> | undefined;
   const client = useEmberClient();
   const name = getFunctionName(ref);
   const shard = opts?.shard;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  return useMemo(() => makeMutation<M>(client, ref, shard === undefined ? undefined : { shard }), [client, name, shard]);
+  // The latest committed optimistic update, read at call time: an inline one does not make a new mutation function per
+  // render. Published at commit (a render that suspends or is discarded never hands its callback to the UI on screen);
+  // an insertion effect runs before layout effects and event handlers, and on the server never.
+  const latest = opts?.optimisticUpdate;
+  const update = useRef(latest);
+  useInsertionEffect(() => {
+    update.current = latest;
+  }, [latest]);
+  const optimistic = opts?.optimisticUpdate !== undefined;
+  return useMemo(
+    () => makeMutation<M>(client, ref, shard === undefined ? undefined : { shard }, optimistic ? (store, args, m) => update.current?.(store, args, m) : undefined),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [client, name, shard, optimistic],
+  );
 }
 
 /** `useMutationState`: the mutation plus its last call's state, for forms and buttons. */
@@ -303,28 +419,44 @@ export interface MutationState<M extends MutationReference> {
   readonly isPending: boolean;
   readonly data: ReturnOf<M> | undefined;
   readonly error: EmberErrorOf<M> | undefined;
+  /** The last call's Result (undefined before the first one, or after `reset`). */
+  readonly result: Result<ReturnOf<M>, EmberErrorOf<M>> | undefined;
   reset(): void;
 }
 
-export function useMutationState<M extends MutationReference>(ref: M, ...options: HookOptions<M>): MutationState<M> {
+/**
+ * The mutation and its last call's state (`isPending`, `data`, `error`), for forms and buttons. `{ optimisticUpdate }`
+ * applies an optimistic update on every call. The returned object is memoized: it changes only when the state does,
+ * and `mutate` / `reset` keep their identity.
+ */
+export function useMutationState<M extends MutationReference>(ref: M, ...options: HookOptions<M, MutationHookOptions<M>>): MutationState<M> {
   const m = useMutation(ref, ...options);
-  const [st, setSt] = useState<{ isPending: boolean; data: ReturnOf<M> | undefined; error: EmberErrorOf<M> | undefined }>({ isPending: false, data: undefined, error: undefined });
+  const { run, reset, st } = useCallState<OptionalRestArgs<M>, ReturnOf<M>, EmberErrorOf<M>>(m.safe);
+  return useMemo(() => ({ mutate: run, reset, ...st }), [run, reset, st]);
+}
+
+type CallState<R, E> = { readonly isPending: boolean; readonly data: R | undefined; readonly error: E | undefined; readonly result: Result<R, E> | undefined };
+const IDLE: CallState<never, never> = Object.freeze({ isPending: false, data: undefined, error: undefined, result: undefined });
+
+/** The state of the last call of `safe` (a newer call wins over an older one still running). */
+function useCallState<A extends unknown[], R, E>(safe: (...args: A) => Promise<Result<R, E>>) {
+  const [st, setSt] = useState<CallState<R, E>>(IDLE);
   const seq = useRef(0);
-  const mutate = useCallback(
-    async (...args: OptionalRestArgs<M>) => {
+  const run = useCallback(
+    async (...args: A) => {
       const mine = ++seq.current;
-      setSt((p) => ({ ...p, isPending: true }));
-      const r = await m.safe(...args);
-      if (mine === seq.current) setSt(r.ok ? { isPending: false, data: r.value, error: undefined } : { isPending: false, data: undefined, error: r.error });
+      setSt((p) => (p.isPending ? p : { ...p, isPending: true }));
+      const r = await safe(...args);
+      if (mine === seq.current) setSt(r.ok ? { isPending: false, data: r.value, error: undefined, result: r } : { isPending: false, data: undefined, error: r.error, result: r });
       return r;
     },
-    [m],
+    [safe],
   );
   const reset = useCallback(() => {
     seq.current++;
-    setSt({ isPending: false, data: undefined, error: undefined });
+    setSt(IDLE);
   }, []);
-  return { mutate, reset, ...st };
+  return { run, reset, st };
 }
 
 export interface ReactAction<A extends ActionReference> {
@@ -347,12 +479,95 @@ export function useAction<A extends ActionReference>(ref: A, ...options: HookOpt
   }, [client, name, shard]);
 }
 
-/** Online flag, per-shard socket state and the number of unconfirmed mutations. */
-export function useConnectionState(): ConnectionState {
+/** `useActionState`: an action and its last call's state. */
+export interface ActionState<A extends ActionReference> {
+  /** Runs the action; resolves to a Result (never throws). A newer call's state replaces an older one's. */
+  run(...args: OptionalRestArgs<A>): Promise<Result<ReturnOf<A>, EmberErrorOf<A>>>;
+  readonly isPending: boolean;
+  readonly data: ReturnOf<A> | undefined;
+  readonly error: EmberErrorOf<A> | undefined;
+  /** The last call's Result (undefined before the first one, or after `reset`). */
+  readonly result: Result<ReturnOf<A>, EmberErrorOf<A>> | undefined;
+  reset(): void;
+  /**
+   * The action in React 19's `useActionState` shape, `(previous, args) => Promise<Result>`: `const [result, dispatch,
+   * pending] = React.useActionState(state.reducer, null)` for `<form action>` and transitions. It does not update
+   * this hook's own state (that hook keeps it).
+   */
+  reducer(previous: Result<ReturnOf<A>, EmberErrorOf<A>> | null | undefined, args: ArgsOf<A>): Promise<Result<ReturnOf<A>, EmberErrorOf<A>>>;
+}
+
+/**
+ * An action (`useAction`) with the state of its last call: `isPending`, `data`, `error`, `result`. Works on React 18
+ * and 19; with React 19's `useActionState` use `.reducer`. Memoized like `useMutationState`.
+ */
+export function useActionState<A extends ActionReference>(ref: A, ...options: HookOptions<A>): ActionState<A> {
+  const a = useAction(ref, ...options);
+  const { run, reset, st } = useCallState<OptionalRestArgs<A>, ReturnOf<A>, EmberErrorOf<A>>(a.safe);
+  const reducer = useCallback((_prev: unknown, args: ArgsOf<A>) => (a.safe as (x: unknown) => Promise<Result<ReturnOf<A>, EmberErrorOf<A>>>)(args), [a]);
+  return useMemo(() => ({ run, reset, reducer, ...st }), [run, reset, reducer, st]);
+}
+
+/**
+ * Online flag, per-shard socket state and the number of unconfirmed mutations. With `select`, only that part:
+ * `useConnectionState((s) => s.pendingMutations > 0)` re-renders when it flips, not on every socket change.
+ */
+export function useConnectionState(): ConnectionState;
+export function useConnectionState<S>(select: (state: ConnectionState) => S, equals?: (a: S, b: S) => boolean): S;
+export function useConnectionState<S>(select?: (state: ConnectionState) => S, equals?: (a: S, b: S) => boolean): ConnectionState | S {
   const client = useEmberClient();
   const subscribe = useCallback((l: () => void) => client.onConnectionStateChange(l), [client]);
   const get = useCallback(() => client.connectionState(), [client]);
-  return useSyncExternalStore(subscribe, get, get);
+  const pick = useCallback((s: ConnectionState) => (select ? select(s) : s), [select]);
+  return useSelected<ConnectionState, ConnectionState | S>(subscribe, get, pick, (equals ?? (select ? shallowEqual : Object.is)) as (a: ConnectionState | S, b: ConnectionState | S) => boolean);
+}
+
+// ------------------------------------------------------------------------------------------------ hydration
+
+/** A query read on the server (`client.fetchForHydration` / `preloadQuery`), for `usePreloadedQuery`. */
+export type Preloaded<Q extends QueryReference> = HydratedQuery<ReturnOf<Q>>;
+
+/** `client.fetchForHydration`, typed for `usePreloadedQuery` (a server component, a loader). */
+export function preloadQuery<Q extends QueryReference>(client: EmberClient, ref: Q, ...rest: ArgsAndOptions<Q, ShardOptions>): Promise<Preloaded<Q>> {
+  return (client.fetchForHydration as (r: Q, ...x: unknown[]) => Promise<Preloaded<Q>>)(ref, ...rest);
+}
+
+export interface EmberHydrateProps {
+  /** What the server's client read: `client.dehydrate()`, as is or encoded (`encodeJson`). Null: nothing. */
+  state: readonly HydratedQuery[] | string | null | undefined;
+  children?: ReactNode;
+}
+
+/**
+ * Hands server-read values to the client before its children render (`client.hydrate`), so every hook below shows
+ * them from the first render (no loading flash) and subscribes with `resume`. A new `state` hydrates again (entries
+ * the client already has are ignored), the same one does nothing.
+ */
+export function EmberHydrate({ state, children }: EmberHydrateProps) {
+  const client = useEmberClient();
+  const done = useRef<{ client: EmberClient; state: EmberHydrateProps["state"] } | null>(null);
+  if (state && (done.current?.client !== client || done.current.state !== state)) {
+    client.hydrate(...(typeof state === "string" ? (decodeJson(state) as HydratedQuery[]) : state));
+    done.current = { client, state };
+  }
+  return createElement(Fragment, null, children);
+}
+
+/**
+ * The live value of a query preloaded on the server (`preloadQuery` / `fetchForHydration`): shown at once from the
+ * preloaded value, then live (the subscription resumes from it). Same shard as the preload (its routing included).
+ * A preload the client refuses (read for another identity than the one signed in now) is not shown: the hook
+ * suspends until the live value comes (wrap it in `<Suspense>`). Errors go to the error boundary.
+ */
+export function usePreloadedQuery<T>(preloaded: HydratedQuery<T>): T {
+  const client = useEmberClient();
+  const done = useRef<{ client: EmberClient; preloaded: HydratedQuery<T> } | null>(null);
+  if (done.current?.client !== client || done.current.preloaded !== preloaded) {
+    client.hydrate(preloaded);
+    done.current = { client, preloaded };
+  }
+  const ref = useMemo(() => unsafeRef<"query">(preloaded.fn), [preloaded.fn]);
+  return useSuspenseQuery(ref, preloaded.args, { shard: preloaded.shard }) as T;
 }
 
 // ------------------------------------------------------------------------------------------------ pagination

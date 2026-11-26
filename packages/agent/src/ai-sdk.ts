@@ -81,12 +81,17 @@ export function aiSdk(model: LanguageModelLike, settings: Record<string, unknown
     async *stream(req: ModelRequest): AsyncGenerator<ModelEvent> {
       const tools = req.tools.map((t) => (v1 ? { type: "function", name: t.name, description: t.description, parameters: t.parameters } : { type: "function", name: t.name, description: t.description, inputSchema: t.parameters }));
       const options: Rec = { ...settings, prompt: toAiSdkPrompt(req.system, req.messages, v1), abortSignal: req.signal };
+      const format = req.responseFormat;
+      const named = format ? { ...(format.name !== undefined ? { name: format.name } : {}), ...(format.description !== undefined ? { description: format.description } : {}) } : {};
       if (v1) {
         options.inputFormat = "messages";
-        options.mode = { type: "regular", ...(tools.length ? { tools } : {}) };
+        // V1 has one mode per call: object-json (the response format) or regular (tools), never both.
+        if (format && tools.length) throw new Error("aiSdk: an AI SDK v1 model cannot take a responseFormat and tools in one call");
+        options.mode = format ? { type: "object-json", schema: format.schema, ...named } : { type: "regular", ...(tools.length ? { tools } : {}) };
         if (req.maxOutputTokens !== undefined) options.maxTokens = req.maxOutputTokens;
       } else {
         if (tools.length) options.tools = tools;
+        if (format) options.responseFormat = { type: "json", schema: format.schema, ...named };
         if (req.maxOutputTokens !== undefined) options.maxOutputTokens = req.maxOutputTokens;
       }
       if (req.temperature !== undefined) options.temperature = req.temperature;
@@ -104,6 +109,7 @@ export function aiSdk(model: LanguageModelLike, settings: Record<string, unknown
               if (text) yield { type: "text-delta", text };
               break;
             }
+            // v1 `reasoning` { textDelta }; v2/v3 `reasoning-delta` { delta } (between reasoning-start / -end).
             case "reasoning":
             case "reasoning-delta": {
               const text = typeof p.delta === "string" ? p.delta : typeof p.textDelta === "string" ? p.textDelta : "";
