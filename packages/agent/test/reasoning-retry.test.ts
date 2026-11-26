@@ -1,6 +1,6 @@
 // Reasoning streamed in deltas, retries before the first delta, and generateObject (scripted models, real engine).
 import { v } from "@freecorps/ember-server";
-import { toJsonSchema } from "@freecorps/ember-values";
+import { isValidator, toJsonSchema } from "@freecorps/ember-values";
 import { beforeEach, describe, expect, expectTypeOf, test } from "vitest";
 import { Agent, generateObject, mockModel, modelJsonSchema, ObjectGenerationError, parseJsonAnswer, retryAfterMs, withRetry, withStreams, type AgentModel, type ModelEvent, type ModelRequest } from "../src/index.ts";
 import { app, functions, models, schema, toolCalls } from "./app.ts";
@@ -190,6 +190,22 @@ describe("generateObject", () => {
     await expect(generateObject(mockModel([{ text: "I cannot do that." }]), { schema: recipe, prompt: "?" })).rejects.toBeInstanceOf(ObjectGenerationError);
     expect(parseJsonAnswer('Sure! Here it is: {"a": [1, 2]} Hope it helps.')).toEqual({ a: [1, 2] });
     expect(parseJsonAnswer("[1,2]")).toEqual([1, 2]);
+    expect(parseJsonAnswer('{"a":1} see [docs]')).toEqual({ a: 1 });
+  });
+
+  test("int64 and bytes fields: the tagged wire values the JSON Schema asks for are decoded before the check", async () => {
+    const schema = v.object({ id: v.int64(), blob: v.bytes(), n: v.number() });
+    const r = await generateObject(mockModel([{ text: '{"id":{"$int64":"9007199254740993"},"blob":{"$bytes":"AQID"},"n":1}' }]), { schema, prompt: "?" });
+    expect(r.object).toEqual({ id: 9007199254740993n, blob: new Uint8Array([1, 2, 3]), n: 1 });
+    await expect(generateObject(mockModel([{ text: '{"id":{"$int64":"twelve"},"blob":{"$bytes":"AQID"},"n":1}' }]), { schema, prompt: "?" })).rejects.toBeInstanceOf(ObjectGenerationError);
+  });
+
+  test("an object of validators with fields named shape and isOptional is a field map, not a validator", async () => {
+    const schema = { shape: v.string(), isOptional: v.boolean() };
+    const r = await generateObject(mockModel([{ text: '{"shape":"round","isOptional":true}' }]), { schema, prompt: "?" });
+    expect(r.object).toEqual({ shape: "round", isOptional: true });
+    expect(isValidator(schema)).toBe(false);
+    expect(isValidator(v.object(schema))).toBe(true);
   });
 
   test("an object of validators works as the schema; Agent.generateObject uses the agent's model and instructions", async () => {

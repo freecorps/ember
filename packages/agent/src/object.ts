@@ -3,7 +3,7 @@
 // and validated (defaults applied) before it is returned: a model that ignores the format still cannot hand back
 // something the validator rejects.
 
-import { isValidator, toJsonSchema, v, withDefaults, type GenericValidator, type Infer, type ObjectType, type PropertyValidators } from "@freecorps/ember-values";
+import { fromJSONValue, isValidator, toJsonSchema, v, withDefaults, type GenericValidator, type Infer, type ObjectType, type PropertyValidators } from "@freecorps/ember-values";
 import { aiSdk, isLanguageModel, type LanguageModelLike } from "./ai-sdk.ts";
 import { withRetry, type AgentModel, type ModelMessage, type RetryOptions, type Usage } from "./model.ts";
 
@@ -55,12 +55,17 @@ export function parseJsonAnswer(text: string): unknown {
     const starts = [body.indexOf("{"), body.indexOf("[")].filter((i) => i >= 0);
     if (!starts.length) throw new ObjectGenerationError("the model did not answer with JSON", text);
     const from = Math.min(...starts);
-    const to = Math.max(body.lastIndexOf("}"), body.lastIndexOf("]"));
-    try {
-      return JSON.parse(body.slice(from, to + 1));
-    } catch {
-      throw new ObjectGenerationError("the model did not answer with valid JSON", text);
+    // The last closing bracket first, then earlier ones (prose after the JSON may hold a `]` or `}`): a few tries.
+    let tries = 0;
+    for (let to = body.length - 1; to > from && tries < 32; to--) {
+      const c = body[to];
+      if (c !== "}" && c !== "]") continue;
+      tries++;
+      try {
+        return JSON.parse(body.slice(from, to + 1));
+      } catch {}
     }
+    throw new ObjectGenerationError("the model did not answer with valid JSON", text);
   }
 }
 
@@ -112,7 +117,15 @@ export async function generateObject<S extends ObjectSchema>(model: AgentModel |
       finishReason = ev.finishReason;
     } else if (ev.type === "error") throw ev.error instanceof Error ? ev.error : new Error(typeof ev.error === "string" ? ev.error : JSON.stringify(ev.error));
   }
-  const value = withDefaults(validator.shape, parseJsonAnswer(text));
+  // The schema asks for the wire form (`{ "$int64": "…" }`, `{ "$bytes": "…" }`): decoded before the check.
+  let decoded: unknown;
+  try {
+    decoded = fromJSONValue(parseJsonAnswer(text));
+  } catch (e) {
+    if (e instanceof ObjectGenerationError) throw e;
+    throw new ObjectGenerationError(`the model's object has an invalid tagged value: ${e instanceof Error ? e.message : String(e)}`, text);
+  }
+  const value = withDefaults(validator.shape, decoded);
   const check = validator.validate(value);
   if (!check.ok) throw new ObjectGenerationError(`the model's object does not match the schema${check.path ? ` at ${check.path}` : ""}: ${check.message}`, text, check.path);
   const out: GenerateObjectResult<SchemaType<S>> = { object: value as SchemaType<S>, text };
