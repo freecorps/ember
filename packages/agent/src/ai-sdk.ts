@@ -85,7 +85,9 @@ export function aiSdk(model: LanguageModelLike, settings: Record<string, unknown
       const named = format ? { ...(format.name !== undefined ? { name: format.name } : {}), ...(format.description !== undefined ? { description: format.description } : {}) } : {};
       if (v1) {
         options.inputFormat = "messages";
-        options.mode = format && !tools.length ? { type: "object-json", schema: format.schema, ...named } : { type: "regular", ...(tools.length ? { tools } : {}) };
+        // V1 has one mode per call: object-json (the response format) or regular (tools), never both.
+        if (format && tools.length) throw new Error("aiSdk: an AI SDK v1 model cannot take a responseFormat and tools in one call");
+        options.mode = format ? { type: "object-json", schema: format.schema, ...named } : { type: "regular", ...(tools.length ? { tools } : {}) };
         if (req.maxOutputTokens !== undefined) options.maxTokens = req.maxOutputTokens;
       } else {
         if (tools.length) options.tools = tools;

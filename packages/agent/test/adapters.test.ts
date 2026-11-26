@@ -283,6 +283,10 @@ describe("aiSdk (structural LanguageModel)", () => {
     const v1 = fake("v1", [{ type: "text-delta", textDelta: '{"n": 4}' }]);
     expect((await generateObject(v1.model, { schema, prompt: "four" })).object).toEqual({ n: 4 });
     expect(v1.calls[0].mode).toMatchObject({ type: "object-json", schema: { type: "object" } });
+    // A response format with tools: v1 has no mode for both, so it says so instead of dropping the format.
+    const both = fake("v1", []);
+    const req = { ...request(), responseFormat: { type: "json" as const, schema: { type: "object" } } };
+    await expect(collect(aiSdk(both.model).stream(req))).rejects.toThrow(/responseFormat and tools/);
   });
 
   test("an Agent given an AI SDK model wraps it; defineModel turns generate into one step", async () => {
