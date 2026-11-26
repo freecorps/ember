@@ -22,8 +22,9 @@
 //     `compareStrings`; literals with a lone surrogate or a NUL, and stored texts that may hold one (WTF8), are left
 //     to JS. Numbers: only finite literals other
 //     than -0 (columns never hold NaN, -0 or ±Infinity: those go to `_json`). Booleans: 0 / 1.
-// Anything else in the expression is NULL (left to JS). An expression with no decided part, a malformed one, or one
-// with a non-primitive literal or a non-string field path (whose JS evaluation could throw) is not pushed at all.
+// Anything else in the expression is NULL (left to JS). An expression with no decided part, a malformed one, one
+// with a non-primitive literal or a non-string field path (whose JS evaluation could throw), or one over the size
+// budget (`MAX_PUSHED_NODES`, `MAX_PUSHED_SQL`) is not pushed at all.
 //
 // Cost: the expression runs in C on rows SQLite reads anyway, a fraction of decoding them in JS (scripts/bench-hot-path.ts).
 
@@ -102,17 +103,26 @@ const isPrimitive = (x: unknown): boolean => x === null || x === undefined || ty
  * `compileExpr` reads it), every field path a string, every literal a primitive or bytes. Only then may SQLite answer
  * for some rows without JS running the expression.
  */
-function safe(e: FilterExpr, depth = 0): boolean {
+function safe(e: FilterExpr, budget: { nodes: number }, depth = 0): boolean {
   if (depth > 64 || typeof e !== "object" || e === null) return false;
   if ("field" in e) return typeof e.field === "string";
   if ("literal" in e) return isPrimitive(e.literal) || e.literal instanceof Uint8Array;
+  if (--budget.nodes < 0) return false;
   const { op, args } = e as { op?: unknown; args?: unknown };
   if (!Array.isArray(args) || !args.every((a) => typeof a === "object" && a !== null)) return false;
-  if (op === "and" || op === "or") return args.every((a) => safe(a as FilterExpr, depth + 1));
-  if (op === "not") return args.length >= 1 && safe(args[0] as FilterExpr, depth + 1);
-  if (typeof op === "string" && CMP.has(op)) return args.length >= 2 && safe(args[0] as FilterExpr, depth + 1) && safe(args[1] as FilterExpr, depth + 1);
+  if (op === "and" || op === "or") return args.every((a) => safe(a as FilterExpr, budget, depth + 1));
+  if (op === "not") return args.length >= 1 && safe(args[0] as FilterExpr, budget, depth + 1);
+  if (typeof op === "string" && CMP.has(op)) return args.length >= 2 && safe(args[0] as FilterExpr, budget, depth + 1) && safe(args[1] as FilterExpr, budget, depth + 1);
   return false;
 }
+
+/**
+ * The largest filter pushed: operator nodes (`and`/`or`/`not`/comparisons) and characters of its SQL. A flat `or` of
+ * n terms is an SQLite expression tree n deep (SQLite refuses more than 1000), and DO SQLite refuses a statement over
+ * 100 KB: a bigger filter is evaluated in JS, as before, whatever its number of bound values.
+ */
+export const MAX_PUSHED_NODES = 256;
+export const MAX_PUSHED_SQL = 32 * 1024;
 
 class Builder {
   readonly params: SqlValue[] = [];
@@ -181,9 +191,9 @@ class Builder {
  * are still decided).
  */
 export function pushFilter(layout: Layout, e: FilterExpr, text: boolean): PushedFilter | undefined {
-  if (!safe(e)) return undefined;
+  if (!safe(e, { nodes: MAX_PUSHED_NODES })) return undefined;
   if ("field" in e || "literal" in e) return undefined;
   const b = new Builder(layout, text);
   const sql = b.expr(e);
-  return b.decided ? { sql, params: b.params } : undefined;
+  return b.decided && sql.length <= MAX_PUSHED_SQL ? { sql, params: b.params } : undefined;
 }

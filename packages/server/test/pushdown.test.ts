@@ -12,7 +12,7 @@ import { createNodeSqliteDriver } from "../src/testing.ts";
 import { createEngine, defineSchema, defineTable, mutationGeneric, queryGeneric, type SqlDriver } from "../src/index.ts";
 import { passes } from "../src/filter.ts";
 import { decodeRow, decodeValues, layoutOf } from "../src/layout.ts";
-import { pushFilter } from "../src/pushdown.ts";
+import { MAX_PUSHED_NODES, MAX_PUSHED_SQL, pushFilter } from "../src/pushdown.ts";
 import type { Doc, FilterExpr } from "../src/types.ts";
 import { prng } from "./fixtures.ts";
 
@@ -350,6 +350,39 @@ describe("pushdown on × off: the same results, read sets and usage", () => {
         handler: (ctx: any) => ctx.db.query("t").filter((q: any) => q.or(...Array.from({ length: k }, (_, i) => q.eq(q.field("s"), `v${i}`)), q.eq(q.field("s"), "a"))).collect().length,
       }) as any;
     for (const k of [10, 40, 120]) expect(e.runQuery(wide(k), {}).value).toBe(1);
+  });
+
+  it("big filters without bound values: not pushed past the size budget (SQLite's expression depth, DO's 100 KB)", () => {
+    const layout = layoutOf("t", schema.manifest.tables.t!.document);
+    // `eq(on, undefined)` binds nothing: only the number of nodes and the SQL length can keep it out of SQLite.
+    const flat = (k: number): FilterExpr => ({ op: "or", args: Array.from({ length: k }, () => ({ op: "eq", args: [{ field: "on" }, { literal: undefined }] })) });
+    const small = pushFilter(layout, flat(20), true);
+    expect(small?.params).toEqual([]);
+    expect(small!.sql.length).toBeLessThanOrEqual(MAX_PUSHED_SQL);
+    expect(pushFilter(layout, flat(MAX_PUSHED_NODES), true)).toBeUndefined();
+    expect(pushFilter(layout, flat(2000), true)).toBeUndefined();
+    // Under the node budget but over the SQL one: text range comparisons (the longest SQL per node).
+    const texts = (k: number): FilterExpr => ({ op: "or", args: Array.from({ length: k }, (_, i) => ({ op: "lt", args: [{ field: "os" }, { literal: `v${i}` }] })) });
+    const one = pushFilter(layout, texts(1), true)!.sql.length;
+    const k = Math.ceil(MAX_PUSHED_SQL / one) + 1;
+    expect(k).toBeLessThan(MAX_PUSHED_NODES);
+    expect(pushFilter(layout, texts(k - 10), true)).toBeDefined();
+    expect(pushFilter(layout, texts(k), true)).toBeUndefined();
+    const on = engine({ pushdown: true });
+    const off = engine({ pushdown: false });
+    const docs = [
+      { s: "a", ns: null, n: 1, nn: null, b: true, lit: "a" },
+      { s: "b", ns: null, n: 2, nn: null, b: true, lit: "a", on: 3 },
+    ];
+    seed(on.e, docs);
+    seed(off.e, docs);
+    for (const k of [20, 400, 2000]) {
+      const fn = queryGeneric({
+        handler: (ctx: any) => ctx.db.query("t").filter((q: any) => q.or(...Array.from({ length: k }, () => q.eq(q.field("on"), undefined)))).collect().map((d: Doc) => d.s),
+      }) as any;
+      expect(on.e.runQuery(fn, {}).value).toEqual(["a"]);
+      expect(strip(on.e.runQuery(fn, {}).usage)).toEqual(strip(off.e.runQuery(fn, {}).usage));
+    }
   });
 });
 
