@@ -59,7 +59,9 @@ export type InternalAction<Args, Returns, Errors extends ErrorSpec> = FunctionRe
 export declare const api: {
   messages: {
     /**
-     * @source ember/messages.ts:18
+     * One aggregate row read (the schema's \`per_channel\`), however many messages the channel has.
+     *
+     * @source ember/messages.ts:19
      */
     count: Query<{
       channel: string;
@@ -68,18 +70,20 @@ export declare const api: {
      * Actions run in the Worker and may do I/O (fetch, AI, email); they reach the shard through ctx.runQuery,
      * ctx.runMutation and ctx.scheduler (each call is its own transaction).
      *
-     * @source ember/messages.ts:49
+     * @source ember/messages.ts:50
      */
     digest: Action<{
       channel: string;
     }, string, never>;
     /**
+     * @throws {MessageNotFound} No such message.
+     * @throws {MessageTooLong} This message is too long.
      * @source ember/messages.ts:35
      */
     edit: Mutation<{
       id: Id<"messages">;
       body: string;
-    }, string | null, never>;
+    }, string, E.MessageNotFound | E.MessageTooLong>;
     /**
      * @source ember/messages.ts:8
      */
@@ -108,9 +112,9 @@ export declare const api: {
 export declare const internal: {
   messages: {
     /**
-     * Internal: run by the cron in crons.ts.
+     * Internal: run by the cron in crons.ts. Deletes the oldest messages past \`keep\`, at most 500 per run.
      *
-     * @source ember/messages.ts:58
+     * @source ember/messages.ts:59
      */
     trim: InternalMutation<{
       channel: string;

@@ -60,12 +60,14 @@ Commands:
                                           runtime is too old to answer, or on a schema rollback (below)
   deploy [--env prod] [--gradual N] [--dry-run] [--message text]
          [--wait [--shard kind:key ...] [--wait-timeout s] [--url URL]] [--admin-token T]
-         [--dashboard | --no-dashboard] [--allow-schema-rollback]
+         [--dashboard | --no-dashboard] [--allow-schema-rollback] [--allow-missing-env]
                                           Deploy ember-<project>-<env> through the Cloudflare API. --wait polls
                                           global:main (+ --shard) until migrated; fails on a refused migration.
                                           Stops before uploading when the app schema is one this env already left
                                           for a newer one (registry deploy history) unless --allow-schema-rollback;
                                           --dry-run reports it and exits 1.
+                                          Stops when a var declared in defineApp({ env }) is neither a secret on
+                                          the Worker nor a var in ember.json, unless --allow-missing-env
                                           The first deploy in a terminal asks whether to add the Ember Dashboard
                                           and saves the answer ("dashboard" in ember.json); CI never asks
   destroy [--env name] --yes              Delete ember-<project>-<env>: its dashboard link, the Worker and its Durable Object data, this
@@ -286,9 +288,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           "no-dashboard": { type: "boolean" },
           preflight: { type: "boolean" },
           "allow-schema-rollback": { type: "boolean" },
+          "allow-missing-env": { type: "boolean" },
         },
       });
       const allowSchemaRollback = !!values["allow-schema-rollback"];
+      if (values.preflight && values["allow-missing-env"]) throw new Error("--preflight uploads nothing: it does not take --allow-missing-env");
       if (values.preflight) {
         const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "no-dashboard"] as const).filter((k) => values[k] !== undefined);
         if (clash.length) throw new Error(`--preflight uploads nothing: it does not take ${clash.map((k) => `--${k}`).join(", ")}`);
@@ -352,6 +356,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
           ...(values["admin-token"] ? { adminToken: values["admin-token"] } : {}),
           ...(values.registry ? { registryName: values.registry } : {}),
           ...(allowSchemaRollback ? { allowSchemaRollback } : {}),
+          ...(values["allow-missing-env"] ? { allowMissingEnv: true } : {}),
           ...(values.wait
             ? {
                 wait: {

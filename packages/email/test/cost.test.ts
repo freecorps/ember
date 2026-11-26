@@ -75,8 +75,9 @@ describe("email: fewer rows per write", () => {
     const h = inboxHarness(noLimit);
     h.resetCounters();
     const r = h.ingest({ messageId: "c1@user.test" });
-    // before PR 2D: 18 rows written (thread insert, then a patch of counts and unread flag, the `unread` aggregate); now 10.
-    expect(h.counters.rowsWritten).toBeLessThanOrEqual(10);
+    // before PR 2D: 18 rows written (thread insert, then a patch of counts and unread flag, the `unread` aggregate); now 10,
+    // plus the rateLimit GC's bookkeeping row (`gc`), written by the first new bucket of a shard (once per GC cycle).
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(11);
     const t = h.query("@email/lib:thread", { threadId: r.threadId }).thread;
     expect(t).toMatchObject({ messageCount: 1, unreadCount: 1, hasUnread: true, status: "open", lastInboundAt: t.lastMessageAt });
     expect(h.query("@email/lib:counts", { mailbox: "support" }).all).toEqual({ threads: 1, unread: 1, unreadThreads: 1 });
@@ -90,8 +91,9 @@ describe("email: fewer rows per write", () => {
     const h = inboxHarness();
     h.resetCounters();
     const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["caio@user.test"], subject: "Hi", text: "Hello", bcc: ["audit@acme.test"] });
-    // before PR 2D: 11 rows written (thread insert, then a patch with the first message's counts); now 9.
-    expect(h.counters.rowsWritten).toBeLessThanOrEqual(9);
+    // before PR 2D: 11 rows written (thread insert, then a patch with the first message's counts); now 9, plus the
+    // rateLimit GC's `gc` row of the shard's first bucket (see above).
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(10);
     const t = h.query("@email/lib:thread", { threadId: c.threadId }).thread;
     expect(t).toMatchObject({ messageCount: 1, unreadCount: 0, hasUnread: false, status: "waiting", blind: ["audit@acme.test"] });
     expect(h.query("@email/lib:counts", { mailbox: "support" }).byStatus.waiting).toEqual({ threads: 1, unread: 0, unreadThreads: 0 });
