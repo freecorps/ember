@@ -106,9 +106,34 @@ export const tally = defineComponent({
           { kind: "actions", actions: [{ id: "bump", label: "Bump", fn: tallyLib.bump, args: { by: 1 } }, { id: "twice", label: "Bump twice", fn: tallyLib.bumpTwice }] },
         ],
       },
+      // An embed block (dashboards.test.ts): the page is a GET route of the component's own router.
+      // `big` streams past the 1 MiB limit with no content-length; the app serves a route at `shadowed`'s mounted path.
+      {
+        id: "lab",
+        label: "Lab",
+        blocks: [
+          { kind: "embed", id: "page", route: "/dashboard/page", functions: [tallyLib.get, tallyLib.bump] },
+          { kind: "embed", id: "big", route: "/dashboard/big" },
+          { kind: "embed", id: "shadowed", route: "/dashboard/shadowed" },
+          { kind: "embed", id: "empty", route: "/dashboard/empty" },
+        ],
+      },
     ],
   },
-  http: httpRouter().route({ path: "/hit", method: "POST", handler: hooks.hit, shard: (r) => new URL(r.url).searchParams.get("shard") ?? "global:main" }),
+  http: httpRouter()
+    .route({ path: "/hit", method: "POST", handler: hooks.hit, shard: (r) => new URL(r.url).searchParams.get("shard") ?? "global:main" })
+    .route({ path: "/dashboard/page", method: "GET", handler: c.httpAction(async (_ctx, request) => new Response(`<!doctype html><p>tally page ${request.headers.get("authorization") ?? "anonymous"}</p>`, { headers: { "content-type": "text/html; charset=utf-8", "set-cookie": "a=b" } })) })
+    .route({
+      path: "/dashboard/big",
+      method: "GET",
+      handler: c.httpAction(async () => {
+        const chunk = new TextEncoder().encode("x".repeat(64 * 1024));
+        let n = 0;
+        return new Response(new ReadableStream<Uint8Array>({ pull: (s) => (++n > 17 ? s.close() : s.enqueue(chunk)) }), { headers: { "content-type": "text/html" } });
+      }),
+    })
+    .route({ path: "/dashboard/empty", method: "GET", handler: c.httpAction(async () => new Response(null, { status: 204 })) })
+    .route({ path: "/dashboard/shadowed", method: "GET", handler: c.httpAction(async () => new Response("<p>tally's own page</p>", { headers: { "content-type": "text/html" } })) }),
 });
 
 // ------------------------------------------------------------------ hooks: crons, own queue, email()
@@ -275,6 +300,8 @@ export const componentFunctions = {
 const routeErrors = defineErrors({ NoChannel: { data: v.object({ channel: v.string() }), status: 404, message: "No such channel" } });
 
 export const http = httpRouter()
+  // At the tally install's mounted embed path (dashboards.test.ts): the app's route never serves tally's embed.
+  .route({ path: "/tally/dashboard/shadowed", method: "GET", handler: httpActionGeneric(async () => new Response("<p>the app's page</p>", { headers: { "content-type": "text/html" } })) })
   // Typed routes (docs/design/dx.md §3.11): params, query and body validated; the value is the JSON response.
   .route({
     method: "GET",

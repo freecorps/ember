@@ -98,4 +98,48 @@ describe("dashboards (admin API)", () => {
     expect([elsewhere.status, elsewhere.body.error.code]).toEqual([400, "bad_shard"]);
     expect((await post("dashboards/run", { dashboard: "", fn: "components:bump", args: { key: "g" } })).body).toMatchObject({ ok: true, value: 1, shard: "global:main" });
   });
+
+  it("serves an embed block's page: only a route the spec names, anonymously, with only its type and body", async () => {
+    const caps = await get("capabilities");
+    expect(caps.body.features).toContain("dashboards/embed");
+    const spec = (await get("dashboards")).body.dashboards.find((d: { key: string }) => d.key === "tally");
+    expect(spec.tabs[1].blocks[0]).toEqual({ kind: "embed", id: "page", route: "/dashboard/page", path: "/tally/dashboard/page", height: "auto", functions: { "lib:get": "@tally/lib:get", "lib:bump": "@tally/lib:bump" } });
+    const embed = (dashboard: string, route: string, token = "admin-secret") => SELF.fetch(`http://ember/api/_ember/dashboards/embed?${new URLSearchParams({ dashboard, route })}`, { headers: { authorization: `Bearer ${token}` } });
+    const ok = await embed("tally", "/dashboard/page");
+    expect(ok.status).toBe(200);
+    // Run anonymously: the admin token never reaches the route; its own headers (a cookie) are dropped.
+    expect(await ok.text()).toBe("<!doctype html><p>tally page anonymous</p>");
+    expect(ok.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(ok.headers.get("set-cookie")).toBeNull();
+    expect(ok.headers.get("content-security-policy")).toBe("default-src 'none'; sandbox");
+    // A route no embed block names (even one the component serves), another spec, or no token: refused.
+    const other = await embed("tally", "/hit");
+    expect(other.status).toBe(404);
+    expect(((await other.json()) as { error: { code: string } }).error.code).toBe("unknown_embed");
+    expect((await embed("nope", "/dashboard/page")).status).toBe(404);
+    expect((await embed("", "/dashboard/page")).status).toBe(404);
+    expect((await embed("tally", "/dashboard/page", "wrong")).status).toBe(401);
+    expect((await SELF.fetch("http://ember/api/_ember/dashboards/embed?dashboard=tally&route=%2Fdashboard%2Fpage", { method: "POST", headers: { authorization: "Bearer admin-secret" } })).status).toBe(405);
+  });
+
+  it("an embed page over 1 MiB is refused even when the route streams it without content-length", async () => {
+    const big = await SELF.fetch(`http://ember/api/_ember/dashboards/embed?${new URLSearchParams({ dashboard: "tally", route: "/dashboard/big" })}`, { headers: { authorization: "Bearer admin-secret" } });
+    expect(big.status).toBe(413);
+    expect(((await big.json()) as { error: { code: string } }).error.code).toBe("too_large");
+  });
+
+  it("a route answering with a null-body status (204) keeps it, with no body", async () => {
+    const res = await SELF.fetch(`http://ember/api/_ember/dashboards/embed?${new URLSearchParams({ dashboard: "tally", route: "/dashboard/empty" })}`, { headers: { authorization: "Bearer admin-secret" } });
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+  });
+
+  it("an embed page is served by its own install's route, never by another scope's route at the same path", async () => {
+    // The app serves a route at /tally/dashboard/shadowed, the mounted path of tally's embed: ingress picks the app's,
+    // the embed always tally's own.
+    expect(await (await SELF.fetch("http://ember/tally/dashboard/shadowed")).text()).toBe("<p>the app's page</p>");
+    const res = await SELF.fetch(`http://ember/api/_ember/dashboards/embed?${new URLSearchParams({ dashboard: "tally", route: "/dashboard/shadowed" })}`, { headers: { authorization: "Bearer admin-secret" } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("<p>tally's own page</p>");
+  });
 });

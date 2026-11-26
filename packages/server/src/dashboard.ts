@@ -11,6 +11,7 @@
 
 import { validate, type FieldShape, type ObjectShape, type Shape } from "@freecorps/ember-values";
 import { getFunctionName, IS_FUNCTION, isRegisteredFunction, type AnyRegisteredFunction, type FunctionType, type RegisteredHttpAction } from "./functions.ts";
+import { matchRoute, mountPath, type HttpRoute } from "./http.ts";
 
 // ------------------------------------------------------------------------------------------------ input (authoring)
 
@@ -127,7 +128,25 @@ export type DashboardBlockInput =
       arg: string;
       mutationArgs?: DashboardArgs;
     })
-  | (BlockBase & { kind: "actions"; actions: DashboardActionInput[] });
+  | (BlockBase & { kind: "actions"; actions: DashboardActionInput[] })
+  | (BlockBase & DashboardEmbedInput);
+
+/**
+ * A page of the component's (or app's) own, shown in a sandboxed iframe (contracts.md "Dashboard", "Embeds"): the
+ * dashboard loads `route` (a `GET` route of its `http` router) through its own Worker, serves it under a strict CSP
+ * (inline scripts allowed by hash only, no network), and the page talks to the dashboard only through
+ * `@freecorps/ember-dashboard-sdk` (`postMessage`): it may run the `functions` listed here, by their local names, and
+ * every mutation or action is confirmed by the person in the dashboard first.
+ */
+export interface DashboardEmbedInput {
+  kind: "embed";
+  /** Path of a `GET` route of this component's (app's) `http` router, as declared there (`/dashboard/playground`). */
+  route: string;
+  /** Pixels, or `"auto"` (default): the page sets it with `dash.resize(height)`. */
+  height?: number | "auto";
+  /** Functions the page may call through the SDK (`dash.query("dashboard:threads", ...)`): the embed's allowlist. */
+  functions?: DashboardFn[];
+}
 
 export interface DashboardTabInput {
   id: string;
@@ -197,7 +216,23 @@ export type DashboardBlock =
     }
   | ({ kind: "detail"; id: string; label?: string; description?: string } & DashboardDetail)
   | { kind: "toggle"; id: string; label: string; description?: string; query: string; args?: Record<string, unknown>; path: string; mutation: string; arg: string; mutationArgs?: Record<string, unknown> }
-  | { kind: "actions"; id: string; label?: string; description?: string; actions: DashboardAction[] };
+  | { kind: "actions"; id: string; label?: string; description?: string; actions: DashboardAction[] }
+  | DashboardEmbed;
+
+/** A resolved embed block. */
+export interface DashboardEmbed {
+  kind: "embed";
+  id: string;
+  label?: string;
+  description?: string;
+  /** The route as the component declares it (relative to its HTTP mount). */
+  route: string;
+  /** Where the route is served in the deployment (`/agent/dashboard/playground`): set by `composeApp`. */
+  path?: string;
+  height: number | "auto";
+  /** Local name the page calls → name in the manifest (`dashboard:threads` → `@agent/dashboard:threads`). */
+  functions: Record<string, string>;
+}
 
 /** The serializable spec (function names are absolute in the manifest: `@workpool/lib:stats`). */
 export interface DashboardSpec {
@@ -227,8 +262,21 @@ const MAX_TABS = 20;
 const MAX_BLOCKS = 30;
 const MAX_ITEMS = 50;
 export const DASHBOARD_PAGE_MAX = 200;
+/** Bounds of an embed's fixed height, in pixels. */
+export const DASHBOARD_EMBED_HEIGHT = { min: 40, max: 4000 } as const;
+/**
+ * An embed's route: a plain path (no scheme, host, query, fragment, `.`/`..` segment, `//` or percent-escape), at most
+ * 200 characters.
+ */
+const ROUTE = /^\/(?:[A-Za-z0-9_~.-]+\/)*[A-Za-z0-9_~.-]*$/;
+
+/** Whether `route` is a path an embed block may name (the same check `resolveDashboard` runs). */
+export function isDashboardEmbedRoute(route: unknown): route is string {
+  return typeof route === "string" && route.length <= 200 && ROUTE.test(route) && !route.split("/").some((s) => s === "." || s === "..");
+}
 
 type Fns = ReadonlyMap<string, AnyRegisteredFunction | RegisteredHttpAction>;
+type Routes = readonly Pick<HttpRoute, "path" | "pathPrefix" | "method" | "pattern">[];
 
 class SpecError extends Error {}
 
@@ -236,9 +284,9 @@ class SpecError extends Error {}
  * Checks a dashboard spec and serializes it. `functions` are the functions its refs may name (a component's own, or
  * the app's), by local name. Throws with the path of the first problem.
  */
-export function resolveDashboard(input: unknown, functions: Fns, where: string, owner: "component" | "app" = "component"): DashboardSpec {
+export function resolveDashboard(input: unknown, functions: Fns, where: string, owner: "component" | "app" = "component", routes: Routes = []): DashboardSpec {
   try {
-    return new Resolver(functions, owner).spec(input);
+    return new Resolver(functions, owner, routes).spec(input);
   } catch (e) {
     if (e instanceof SpecError) throw new Error(`${where}: dashboard ${e.message}`);
     throw e;
@@ -248,7 +296,7 @@ export function resolveDashboard(input: unknown, functions: Fns, where: string, 
 /** The structural part of the checks, without functions (`defineApp` runs it; `composeApp` resolves the refs). */
 export function checkDashboardShape(input: unknown, where: string): void {
   try {
-    new Resolver(null, "app").spec(input);
+    new Resolver(null, "app", null).spec(input);
   } catch (e) {
     if (e instanceof SpecError) throw new Error(`${where}: dashboard ${e.message}`);
     throw e;
@@ -279,6 +327,8 @@ export function prefixDashboard(spec: DashboardSpec, prefix: string): DashboardS
         return { ...b, query: p(b.query), mutation: p(b.mutation) };
       case "actions":
         return { ...b, actions: b.actions.map(action) };
+      case "embed":
+        return { ...b, functions: Object.fromEntries(Object.entries(b.functions).map(([k, n]) => [k, p(n)])) };
     }
   };
   return {
@@ -286,6 +336,14 @@ export function prefixDashboard(spec: DashboardSpec, prefix: string): DashboardS
     tabs: spec.tabs.map((t) => ({ ...t, blocks: t.blocks.map(block) })),
     functions: Object.fromEntries(Object.entries(spec.functions).map(([n, f]) => [p(n), f])),
   };
+}
+
+/**
+ * The spec with each embed's `path`: where its route is served once the component is mounted at `httpPrefix` (`/` for
+ * the app's own routes), joined the way `composeApp` mounts the component's routes.
+ */
+export function mountDashboard(spec: DashboardSpec, httpPrefix: string): DashboardSpec {
+  return { ...spec, tabs: spec.tabs.map((t) => ({ ...t, blocks: t.blocks.map((b) => (b.kind === "embed" ? { ...b, path: mountPath(httpPrefix, b.route) } : b)) })) };
 }
 
 const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
@@ -310,6 +368,8 @@ class Resolver {
   constructor(
     private readonly fns: Fns | null,
     private readonly owner: "component" | "app",
+    /** The owner's HTTP routes (as declared, before mounting); null in the shape-only check. */
+    private readonly routes: Routes | null,
   ) {}
 
   spec(input: unknown): DashboardSpec {
@@ -432,8 +492,34 @@ class Resolver {
         const o = this.object(input, at, [...common, "actions"]);
         return { kind: "actions", ...base(o), actions: this.actions(o.actions, `${at}.actions`, false) };
       }
+      case "embed": {
+        const o = this.object(input, at, [...common, "route", "height", "functions"]);
+        if (!isDashboardEmbedRoute(o.route)) throw new SpecError(`${at}.route must be a path like "/dashboard/page" (no scheme, host, query, "..", "//" or escapes)`);
+        const route = o.route;
+        if (this.routes) {
+          const hit = matchRoute(this.routes, "GET", route);
+          if (!hit || "methodMismatch" in hit) throw new SpecError(`${at}.route ${route}: not a GET route of this ${this.owner}'s http router`);
+        }
+        const height = o.height === undefined ? "auto" : o.height;
+        if (height !== "auto" && (!Number.isInteger(height) || (height as number) < DASHBOARD_EMBED_HEIGHT.min || (height as number) > DASHBOARD_EMBED_HEIGHT.max)) {
+          throw new SpecError(`${at}.height must be "auto" or an integer in ${DASHBOARD_EMBED_HEIGHT.min}..${DASHBOARD_EMBED_HEIGHT.max}`);
+        }
+        const functions: Record<string, string> = {};
+        if (o.functions !== undefined) {
+          this.list(o.functions, `${at}.functions`, MAX_ITEMS, false).forEach((ref, i) => {
+            const f = this.fn(ref, `${at}.functions[${i}]`, ["query", "mutation", "action"]);
+            // The shape-only check (`checkDashboardShape`) resolves no function: there is no name to list yet.
+            if (!this.fns) return;
+            // Never dropped in silence: a listed function the page could not call is a broken block.
+            if (!f.name) throw new SpecError(`${at}.functions[${i}]: the function has no name`);
+            // Local and manifest names are the same here; `prefixDashboard` prefixes the manifest side.
+            functions[f.name] = f.name;
+          });
+        }
+        return { kind: "embed", ...base(o), route, height: height as number | "auto", functions };
+      }
       default:
-        throw new SpecError(`${at}.kind ${JSON.stringify(input.kind)}: one of stats, table, detail, toggle, actions`);
+        throw new SpecError(`${at}.kind ${JSON.stringify(input.kind)}: one of stats, table, detail, toggle, actions, embed`);
     }
   }
 

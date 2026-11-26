@@ -58,6 +58,7 @@ const CONSUMER = `import { EmberClient } from "@freecorps/ember-client";
 import { useSmoothText } from "@freecorps/ember-agent/react";
 import { usePresence } from "@freecorps/ember-presence/react";
 import { useFlag } from "@freecorps/ember-flags/react";
+import { connect, embedPage, type DashboardBridge } from "@freecorps/ember-dashboard-sdk";
 import { EmberProvider, useMutation, useQuery } from "@freecorps/ember-react";
 import { defineSchema, defineTable, v } from "@freecorps/ember-server";
 import { api } from "../ember/_generated/api";
@@ -74,6 +75,8 @@ export type Client = EmberClient;
 export const smooth = (t: string): [string, { isStreaming: boolean }] => useSmoothText(t);
 export const online = (): readonly { user: string | null; state: { name: string } | undefined }[] => usePresence<{ name: string }>("room:1").members;
 export const fresh = (): boolean => useFlag("newCheckout", false);
+export const embedded = (): Promise<number> => { const dash: DashboardBridge = connect(); return dash.query<number>("lib:count", {}); };
+export const page: string = embedPage({ title: "t", script: "EmberDashboard.connect()" });
 `;
 const CONSUMER_ERR = `import { useQuery } from "@freecorps/ember-react";
 import { api } from "../ember/_generated/api";
@@ -192,7 +195,7 @@ try {
   writeFileSync(join(app, "tsconfig.bundler.json"), tsconfig(bundler, ["src/consumer.ts"]));
   writeFileSync(join(app, "tsconfig.error.json"), tsconfig(bundler, ["src/consumer-error.ts"]));
   writeFileSync(join(app, "tsconfig.nodenext.json"), tsconfig({ module: "NodeNext", moduleResolution: "NodeNext", types: ["node"] }, ["src/nodenext.ts"]));
-  await step("types: server + client + react + agent/react + presence/react + flags/react + generated api (bundler, skipLibCheck off)", () => void tsc("tsconfig.bundler.json"));
+  await step("types: server + client + react + agent/react + presence/react + flags/react + dashboard-sdk + generated api (bundler, skipLibCheck off)", () => void tsc("tsconfig.bundler.json"));
   await step("types: a wrong arg type is rejected (types are not any)", () => {
     const out = tsc("tsconfig.error.json", true);
     if (!/TS2322|TS2345|TS2769/.test(out)) throw new Error(`unexpected tsc output:\n${out}`);
@@ -217,7 +220,7 @@ try {
        c.close();`,
     ]);
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, flags, flags/eval, webhooks, webhooks/verify)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, flags, flags/eval, webhooks, webhooks/verify, dashboard-sdk)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
@@ -240,7 +243,10 @@ try {
        if (wh.webhooks?.name !== "webhooks" || typeof wh.Webhooks !== "function") throw new Error("missing webhooks exports");
        // The Standard Webhooks test vector, through the published /verify entry (WebCrypto on Node).
        const sig = await wv.signWebhook("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", "msg_p5jXN8AQM9LWM0D4loKWxJek", 1614265330, '{"test": 2432232314}');
-       if (sig !== "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=") throw new Error("webhook signature vector: " + sig);`,
+       if (sig !== "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=") throw new Error("webhook signature vector: " + sig);
+       const ds = await import("@freecorps/ember-dashboard-sdk");
+       if (typeof ds.connect !== "function" || typeof ds.EMBED_SDK_SCRIPT !== "string" || !ds.embedPage({ title: "t", script: "1" }).includes(ds.EMBED_SDK_SCRIPT)) throw new Error("missing dashboard-sdk exports");
+       if (!m[7].email.http?.routes?.some((r) => r.path === "/dashboard/preview")) throw new Error("the email component lost its preview route");`,
     ]);
   });
   await step("auth/session-lookup on node: the origin's side of L14 imports alone and checks Ember's signature", () => {

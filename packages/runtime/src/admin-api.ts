@@ -17,7 +17,7 @@ import { parse } from "./wire.ts";
 import { validate, withDefaults } from "@freecorps/ember-values";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 16;
+export const ADMIN_API_LEVEL = 17;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -93,6 +93,9 @@ export const ADMIN_FEATURES = [
   // level 16: the SQL Explorer (one read-only query per call, admin-sql.ts); `data/list` also takes `id` (a direct
   // get), range bounds on the next index field (`gt`/`gte`/`lt`/`lte`) and a full-text `search` through a searchIndex
   "sql",
+  // level 17: an embed block's page (`{ kind: "embed", route }`): the route's response, fetched by the dashboard's
+  // Worker (which serves it in a sandboxed iframe under its own CSP); only routes an embed block names
+  "dashboards/embed",
 ] as const;
 
 /** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`), or null. */
@@ -198,6 +201,11 @@ export interface AdminDeps {
   bucket?: () => R2Bucket | null;
   /** One page of the orphan sweep (files.ts `sweepOrphans`); null without an EMBER_FILES bucket. */
   orphans?: (o: OrphanSweepOptions) => Promise<OrphanSweepPage> | null;
+  /**
+   * Runs the app's GET route at `path` anonymously (no identity) and returns its Response, or null when no route of
+   * the install `scope` (`[]`: the app's own) serves that path. For `dashboards/embed`.
+   */
+  embedRoute?: (path: string, scope: string[]) => Promise<Response | null>;
   /** Ends an identity's live sockets on a shard (`Shard.revokeSockets`). */
   revokeSockets: (shard: string, match: RevokeMatch, opts?: { forMs?: number; close?: boolean }) => Promise<{ sockets: number }>;
 }
@@ -397,6 +405,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     return deps.json({ ...reply, ms, type: info.type, as: identity ? identity.subject : null }, status);
   }
   if (url.pathname === "/api/_ember/dashboards" || url.pathname === "/api/_ember/dashboards/query" || url.pathname === "/api/_ember/dashboards/run") return handleDashboards(request, url, deps);
+  if (url.pathname === "/api/_ember/dashboards/embed") return handleEmbed(request, url, deps);
   const ops = await handleOps(request, url, deps, reply);
   if (ops) return ops;
   if (url.pathname.startsWith("/api/_ember/import/")) return handleImport(request, url, deps);
@@ -549,6 +558,47 @@ async function handleDashboards(request: Request, url: URL, deps: AdminDeps): Pr
   // As `run`: a refused shard is a 409; any other failure is the function's own (400).
   const status = reply.ok ? 200 : statusOf(reply.error.code) === 409 ? 409 : 400;
   return deps.json({ ...reply, ms, type: declared.type, shard }, status);
+}
+
+/** Largest page an embed route may answer with (the dashboard's Worker has the same limit). */
+export const DASHBOARD_EMBED_MAX = 1024 * 1024;
+
+/**
+ * `GET dashboards/embed?dashboard&route`: the page of an embed block (contracts.md "Dashboard", "Embeds"). Only a
+ * route some embed block of that spec names, served by a route of that install (never another component's that would
+ * happen to match the path), run anonymously as a plain GET (no headers of the caller's). The response keeps only
+ * its status, `content-type` and body: the dashboard's Worker re-serves it under its own CSP and sandbox.
+ */
+async function handleEmbed(request: Request, url: URL, deps: AdminDeps): Promise<Response> {
+  if (request.method !== "GET") return deps.error(405, "method_not_allowed", "use GET");
+  const key = url.searchParams.get("dashboard");
+  const route = url.searchParams.get("route") ?? "";
+  const spec = typeof key === "string" ? (deps.config.dashboards ?? []).find((d) => d.key === key) : undefined;
+  if (!spec) return deps.error(404, "unknown_dashboard", `no dashboard ${JSON.stringify(key)} (the app's is "", a component's is its install name)`);
+  const block = spec.tabs.flatMap((t) => t.blocks).find((b): b is Extract<typeof b, { kind: "embed" }> => b.kind === "embed" && b.route === route);
+  if (!block) return deps.error(404, "unknown_embed", `the ${spec.key ? `${spec.key} ` : "app's "}dashboard has no embed block for route ${JSON.stringify(route)}`);
+  if (!deps.embedRoute) return deps.error(501, "not_supported", "this runtime cannot serve embed routes");
+  const res = await deps.embedRoute(block.path ?? block.route, spec.key ? spec.key.split("/") : []);
+  if (!res) return deps.error(404, "unknown_route", `no GET route serves ${block.path ?? block.route} (was it removed from the http router?)`);
+  // The real size, not `content-length` (a route may stream without one): read up to the limit, then cancel.
+  const len = Number(res.headers.get("content-length") ?? "0");
+  const bytes = len > DASHBOARD_EMBED_MAX ? null : await readLimited(res.body, DASHBOARD_EMBED_MAX);
+  if (!bytes) {
+    await res.body?.cancel().catch(() => undefined);
+    return deps.error(413, "too_large", `the embed page is over ${DASHBOARD_EMBED_MAX} bytes`);
+  }
+  // A null-body status (204, 205, 304) keeps its null body: a Response refuses one with a body, even an empty one.
+  const nullBody = res.status === 204 || res.status === 205 || res.status === 304;
+  return new Response(nullBody ? null : (bytes as Uint8Array<ArrayBuffer>), {
+    status: res.status,
+    headers: {
+      "content-type": res.headers.get("content-type") ?? "application/octet-stream",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      // Never rendered from here: the dashboard re-serves it with its own policy.
+      "content-security-policy": "default-src 'none'; sandbox",
+    },
+  });
 }
 
 /**
