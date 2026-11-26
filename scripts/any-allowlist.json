@@ -32,7 +32,7 @@
   "packages/server/src/functions.ts": 44,
   "packages/server/src/indexKinds.ts": 2,
   "packages/server/src/local.ts": 1,
-  "packages/server/src/query.ts": 3,
+  "packages/server/src/query.ts": 2,
   "packages/server/src/schema.ts": 12,
   "packages/server/src/sqlQuery.ts": 3,
   "packages/values/src/refs.ts": 9,

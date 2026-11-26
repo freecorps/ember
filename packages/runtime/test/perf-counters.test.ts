@@ -76,11 +76,12 @@ describe("performance counters (regression guard)", () => {
       row("mutation: transactions", (after.transactions - before.transactions) / N);
       expect(statements).toBeGreaterThan(0);
       // Measured: 2.15 statements (the commit's row + its ring slot; a dedup lookup now and then), 3.6 rows read,
-      // 2 rows written, 3 transactions (batch, its savepoint, the commit's ring row).
+      // 2 rows written, 1 transaction (the items and the commit's ring row; PR 3b: no savepoint while no item fails,
+      // there were 3 before).
       expect(statements).toBeLessThanOrEqual(2.5);
       expect((["select", "insert", "update", "delete", "other"] as const).reduce((a, k) => a + per(k, 1), 0)).toBeLessThanOrEqual(4);
       expect(per("insert", 2) + per("update", 2) + per("delete", 2) + per("other", 2) + per("select", 2)).toBeLessThanOrEqual(2);
-      expect((after.transactions - before.transactions) / N).toBeLessThanOrEqual(3);
+      expect((after.transactions - before.transactions) / N).toBeLessThanOrEqual(1);
       w.c.close();
     }
 
