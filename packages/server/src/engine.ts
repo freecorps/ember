@@ -1956,7 +1956,7 @@ class EngineImpl implements Engine {
   /** `ctx.db` of a mutation. Components never reach the app's tables, and only app tables have triggers. */
   private mutationDb(scope: Scope, st: MutationState, applier: boolean, filesExec: Tx["exec"]) {
     // (Replica tables too: their changes fire the app's triggers when the applier writes them.)
-    return this.writer(st.tx, st.now, st.random, st.changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
+    return this.writer(st.tx, st.now, st.random, st.changes, scope, filesExec, scope === this.scopes.root || scope === this.scopes.applier ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
   }
 
   /** `ctx.storage` of a mutation (its `FileStore` on first use). */
