@@ -285,8 +285,15 @@ export const CHANGE_LOG_ENTRY_MAX_BYTES = 128 * 1024;
 /**
  * The `changes` of a version whose changes did not fit (`changeLogEntryMaxBytes`): JSON `null`. A resume that needs
  * that version answers with a full snapshot (`changesSince` → null), as for a version the ring no longer holds.
+ *
+ * Rollback: runtimes before the ceiling parse every row of a resume's range as an array. So the version also gets a
+ * second row, out of the ring (`slot = -version`, `oversizedSlot`): their `changesSince` then counts one row more than
+ * versions in any range that holds it, the check they already make for a ring that lost a version, and answers with a
+ * snapshot before parsing anything. The extra row goes once the ring slot of its version is reused (`dropOversized`);
+ * until then it is outside every range a resume can ask for once that version is out of the ring.
  */
 const OVERSIZED_CHANGES = "null";
+const oversizedSlot = (version: number): number => -version;
 const entryCap = (cfg: EmberConfig): number => {
   const c = cfg.changeLogEntryMaxBytes;
   return c !== undefined && Number.isFinite(c) && c >= 0 ? Math.floor(c) : CHANGE_LOG_ENTRY_MAX_BYTES;
@@ -1054,6 +1061,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     this.version = Math.max(Number(this.getMeta("version") ?? "0"), Number(newest ?? 0));
     this.loadDedup();
     if (!cached) this.trimRing();
+    this.loadOversized();
     this.ring = null;
     this.volatile.clear();
     this.volatileSizes.clear();
@@ -1475,6 +1483,28 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       this.driver.exec("DELETE FROM _ember_changes WHERE slot >= ?", size);
       this.driver.exec("UPDATE _ember_changes SET dedup = NULL, acks = NULL WHERE dedup IS NOT NULL OR acks IS NOT NULL");
     });
+  }
+
+  /**
+   * Versions with an out-of-ring row (`OVERSIZED_CHANGES`), oldest first. Read once per load; one whose ring slot no
+   * longer holds it (a ring that grew or shrank since) goes then.
+   */
+  private oversizedRows: number[] = [];
+
+  private loadOversized(): void {
+    const read = () => this.driver.exec("SELECT version FROM _ember_changes WHERE slot < 0 ORDER BY version").rows.map((r) => Number(r.version));
+    this.oversizedRows = read();
+    if (!this.oversizedRows.length) return;
+    this.driver.exec("DELETE FROM _ember_changes WHERE slot < 0 AND version NOT IN (SELECT version FROM _ember_changes WHERE slot >= 0)");
+    this.oversizedRows = read();
+  }
+
+  /** At the commit of version `v` (in its transaction): out-of-ring rows of versions the ring no longer holds go. */
+  private dropOversized(v: number): void {
+    const gone = v - ringSize(this.cfg);
+    while (this.oversizedRows.length && this.oversizedRows[0]! <= gone) {
+      this.driver.exec("DELETE FROM _ember_changes WHERE slot = ?", oversizedSlot(this.oversizedRows.shift()!));
+    }
   }
 
   // ------------------------------------------------------------------ meta
@@ -2531,7 +2561,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         text = OVERSIZED_CHANGES;
         this.ringPending!.oversized = v;
         this.stats.changeLogOversized++;
+        // The row that makes a runtime before the ceiling see the gap (`OVERSIZED_CHANGES`).
+        this.driver.exec("INSERT OR REPLACE INTO _ember_changes(slot, version, at, changes) VALUES (?, ?, ?, ?)", oversizedSlot(v), v, now, OVERSIZED_CHANGES);
+        this.oversizedRows.push(v);
       }
+      this.dropOversized(v);
       this.driver.exec(
         "INSERT INTO _ember_changes(slot, version, at, changes, dedup, acks) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(slot) DO UPDATE SET version = excluded.version, at = excluded.at, changes = excluded.changes, dedup = excluded.dedup, acks = excluded.acks",
         v % ringSize(this.cfg), v, now, text, ring.dedup, ring.acks,
@@ -4126,6 +4160,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     }
     if (!missing) return out;
     const rows = this.driver.exec("SELECT version, changes FROM _ember_changes WHERE version > ? ORDER BY version", version).rows;
+    // A version gone from the ring (one row short) or an oversized one in range (its out-of-ring row: one more).
     if (rows.length !== this.version - version) return null;
     // Bounded: a resume burst keeps a few thousand changes; dropped whole (and re-read) past that.
     if (this.parsedSize > 20_000) {
