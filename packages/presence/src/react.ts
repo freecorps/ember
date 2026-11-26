@@ -19,7 +19,7 @@ export { Presence, type Cursor, type Typing, type PresenceOptions } from "./pres
 type RoomOptions = Omit<PresenceOptions, "state">;
 
 interface Held {
-  presence: Presence<any, any>;
+  presence: Presence<unknown, unknown>;
   refs: number;
   closing: ReturnType<typeof setTimeout> | null;
 }
@@ -32,7 +32,7 @@ export function retainPresence<S = unknown, C = DefaultCursor>(client: ChannelSo
   if (!map) rooms.set(client, (map = new Map()));
   const key = `${opts.shard ?? ""}\u0000${room}`;
   let held = map.get(key);
-  if (!held) map.set(key, (held = { presence: new Presence<S, C>(client, room, opts), refs: 0, closing: null }));
+  if (!held) map.set(key, (held = { presence: new Presence<S, C>(client, room, opts) as unknown as Presence<unknown, unknown>, refs: 0, closing: null }));
   else if (opts.state !== undefined) held.presence.setState(opts.state);
   if (held.closing) clearTimeout(held.closing);
   held.closing = null;
@@ -41,7 +41,7 @@ export function retainPresence<S = unknown, C = DefaultCursor>(client: ChannelSo
   const m = map;
   let released = false;
   return {
-    presence: h.presence as Presence<S, C>,
+    presence: h.presence as unknown as Presence<S, C>,
     release: () => {
       if (released) return;
       released = true;
