@@ -522,11 +522,12 @@ describe("workflows component", () => {
     expect(h.status(id)).toMatchObject({ status: "completed", result: [1, 2, 2] });
   });
 
-  test("no index without a reader: workflows.by_status and steps.by_event are gone (an index write each)", () => {
+  test("no index without a reader: steps.by_event is gone; workflows.by_status serves list", () => {
     const h = harness();
     const names = h.sql(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name LIKE 'workflows$%'`).map((r: any) => String(r.name));
     expect(names.some((n) => n.includes("by_workflow"))).toBe(true);
-    expect(names.filter((n) => n.includes("by_status") || n.includes("by_event"))).toEqual([]);
+    expect(names.filter((n) => n.includes("by_event"))).toEqual([]);
+    expect(names.filter((n) => n.includes("by_status"))).toEqual(["workflows$workflows__by_status"]);
   });
 
   test("cancel with a stale pendingJob (the action that already ran) cancels the next job only", async () => {

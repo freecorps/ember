@@ -38,4 +38,15 @@ describe("workflows dashboard", () => {
     expect(engine.runQuery("@workflows/dashboard:detail", { id: ids[0]! }).value).toBeNull();
     expect(list({ status: "running" }).page).toHaveLength(2);
   });
+
+  test("one status is a range of by_status: it never reads the other workflows", () => {
+    const composed = composeApp({ schema, functions: { flows }, app });
+    const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver: createNodeSqliteDriver(), now: () => 1_700_000_000_000 });
+    engine.migrate();
+    const ids = Array.from({ length: 40 }, (_, i) => engine.runMutation("flows:start", { user: `u${i}` }).value as string);
+    engine.runMutation("@workflows/lib:cancel", { id: ids[5]! });
+    const r = engine.runQuery("@workflows/dashboard:list", { status: "canceled", paginationOpts: { numItems: 10, cursor: null } });
+    expect((r.value as { page: Array<{ _id: string }> }).page.map((w) => w._id)).toEqual([ids[5]]);
+    expect(r.usage!.rowsRead).toBeLessThan(10);
+  });
 });

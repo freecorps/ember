@@ -48,7 +48,9 @@ const schema = defineSchema({
        * when a step schedules a job again. Absent in rows from older versions (= no inline run).
        */
       driving: v.optional(v.number()),
-    }),
+    })
+      // `list` by status, newest first (a status changes at most twice: the entry is written on start and on finish).
+      .index("by_status", ["status"]),
     steps: defineTable({
       workflow: v.id("workflows"),
       index: v.number(),
@@ -67,7 +69,7 @@ const schema = defineSchema({
       completedAt: v.optional(v.number()),
     })
       // Only `by_workflow`: steps run one at a time, so a waiting event step is the last one (`stepCount - 1`). The
-      // `by_event` and `workflows.by_status` indexes of older versions had no reader: dropped (an index write each).
+      // `by_event` index of older versions had no reader: dropped (an index write each).
       .index("by_workflow", ["workflow", "index"]),
     /** Events sent before the workflow waits for them. */
     events: defineTable({ workflow: v.id("workflows"), event: v.string(), payload: v.optional(v.any()) }).index("by_workflow", ["workflow", "event"]),
@@ -576,21 +578,24 @@ export const functions = {
 
 // ------------------------------------------------------------------------------------------------ dashboard
 
+/** Steps of a workflow's journal its dashboard detail shows (the last ones). */
+const STEPS_SHOWN = 500;
+
 /** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
 const dashboardFunctions = {
-  /** Workflows in this shard, newest first (optionally one status). */
+  /** Workflows in this shard, newest first (optionally one status, through `by_status`: never a scan of the table). */
   list: internalQuery({
     args: { status: v.optional(status), paginationOpts: paginationOptsValidator },
     handler: (ctx, { status: s, paginationOpts }) => {
-      const q = ctx.db.query("workflows").order("desc");
-      const page = (s ? q.filter((f) => f.eq(f.field("status"), s)) : q).paginate(paginationOpts);
+      const q = s ? ctx.db.query("workflows").withIndex("by_status", (r) => r.eq("status", s)).order("desc") : ctx.db.query("workflows").order("desc");
+      const page = q.paginate(paginationOpts);
       return {
         ...page,
         page: page.page.map((w) => ({ _id: w._id, driver: w.driver.startsWith("&") ? w.driver.slice(1) : w.driver, status: w.status, steps: w.stepCount, error: w.error ?? null, startedAt: w.startedAt, finishedAt: w.finishedAt ?? null })),
       };
     },
   }),
-  /** One workflow with its journal as a timeline; null when unknown. */
+  /** One workflow with the last `STEPS_SHOWN` steps of its journal as a timeline (`stepCount` has them all); null when unknown. */
   detail: internalQuery({
     args: { id: v.string() },
     handler: (ctx, { id }) => {
@@ -599,7 +604,9 @@ const dashboardFunctions = {
       const steps = ctx.db
         .query("steps")
         .withIndex("by_workflow", (q) => q.eq("workflow", w._id))
-        .collect()
+        .order("desc")
+        .take(STEPS_SHOWN)
+        .reverse()
         .map((x) => ({
           at: x.startedAt,
           title: `#${x.index} ${x.kind} ${x.name}`,
