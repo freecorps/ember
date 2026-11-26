@@ -72,7 +72,7 @@
 
 import type { WebSocketConstructor, WebSocketLike } from "./client.ts";
 import { jwtPayload } from "./jwt.ts";
-import { PING, PONG } from "./protocol.ts";
+import { MAX_BATCH_BYTES, MAX_BATCH_MESSAGES, PING, PONG } from "./protocol.ts";
 import { FrameQueue } from "./zframe.ts";
 
 /** The part of `navigator.locks` (Web Locks API) used here. */
@@ -922,9 +922,7 @@ class Leader {
   /** `unsub` of prefixed qids on the shared socket. */
   private unsubShared(g: Group, qids: string[]): void {
     if (!g.ready || !qids.length) return;
-    const unsubs = qids.map((qid) => ({ t: "unsub", qid }));
-    if (g.batch) for (let i = 0; i < unsubs.length; i += 256) this.real(g, JSON.stringify(unsubs.slice(i, i + 256)));
-    else for (const u of unsubs) this.real(g, JSON.stringify(u));
+    this.flush(g, qids.map((qid) => ({ t: "unsub", qid })), g.batch);
   }
 
   private readonly onInbox = (ev: { data: unknown }) => {
@@ -1062,9 +1060,11 @@ class Leader {
    * the value. Null when the leader cannot tell: it does not hold the value and the resume does not fit, or the query
    * fails now (the `sub` then goes to the shard on its own: the shard runs a failing query again for a new `sub`, so a
    * failure that cleared is not kept, and a value retained from before the failure is never confirmed as current).
+   * Null too while the shared socket's token has expired (`authExpired`): the shard would refuse that `sub`, and the
+   * leader never hands out a value it holds until a fresh token is in (the `sub` goes to the shard, which refuses it).
    */
   private answerFrom(g: Group, s: Shared, qid: string | number, resume: Resume | undefined): unknown[] | null {
-    if (s.error) return null;
+    if (s.error || g.expired) return null;
     const version = Math.max(s.version, g.patchVersion);
     const fits =
       !!resume && g.ident && s.since !== null && resume.epoch === g.ready?.epoch && resume.ik !== undefined && resume.ik === s.ik && typeof resume.version === "number" && resume.version >= s.since && resume.version <= version;
@@ -1382,10 +1382,31 @@ class Leader {
     else for (const x of back) this.sendTo(m, JSON.stringify(x));
   }
 
+  /**
+   * Messages to the shard. Feature "batch": as array frames of at most `MAX_BATCH_MESSAGES` and `MAX_BATCH_BYTES` each
+   * (the shard refuses a larger batch whole; split, they are still handled in order). Many fallback `sub`s of one
+   * shard frame (`snapShared`), the unsubs of a tab that leaves, or a member's full frame with its qids prefixed can
+   * go past them.
+   */
   private flush(g: Group, out: unknown[], array: boolean): void {
     if (!out.length) return;
-    if (array) this.real(g, JSON.stringify(out));
-    else for (const x of out) this.real(g, JSON.stringify(x));
+    if (!array) {
+      for (const x of out) this.real(g, JSON.stringify(x));
+      return;
+    }
+    let chunk: string[] = [];
+    let bytes = 2;
+    for (const x of out) {
+      const f = JSON.stringify(x);
+      if (chunk.length && (chunk.length >= MAX_BATCH_MESSAGES || bytes + f.length + 1 > MAX_BATCH_BYTES)) {
+        this.real(g, `[${chunk.join(",")}]`);
+        chunk = [];
+        bytes = 2;
+      }
+      chunk.push(f);
+      bytes += f.length + 1;
+    }
+    this.real(g, `[${chunk.join(",")}]`);
   }
 
   /** A frame from the shard: each message to the member it belongs to (by qid prefix, or mid), the rest to all. */

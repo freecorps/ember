@@ -6,6 +6,7 @@ import { FakeBrowser, FakeFunctionError, type FakeTab } from "../src/testing.ts"
 import { multiTabSupported, unsafeRef, type EmberClientOptions, type QueryReference, type QuerySnapshot } from "../src/index.ts";
 import { createMultiTab, multiTab, socketIdentityKey, type LockManagerLike, type MultiTabOptions } from "../src/multitab.ts";
 import { MemoryPendingStorage } from "../src/storage.ts";
+import { PROTOCOL_VERSION } from "../src/protocol.ts";
 import type { WebSocketConstructor } from "../src/client.ts";
 import type { FakeEmberServer, FakeSocket } from "../src/testing.ts";
 
@@ -1028,5 +1029,90 @@ describe("FakeBrowser (testing helper)", () => {
     from.postMessage({ n: 1 });
     await tick(5);
     expect(seen).toEqual([{ n: 1 }, { n: 1 }]);
+  });
+});
+
+/** A leader hub of its own and raw virtual sockets on it (frames written by the test, as a client would). */
+function rawLeader(server: FakeEmberServer) {
+  const browser = new FakeBrowser();
+  const tab = browser.tab();
+  const hub = createMultiTab({ name: `raw${Math.random()}`, locks: tab.locks, BroadcastChannel: tab.BroadcastChannel, lifecycle: false, openTimeoutMs: 2_000, WebSocket: server.WebSocket, heartbeat: false })!;
+  const WS = hub.socketConstructor();
+  const member = async (hello: Record<string, unknown>) => {
+    const ws = new WS(`wss://ember.test/ws?shard=${encodeURIComponent(SHARD)}`);
+    const got: Array<Record<string, unknown>> = [];
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(String(ev.data)) as unknown;
+      for (const x of Array.isArray(m) ? m : [m]) got.push(x as Record<string, unknown>);
+    };
+    await until(() => ws.readyState === 1);
+    ws.send(JSON.stringify({ t: "hello", protocol: PROTOCOL_VERSION, clientId: "raw-client", features: ["batch", "ident"], ...hello }));
+    await until(() => got.some((m) => m.t === "ready"));
+    const snaps = (qid: string) => got.filter((m) => (m.t === "snap" || m.t === "err") && m.qid === qid);
+    return { ws, got, snaps, send: (msgs: unknown[]) => ws.send(JSON.stringify(msgs)) };
+  };
+  return { hub, member, close: () => hub.close() };
+}
+
+describe("multiTab: the leader's frames to the shard", () => {
+  it("many fallback subs out of one shard frame go in batches within the shard's limit (MAX_BATCH_MESSAGES)", async () => {
+    const server = messagesServer({ batch: true, ident: true });
+    const raw = rawLeader(server);
+    try {
+      await until(() => raw.hub.role === "leader");
+      const a = await raw.member({});
+      const b = await raw.member({});
+      const ready = a.got.find((m) => m.t === "ready")!;
+      const args = { channel: "g" };
+      // The value once, to resume from it; then nobody holds it.
+      a.send([{ t: "sub", qid: "first", fn: "messages:list", args }]);
+      await until(() => a.snaps("first").length === 1);
+      const snap = a.snaps("first")[0]!;
+      a.send([{ t: "unsub", qid: "first" }]);
+      await until(() => server.subscriptionCount(SHARD) === 0);
+      // One `sub` with a resume the shard answers `unchanged` (the leader then holds no value), 600 waiting on it
+      // without one: each goes to the shard on its own, out of that one answer.
+      const plain = (tag: string, n: number) => Array.from({ length: n }, (_, i) => ({ t: "sub", qid: `${tag}${i}`, fn: "messages:list", args }));
+      a.send([{ t: "sub", qid: "r", fn: "messages:list", args, resume: { version: snap.version, epoch: ready.epoch, ik: snap.ik } }, ...plain("a", 300)]);
+      b.send(plain("b", 300));
+      await until(() => server.subscriptionCount(SHARD) === 601, 3000);
+      const [ws] = shardSockets(server);
+      expect(Math.max(...ws!.batchSizes)).toBeLessThanOrEqual(512);
+      expect(ws!.received.filter((m) => m !== "pong" && m.t === "err")).toEqual([]);
+      expect(a.snaps("r")[0]).toMatchObject({ t: "snap", unchanged: true });
+      for (let i = 0; i < 300; i++) {
+        expect(a.snaps(`a${i}`)[0]).toMatchObject({ t: "snap", value: [] });
+        expect(b.snaps(`b${i}`)[0]).toMatchObject({ t: "snap", value: [] });
+      }
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("after the shared socket's authExpired, a new sub is not answered from the leader's copy: it goes to the shard", async () => {
+    let skew = 0;
+    const server = messagesServer({ batch: true, ident: true, verify: verifyJwt, now: () => Date.now() + skew });
+    const raw = rawLeader(server);
+    try {
+      await until(() => raw.hub.role === "leader");
+      // Unexpired here; the shard's clock is ahead (or the token is cut short there): it expires it first.
+      const token = jwt({ sub: "ana", exp: Math.floor(Date.now() / 1000) + 60 });
+      const a = await raw.member({ token });
+      a.send([{ t: "sub", qid: "q1", fn: "messages:list", args: { channel: "g" } }]);
+      await until(() => a.snaps("q1").length === 1);
+      expect(a.snaps("q1")[0]).toMatchObject({ t: "snap", value: [] });
+      skew = 120_000;
+      a.send([{ t: "sub", qid: "q2", fn: "messages:list", args: { channel: "h" } }]);
+      await until(() => a.got.some((m) => m.t === "authExpired"));
+      // Another tab of the same identity (same token: no renewal) subscribes to the query the leader holds.
+      const b = await raw.member({ token });
+      await until(() => b.got.some((m) => m.t === "authExpired"));
+      b.send([{ t: "sub", qid: "q1", fn: "messages:list", args: { channel: "g" } }]);
+      await until(() => b.snaps("q1").length === 1);
+      expect(b.snaps("q1")[0]).toMatchObject({ t: "err", code: "auth_expired" });
+      expect(b.got.filter((m) => m.t === "snap")).toEqual([]);
+    } finally {
+      raw.close();
+    }
   });
 });
