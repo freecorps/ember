@@ -1,0 +1,67 @@
+{
+  "name": "@freecorps/ember-analytics",
+  "version": "0.9.0",
+  "description": "Product analytics component for Ember on Cloudflare: events go to Workers Analytics Engine (one data point each, no Durable Object write), an HTTP ingest route with caps and optional rate limiting, an optional gzip NDJSON archive in R2, counts, funnels and retention through the Analytics Engine SQL API (cached), a tiny batching browser client and a dashboard screen.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "component",
+    "analytics",
+    "product-analytics",
+    "analytics-engine",
+    "funnel",
+    "retention",
+    "events"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/analytics#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/analytics"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "@freecorps/ember-source": "./src/client.ts",
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run && vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@freecorps/ember-rate-limit": "workspace:*",
+    "@freecorps/ember-server": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@freecorps/ember-testing": "workspace:*",
+    "wrangler": "^4.157.0"
+  }
+}
