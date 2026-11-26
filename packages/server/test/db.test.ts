@@ -413,34 +413,42 @@ describe("ctx.db.insert(table, (id) => doc)", () => {
     const r = s.engine.runMutation(
       mutationGeneric((ctx: any) => {
         const caught: string[] = [];
+        // written before the attempts: each failed callback patches it, and the patch must not stay
+        const kept = ctx.db.insert("tasks", { label: "kept" });
+        const label = () => (ctx.db.get(kept) as { label: string }).label;
+        const labels: string[] = [];
         const attempt = (build: (id: string) => unknown) => {
           try {
             ctx.db.insert("tasks", build);
           } catch (e) {
             caught.push((e as { code?: string }).code ?? (e as Error).message);
           }
+          labels.push(label());
         };
         // the document it returns is refused after it wrote and scheduled
         attempt((id) => {
+          ctx.db.patch(kept, { label: "changed by a refused build" });
           ctx.db.insert("notes", { task: id });
           ctx.scheduler.runAfter(0, makeFunctionReference("tasks:run"), { id });
           return { label: 1 };
         });
         // the callback itself throws after writing
         attempt((id) => {
+          ctx.db.patch(kept, { label: "changed by a throwing build" });
           ctx.db.insert("notes", { task: id });
           ctx.scheduler.runAfter(0, makeFunctionReference("tasks:run"), { id });
           throw new Error("boom");
         });
-        // what the mutation wrote before stays
-        ctx.db.insert("tasks", (id: string) => ({ label: "kept", job: ctx.scheduler.runAfter(0, makeFunctionReference("tasks:run"), { id }) }));
-        return caught;
+        // the mutation goes on: a later callback insert commits with it
+        ctx.db.insert("tasks", (id: string) => ({ label: "after", job: ctx.scheduler.runAfter(0, makeFunctionReference("tasks:run"), { id }) }));
+        return { caught, labels };
       }) as any,
     );
-    expect(r.value).toEqual(["ValidationError", "boom"]);
+    expect(r.value).toEqual({ caught: ["ValidationError", "boom"], labels: ["kept", "kept"] });
     expect(s.sql(`SELECT count(*) AS n FROM notes`)[0]!.n).toBe(0);
-    expect(s.sql(`SELECT label FROM tasks`).map((x) => x.label)).toEqual(["kept"]);
+    expect(s.sql(`SELECT label FROM tasks ORDER BY label`).map((x) => x.label)).toEqual(["after", "kept"]);
     expect(r.scheduled.length).toBe(1);
-    expect(r.changes.map((c: { table: string }) => c.table)).toEqual(["tasks"]);
+    // the two inserts that stayed; the rolled-back patches of "kept" are not changes
+    expect(r.changes.map((c: { table: string }) => c.table)).toEqual(["tasks", "tasks"]);
   });
 });
