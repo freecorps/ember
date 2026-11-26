@@ -71,15 +71,49 @@ export interface EmberAuthExtras {
 /** Options Ember owns; setting them in auth.config.ts is an error. */
 export const INJECTED_OPTIONS = ["database", "secret", "secondaryStorage"] as const;
 
-export type EmberAuthConfig<O extends BetterAuthOptions = BetterAuthOptions> = O & {
+/**
+ * Claims every Ember session's token carries (`jwt.definePayload` in `resolveAuthOptions`; a session-token or cookie
+ * identity has the same): the Better Auth session id and the user's email, name and verification.
+ */
+export type SessionClaims = {
+  /** Better Auth session id. */
+  sid: string;
+  email: string;
+  name: string;
+  emailVerified: boolean;
+};
+/** With the `organization()` plugin: the session's active organization (absent when none is active). */
+export type OrganizationClaims = { org?: string };
+
+type Expand<T> = { [K in keyof T]: T[K] };
+type HasPlugin<O, Id extends string> = O extends { plugins?: infer P } ? (P extends ReadonlyArray<infer E> ? ([Extract<E, { id: Id }>] extends [never] ? false : true) : false) : false;
+type CustomClaims<O> = O extends { ember?: { claims?: infer F } } ? (F extends (...args: never) => infer R ? Awaited<R> : {}) : {};
+
+/**
+ * The claims of an identity signed in with these options: `SessionClaims`, `org` with the organization plugin, and
+ * what `ember.claims` returns. Those are optional: only a JWT carries them (an identity from a session token or the
+ * session cookie has the Better Auth claims alone).
+ */
+export type ClaimsOfOptions<O> = Expand<SessionClaims & (HasPlugin<O, "organization"> extends true ? OrganizationClaims : {}) & Partial<CustomClaims<O>>>;
+
+/**
+ * The claims of the identities an `ember/auth.config.ts` signs in (`ClaimsOf<typeof authConfig>`): what codegen prints
+ * in `_generated/claims.d.ts`, typing `ctx.auth.require().claims` and `fromAuth("...")`. `SessionClaims` for a config
+ * that does not tell (plain Better Auth options).
+ */
+export type ClaimsOf<C> = C extends { readonly __claims?: infer K } ? Exclude<K, undefined> : SessionClaims;
+
+export type EmberAuthConfig<O extends BetterAuthOptions = BetterAuthOptions, Claims = SessionClaims> = O & {
   ember?: EmberAuthExtras;
   /** Brand checked by the CLI so it can tell an Ember auth config from a random default export. */
   readonly __emberAuth: true;
+  /** Type only (never set): the claims of the identities it signs in (`ClaimsOf`). */
+  readonly __claims?: Claims;
 };
 
 export type DefineAuthInput = Omit<BetterAuthOptions, (typeof INJECTED_OPTIONS)[number]> & { ember?: EmberAuthExtras };
 
-function defineAuthValue<const O extends DefineAuthInput>(options: O): EmberAuthConfig<O & BetterAuthOptions> {
+function defineAuthValue<const O extends DefineAuthInput>(options: O): EmberAuthConfig<O & BetterAuthOptions, ClaimsOfOptions<O>> {
   for (const k of INJECTED_OPTIONS) {
     if (k in (options as Record<string, unknown>)) {
       throw new Error(`defineAuth: "${k}" is managed by Ember (auth runs in the Auth Durable Object); remove it from auth.config.ts`);
@@ -91,7 +125,7 @@ function defineAuthValue<const O extends DefineAuthInput>(options: O): EmberAuth
     if (pluginIds.has(p.id)) throw new Error(`defineAuth: plugin "${p.id}" is listed twice`);
     pluginIds.add(p.id);
   }
-  return Object.freeze({ ...options, __emberAuth: true as const }) as unknown as EmberAuthConfig<O & BetterAuthOptions>;
+  return Object.freeze({ ...options, __emberAuth: true as const }) as unknown as EmberAuthConfig<O & BetterAuthOptions, ClaimsOfOptions<O>>;
 }
 
 /** Checks the parts of the `ember` block that are plain data (embedded in the Worker entry, read at codegen). */
@@ -135,13 +169,15 @@ export type AuthEnv = Record<string, unknown>;
  * `defineAuth((env) => ({...}))`: options that depend on the environment (a variable, a binding a hook writes to). Codegen
  * calls it with an empty `env` (the tables must not depend on it); the Worker and the `Auth` DO with their own.
  */
-export type EmberAuthFactory = {
+export type EmberAuthFactory<Claims = SessionClaims> = {
   readonly __emberAuth: true;
   readonly factory: (env: AuthEnv) => EmberAuthConfig;
+  /** Type only (never set): the claims of the identities it signs in (`ClaimsOf`). */
+  readonly __claims?: Claims;
 };
 
-export function defineAuth<const O extends DefineAuthInput>(build: (env: AuthEnv) => O): EmberAuthFactory;
-export function defineAuth<const O extends DefineAuthInput>(options: O): EmberAuthConfig<O & BetterAuthOptions>;
+export function defineAuth<const O extends DefineAuthInput>(build: (env: AuthEnv) => O): EmberAuthFactory<ClaimsOfOptions<O>>;
+export function defineAuth<const O extends DefineAuthInput>(options: O): EmberAuthConfig<O & BetterAuthOptions, ClaimsOfOptions<O>>;
 export function defineAuth(input: DefineAuthInput | ((env: AuthEnv) => DefineAuthInput)): EmberAuthConfig | EmberAuthFactory {
   if (typeof input === "function") {
     return Object.freeze({ __emberAuth: true as const, factory: (env: AuthEnv) => defineAuthValue(input(env)) });

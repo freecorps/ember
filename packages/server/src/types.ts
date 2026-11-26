@@ -52,16 +52,23 @@ export interface TableLayout {
   expr(path: string, rowRef?: string): string;
 }
 
-/** Verified caller identity (kept small: it lives in a 16 KB socket attachment). */
-export type Identity = {
+/** The claims of an identity when nothing declares them (no `ember/auth.config.ts`): any name, `unknown` values. */
+export type AnyClaims = Record<string, unknown>;
+/**
+ * Verified caller identity (kept small: it lives in a 16 KB socket attachment). `Claims`: what its token carries,
+ * typed by `_generated/claims.d.ts` (from `ember/auth.config.ts`) in the app's `ctx.auth`; `AnyClaims` otherwise.
+ */
+export type Identity<Claims = AnyClaims> = {
   subject: string;
   issuer?: string;
   /** Expiry, seconds since epoch (JWT `exp`). */
   exp?: number;
   /** When the token was issued, seconds since epoch (JWT `iat`): tells a new sign-in from a revoked token. */
   iat?: number;
-  claims?: Record<string, unknown>;
+  claims?: Claims;
 };
+/** The names `fromAuth` takes for these claims (any string when they are not declared). */
+export type ClaimName<Claims> = string extends keyof Claims ? string : Extract<keyof Claims, string>;
 /**
  * Who a run is for. `system`: a run the server started by itself (a scheduled job, a cron, a component hook), with no
  * caller: `fromAuth` shards do not check a claim then (the job runs on the shard it was scheduled on). Never set from a
