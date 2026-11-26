@@ -78,6 +78,8 @@ export interface UpdateRequest {
   format: "multipart" | "json";
   /** The media type `accept` selected (the JSON form's `content-type`). */
   mediaType: MediaType;
+  /** `accept` also allows multipart (q above 0): a directive goes as multipart though JSON ranked higher. */
+  multipartAccepted: boolean;
 }
 
 /** The media types a response can have: multipart, or the manifest alone as JSON. */
@@ -112,6 +114,7 @@ export function parseUpdateRequest(headers: Headers, defaultChannel: string | nu
     return x && x.length <= 64 ? x : null;
   };
   const clientRaw = (headers.get("eas-client-id") ?? headers.get("expo-eas-client-id") ?? "").trim();
+  const qualities = acceptQualities(headers.get("accept"));
   const mediaType = negotiate(headers.get("accept"));
   if (!mediaType) throw new ProtocolError(406, "accept must allow multipart/mixed, application/expo+json or application/json");
   return {
@@ -125,6 +128,7 @@ export function parseUpdateRequest(headers: Headers, defaultChannel: string | nu
     expectSignature: headers.has("expo-expect-signature"),
     format: mediaType === "multipart/mixed" ? "multipart" : "json",
     mediaType,
+    multipartAccepted: qualities["multipart/mixed"] > 0,
   };
 }
 
@@ -139,7 +143,21 @@ const MEDIA_TYPES: readonly MediaType[] = ["multipart/mixed", "application/json"
  * parameter, or charset, makes it match nothing here); parameters after `q` are extensions and are ignored.
  */
 export function negotiate(accept: string | null): MediaType | null {
-  if (accept === null || accept.trim() === "") return "multipart/mixed";
+  const q = acceptQualities(accept);
+  let best: MediaType | null = null;
+  let bestQ = 0;
+  for (const t of MEDIA_TYPES) if (q[t] > bestQ) [best, bestQ] = [t, q[t]];
+  return best;
+}
+
+/**
+ * The q-value `accept` gives each media type we can send (0: not acceptable), by the rules of `negotiate`. A range
+ * whose `charset=utf-8` matches what is sent is more specific than the bare type (`application/json;charset=utf-8;q=0`
+ * excludes JSON though `application/json` allows it).
+ */
+export function acceptQualities(accept: string | null): Record<MediaType, number> {
+  const out: Record<MediaType, number> = { "multipart/mixed": 0, "application/json": 0, "application/expo+json": 0 };
+  if (accept === null || accept.trim() === "") return { ...out, "multipart/mixed": 1 };
   const ranges: Array<{ type: string; q: number; utf8Only: boolean; other: boolean }> = [];
   for (const item of accept.split(",")) {
     const [type, ...params] = item.split(";").map((s) => s.trim().toLowerCase());
@@ -157,8 +175,6 @@ export function negotiate(accept: string | null): MediaType | null {
     }
     ranges.push({ type, q, utf8Only, other });
   }
-  let best: MediaType | null = null;
-  let bestQ = 0;
   for (const t of MEDIA_TYPES) {
     const wildcard = `${t.slice(0, t.indexOf("/"))}/*`;
     let specificity = -1;
@@ -166,13 +182,15 @@ export function negotiate(accept: string | null): MediaType | null {
     for (const r of ranges) {
       // We send multipart with a boundary of our own and JSON as UTF-8: a range asking for something else is not this.
       if (r.other || (r.utf8Only && t === "multipart/mixed")) continue;
-      const s = r.type === t ? 2 : r.type === wildcard ? 1 : r.type === "*/*" ? 0 : -1;
+      const base = r.type === t ? 4 : r.type === wildcard ? 2 : r.type === "*/*" ? 0 : -1;
+      if (base < 0) continue;
+      const s = base + (r.utf8Only ? 1 : 0);
       if (s > specificity) [specificity, q] = [s, r.q];
-      else if (s === specificity && s >= 0) q = Math.max(q, r.q);
+      else if (s === specificity) q = Math.max(q, r.q);
     }
-    if (specificity >= 0 && q > bestQ) [best, bestQ] = [t, q];
+    out[t] = specificity >= 0 ? q : 0;
   }
-  return best;
+  return out;
 }
 
 /**
@@ -468,7 +486,7 @@ export class SigningKeyMissing extends Error {}
  */
 export async function renderResponse(
   outcome: Outcome,
-  req: Pick<UpdateRequest, "protocolVersion" | "expectSignature" | "format"> & { mediaType?: MediaType },
+  req: Pick<UpdateRequest, "protocolVersion" | "expectSignature" | "format"> & { mediaType?: MediaType; multipartAccepted?: boolean },
   o: { assetUrl: (sha256: string) => string; signer: Signer | null; boundary?: string },
 ): Promise<RenderedResponse> {
   const headers: Record<string, string> = { "expo-protocol-version": String(req.protocolVersion), "expo-sfv-version": "0", "cache-control": "private, max-age=0" };
@@ -478,8 +496,9 @@ export async function renderResponse(
     return { "expo-signature": await signatureHeader(o.signer, body) };
   };
   const empty = (): RenderedResponse => ({ status: 204, headers, body: null });
-  if (outcome.type !== "update" && (req.protocolVersion === 0 || req.format === "json")) {
-    // Protocol 0 has no directives; the JSON form cannot carry one. "Nothing new" is an empty answer; a rollback
+  // The JSON form cannot carry a directive: one goes as multipart when `accept` allows it at all (q above 0).
+  if (outcome.type !== "update" && (req.protocolVersion === 0 || (req.format === "json" && !(outcome.type === "rollBackToEmbedded" && req.multipartAccepted)))) {
+    // Protocol 0 has no directives. "Nothing new" is an empty answer; a rollback that no accepted form can carry
     // cannot be expressed (the spec's 406 for "the newest item is not an update").
     if (outcome.type === "noUpdateAvailable") return empty();
     return { status: 406, headers: { ...headers, "content-type": "text/plain; charset=utf-8" }, body: "the update to serve is a directive (rollBackToEmbedded): it needs expo-protocol-version 1 and multipart/mixed" };
@@ -516,9 +535,17 @@ function randomBoundary(): string {
  * part's body leaves the part's bytes intact.
  */
 export function parseMultipart(body: string, contentType: string): Array<{ name: string | null; headers: Record<string, string>; body: string }> {
-  const m = /boundary=("?)([^";]+)\1/i.exec(contentType);
-  if (!m) throw new Error("no boundary in content-type");
-  const delim = `\r\n--${m[2]}`;
+  // The `boundary` parameter by its whole name (case-insensitive); its value keeps its case.
+  let boundary: string | null = null;
+  for (const param of contentType.split(";").slice(1)) {
+    const eq = param.indexOf("=");
+    if (eq < 0 || param.slice(0, eq).trim().toLowerCase() !== "boundary") continue;
+    const value = param.slice(eq + 1).trim();
+    boundary = value.length >= 2 && value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;
+    break;
+  }
+  if (!boundary) throw new Error("no boundary in content-type");
+  const delim = `\r\n--${boundary}`;
   const out: Array<{ name: string | null; headers: Record<string, string>; body: string }> = [];
   // The first delimiter may open the body (no CRLF before it); what precedes it is the preamble. A match whose line
   // goes on with anything but `--` and transport padding (`--BOUNDARY2` for `BOUNDARY`) is part of the content.

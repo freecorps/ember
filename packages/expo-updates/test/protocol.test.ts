@@ -41,7 +41,7 @@ const headers = (h: Record<string, string>) => new Headers({ "expo-protocol-vers
 describe("request headers", () => {
   test("parses the protocol headers; defaults and errors", () => {
     const r = parseUpdateRequest(headers({ "expo-channel-name": "staging", "expo-current-update-id": "ABC", "eas-client-id": "client-1", "expo-expect-signature": 'sig, keyid="main"' }), "production");
-    expect(r).toEqual({ protocolVersion: 1, platform: "ios", runtimeVersion: "1.0.0", channel: "staging", currentUpdateId: "abc", embeddedUpdateId: null, clientId: "client-1", expectSignature: true, format: "multipart", mediaType: "multipart/mixed" });
+    expect(r).toEqual({ protocolVersion: 1, platform: "ios", runtimeVersion: "1.0.0", channel: "staging", currentUpdateId: "abc", embeddedUpdateId: null, clientId: "client-1", expectSignature: true, format: "multipart", mediaType: "multipart/mixed", multipartAccepted: true });
     expect(parseUpdateRequest(headers({ "expo-protocol-version": "" }), "production")).toMatchObject({ protocolVersion: 0, channel: "production", expectSignature: false });
     expect(parseUpdateRequest(headers({ "expo-eas-client-id": "x" }), null)).toMatchObject({ clientId: "x", channel: null });
     const status = (h: Record<string, string>) => {
@@ -56,7 +56,8 @@ describe("request headers", () => {
     expect(status({ "expo-runtime-version": "" })).toBe(400);
     expect(status({ "expo-protocol-version": "2" })).toBe(406);
     expect(status({ accept: "text/html" })).toBe(406);
-    expect(parseUpdateRequest(headers({ accept: "application/expo+json" }), "p")).toMatchObject({ format: "json", mediaType: "application/expo+json" });
+    expect(parseUpdateRequest(headers({ accept: "application/expo+json" }), "p")).toMatchObject({ format: "json", mediaType: "application/expo+json", multipartAccepted: false });
+    expect(parseUpdateRequest(headers({ accept: "application/json, multipart/mixed;q=0.1" }), "p")).toMatchObject({ format: "json", multipartAccepted: true });
   });
 
   test("negotiation over accept: multipart preferred, q-values honoured, the most specific range decides", () => {
@@ -82,6 +83,9 @@ describe("request headers", () => {
     expect(negotiate("multipart/mixed;boundary=x, application/json;q=0.1")).toBe("application/json");
     expect(negotiate("application/json;q=0.8;ext=1, multipart/mixed;q=0.5")).toBe("application/json");
     expect(negotiate("application/json;charset=iso-8859-1")).toBeNull();
+    // A matching charset range is more specific than the bare type: its q=0 excludes UTF-8 JSON.
+    expect(negotiate("application/json;q=1, application/json;charset=utf-8;q=0, multipart/mixed;q=0.5")).toBe("multipart/mixed");
+    expect(negotiate("application/json;charset=utf-8;q=1, application/json;q=0")).toBe("application/json");
   });
 });
 
@@ -135,7 +139,11 @@ describe("manifest and multipart", () => {
     const longer = "--BOUND\r\ncontent-disposition: form-data; name=\"a\"\r\n\r\nx\r\n--BOUNDARY2 y\r\n--BOUND--\r\n";
     // The parameter name is case-insensitive; its value keeps its case.
     expect(parseMultipart(`preamble\r\n${body}epilogue`, "multipart/mixed; Boundary=BOUND").map((p) => p.name)).toEqual(parseMultipart(`preamble\r\n${body}epilogue`, 'multipart/mixed; boundary="BOUND"').map((p) => p.name));
-    expect(() => parseMultipart(`preamble\r\n${body}epilogue`, "multipart/mixed; BOUNDARY=bound")).not.toThrow(/no boundary/);
+    // The value is case-sensitive: `bound` does not frame a body delimited by `--BOUND`.
+    expect(parseMultipart(`preamble\r\n${body}epilogue`, "multipart/mixed; BOUNDARY=bound")).toEqual([]);
+    // The parameter by its whole name: `x-boundary` is another one.
+    expect(parseMultipart(`preamble\r\n${body}epilogue`, "multipart/mixed; x-boundary=OTHER; boundary=BOUND").map((p) => p.name)).toEqual(parseMultipart(`preamble\r\n${body}epilogue`, "multipart/mixed; boundary=BOUND").map((p) => p.name));
+    expect(() => parseMultipart(body, "multipart/mixed; x-boundary=BOUND")).toThrow(/no boundary/);
     expect(parseMultipart(longer, "multipart/mixed; boundary=BOUND")).toEqual([{ name: "a", headers: { "content-disposition": 'form-data; name="a"' }, body: "x\r\n--BOUNDARY2 y" }]);
   });
 
