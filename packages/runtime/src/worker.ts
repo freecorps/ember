@@ -646,7 +646,10 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const matched = admins.map((a) => !!token && sameSecret(token, a)).some(Boolean);
         if (!matched) return error(401, "unauthenticated", "invalid admin token");
         try {
-          const [{ handleRestoreRequest }, { handleAdminApi, noLocalAuth, REFUSED_CODES }, { sweepOrphans }] = await Promise.all([restoreApi(), adminApi(), filesApi()]);
+          const [{ handleRestoreRequest }, { handleAdminApi, noLocalAuth, REFUSED_CODES, wrongEnvironment }, { sweepOrphans }] = await Promise.all([restoreApi(), adminApi(), filesApi()]);
+          // A caller that names its environment (`x-ember-env`, `ember mcp`) is refused by a Worker of another one.
+          const elsewhere = wrongEnvironment(request, env, error);
+          if (elsewhere) return elsewhere;
           // Point-in-time recovery: list / record bookmarks, restore (restore.ts).
           const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
           if (pitr) return pitr;

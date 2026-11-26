@@ -55,9 +55,10 @@ function io(o: { interactive: boolean; answers?: Array<boolean | string> }): Das
   return { interactive: o.interactive, prompter, log: (l) => lines.push(l), show: (l) => shown.push(l), lines, shown, asked };
 }
 
-async function run(cf: ReturnType<typeof fakeAccount>, project: Project, flag: boolean | undefined, out: ReturnType<typeof io>) {
+async function run(cf: ReturnType<typeof fakeAccount>, project: Project, flag: boolean | undefined, out: ReturnType<typeof io>, skip = false) {
   return deployWithDashboard(project, {
     flag,
+    ...(skip ? { skip } : {}),
     env: "prod",
     dryRun: false,
     io: out,
@@ -101,6 +102,46 @@ describe("whether to deploy the dashboard", () => {
     expect(JSON.parse(readFileSync(p2.configPath, "utf8")).dashboard).toBe(false);
     expect(cf.workers.has("ember-dashboard")).toBe(false);
     expect(() => validateConfig({ project: "x", compatibilityDate: "2026-10-01", environments: { prod: {} }, dashboard: "yes" })).toThrow(/dashboard/);
+  }, 60_000);
+
+  it("skip (a preview's default): not linked, nothing asked, ember.json's choice left as it is", async () => {
+    const cf = fakeAccount();
+    for (const saved of [undefined, true]) {
+      const p = repo(saved === undefined ? {} : { project: "saved", dashboard: saved });
+      const out = io({ interactive: true, answers: [true] });
+      await run(cf, p, undefined, out, true);
+      expect(out.asked).toEqual([]);
+      expect(JSON.parse(readFileSync(p.configPath, "utf8")).dashboard).toBe(saved);
+      expect(p.config.dashboard).toBe(saved);
+    }
+    expect(cf.workers.has("ember-dashboard")).toBe(false);
+  }, 60_000);
+
+  it('a derived preview (`--env preview-<slug>` as well as `--preview`) is skipped by default, even with "dashboard": true', async () => {
+    const cf = fakeAccount();
+    const p = repo({ project: "prev", dashboard: true, environments: { prod: {}, preview: {} } });
+    const go = async (env: string, flag?: boolean) => {
+      const out = io({ interactive: false });
+      let linked = false;
+      const token = await deployWithDashboard(p, {
+        flag,
+        env,
+        dryRun: false,
+        io: out,
+        client: () => {
+          linked = true;
+          return cf.client;
+        },
+        registry: () => Promise.reject(new Error("unused")),
+        deploy: async (t) => t ?? null,
+      });
+      return { linked, token, asked: out.asked };
+    };
+    expect(await go("preview-feat-x")).toEqual({ linked: false, token: null, asked: [] });
+    // --dashboard still links it; a declared environment keeps the saved choice.
+    expect((await go("preview-feat-x", true)).linked).toBe(true);
+    expect((await go("prod")).linked).toBe(true);
+    expect(JSON.parse(readFileSync(p.configPath, "utf8")).dashboard).toBe(true);
   }, 60_000);
 
   it('"dashboard": true without a terminal updates an existing dashboard but never creates one', async () => {

@@ -10,7 +10,9 @@ const fail = (status: number, code: number, message: string) => new Response(JSO
  * Fake Cloudflare account: D1 REST API backed by node:sqlite, a Workers API good enough for `deploy`, zones,
  * custom domains and routes. Every call is recorded.
  */
-export function fakeAccount() {
+export function fakeAccount(o: { namespaces?: boolean } = {}) {
+  /** With `namespaces`: the DO classes each Script PUT provisioned (`exports`), listed like the API does. */
+  const provisioned = new Map<string, string[]>();
   const dbs = new Map<string, { name: string; db: DatabaseSync }>();
   const calls: Array<{ method: string; path: string; json?: any; metadata?: any }> = [];
   const workers = new Set<string>();
@@ -66,6 +68,7 @@ export function fakeAccount() {
       if (method === "DELETE" && del) return secretsOf(name!).delete(del[1]!) ? ok(null) : fail(404, 10056, "no secret");
       if (method === "DELETE" && rest === "") {
         if (!workers.delete(name!)) return fail(404, 10007, "no worker");
+        provisioned.delete(name!);
         settings.delete(name!);
         secrets.delete(name!);
         return ok(null);
@@ -75,10 +78,13 @@ export function fakeAccount() {
         if (!workers.has(name!)) return fail(404, 10007, "no worker");
         // Like the API: plain bindings with their text, secrets by name only.
         const plain = (settings.get(name!)?.bindings ?? []).filter((b: any) => b.type !== "secret_text");
-        return ok({ bindings: [...plain, ...[...secretsOf(name!).keys()].map((n) => ({ type: "secret_text", name: n }))] });
+        // Script-level settings the last Script PUT set (a version upload cannot change them).
+        const { limits, placement } = settings.get(name!) ?? {};
+        return ok({ bindings: [...plain, ...[...secretsOf(name!).keys()].map((n) => ({ type: "secret_text", name: n }))], ...(limits ? { limits } : {}), ...(placement ? { placement } : {}) });
       }
       if (method === "PUT" && rest === "") {
         workers.add(name!);
+        provisioned.set(name!, Object.keys(call.metadata?.exports ?? {}));
         settings.set(name!, call.metadata);
         for (const b of call.metadata?.bindings ?? []) if (b.type === "secret_text") secretsOf(name!).set(b.name, b.text);
         return ok({ id: name });
@@ -91,7 +97,8 @@ export function fakeAccount() {
       if (method === "DELETE" && rest === "/tails/tail-1") return ok(null);
     }
     if (method === "GET" && path === "/workers/scripts") return ok([...workers].map((id) => ({ id })));
-    if (method === "GET" && path.startsWith("/workers/durable_objects/namespaces")) return ok([]);
+    if (method === "GET" && path.startsWith("/workers/durable_objects/namespaces"))
+      return ok(o.namespaces ? [...provisioned].flatMap(([script, classes]) => classes.map((c) => ({ id: `${script}-${c}`, script, class: c }))) : []);
     if (method === "GET" && path === "/workers/subdomain") return ok({ subdomain: "acme" });
     if (method === "GET" && path === "/zones") return ok(url.searchParams.get("name") === "example.com" ? [{ id: "z1", name: "example.com" }] : []);
     if (method === "GET" && path === "/workers/domains") return ok(customDomains.filter((d) => d.zone_id === url.searchParams.get("zone_id")));

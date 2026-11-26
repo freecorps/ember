@@ -22,6 +22,8 @@ import { WORKER_BUILD_OPTIONS } from "./build.ts";
 import { CloudflareApiError, type CfClient } from "./deploy/cf.ts";
 import { workerForm } from "./deploy/index.ts";
 import { DEFAULT_METRICS_DATASET, type Binding, type WorkerMetadata } from "./deploy/plan.ts";
+import { adminTokenKey } from "@freecorps/ember-dashboard/projects";
+import { PREVIEW_PREFIX } from "./config.ts";
 import type { D1Registry } from "./registry.ts";
 import { CLI_ROOT, FROM_SOURCE } from "./source.ts";
 
@@ -135,6 +137,8 @@ export interface DashboardDeployOptions {
   extraSecrets?: Record<string, string>;
   /** Workers to leave out of the service bindings (a project env being destroyed). */
   exclude?: string[];
+  /** Workers linked explicitly by this deploy (a `preview-*` environment deployed with `--dashboard`). */
+  include?: string[];
   /** Never generate DASHBOARD_TOKEN (Cloudflare Access only). */
   noToken?: boolean;
   /** Skip the upload when the build, the bound Workers and the given settings are what the Worker already has. */
@@ -170,12 +174,15 @@ export interface DashboardDeployResult {
 }
 
 /** Service binding names for the registry's Workers that exist in the account. */
-export async function projectServices(client: CfClient, registry: D1Registry): Promise<Array<{ worker: string; binding: string }>> {
+export async function projectServices(client: CfClient, registry: D1Registry, o: { linked?: (worker: string) => boolean } = {}): Promise<Array<{ worker: string; binding: string }>> {
   const scripts = new Set((await client.call<Array<{ id: string }>>("GET", "/workers/scripts")).map((s) => s.id));
-  const envs = await registry.exec("SELECT worker FROM environments ORDER BY project, env");
+  const envs = await registry.exec("SELECT worker, env FROM environments ORDER BY project, env");
   return envs
+    .filter((e) => scripts.has(String(e.worker)))
+    // A preview environment (one per branch) is bound only once it was linked explicitly (`--dashboard`): its Worker
+    // existing is not enough, or every dashboard deploy would bind every branch.
+    .filter((e) => !String(e.env).startsWith(PREVIEW_PREFIX) || (o.linked?.(String(e.worker)) ?? false))
     .map((e) => String(e.worker))
-    .filter((w) => scripts.has(w))
     .slice(0, 200)
     .map((worker, i) => ({ worker, binding: `EMBER_SVC_${i}` }));
 }
@@ -187,9 +194,17 @@ export async function deployDashboard(client: CfClient, o: DashboardDeployOption
   const existing = await client.request<Array<{ name: string }>>("GET", `/workers/scripts/${name}/secrets`);
   const secrets = new Set(existing.success ? (existing.result ?? []).map((s) => s.name) : []);
 
-  const services = (await projectServices(client, o.registry)).filter((s) => !o.exclude?.includes(s.worker)).map((s, i) => ({ ...s, binding: `EMBER_SVC_${i}` }));
   const current = await currentVars(client, name);
   const before = current ?? {};
+  let bound: Record<string, unknown> = {};
+  try {
+    bound = JSON.parse(before.EMBER_SERVICES ?? "{}") as Record<string, unknown>;
+  } catch {
+    bound = {};
+  }
+  // Linked: bound already, linked by this deploy, or holding its own admin token on the dashboard.
+  const linked = (worker: string) => Object.hasOwn(bound, worker) || !!o.include?.includes(worker) || secrets.has(adminTokenKey(worker)) || Object.hasOwn(o.extraSecrets ?? {}, adminTokenKey(worker));
+  const services = (await projectServices(client, o.registry, { linked })).filter((s) => !o.exclude?.includes(s.worker)).map((s, i) => ({ ...s, binding: `EMBER_SVC_${i}` }));
   const buildId = createHash("sha256").update(build.code).digest("hex").slice(0, 16);
   const vars: Record<string, string> = {};
   for (const k of KEPT_DASHBOARD_VARS) if (before[k] !== undefined) vars[k] = before[k];

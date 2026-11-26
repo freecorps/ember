@@ -8,10 +8,12 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, join, relative, resolve, sep } from "node:path";
 import ts from "typescript";
 import { Analysis, type Finding } from "./analyze.ts";
+import { checkLibraries, type LibraryCheck } from "./deps.ts";
 import { renderReport } from "./report.ts";
 import { FileRewriter, type ErrorSite, type MigrationState } from "./rewrite.ts";
 
 export type { Finding, Severity } from "./analyze.ts";
+export { checkLibraries, libraryLines, type LibraryCheck, type LibraryFinding } from "./deps.ts";
 export { verifyMigration, type VerifyResult } from "./verify.ts";
 
 export interface MigrateOptions {
@@ -25,6 +27,8 @@ export interface MigrateOptions {
   dryRun?: boolean;
   /** Write into a non-empty `out`. */
   force?: boolean;
+  /** The library check already made (`checkLibraries(src)`); default: made here. */
+  libraries?: LibraryCheck;
 }
 
 export type FileStatus = "converted" | "copied" | "unchanged" | "skipped" | "generated";
@@ -55,6 +59,8 @@ export interface MigrateResult {
   report: string;
   /** "manual" findings (what `--check` fails on). */
   manual: number;
+  /** Which libraries run in an Ember action (deps.ts). */
+  libraries: LibraryCheck;
 }
 
 const CODE = /\.(ts|tsx|mts|js|mjs|jsx)$/;
@@ -102,6 +108,9 @@ export function migrateConvex(options: MigrateOptions): MigrateResult {
     if (!options.dryRun && !options.force && existsSync(outDir) && readdirSync(outDir).length) throw new Error(`${outDir} is not empty (pass --force to write into it)`);
   }
 
+  // The original sources' libraries, before anything is written (with --in-place the output lands in src, and its
+  // generated files import Ember's own packages).
+  const libraries = options.libraries ?? checkLibraries(src);
   const all = walk(src);
   const files: FileResult[] = [];
   const skipped = new Map<string, string>();
@@ -209,6 +218,7 @@ export function migrateConvex(options: MigrateOptions): MigrateResult {
     written,
     outputs: Object.fromEntries([...outputs].sort(([x], [y]) => x.localeCompare(y))),
     manual: a.findings.filter((x) => x.severity === "manual").length,
+    libraries,
   };
   return { ...result, report: renderReport(result, options) };
 }

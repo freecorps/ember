@@ -1,5 +1,6 @@
 // `ember.json` (PLAN §21): one project per file, N environments, resources named `ember-<project>-<env>`.
 
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
@@ -62,7 +63,30 @@ export interface EnvironmentConfig {
   vars?: Record<string, string>;
   /** Per-environment overrides of the project's `auth` (e.g. a custom domain as `url`). */
   auth?: AuthSettings;
+  /** Overrides the project's `limits` (merged key by key). */
+  limits?: WorkerLimits;
+  /** Overrides the project's `placement`. */
+  placement?: WorkerPlacement;
 }
+
+/**
+ * Worker limits (ember.json `limits`). `cpuMs`: CPU time one invocation of the Worker may use, in ms (Cloudflare's
+ * `limits.cpu_ms`; 10–300000 on the paid plan, whose default is 30000). Durable Objects have their own CPU limit per
+ * request; this one bounds the Worker (HTTP routing, actions). Absent: not managed (whatever the Worker has stays).
+ */
+export interface WorkerLimits {
+  cpuMs?: number;
+}
+
+/**
+ * `"smart"`: Smart Placement (Cloudflare runs the Worker near the back ends it talks to: its Durable Objects, the
+ * APIs actions call). Absent: not managed (the Worker keeps whatever placement it has).
+ */
+export type WorkerPlacement = "smart";
+
+/** Bounds of `limits.cpuMs` (Cloudflare Workers, paid plan). */
+export const CPU_MS_MIN = 10;
+export const CPU_MS_MAX = 300_000;
 
 export interface EmberConfigFile {
   project: string;
@@ -111,6 +135,10 @@ export interface EmberConfigFile {
    * Shard DO's startup); `false` imports every module statically.
    */
   build?: { keepNames?: boolean; lazyActions?: boolean };
+  /** Worker limits (`cpuMs`), applied by `ember deploy`; environments may override them. */
+  limits?: WorkerLimits;
+  /** `"smart"`: Smart Placement, applied by `ember deploy`; environments may override it. */
+  placement?: WorkerPlacement;
 }
 
 export interface Project {
@@ -219,10 +247,25 @@ export function validateConfig(raw: unknown, where = CONFIG_FILE): EmberConfigFi
     }
   };
   checkAuth(c.auth, `"auth"`);
+  const checkLimits = (l: unknown, at: string) => {
+    if (l === undefined) return;
+    if (!l || typeof l !== "object" || Array.isArray(l)) fail(`${at} must be an object { cpuMs? }`);
+    const o = l as Record<string, unknown>;
+    for (const k of Object.keys(o)) if (k !== "cpuMs") fail(`${at}.${k} is unknown (cpuMs)`);
+    if (o.cpuMs !== undefined && (typeof o.cpuMs !== "number" || !Number.isInteger(o.cpuMs) || o.cpuMs < CPU_MS_MIN || o.cpuMs > CPU_MS_MAX))
+      fail(`${at}.cpuMs must be an integer number of milliseconds (${CPU_MS_MIN}-${CPU_MS_MAX})`);
+  };
+  const checkPlacement = (p: unknown, at: string) => {
+    if (p !== undefined && p !== "smart") fail(`${at} must be "smart" (Smart Placement) or absent`);
+  };
+  checkLimits(c.limits, `"limits"`);
+  checkPlacement(c.placement, `"placement"`);
   for (const [name, e] of Object.entries(envs as object)) {
     if (!NAME.test(name)) fail(`environment "${name}" must match ${NAME}`);
     if (!e || typeof e !== "object") fail(`environment "${name}" must be an object`);
     checkAuth((e as EnvironmentConfig).auth, `environments.${name}.auth`);
+    checkLimits((e as EnvironmentConfig).limits, `environments.${name}.limits`);
+    checkPlacement((e as EnvironmentConfig).placement, `environments.${name}.placement`);
   }
   const worker = workerName(c.project as string, Object.keys(envs as object).sort((a, b) => b.length - a.length)[0]!);
   if (worker.length > 63) fail(`project + environment names are too long for a Worker name (${worker})`);
@@ -267,16 +310,80 @@ export function workerName(project: string, env: string): string {
 export function resolveEnv(project: Project, env: string | undefined): { name: string; config: EnvironmentConfig } {
   const envs = project.config.environments;
   const name = env ?? (envs.prod ? "prod" : Object.keys(envs)[0]!);
-  const config = envs[name];
-  if (!config) throw new ConfigError(`Unknown environment "${name}". Known: ${Object.keys(envs).join(", ")}`);
+  const config = envConfig(project, name);
+  if (!config) {
+    const hint = name.startsWith(PREVIEW_PREFIX) && !envs[PREVIEW_BASE] ? ` (preview environments derive from "environments.${PREVIEW_BASE}", which ember.json does not declare)` : "";
+    throw new ConfigError(`Unknown environment "${name}". Known: ${Object.keys(envs).join(", ")}${hint}`);
+  }
   return { name, config };
 }
 
-/** Project `auth` merged with the environment's overrides. */
+/**
+ * Ephemeral preview environments (`ember deploy --preview <branch>`): `preview-<slug>`, never declared in ember.json,
+ * derived from `environments.preview` (vars, account, auth overrides but its `url`, limits, placement). Every resource
+ * name derives from the environment (`ember-<project>-preview-<slug>`: the Worker, its Durable Objects, R2 bucket,
+ * queues, indexes), so a preview shares nothing with prod.
+ */
+export const PREVIEW_BASE = "preview";
+export const PREVIEW_PREFIX = "preview-";
+
+/**
+ * The longest suffix `ember deploy` appends to `ember-<project>-<env>` for a resource of its own (queues `-files`,
+ * `-actions`, `-indexing`): a preview's slug leaves room for it, so every derived name fits Cloudflare's 63 characters.
+ * (Vectorize indexes and AI Search instances budget their own names; component queues add their install's suffix.)
+ */
+export const RESOURCE_SUFFIX_MAX = "-indexing".length;
+
+/**
+ * The environment `--preview <branch>` deploys: `preview-<slug>`, the slug being the branch lowercased with every run
+ * of other characters turned into one `-`. A slug longer than fits (the environment name is at most 40 characters, and
+ * the Worker name `ember-<project>-preview-<slug>` plus `RESOURCE_SUFFIX_MAX` at most 63) is cut and ends in 6 hex
+ * characters of the branch's sha256, so two long branches with a common prefix stay apart. The same branch always
+ * gives the same name; two branches with the same slug (`feat/x`, `feat-x`) give the same one, and share it.
+ */
+export function previewEnvName(project: string, branch: string): string {
+  const raw = branch.trim();
+  const slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!slug) throw new ConfigError(`--preview: ${JSON.stringify(branch)} has no letters or digits to name an environment after`);
+  const max = Math.min(40 - PREVIEW_PREFIX.length, 63 - RESOURCE_SUFFIX_MAX - workerName(project, PREVIEW_PREFIX).length);
+  if (slug.length <= max) return `${PREVIEW_PREFIX}${slug}`;
+  // A cut slug is at least one character, "-" and the 6-character hash.
+  if (max < 8) throw new ConfigError(`--preview: the project name "${project}" is too long for preview environments (ember-${project}-preview-<slug> and its resources must fit 63 characters): a shorter "project" in ember.json makes room`);
+  const hash = createHash("sha256").update(raw).digest("hex").slice(0, 6);
+  return `${PREVIEW_PREFIX}${slug.slice(0, max - 7).replace(/-+$/, "")}-${hash}`;
+}
+
+/** Whether `name` is a preview environment derived from `environments.preview` (not declared in ember.json). */
+export function isDerivedPreview(project: Project, name: string): boolean {
+  const envs = project.config.environments;
+  return !Object.hasOwn(envs, name) && name.startsWith(PREVIEW_PREFIX) && name.length > PREVIEW_PREFIX.length && NAME.test(name) && !!envs[PREVIEW_BASE];
+}
+
+/** An environment's config: declared in ember.json, or derived from `environments.preview` (`preview-<slug>`). */
+export function envConfig(project: Project, name: string): EnvironmentConfig | undefined {
+  const envs = project.config.environments;
+  if (Object.hasOwn(envs, name)) return envs[name];
+  return isDerivedPreview(project, name) ? envs[PREVIEW_BASE] : undefined;
+}
+
+/**
+ * Project `auth` merged with the environment's overrides. A derived preview environment drops `url`: the issuer of
+ * one branch's Worker is its own workers.dev address, never the URL the base environment names.
+ */
 export function authSettings(project: Project, env?: string): AuthSettings {
   const base = project.config.auth ?? {};
-  const over = env ? (project.config.environments[env]?.auth ?? {}) : {};
-  return { ...base, ...over };
+  const over = env ? (envConfig(project, env)?.auth ?? {}) : {};
+  const merged: AuthSettings = { ...base, ...over };
+  if (env && isDerivedPreview(project, env)) delete merged.url;
+  return merged;
+}
+
+/** Cloudflare settings `ember deploy` manages for an environment (the environment's values over the project's). */
+export function workerSettings(project: Project, env: string): { limits?: WorkerLimits; placement?: WorkerPlacement } {
+  const e = envConfig(project, env);
+  const limits = { ...(project.config.limits ?? {}), ...(e?.limits ?? {}) };
+  const placement = e?.placement ?? project.config.placement;
+  return { ...(limits.cpuMs !== undefined ? { limits } : {}), ...(placement ? { placement } : {}) };
 }
 
 /** Sets one top-level key of ember.json, keeping the user's key order and the rest of the file as parsed. */

@@ -1,7 +1,7 @@
 // Admin endpoints added for the Ember Dashboard (admin-api.ts; docs/design/contracts.md "Dashboard").
 import { SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { ADMIN_API_LEVEL, ADMIN_FEATURES } from "../src/admin-api.ts";
+import { ADMIN_API_LEVEL, ADMIN_FEATURES, handleAdminApi, type AdminDeps } from "../src/admin-api.ts";
 
 const call = (path: string, init: RequestInit & { token?: string | null } = {}) => {
   const { token = "admin-secret", ...rest } = init;
@@ -17,7 +17,24 @@ describe("GET /api/_ember/capabilities", () => {
     const body = (await res.json()) as { ok: boolean; level: number; features: string[]; system: boolean };
     expect(body).toMatchObject({ ok: true, level: ADMIN_API_LEVEL, system: true });
     expect(body.features).toEqual([...ADMIN_FEATURES]);
+    // The test Worker's EMBER_VERSION (vitest.config.ts).
+    expect((body as { version?: unknown }).version).toBe("test-version-1");
     expect((await call("/api/_ember/capabilities", { method: "POST", body: "{}" })).status).toBe(405);
+  });
+
+  it("says which Worker version answered (EMBER_VERSION), for callers that pin their next requests to it", async () => {
+    const url = new URL("http://ember/api/_ember/capabilities");
+    const deps = {
+      config: {},
+      env: { EMBER_VERSION: { id: "0f1e2d3c-v14", tag: "", timestamp: "" } },
+      json: (b: unknown, status = 200) => new Response(JSON.stringify(b), { status }),
+      error: (status: number, code: string, message: string) => new Response(JSON.stringify({ ok: false, error: { code, message } }), { status }),
+    } as unknown as AdminDeps;
+    const res = await handleAdminApi(new Request(url), url, deps);
+    expect(await res!.json()).toMatchObject({ ok: true, level: ADMIN_API_LEVEL, version: "0f1e2d3c-v14" });
+    // Without the binding: null (nothing to pin to; `ember mcp` refuses such a deployment).
+    const bare = await handleAdminApi(new Request(url), url, { ...deps, env: {} } as AdminDeps);
+    expect(((await bare!.json()) as { version: unknown }).version).toBeNull();
   });
 
   it("every listed GET feature answers (no listed endpoint is a 404)", async () => {
