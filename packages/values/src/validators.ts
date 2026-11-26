@@ -309,6 +309,12 @@ export function validatorFromShape(shape: Shape, optional = false): GenericValid
   return make<any, Optionality, any>(shape, optional ? "optional" : "required");
 }
 
+/**
+ * A validator instance (`v.string()`, `v.object({...})`), not an object of validators: a field map may have fields
+ * named `shape` or `isOptional`, but their values are validators, never a `validate` function or an optionality.
+ */
 export function isValidator(x: unknown): x is GenericValidator {
-  return typeof x === "object" && x !== null && "shape" in x && "isOptional" in x;
+  if (typeof x !== "object" || x === null) return false;
+  const o = x as { shape?: unknown; isOptional?: unknown; validate?: unknown };
+  return typeof o.validate === "function" && (o.isOptional === "optional" || o.isOptional === "required") && typeof o.shape === "object" && o.shape !== null;
 }
