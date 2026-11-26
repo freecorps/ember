@@ -548,6 +548,9 @@ function keyIndexesByField(keyIndexes: ReadonlyArray<{ fields: readonly string[]
   return out;
 }
 
+/** Whether a stored `_json` text may hold `field` (its quoted name is in it): over-approximate, never misses one. */
+const jsonHolds = (json: SqlValue | undefined, field: string): boolean => typeof json === "string" && json !== "{}" && json.includes(JSON.stringify(field));
+
 /**
  * The columns of `values` that differ from the stored `row`: an UPDATE that sets an indexed column rewrites its index
  * entry even when the value is the same (one more billed row per index), so a patch sets only what changed.
@@ -1372,6 +1375,9 @@ class EngineImpl implements Engine {
             out.push([k, null]);
           } else out.push([k, sv]);
           if (!json && toSqlValue(c.spec.cls, before[k]) === ESCAPE) json = true;
+          // The stored `_json` holds the field beside its column (a column added after the row was written: migrate.ts
+          // `addColumn` moves nothing): rewritten, or the decoder, which reads `_json` first, keeps the old value.
+          if (!json && jsonHolds(stored("_json"), k)) json = true;
         } else json = true;
         for (const i of t.keyIndexesOf.get(k) ?? []) indexes.add(i);
       }

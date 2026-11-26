@@ -10,11 +10,13 @@
 // (three-valued: SQLite's AND/OR/NOT on 0/1/NULL is Kleene logic, so a definite answer is the one every evaluation
 // of the undecided parts would give). The field must be `_id`, `_creationTime` or a top-level typed column of class
 // text, real or boolean (layout.ts); the literal a primitive. Per row:
-//   - the column is not NULL: it holds the value (a value the column cannot hold, NaN, -0 or ±Infinity, is written to
-//     `_json` with the column NULL: layout.ts `encodeJson`, engine.ts `patchValues`);
-//   - the column is NULL and `_json` may hold the field (its quoted name is in the text; a column added to a table
-//     whose old rows kept the field in `_json`): NULL;
-//   - the column is NULL otherwise: the field is `null` (nullable) or absent, compared in JS once, at build time;
+//   - `_json` may hold the field (its quoted name is in the text): NULL, whatever the column holds. The decoder reads
+//     the field from `_json` first, and a row can have it there beside a column: a value the column cannot hold (NaN,
+//     -0, ±Infinity: layout.ts `encodeJson`, column NULL), or a column added to a table whose old rows kept the field
+//     in `_json` (migrate.ts `addColumn` moves nothing; a row written by an older `patchValues` may even have a
+//     value in both);
+//   - else the column is not NULL: it holds the value;
+//   - else the field is `null` (nullable) or absent, compared in JS once, at build time;
 //   - the literal has another type than the column: the type order decides, also once, in JS;
 //   - same type: SQLite compares. Text with BINARY collation is UTF-8 byte order, which is the code point order of
 //     `compareStrings`; literals with a lone surrogate or a NUL, and stored texts that may hold one (WTF8), are left
@@ -166,9 +168,9 @@ class Builder {
     const exact = wtf ? `WHEN ${WTF8(col)} THEN NULL ` : "";
     if (f.notNull) return wtf ? `(CASE ${exact}ELSE ${present} END)` : `(${present})`;
     const absent = test(compareValues(f.nullValue, x)) ? "1" : "0";
-    // A non-NULL column is the value (an escaped one leaves the column NULL: layout.ts `encodeJson`). A NULL one is
-    // `null` / absent unless `_json` holds the field, which needs its quoted name in the text.
-    return `(CASE WHEN ${col} IS NULL THEN (CASE WHEN instr("_json", ${lit(`"${f.column}"`)}) > 0 THEN NULL ELSE ${absent} END) ${exact}ELSE ${present} END)`;
+    // `_json` first, as the decoder: a row that may hold the field there (its quoted name is in the text) is left to
+    // JS, whatever its column holds. Else a non-NULL column is the value and a NULL one is `null` / absent.
+    return `(CASE WHEN instr("_json", ${lit(`"${f.column}"`)}) > 0 THEN NULL WHEN ${col} IS NULL THEN ${absent} ${exact}ELSE ${present} END)`;
   }
 }
 

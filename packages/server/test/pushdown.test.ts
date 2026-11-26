@@ -352,3 +352,86 @@ describe("pushdown on × off: the same results, read sets and usage", () => {
     for (const k of [10, 40, 120]) expect(e.runQuery(wide(k), {}).value).toBe(1);
   });
 });
+
+describe("a column added to a table whose rows kept the field in _json", () => {
+  const v1 = defineSchema({ tables: { g: defineTable({ a: v.string() }) } });
+  const v2 = defineSchema({ tables: { g: defineTable({ a: v.string(), x: v.optional(v.number()) }).index("by_x", ["x"]) } });
+
+  /** The `i` of a row (`a` is `r<i>`), in SQL. */
+  const N = `CAST(substr("a", 2) AS INTEGER)`;
+
+  /** Rows written under v1 (half of them keep `x` in `_json`: data outside the schema), then v2 adds the column. */
+  function grown(pushdown: boolean) {
+    const inner = createNodeSqliteDriver();
+    let clock = 1_700_000_000_000;
+    const open = (schema: typeof v1 | typeof v2) => createEngine({ schema, driver: inner, now: () => (clock += 1), random: prng(11), filterPushdown: pushdown });
+    const e1 = open(v1);
+    e1.migrate();
+    for (let i = 0; i < 12; i++) e1.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.db.insert("g", { a: `r${i}` }) }) as any, {});
+    inner.exec(`UPDATE "g" SET "_json" = json_set("_json", '$.x', ${N} % 3) WHERE ${N} % 2 = 0`);
+    const e = open(v2);
+    const report = e.migrate();
+    expect(report.steps).toContainEqual(expect.objectContaining({ op: "addColumn", table: "g", field: "x" }));
+    while (!e.backfillStep().done);
+    return { e, inner };
+  }
+
+  const ids = (e: ReturnType<typeof grown>["e"]) => (e.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.query("g").collect().map((d: Doc) => d._id) }) as any, {}).value as string[]);
+  const docs = (e: ReturnType<typeof grown>["e"]) => (e.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.query("g").collect() }) as any, {}).value as Doc[]);
+  const patch = (e: ReturnType<typeof grown>["e"], id: string, x: number) => e.runMutation(mutationGeneric({ handler: (ctx: any) => ctx.db.patch(id, { x }) }) as any, {});
+
+  it("a patch of the field is what reads return (the stale `_json` value is rewritten)", () => {
+    const { e, inner } = grown(true);
+    const all = ids(e);
+    // Rows 0, 2, 4, ... hold `x` in `_json` (0, 1 or 2); patching them writes the column, and must drop the old value.
+    for (const [i, id] of all.entries()) if (i % 3 === 1) patch(e, id, 10 + i);
+    const got = docs(e);
+    for (const [i, d] of got.entries()) {
+      if (i % 3 === 1) expect(d.x).toBe(10 + i);
+    }
+    // No row keeps a value in `_json` beside a non-NULL column.
+    expect(inner.exec(`SELECT count(*) AS n FROM "g" WHERE "x" IS NOT NULL AND instr("_json", '"x"') > 0`).rows[0]!.n).toBe(0);
+    // The index key is the patched value too: a range on it finds exactly the patched rows.
+    const ranged = e.runQuery(queryGeneric({ handler: (ctx: any) => ctx.db.query("g").withIndex("by_x", (q: any) => q.gte("x", 10)).collect().map((d: Doc) => d.x) }) as any, {}).value;
+    expect(ranged).toEqual(got.filter((_, i) => i % 3 === 1).map((d) => d.x));
+  });
+
+  it("the SQL verdict is passes() on such rows, also when a column and `_json` disagree (older writes)", () => {
+    const { e, inner } = grown(true);
+    for (const [i, id] of ids(e).entries()) if (i % 4 === 3) patch(e, id, i % 3);
+    // What an older `patchValues` left: the column patched, the old value still in `_json` (which reads return).
+    inner.exec(`UPDATE "g" SET "x" = 7 WHERE ${N} % 4 = 2 AND instr("_json", '"x"') > 0`);
+    const layout = layoutOf("g", v2.manifest.tables.g!.document);
+    const rows = inner.exec(`SELECT * FROM "g" ORDER BY "_rowid"`).rows;
+    const decoded = rows.map((row) => decodeRow(layout, row));
+    expect(decoded.some((d, i) => rows[i]!.x === 7 && d.x !== 7)).toBe(true);
+    let decided = 0;
+    for (const op of CMP) {
+      for (const x of [undefined, 0, 1, 2, 7, 10]) {
+        for (const args of [[{ field: "x" }, { literal: x }], [{ literal: x }, { field: "x" }]] as FilterExpr[][]) {
+          const f = { op, args } as FilterExpr;
+          const pushed = pushFilter(layout, f, true)!;
+          const verdicts = inner.exec(`SELECT ${pushed.sql} AS m FROM "g" ORDER BY "_rowid"`, ...pushed.params).rows;
+          for (const [i, { m }] of verdicts.entries()) {
+            if (m === null) continue;
+            decided++;
+            expect({ f, doc: decoded[i], m: m === 1 }).toEqual({ f, doc: decoded[i], m: passes(f, decoded[i]!) });
+          }
+        }
+      }
+    }
+    expect(decided).toBeGreaterThan(100);
+  });
+
+  it("pushdown on × off: the same documents and usage", () => {
+    const on = grown(true);
+    const off = grown(false);
+    for (const g of [on, off]) for (const [i, id] of ids(g.e).entries()) if (i % 3 === 0) patch(g.e, id, i % 4);
+    for (const x of [0, 1, 2, 3]) {
+      const fn = queryGeneric({ handler: (ctx: any) => ctx.db.query("g").filter((q: any) => q.or(q.eq(q.field("x"), x), q.gt(q.field("x"), 2))).collect() }) as any;
+      const a = on.e.runQuery(fn, {});
+      const b = off.e.runQuery(fn, {});
+      expect(strip({ value: a.value, usage: a.usage })).toEqual(strip({ value: b.value, usage: b.usage }));
+    }
+  });
+});
