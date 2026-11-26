@@ -1,11 +1,13 @@
 // Real-user latency (rum.ts, contracts.md "RUM"): the public batch endpoint (validation, size limit, Analytics Engine
 // only, no personal data, CORS), the bucket formula, and the shard's colo for sockets that negotiated "rum".
-import { SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
 import { setMetricsSink, type AnalyticsEngineDatasetLike } from "../src/metrics.ts";
 import { parseRumBatch, rumBucket, rumBucketMs, RUM_MAX_BYTES, writeRum } from "../src/rum.ts";
-import { probeColo } from "../src/colo.ts";
-import { connect, hello, is } from "./helpers.ts";
+import { COLO_RETRY_MS, ColoCache, probeColo } from "../src/colo.ts";
+import type { Shard } from "../src/shard.ts";
+import type { ServerMessage } from "../src/protocol.ts";
+import { connect, hello, is, shardStub } from "./helpers.ts";
 
 type Point = Parameters<AnalyticsEngineDatasetLike["writeDataPoint"]>[0] & {};
 function sink() {
@@ -91,11 +93,12 @@ describe("RUM batches (POST /api/_ember/rum)", () => {
 
 describe("the shard's colo (feature rum)", () => {
   it("ready carries it only for a socket that negotiated rum", async () => {
+    // The binding EMBER_COLO = "TST" (packages/runtime/vitest.config.ts) stands for the /cdn-cgi/trace probe here: the
+    // object knows its colo without one, so even the first socket gets it in `ready`.
+    expect((env as { EMBER_COLO?: unknown }).EMBER_COLO).toBe("TST");
     const a = await connect("rum:colo");
     const ready = await hello(a, undefined, undefined, ["rum", "batch"]);
-    // EMBER_COLO (vitest config) stands for the /cdn-cgi/trace probe; first socket: the probe answers after ready.
-    const colo = ready.colo ?? ((await a.waitFor(is("colo"))) as { colo: string }).colo;
-    expect(colo).toBe("TST");
+    expect(ready.colo).toBe("TST");
     expect(ready.features).toContain("rum");
     const b = await connect("rum:colo");
     expect((await hello(b, undefined, undefined, ["rum"])).colo).toBe("TST");
@@ -118,5 +121,70 @@ describe("the shard's colo (feature rum)", () => {
     expect(seen).toEqual(["https://www.cloudflare.com/cdn-cgi/trace"]);
     expect(await probeColo({}, (async () => new Response("nope", { status: 500 })) as typeof fetch)).toBeNull();
     expect(await probeColo({}, (async () => Promise.reject(new Error("offline"))) as typeof fetch)).toBeNull();
+  });
+
+  it("a failed probe is not kept: a later ask tries again after a backoff (one probe at a time), a found colo stays", async () => {
+    let now = 1_000;
+    let answer: () => Promise<Response> = async () => Promise.reject(new Error("offline"));
+    let calls = 0;
+    const cache = new ColoCache({}, (async () => (calls++, answer())) as typeof fetch, () => now);
+    const found: string[] = [];
+    const onFound = (c: string) => void found.push(c);
+    expect(cache.get(onFound)).toBeNull();
+    expect(cache.get(onFound)).toBeNull(); // one probe at a time
+    await cache.settled();
+    expect(calls).toBe(1);
+    // Backing off: no probe before the wait.
+    now += COLO_RETRY_MS - 1;
+    expect(cache.get(onFound)).toBeNull();
+    expect(calls).toBe(1);
+    // Then another try (failing again: the wait doubles).
+    now += 1;
+    answer = async () => new Response("nope", { status: 503 });
+    cache.get(onFound);
+    await cache.settled();
+    expect(calls).toBe(2);
+    now += COLO_RETRY_MS;
+    cache.get(onFound);
+    expect(calls).toBe(2);
+    now += COLO_RETRY_MS;
+    answer = async () => new Response("colo=MIA\n");
+    expect(cache.get(onFound)).toBeNull();
+    await cache.settled();
+    expect([calls, found]).toEqual([3, ["MIA"]]);
+    // Found: kept, no more probes.
+    now += 1e9;
+    expect(cache.get(onFound)).toBe("MIA");
+    expect(calls).toBe(3);
+    // A fetch that throws at once is a failure too, never an unhandled rejection.
+    const sync = new ColoCache({}, (() => {
+      throw new TypeError("no fetch here");
+    }) as typeof fetch, () => now);
+    expect(sync.get(onFound)).toBeNull();
+    await sync.settled();
+    // The environment settles it without a probe.
+    expect(new ColoCache({ EMBER_ENV: "local" }, (() => Promise.reject(new Error("not called"))) as typeof fetch).get(onFound)).toBeNull();
+    expect(new ColoCache({ EMBER_COLO: "GRU" }).get(onFound)).toBe("GRU");
+  });
+
+  it("a second hello (without rum) is refused: the socket keeps what its hello negotiated, and only that", async () => {
+    const shard = "rum:rehello";
+    const a = await connect(shard);
+    // Even sent at once, both verifying a token, the second is refused: a socket negotiates its features once.
+    a.send({ t: "hello", clientId: "c1", protocol: 1, token: "good:ana", features: ["rum"] });
+    a.send({ t: "hello", clientId: "c1", protocol: 1, token: "good:ana" });
+    const first = await a.waitFor<Extract<ServerMessage, { t: "ready" }>>(is("ready"));
+    expect(first.features).toEqual(["rum"]);
+    expect(await a.waitFor(is("err"))).toMatchObject({ code: "duplicate_hello" });
+    const b = await connect(shard);
+    await hello(b, "c2", "good:ana");
+    const flags = await runInDurableObject(shardStub(shard), async (_inst: Shard, state) =>
+      state.getWebSockets().map((ws) => (ws.deserializeAttachment() as { clientId?: string; rum?: true }))
+        .map((x) => [x.clientId, x.rum ?? false])
+        .sort(),
+    );
+    expect(flags).toEqual([["c1", true], ["c2", false]]);
+    a.close();
+    b.close();
   });
 });

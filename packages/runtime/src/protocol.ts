@@ -55,7 +55,7 @@ export type ClientMessage =
 export type ServerMessage =
   /** `features`: the subset of the hello's features this server speaks (omitted when none). */
   | { t: "ready"; shard: string; version: number; epoch: string; features?: Feature[]; colo?: string }
-  /** Feature "rum": the colo this shard runs in, once learned after `ready` (rum.ts `probeColo`). */
+  /** Feature "rum": the colo this shard runs in, once learned after `ready` (colo.ts `ColoCache`). */
   | { t: "colo"; colo: string }
   /** `unchanged: true` (value omitted) answers a successful `resume`. Proposed v1 extension. */
   /** `ik` (feature "ident"): identity tag of the value, echoed by the client in `resume.ik`. */

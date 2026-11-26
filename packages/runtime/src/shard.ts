@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { probeColo } from "./colo.ts";
+import { ColoCache } from "./colo.ts";
 import { claimKey, encodeParts, rowDiffJson, valueDiffJson, type EncodedValue } from "@freecorps/ember-values";
 import {
   createMatchIndex,
@@ -2535,24 +2535,20 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   /** Sockets that negotiated feature "zframe" (from `hello`, or their attachment after a wake). */
   private readonly zframes = new WeakSet<WebSocket>();
   /**
-   * Where this object runs (RUM, rum.ts `probeColo`): undefined until a sampled client asks, then the probe (one per
-   * object lifetime), then the colo or null (unknown).
+   * Where this object runs (RUM, colo.ts): settled by the environment, or probed when a sampled client asks (a failed
+   * probe is retried after a backoff, by a later RUM socket). In memory only.
    */
-  private colo: string | null | undefined;
-  private coloProbe: Promise<void> | null = null;
+  private coloCache: ColoCache | null = null;
 
-  /** This object's colo for a RUM socket: known → returned; else probed once, then sent as `{t:"colo"}` to RUM sockets. */
+  /** This object's colo for a RUM socket: known → returned; else probed, then sent as `{t:"colo"}` to RUM sockets. */
   private coloFor(): string | null {
-    if (this.colo !== undefined) return this.colo;
-    this.coloProbe ??= probeColo(this.env as { EMBER_COLO?: unknown; EMBER_ENV?: unknown }).then((c) => {
-      this.colo = c;
-      if (!c) return;
+    this.coloCache ??= new ColoCache(this.env as { EMBER_COLO?: unknown; EMBER_ENV?: unknown });
+    return this.coloCache.get((c) => {
       for (const ws of this.ctx.getWebSockets()) {
         const att = ws.deserializeAttachment() as Attachment | null;
         if (att?.rum) this.send(ws, { t: "colo", colo: c });
       }
     });
-    return null;
   }
   /** Per "zframe" socket, the last frame still being compressed (or waiting behind one): what comes after waits. */
   private readonly zsending = new Map<WebSocket, Promise<void>>();
@@ -3933,7 +3929,8 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         const current = ws.deserializeAttachment() as Attachment;
         const identity = verified ?? current.identity;
         const token = verified ? msg.token : current.token;
-        const { token: _old, ack: _ack, ...prevAtt } = current;
+        // What this hello negotiates replaces what an earlier one did (a hello racing another past the check above).
+        const { token: _old, ack: _ack, rum: _rum, ...prevAtt } = current;
         const rowdiff = msg.features?.includes("rowdiff") === true;
         const vdiff = msg.features?.includes("vdiff") === true;
         const ident = msg.features?.includes("ident") === true;
