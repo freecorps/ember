@@ -1,6 +1,9 @@
 // Phase 1 hardening of the shard's reactivity: read-set index, failing subscriptions, search debounce, token expiry.
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import type { EmberConfig } from "../src/config.ts";
 import type { ServerMessage } from "../src/protocol.ts";
+import type { Shard } from "../src/shard.ts";
 import { connect, hello, is, shardStub, sleep } from "./helpers.ts";
 
 type Patch = Extract<ServerMessage, { t: "patch" }>;
@@ -69,16 +72,45 @@ describe("reactivity", () => {
     expect(after.debouncedReruns).toBe(before.debouncedReruns);
     expect(after.reruns).toBeGreaterThan(before.reruns);
     const base = (await stub.inspect()).stats;
-    // loose: unrelated writes, coalesced into one debounced re-run
-    for (const mid of [2, 3, 4]) b.send({ t: "mut", mid, fn: "messages:send", args: { channel: "c", body: `goodbye ${mid}` } });
-    await b.waitFor(is("mres", (m) => m.mid === 4));
+    // loose: unrelated writes, coalesced into one debounced re-run. The three commits must land inside one window,
+    // which 150 ms does not guarantee on a slow runner (the timer fired between them on CI): this shard's window is
+    // widened while they commit, then the pending re-run is flushed by hand, so coalescing is checked by counters.
+    type Debouncing = { cfg: EmberConfig; debounceTimer: unknown; flushDebounced(): void };
+    const windowMs = await runInDurableObject(stub, (inst: Shard) => {
+      const d = inst as unknown as Debouncing;
+      const cfg = d.cfg;
+      d.cfg = { ...cfg, reactivity: { ...cfg.reactivity, searchDebounceMs: 60_000 } };
+      return cfg.reactivity?.searchDebounceMs;
+    });
+    expect(windowMs).toBe(150);
+    try {
+      for (const mid of [2, 3, 4]) b.send({ t: "mut", mid, fn: "messages:send", args: { channel: "c", body: `goodbye ${mid}` } });
+      await b.waitFor(is("mres", (m) => m.mid === 4));
+      const s = (await stub.inspect()).stats;
+      expect(s.debouncedReruns).toBe(base.debouncedReruns);
+      expect(s.reruns).toBe(base.reruns);
+    } finally {
+      // one timer armed for the three writes; flushing it is the single debounced re-run
+      const armed = await runInDurableObject(stub, (inst: Shard) => {
+        const d = inst as unknown as Debouncing;
+        d.cfg = { ...d.cfg, reactivity: { ...d.cfg.reactivity, searchDebounceMs: windowMs } };
+        const armed = d.debounceTimer !== null;
+        d.flushDebounced();
+        return armed;
+      });
+      expect(armed).toBe(true);
+    }
     let s = (await stub.inspect()).stats;
-    expect(s.debouncedReruns).toBe(base.debouncedReruns);
+    expect(s.debouncedReruns).toBe(base.debouncedReruns + 1);
     expect(s.reruns).toBe(base.reruns);
+    // the real window: a loose write is re-run by the timer once it elapses
+    b.send({ t: "mut", mid: 5, fn: "messages:send", args: { channel: "c", body: "goodbye 5" } });
+    await b.waitFor(is("mres", (m) => m.mid === 5));
     await sleep(300);
     s = (await stub.inspect()).stats;
-    expect(s.debouncedReruns).toBe(base.debouncedReruns + 1);
-    // same results: no patch for the debounced re-run
+    expect(s.debouncedReruns).toBe(base.debouncedReruns + 2);
+    expect(s.reruns).toBe(base.reruns);
+    // same results: no patch for the debounced re-runs
     expect(a.frames.filter((f) => f.t === "patch")).toEqual([]);
     a.close();
     b.close();
