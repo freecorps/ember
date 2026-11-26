@@ -18,6 +18,10 @@ const entries: Record<string, string> = {
     ? `import { EmberClient } from "@freecorps/ember-client";\nimport { multiTab } from "@freecorps/ember-client/multitab";\nglobalThis.c = new EmberClient({ url: "https://x.test", multiTab: multiTab() });\n`
     : `import { EmberClient } from "@freecorps/ember-client";\nglobalThis.c = new EmberClient({ url: "https://x.test", multiTab: true });\n`,
 };
+// The upload helper as an option (`files: files()` of the subpath): in the page's bundle, not loaded with `import()`.
+if (readFileSync(join(src, "files.ts"), "utf8").includes("export function files(")) {
+  entries["EmberClient + files()"] = `import { EmberClient } from "@freecorps/ember-client";\nimport { files } from "@freecorps/ember-client/files";\nglobalThis.c = new EmberClient({ url: "https://x.test", files: files() });\n`;
+}
 
 const dir = mkdtempSync(join(tmpdir(), "ember-bundle-"));
 const kib = (n: number) => `${(n / 1024).toFixed(1)} KiB`;
@@ -33,7 +37,7 @@ try {
       platform: "browser" as const,
       conditions: ["@freecorps/ember-source"],
       // The entry lives outside the repo: the package's entry points by path (as its `exports` map them in the repo).
-      alias: { "@freecorps/ember-client/multitab": join(src, "multitab.ts"), "@freecorps/ember-client": join(src, "index.ts") },
+      alias: { "@freecorps/ember-client/multitab": join(src, "multitab.ts"), "@freecorps/ember-client/files": join(src, "files.ts"), "@freecorps/ember-client": join(src, "index.ts") },
       logLevel: "error" as const,
       write: false,
     };
@@ -42,7 +46,12 @@ try {
     const split = await build({ ...common, splitting: true, outdir: join(dir, "split"), metafile: true });
     // What loads with the page: the entry and the chunks it imports statically (shared code); the rest is `import()`.
     const outs = split.metafile!.outputs;
-    const file = (p: string) => split.outputFiles.find((f) => f.path.endsWith(p.replace(/^.*\//, "/")))!.contents;
+    // Metafile keys are relative to the working directory (esbuild's default `absWorkingDir`); output paths are absolute.
+    const file = (p: string) => {
+      const out = split.outputFiles.find((f) => f.path === resolve(p));
+      if (!out) throw new Error(`bench: no output file for ${p}`);
+      return out.contents;
+    };
     const eager = new Set<string>();
     const walk = (p: string) => {
       if (eager.has(p)) return;
