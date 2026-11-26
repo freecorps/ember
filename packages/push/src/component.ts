@@ -16,7 +16,7 @@
  * go directly to APNs (`APNS_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID` secrets + the topic) or FCM (`FCM_SERVICE_ACCOUNT`).
  * Secret names are configurable; values are read from the Worker env at send time and never stored.
  */
-import { componentBuilders, defineComponent, defineSchema, defineTable, unsafeRef, v, type ComponentCtx, type FunctionReference, type GenericId } from "@freecorps/ember-server";
+import { componentBuilders, defineComponent, defineSchema, defineTable, paginationOptsValidator, unsafeRef, v, type ComponentCtx, type FunctionReference, type GenericId } from "@freecorps/ember-server";
 import type { ApnsOptions } from "./apns.ts";
 import {
   pushDevicesForUser,
@@ -597,12 +597,100 @@ function pruneStep(ctx: MutationCtx, before: number, olderThanMs: number, limit:
   return r.deleted;
 }
 
+// ------------------------------------------------------------------------------------------------ dashboard
+
+/** A push token as the dashboard shows it: enough to recognize it, not enough to use it. */
+const maskToken = (t: string) => (t.length > 16 ? `${t.slice(0, 12)}…${t.slice(-4)}` : "…");
+
+/** What the dashboard's screen reads and does (module `dashboard`, internal: never part of the component's API). */
+const dashboardFunctions = {
+  /** Devices in this shard and pending receipt checks. */
+  overview: internalQuery({
+    args: {},
+    handler: (ctx) => {
+      const count = (provider?: string) => ctx.runQuery(unsafeRef<"query">("lib:count"), provider !== undefined ? { provider } : {}) as number;
+      return { total: count(), expo: count("expo"), apns: count("apns"), fcm: count("fcm"), pendingReceipts: ctx.db.query("pendingReceipts").take(1001).length };
+    },
+  }),
+  /** Devices, most recently registered first (one user's, or one provider's); tokens masked. */
+  devices: internalQuery({
+    args: { userId: v.optional(v.string()), provider: v.optional(v.union(v.literal("expo"), v.literal("apns"), v.literal("fcm"))), paginationOpts: paginationOptsValidator },
+    handler: (ctx, a) => {
+      const base = a.userId !== undefined ? ctx.db.query(TABLE).withIndex("by_user", (q) => q.eq("userId", a.userId!)) : ctx.db.query(TABLE).withIndex("by_updated").order("desc");
+      const page = (a.provider !== undefined ? base.filter((f) => f.eq(f.field("provider"), a.provider!)) : base).paginate(a.paginationOpts);
+      return {
+        ...page,
+        page: page.page.map((d) => ({ _id: d._id, userId: d.userId, provider: d.provider, platform: d.platform ?? null, deviceName: d.deviceName ?? null, environment: d.environment ?? null, token: maskToken(d.token), voip: d.voipToken !== undefined, sealed: d.publicKey !== undefined, updatedAt: d.updatedAt })),
+      };
+    },
+  }),
+  /** Removes one device (by id: the dashboard never holds the token). False if it is gone already. */
+  remove: internalMutation({
+    args: { id: v.string() },
+    returns: v.boolean(),
+    handler: (ctx, { id }) => {
+      const n = ctx.db.normalizeId(TABLE, id);
+      const d = n ? ctx.db.get(n) : null;
+      if (!d) return false;
+      ctx.db.delete(d._id);
+      return true;
+    },
+  }),
+};
+
 const fallbackValidator = v.object({ title: v.optional(v.string()), body: v.optional(v.string()), titleLocKey: v.optional(v.string()), locKey: v.optional(v.string()) });
 
 export const pushComponent = defineComponent({
   name: "push",
   schema,
-  functions: pushFunctions,
+  functions: { ...pushFunctions, dashboard: dashboardFunctions },
+  // The devices' screen in the Ember Dashboard (contracts.md "Telas declarativas"): devices live per shard.
+  dashboard: {
+    label: "Push devices",
+    icon: "bell",
+    description: "Registered devices by provider (tokens masked); remove one, or prune the ones not registered for a while.",
+    tabs: [
+      {
+        id: "devices",
+        label: "Devices",
+        blocks: [
+          {
+            kind: "stats",
+            id: "providers",
+            query: dashboardFunctions.overview,
+            items: [
+              { label: "Devices", path: "total", format: "number" },
+              { label: "Expo", path: "expo", format: "number" },
+              { label: "APNs", path: "apns", format: "number" },
+              { label: "FCM", path: "fcm", format: "number" },
+              { label: "Receipt checks pending", path: "pendingReceipts", format: "number" },
+            ],
+          },
+          {
+            kind: "table",
+            id: "devices",
+            query: dashboardFunctions.devices,
+            columns: [
+              { label: "User", path: "userId", format: "code" },
+              { label: "Provider", path: "provider", format: "badge" },
+              { label: "Platform", path: "platform" },
+              { label: "Device", path: "deviceName" },
+              { label: "Token", path: "token", format: "code" },
+              { label: "Sealed", path: "sealed", format: "boolean" },
+              { label: "Registered", path: "updatedAt", format: "ago" },
+            ],
+            rowActions: [{ id: "remove", label: "Remove", fn: dashboardFunctions.remove, fromRow: { id: "_id" }, destructive: true, description: "The device stops getting pushes until the app registers it again." }],
+          },
+          {
+            kind: "actions",
+            id: "prune",
+            label: "Maintenance",
+            actions: [{ id: "prune", label: "Prune stale devices…", fn: pushFunctions.lib.pruneStale, destructive: true, description: "Deletes devices not registered for olderThanMs (at least 24 h)." }],
+          },
+        ],
+      },
+    ],
+  },
   config: v.optional(
     v.object({
       accessTokenEnv: v.optional(v.string()),
