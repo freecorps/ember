@@ -20,6 +20,7 @@ import {
   defineSchema,
   defineTable,
   EmberError,
+  paginationOptsValidator,
   unsafeRef,
   v,
   type ComponentCtx,
@@ -726,6 +727,32 @@ export const functions = {
       },
     }),
 
+    // ------------------------------------------------------------------------------------------- dashboard
+
+    /** Items of this pool in this shard, newest first (by status: in queue order). The dashboard's "Items" table. */
+    list: internalQuery({
+      args: { status: v.optional(status), paginationOpts: paginationOptsValidator },
+      handler: (ctx, { status: s, paginationOpts }) => {
+        const q = s ? ctx.db.query("work").withIndex("by_queue", (r) => r.eq("status", s)) : ctx.db.query("work").order("desc");
+        const page = q.paginate(paginationOpts);
+        return { ...page, page: page.page.map(itemView) };
+      },
+    }),
+
+    /** One item with its args, result and errors (the dashboard's detail); null when unknown. */
+    item: internalQuery({
+      args: { id: v.string() },
+      handler: (ctx, { id }) => {
+        const w = load(ctx, id);
+        if (!w) return null;
+        const events: Array<{ at: number; event: string; status?: string }> = [{ at: w.enqueuedAt, event: "enqueued" }];
+        if (w.startedAt !== undefined) events.push({ at: w.startedAt, event: `attempt ${w.attempts} started` });
+        if (w.attemptAt !== undefined && w.attempts > 1 && w.status === "running") events.push({ at: w.attemptAt, event: `attempt ${w.attempts} due`, status: "retrying" });
+        if (w.finishedAt !== undefined) events.push({ at: w.finishedAt, event: "finished", status: w.status });
+        return { ...itemView(w), args: w.args, context: w.context ?? null, retry: w.retry ?? null, result: w.result ?? null, onCompleteError: w.onCompleteError ?? null, events };
+      },
+    }),
+
     // ------------------------------------------------------------------------------------------- internal
 
     cancelAllNext: internalMutation({ args: { before: v.number() }, handler: (ctx, { before }) => void cancelPage(ctx, before) }),
@@ -831,6 +858,26 @@ function tickBuffered(ctx: Ctx) {
   if (next !== Infinity) ensureTick(ctx, next);
 }
 
+/** A work item as the dashboard lists it: the function's name without the handle's `&`. */
+function itemView(w: Work) {
+  return {
+    _id: w._id,
+    fn: w.fn.startsWith("&") ? w.fn.slice(1) : w.fn,
+    kind: w.kind,
+    status: w.status,
+    priority: -w.rank,
+    attempts: w.attempts,
+    key: w.key ?? null,
+    cancelRequested: w.cancelRequested === true,
+    lastError: w.lastError ?? null,
+    enqueuedAt: w.enqueuedAt,
+    startedAt: w.startedAt ?? null,
+    finishedAt: w.finishedAt ?? null,
+  };
+}
+
+const lib = functions.lib;
+
 export const installConfigValidator = v.optional(
   v.object({ maxParallelism: v.optional(v.number()), retentionMs: v.optional(v.number()), reclaimIntervalMs: v.optional(v.number()) }),
 );
@@ -840,4 +887,78 @@ export const workpool = defineComponent({
   schema,
   functions,
   config: installConfigValidator,
+  // The pool's screen in the Ember Dashboard (contracts.md "Telas declarativas"): per shard, like its tables.
+  dashboard: {
+    label: "Work pool",
+    icon: "queue",
+    description: "Items by status, with their attempts and errors; cancel one, or everything enqueued so far.",
+    tabs: [
+      {
+        id: "items",
+        label: "Items",
+        blocks: [
+          {
+            kind: "stats",
+            id: "now",
+            query: lib.stats,
+            items: [
+              { label: "Pending", path: "pending", format: "number" },
+              { label: "Running", path: "running", format: "number" },
+              { label: "Max parallelism", path: "maxParallelism", format: "number" },
+              { label: "Succeeded (retained)", path: "finished.success", format: "number" },
+              { label: "Failed (retained)", path: "finished.failed", format: "number" },
+              { label: "Canceled (retained)", path: "finished.canceled", format: "number" },
+            ],
+          },
+          {
+            kind: "table",
+            id: "work",
+            label: "Items",
+            query: lib.list,
+            columns: [
+              { label: "Function", path: "fn", format: "code" },
+              { label: "Kind", path: "kind" },
+              { label: "Status", path: "status", format: "badge" },
+              { label: "Attempts", path: "attempts", format: "number" },
+              { label: "Enqueued", path: "enqueuedAt", format: "ago" },
+              { label: "Last error", path: "lastError" },
+            ],
+            detail: {
+              query: lib.item,
+              fromRow: { id: "_id" },
+              sections: [
+                { kind: "kv", items: [{ label: "Function", path: "fn", format: "code" }, { label: "Status", path: "status", format: "badge" }, { label: "Attempts", path: "attempts", format: "number" }, { label: "Priority", path: "priority", format: "number" }, { label: "Key", path: "key", format: "code" }, { label: "Cancel requested", path: "cancelRequested", format: "boolean" }] },
+                { kind: "timeline", label: "History", path: "events", time: "at", title: "event", status: "status" },
+                { kind: "stacktrace", label: "Last error", path: "lastError" },
+                { kind: "json", label: "Arguments", path: "args" },
+                { kind: "json", label: "Result", path: "result" },
+              ],
+            },
+            rowActions: [{ id: "cancel", label: "Cancel", fn: lib.cancel, fromRow: { id: "_id" }, description: "A pending item is canceled now; an action in flight when it returns." }],
+          },
+          { kind: "actions", id: "bulk", actions: [{ id: "cancelAll", label: "Cancel all", fn: lib.cancelAll, destructive: true, description: "Cancels every item enqueued so far in this shard." }] },
+        ],
+      },
+      {
+        id: "totals",
+        label: "Totals",
+        blocks: [
+          {
+            kind: "stats",
+            id: "totals",
+            description: "Since the pool was created in this shard.",
+            query: lib.stats,
+            items: [
+              { label: "Enqueued", path: "totals.enqueued", format: "number" },
+              { label: "Succeeded", path: "totals.succeeded", format: "number" },
+              { label: "Failed", path: "totals.failed", format: "number" },
+              { label: "Canceled", path: "totals.canceled", format: "number" },
+              { label: "Retries", path: "totals.retries", format: "number" },
+              { label: "Reclaimed", path: "totals.reclaimed", format: "number" },
+            ],
+          },
+        ],
+      },
+    ],
+  },
 });
