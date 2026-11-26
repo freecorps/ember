@@ -1,9 +1,10 @@
 // Health of one environment, from data that already exists: Analytics Engine (errors, latency, rows read per call,
-// busiest shards), the shard catalog and the live migration status of each shard.
+// busiest shards) and the shard catalog (D1). Loading it wakes no shard: the catalog says which shards reported an
+// older schema, and their live migration status is asked for only on demand ("Check live status").
 
 import { useState, type ReactNode } from "react";
 import { path } from "../api.ts";
-import { fmtNum, fmtPct, windowLabel, windows } from "../format.ts";
+import { fmtNum, fmtPct, short, windowLabel, windows } from "../format.ts";
 import { href, useApi, useSession } from "../hooks.ts";
 import { Badge, Empty, Loading, Meter, Mono, Problem, Section, Stat, Table } from "../ui.tsx";
 import { limitWarnings } from "../../metrics-sql.ts";
@@ -22,6 +23,24 @@ export function migrationState(st: StatusBody["shards"][number] | undefined): { 
   return { tone: "warn", text: "pending" };
 }
 
+/** `/api/status` for several shards (one request; the project wakes each one it names). */
+export function statusPath(project: string, env: string, shards: string[]): string {
+  const q = new URLSearchParams({ project, env });
+  for (const s of shards) q.append("shard", s);
+  return `/api/status?${q}`;
+}
+
+/** Catalog rows whose last reported schema is not the deployed one (a migration not reported yet, or pending). */
+export function behindCatalog(rows: ShardRow[], expected: string | null | undefined): ShardRow[] {
+  return expected ? rows.filter((r) => r.schema_version !== expected) : [];
+}
+
+/** What the catalog alone says about a shard's schema (no live status asked). */
+export function catalogState(row: ShardRow, expected: string | null | undefined): { tone: "ok" | "warn" | undefined; text: string } {
+  if (!expected || !row.schema_version) return { tone: undefined, text: "—" };
+  return row.schema_version === expected ? { tone: "ok", text: "current" } : { tone: "warn", text: "behind (catalog)" };
+}
+
 export function Health({ project, env }: { project: string; env: string }) {
   const [hours, setHours] = useState(24);
   const { me } = useSession();
@@ -29,7 +48,12 @@ export function Health({ project, env }: { project: string; env: string }) {
   // Without Analytics Engine there is nothing to ask: one notice instead of an error per panel.
   const fns = useApi<{ functions: FunctionRow[] }>(me.metrics ? path("/api/functions", { ...scope, hours }) : null);
   const hot = useApi<{ shards: Array<{ shard: string; calls: number; errors: number; rowsRead: number; rowsWritten: number }> }>(me.metrics ? path("/api/hot-shards", { ...scope, hours }) : null);
-  const shards = useApi<{ shards: ShardRow[]; status: StatusBody | { ok: false; status: number; error: string } | null }>(path("/api/shards", { ...scope, status: 1 }));
+  // The catalog only: no shard is woken up by opening this screen.
+  const shards = useApi<{ shards: ShardRow[]; expected?: string | null }>(path("/api/shards", scope));
+  const behind = behindCatalog(shards.data?.shards ?? [], shards.data?.expected);
+  // Live status on demand: the shards the catalog says are behind (else the 50 largest), up to 50.
+  const [check, setCheck] = useState<string[] | null>(null);
+  const live = useApi<StatusBody>(check?.length ? statusPath(project, env, check) : null);
   const caps = useApi<{ level: number; features: string[] }>(path("/api/capabilities", scope));
 
   const f = fns.data?.functions ?? [];
@@ -39,13 +63,25 @@ export function Health({ project, env }: { project: string; env: string }) {
   const p95 = f.filter((x) => x.timing === "rpc" || x.timing === "commit" || x.timing === "wall").reduce((a, x) => Math.max(a, x.p95), 0);
   const expensive = f.filter((x) => (x.kind === "query" || x.kind === "subscription") && x.avgRowsRead >= EXPENSIVE_ROWS).sort((a, b) => b.avgRowsRead - a.avgRowsRead).slice(0, 8);
   const failing = f.filter((x) => x.errors > 0).sort((a, b) => b.errors - a.errors).slice(0, 8);
-  const status = shards.data?.status && "shards" in shards.data.status ? shards.data.status : null;
-  const statusError = shards.data?.status && !("shards" in shards.data.status) ? shards.data.status : null;
-  const pending = (status?.shards ?? []).filter((s) => !s.ready);
+  const status = live.data;
+  // A live answer for another deployed schema (a Refresh that overlapped a deploy) says nothing about the current one:
+  // only the live results expecting the schema the catalog expects count; the others keep their catalog warning.
+  const expected = shards.data?.expected;
+  const current = (status?.shards ?? []).filter((s) => !expected || s.expectedVersion === expected);
+  // No live result for the deployed schema left: the screen says what the catalog says (never "all checked ready").
+  const liveNow = status && current.length ? status : undefined;
+  const pending = current.filter((s) => !s.ready);
+  // Catalog-behind shards the live check did not cover (more than 50 behind) keep their catalog warning.
+  const checked = new Set(current.map((s) => s.shard));
+  const unchecked = liveNow ? behind.filter((r) => !checked.has(r.shard)) : behind;
+  /** Without the deployed schema in the registry nothing can be compared: unknown, not "all current". */
+  const known = !!shards.data?.expected;
+  const checkLive = () => setCheck((behind.length ? behind : (shards.data?.shards ?? [])).slice(0, 50).map((r) => r.shard));
 
   const attention: Array<{ tone: "bad" | "warn"; text: ReactNode }> = [];
   if (caps.data && caps.data.level < 2) attention.push({ tone: "warn", text: <>This project runs an older runtime (admin API level {caps.data.level}). Update <code>@freecorps/ember-runtime</code> and redeploy for every screen.</> });
-  for (const s of pending) attention.push({ tone: s.migrationError ? "bad" : "warn", text: <><Mono>{s.shard}</Mono> migration {migrationState(s).text}</> });
+  if (liveNow) for (const s of pending) attention.push({ tone: s.migrationError ? "bad" : "warn", text: <><Mono>{s.shard}</Mono> migration {migrationState(s).text}</> });
+  for (const r of unchecked.slice(0, 5)) attention.push({ tone: "warn", text: <><Mono>{r.shard}</Mono> reported an older schema ({short(r.schema_version)}): check its live status</> });
   for (const x of failing.filter((x) => x.errorRate >= BAD_ERROR_RATE).slice(0, 3)) attention.push({ tone: "bad", text: <><Mono>{x.fn}</Mono> fails {fmtPct(x.errorRate)} of {fmtNum(x.calls)} calls</> });
   // Functions that came within 70% of a per-transaction limit (the `ember dev` warning, from the metrics' peaks).
   for (const x of f) for (const w of limitWarnings(x.limitPeaks ?? {})) attention.push({ tone: (x.limitPeaks?.[w.counter] ?? 0) >= 1 ? "bad" : "warn", text: <><Mono>{x.fn}</Mono> {w.message}</> });
@@ -71,6 +107,7 @@ export function Health({ project, env }: { project: string; env: string }) {
             fns.reload();
             hot.reload();
             shards.reload();
+            if (check) live.reload();
           }}
         >
           Refresh
@@ -91,7 +128,24 @@ export function Health({ project, env }: { project: string; env: string }) {
         <Stat label="Error rate" value={fns.data ? fmtPct(rate) : "—"} tone={fns.data ? (rate >= BAD_ERROR_RATE ? "bad" : "ok") : undefined} hint={fns.data ? `${fmtNum(errors)} errors` : undefined} />
         <Stat label="Worst p95" value={fns.data ? `${fmtNum(p95, 1)} ms` : "—"} hint="rpc / commit / action wall time" />
         <Stat label="Shards" value={shards.data ? fmtNum(shards.data.shards.length) : "—"} hint="in the catalog" />
-        <Stat label="Migrations" value={status ? (pending.length ? `${pending.length} pending` : "all ready") : "—"} tone={status ? (pending.some((s) => s.migrationError) ? "bad" : pending.length ? "warn" : "ok") : undefined} />
+        <Stat
+          label="Migrations"
+          value={
+            liveNow
+              ? pending.length
+                ? `${pending.length} pending`
+                : unchecked.length
+                  ? `${unchecked.length} unchecked`
+                  : `${fmtNum(checked.size)} checked ready`
+              : shards.data && known
+                ? behind.length
+                  ? `${behind.length} behind`
+                  : "all current"
+                : "—"
+          }
+          tone={liveNow ? (pending.some((s) => s.migrationError) ? "bad" : pending.length || unchecked.length ? "warn" : "ok") : shards.data && known ? (behind.length ? "warn" : "ok") : undefined}
+          hint={liveNow ? `live status of ${fmtNum(checked.size)} shard(s)` : known ? "from the catalog" : "no deployed schema in the registry"}
+        />
       </div>
 
       <Section title="Needs attention" id="attention">
@@ -166,25 +220,50 @@ export function Health({ project, env }: { project: string; env: string }) {
             />
           )}
         </Section>
-        <Section title="Pending migrations" id="migrations">
+        <Section
+          title="Pending migrations"
+          id="migrations"
+          actions={
+            shards.data?.shards.length ? (
+              <button type="button" onClick={() => (check ? live.reload() : checkLive())} disabled={live.loading}>
+                {check ? "Check again" : "Check live status"}
+              </button>
+            ) : null
+          }
+        >
           {shards.error ? (
             <Problem error={shards.error} />
           ) : !shards.data ? (
             <Loading />
-          ) : statusError ? (
-            <div className="notice bad">Live status unavailable ({String(statusError.status)}).</div>
           ) : !shards.data.shards.length ? (
             <Empty>No shard has reported yet.</Empty>
-          ) : (
+          ) : live.error ? (
+            <Problem error={live.error} onRetry={live.reload} />
+          ) : live.loading ? (
+            <Loading />
+          ) : liveNow ? (
             <Table
               label="Pending migrations"
-              empty={`All ${fmtNum(status?.shards.length ?? 0)} checked shards are on the deployed schema.`}
+              empty={`All ${fmtNum(current.length)} checked shards are on the deployed schema.`}
               cols={[{ h: "Shard" }, { h: "State" }]}
               rows={pending.map((s) => {
                 const m = migrationState(s);
                 return [<Mono>{s.shard}</Mono>, <Badge {...(m.tone ? { tone: m.tone } : {})}>{m.text}</Badge>];
               })}
             />
+          ) : (
+            <>
+              <p className="muted small">From the catalog (each shard reports after a migration and hourly while active). The live status wakes each shard it asks: up to 50, on demand.</p>
+              <Table
+                label="Pending migrations"
+                empty={known ? `All ${fmtNum(shards.data.shards.length)} shards of the catalog reported the deployed schema.` : "The registry has no deployed schema for this environment: nothing to compare (check the live status)."}
+                cols={[{ h: "Shard" }, { h: "Reported schema" }, { h: "State" }]}
+                rows={behind.slice(0, 50).map((r) => {
+                  const m = catalogState(r, shards.data?.expected);
+                  return [<Mono>{r.shard}</Mono>, <Mono>{short(r.schema_version)}</Mono>, <Badge {...(m.tone ? { tone: m.tone } : {})}>{m.text}</Badge>];
+                })}
+              />
+            </>
           )}
         </Section>
       </div>

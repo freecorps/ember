@@ -18,7 +18,15 @@ export interface LocalOptions {
   components?: Record<string, { queues?: Array<{ queue: string; binding: string }>; bindings?: Array<{ type: string; name: string } & Record<string, unknown>> }>;
   /** `ember dev --remote`: bindings proxied to real Cloudflare resources (remote.ts). */
   remote?: RemoteBindings;
+  /**
+   * `ember dev --dashboard`: a local D1 bound as EMBER_REGISTRY (the shard catalog the runtime reports to, and the
+   * local dashboard's registry and audit log).
+   */
+  registry?: boolean;
 }
+
+/** The local D1 of `ember dev --dashboard` (binding → database id). */
+export const DEV_REGISTRY_D1 = { EMBER_REGISTRY: "ember-dev-registry" };
 
 /** Local queues and send_email bindings that installed components declared (hooks, PLAN §12). */
 function componentLocal(project: string, components: LocalOptions["components"]) {
@@ -95,6 +103,7 @@ export function miniflareOptions(project: Project, build: WorkerBuild, opts: Loc
           ...(c.resources?.files && opts.port ? { EMBER_PUBLIC_URL: `http://${host}:${opts.port}` } : {}),
           ...opts.vars },
         ...(c.resources?.files ? { r2Buckets: ["EMBER_FILES"] } : {}),
+        ...(opts.registry ? { d1Databases: DEV_REGISTRY_D1 } : {}),
         ...componentLocal(c.project, opts.components),
         ...(opts.remote ? remoteBindingOptions(opts.remote) : {}),
       },

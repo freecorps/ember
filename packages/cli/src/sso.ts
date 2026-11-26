@@ -3,7 +3,7 @@
 // `ember-registry`, `environments`), builds the Worker with that URL (`remoteAuth({ from })`: JWKS + issuer) and
 // records the link in `auth_links`. A URL keeps working as before.
 
-import type { AuthSettings, Project } from "./config.ts";
+import { isDerivedPreview, PREVIEW_BASE, type AuthSettings, type Project } from "./config.ts";
 
 const NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
@@ -43,9 +43,14 @@ export async function resolveAuthFrom(registry: SsoRegistry, from: { project: st
   return { project: from.project, env: pick.env, url: pick.url.replace(/\/+$/, "") };
 }
 
-/** The project with `auth.from` replaced by a URL for `env` (the env override wins in `authSettings`). */
+/**
+ * The project with `auth.from` replaced by a URL for `env` (the env override wins in `authSettings`). A derived preview
+ * (`preview-<slug>`) gets it on `environments.preview`, the entry it derives from, in this copy only: declaring the
+ * preview itself would hide what it inherits (vars, account, limits, placement) and keep the base's `auth.url`.
+ */
 export function withAuthFrom(project: Project, env: string, url: string): Project {
   const envs = project.config.environments;
-  const auth: AuthSettings = { ...(envs[env]?.auth ?? {}), from: url };
-  return { ...project, config: { ...project.config, environments: { ...envs, [env]: { ...(envs[env] ?? {}), auth } } } };
+  const key = isDerivedPreview(project, env) ? PREVIEW_BASE : env;
+  const auth: AuthSettings = { ...(envs[key]?.auth ?? {}), from: url };
+  return { ...project, config: { ...project.config, environments: { ...envs, [key]: { ...(envs[key] ?? {}), auth } } } };
 }

@@ -151,6 +151,12 @@ export interface StreamLogsOptions {
   /** Resolves to stop streaming (default: SIGINT/SIGTERM). */
   until?: Promise<void>;
   onEvent?: (ev: TailEvent) => void;
+  /** Called when the tail socket opens (a capture window measured from then, not from before the tail was created). */
+  onOpen?: () => void;
+  /** Fails when the socket has not opened within this many ms (default: no deadline). */
+  openTimeoutMs?: number;
+  /** Prints the "tailing <worker>" line when the socket opens (default true). */
+  banner?: boolean;
 }
 
 /** Streams the Worker's tail until `until` resolves (or the socket closes). Always deletes the tail session. */
@@ -172,10 +178,25 @@ export async function streamLogs(client: CfClient, worker: string, o: StreamLogs
     const ws = new Ws(tail.url, "trace-v1");
     await new Promise<void>((resolve, reject) => {
       let open = false;
+      const setup =
+        o.openTimeoutMs !== undefined
+          ? setTimeout(() => {
+              if (open) return;
+              // Rejected before the close (whose event would resolve the wait as a normal end).
+              reject(new Error(`tail WebSocket did not open within ${o.openTimeoutMs! / 1000} s`));
+              try {
+                ws.close(1000);
+              } catch {
+                // never opened
+              }
+            }, o.openTimeoutMs)
+          : undefined;
       ws.addEventListener("open", () => {
         open = true;
+        clearTimeout(setup);
         ws.send(JSON.stringify({ debug: false }));
-        print(`tailing ${worker} (session ${tail.id.slice(0, 8)}) — Ctrl-C to stop`);
+        if (o.banner !== false) print(`tailing ${worker} (session ${tail.id.slice(0, 8)}) — Ctrl-C to stop`);
+        o.onOpen?.();
       });
       ws.addEventListener("message", async (e) => {
         const data = typeof e.data === "string" ? e.data : e.data instanceof Blob ? await e.data.text() : new TextDecoder().decode(e.data as ArrayBuffer);
@@ -193,7 +214,10 @@ export async function streamLogs(client: CfClient, worker: string, o: StreamLogs
       ws.addEventListener("error", (e) => {
         if (!open) reject(new Error(`tail WebSocket failed: ${(e as { message?: string }).message ?? "error"}`));
       });
-      ws.addEventListener("close", () => resolve());
+      ws.addEventListener("close", () => {
+        clearTimeout(setup);
+        resolve();
+      });
       void until.then(() => {
         try {
           ws.close(1000);

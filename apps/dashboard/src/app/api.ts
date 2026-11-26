@@ -105,7 +105,7 @@ export function path(base: string, params: Record<string, string | number | null
 }
 
 export interface Me {
-  via: "access" | "token";
+  via: "access" | "token" | "dev";
   who: string | null;
   actor: string;
   role: "read" | "admin";

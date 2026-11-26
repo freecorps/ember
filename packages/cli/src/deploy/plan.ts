@@ -12,6 +12,7 @@
 import { createHash } from "node:crypto";
 import { cronTriggers } from "@freecorps/ember-server";
 import { doClasses } from "../build.ts";
+import type { WorkerLimits, WorkerPlacement } from "../config.ts";
 import { aiBindings, type AiBinding, type AiResources } from "./ai.ts";
 
 export type ExportEntry =
@@ -53,6 +54,12 @@ export interface WorkerMetadata {
   /** Binding types carried over from the previous version (secrets set with `ember env set` / `ember keys rotate`). */
   keep_bindings: string[];
   annotations?: Record<string, string>;
+  /**
+   * ember.json `limits` / `placement`. Script-level settings: a Script PUT carries them, a version upload does not
+   * (its metadata has no such fields), so a redeploy that changes them goes up as a Script PUT (`settings-change`).
+   */
+  limits?: { cpu_ms: number };
+  placement?: { mode: "smart" };
 }
 
 export interface CurrentState {
@@ -68,6 +75,11 @@ export interface CurrentState {
    * deploy then sets it as always.
    */
   subdomain?: { enabled: boolean; previews_enabled: boolean };
+  /**
+   * The Worker's `limits.cpu_ms` and `placement.mode` (`GET .../settings`; null = not set), read only when ember.json
+   * manages one of them. Absent with such a setting: unknown (the deploy applies it).
+   */
+  settings?: { cpuMs: number | null; placement: string | null };
 }
 
 export interface MetadataInput {
@@ -102,6 +114,10 @@ export interface MetadataInput {
   observability?: WorkerObservability;
   /** The build has chunks besides `index.js` (`WorkerBuild.modules`): see `workerCompatibilityFlags`. */
   splitModules?: boolean;
+  /** ember.json `limits` (`workerSettings`). */
+  limits?: WorkerLimits;
+  /** ember.json `placement`. */
+  placement?: WorkerPlacement;
 }
 
 type ComponentsLike = Record<
@@ -264,8 +280,29 @@ export function buildMetadata(i: MetadataInput): { metadata: WorkerMetadata; cre
     exports,
     observability: i.observability ?? { enabled: true },
     keep_bindings: ["secret_text", "secret_key"],
+    ...(i.limits?.cpuMs !== undefined ? { limits: { cpu_ms: i.limits.cpuMs } } : {}),
+    ...(i.placement ? { placement: { mode: i.placement } } : {}),
   };
   return { metadata, createdClasses: created };
+}
+
+/**
+ * What ember.json's `limits` / `placement` would change on the Worker (`["limits.cpu_ms 30000 → 50"]`); empty when
+ * the Worker already has them (or ember.json manages neither). Unknown current settings count as changes.
+ */
+export function settingsChanges(metadata: Pick<WorkerMetadata, "limits" | "placement">, current: Pick<CurrentState, "settings">): string[] {
+  const out: string[] = [];
+  const now = current.settings;
+  const show = (x: number | string | null | undefined) => (!now ? "unknown" : x === null || x === undefined ? "unset" : String(x));
+  if (metadata.limits && now?.cpuMs !== metadata.limits.cpu_ms) out.push(`limits.cpu_ms ${show(now?.cpuMs)} → ${metadata.limits.cpu_ms}`);
+  if (metadata.placement && now?.placement !== metadata.placement.mode) out.push(`placement ${show(now?.placement)} → ${metadata.placement.mode}`);
+  return out;
+}
+
+/** The metadata of a version upload: no script-level settings (`limits`, `placement`). */
+export function versionMetadata(m: WorkerMetadata): WorkerMetadata {
+  const { limits: _l, placement: _p, ...rest } = m;
+  return rest;
 }
 
 /** The metadata with secret values replaced (for printing). */
@@ -279,7 +316,12 @@ export type Strategy =
   /** `exports` change (new class): version upload, then a 100% deployment (R2). */
   | "exports-change"
   /** Code-only: version upload, then a 100% or percentage deployment (R2: DO ids stick to one version). */
-  | "code-only";
+  | "code-only"
+  /**
+   * `limits` / `placement` change: one Script PUT (it carries them; a version upload cannot) deploys at 100%. A
+   * redeploy whose Worker already has them is code-only: no extra write.
+   */
+  | "settings-change";
 
 export type Step =
   | { kind: "upload-script"; method: "PUT"; path: string }
@@ -314,6 +356,8 @@ export interface DeployPlan {
   metadata: WorkerMetadata;
   steps: Step[];
   warnings: string[];
+  /** `settingsChanges`: what this deploy changes in `limits` / `placement` (empty: nothing). */
+  settings: string[];
 }
 
 /** Placeholder for the version id returned by the upload step. */
@@ -346,6 +390,8 @@ export function planDeploy(input: {
   const base = `/workers/scripts/${worker}`;
   const warnings: string[] = [];
   const steps: Step[] = [];
+  // A new Worker's Script PUT carries every setting: nothing "changes" then.
+  const settings = current.exists ? settingsChanges(metadata, current) : [];
   if (input.files) steps.push({ kind: "files-resources", ...input.files });
   const ai = input.ai;
   if (ai && (ai.vectorize.length || ai.aiSearch.length)) {
@@ -359,11 +405,15 @@ export function planDeploy(input: {
     steps.push({ kind: "upload-script", method: "PUT", path: base });
     if (input.gradual !== undefined) warnings.push("--gradual ignored: first deploy goes to 100%.");
   } else {
-    strategy = createdClasses.length ? "exports-change" : "code-only";
+    strategy = createdClasses.length ? "exports-change" : settings.length ? "settings-change" : "code-only";
     if (strategy === "exports-change") {
       // One Script PUT: provisions the new classes and deploys at 100% (a version referencing them is refused, 100406).
       steps.push({ kind: "upload-script", method: "PUT", path: base });
       if (input.gradual !== undefined && input.gradual < 100) warnings.push(`--gradual ignored: exports change (${createdClasses.join(", ")}) must deploy at 100% (R2, error 100405).`);
+    } else if (strategy === "settings-change") {
+      // limits / placement are script-level: only a Script PUT sets them, and it deploys at 100%.
+      steps.push({ kind: "upload-script", method: "PUT", path: base });
+      if (input.gradual !== undefined && input.gradual < 100) warnings.push(`--gradual ignored: ${settings.join(", ")} goes up with the code as one Script PUT, at 100%.`);
     } else {
       steps.push({ kind: "upload-version", method: "POST", path: `${base}/versions` });
       let versions = [{ version_id: NEW_VERSION, percentage: 100 }];
@@ -392,5 +442,5 @@ export function planDeploy(input: {
   if (cq?.stale.length) steps.push({ kind: "component-queues-prune", queues: cq.stale });
   if (input.authJwks) steps.push({ kind: "auth-jwks", method: "PUT", path: `${base}/secrets` });
   steps.push({ kind: "registry", note: "record the deployment in the account registry (D1 ember-registry)" });
-  return { worker, strategy, createdClasses, metadata, steps, warnings };
+  return { worker, strategy, createdClasses, metadata, steps, warnings, settings };
 }

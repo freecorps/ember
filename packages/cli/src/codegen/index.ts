@@ -106,6 +106,8 @@ export interface CodegenResult {
   contracts: Map<string, string>;
   /** The evaluated project (pass to `buildWorker({ loaded })` so the same rebuild does not evaluate it twice). */
   loaded: LoadedProject;
+  /** What it was generated from (manifest.json `sources`): the hash and the files outside ember/ that were read. */
+  sources?: SourcesStamp;
 }
 
 export interface CodegenOptions {
@@ -289,7 +291,7 @@ export async function codegen(project: Project, opts: CodegenOptions = {}): Prom
       if (onDisk(name) !== text) stale.push(name);
     } else writeIfChanged(out, name, text, written);
   }
-  return { manifest, written, warnings, errors, stale, contracts: rendered.contracts, loaded };
+  return { manifest, written, warnings, errors, stale, contracts: rendered.contracts, loaded, sources };
 }
 
 /**

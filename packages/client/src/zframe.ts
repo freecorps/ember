@@ -64,21 +64,40 @@ export class FrameQueue<T = undefined> {
   }
 }
 
+/** What `withoutStale` keeps of a frame, and the channels whose member list it dropped (to ask for again). */
+export interface StaleFiltered {
+  text: string | null;
+  channels: string[];
+}
+
 /**
- * A frame's text without its subscription deliveries (`snap`, `patch`): null when nothing is left. For a frame that
- * arrived under an identity replaced since (see the socket's `FrameQueue`): the rest (`mres`, `qres`, …) is not tied
- * to whose values a subscription holds.
+ * A frame that arrived under an identity replaced since (see the socket's `FrameQueue`), without what was that
+ * identity's to see: subscription deliveries (`snap`, `patch`) and channel traffic (`msg`, and the member lists of
+ * `joined` and `members`, named in `channels`: the caller asks for them again, as the identity now). `text` is null
+ * when nothing is left. The rest stays: `mres`, `qres`, … are not tied to whose values a subscription holds, and a
+ * channel's `left`, `err` and `published` only drive its join (a refusal of a join sent as the identity before is
+ * tried again as the one now) and carry nothing of the others.
  */
-export function withoutDeliveries(text: string): string | null {
+export function withoutStale(text: string): StaleFiltered {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return text; // not ours to judge: `onFrame` reports it
+    return { text, channels: [] }; // not ours to judge: `onFrame` reports it
   }
-  const isDelivery = (m: unknown) => typeof m === "object" && m !== null && ((m as { t?: unknown }).t === "snap" || (m as { t?: unknown }).t === "patch");
-  if (!Array.isArray(parsed)) return isDelivery(parsed) ? null : text;
-  const kept = parsed.filter((m) => !isDelivery(m));
-  if (!kept.length) return null;
-  return kept.length === parsed.length ? text : JSON.stringify(kept);
+  const channels = new Set<string>();
+  const stale = (m: unknown): boolean => {
+    if (typeof m !== "object" || m === null) return false;
+    const { t, ch } = m as { t?: unknown; ch?: unknown };
+    if (t === "snap" || t === "patch" || t === "msg") return true;
+    if (t === "joined" || t === "members") {
+      if (typeof ch === "string") channels.add(ch);
+      return true;
+    }
+    return false;
+  };
+  if (!Array.isArray(parsed)) return stale(parsed) ? { text: null, channels: [...channels] } : { text, channels: [] };
+  const kept = parsed.filter((m) => !stale(m));
+  const out = !kept.length ? null : kept.length === parsed.length ? text : JSON.stringify(kept);
+  return { text: out, channels: [...channels] };
 }
