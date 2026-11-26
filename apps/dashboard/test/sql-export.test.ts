@@ -61,5 +61,8 @@ describe("Schema Explorer: index state", () => {
     expect(indexState(refused, "messages", "by_author")).toBe("not migrated");
     expect(indexState(refused, "messages", null)).toBe("not migrated");
     expect(indexState(status({ schemaVersion: "v1" }), "messages", "by_author")).toBe("not migrated");
+    // A status for another deployed schema than the one on screen (a deploy since the page loaded): unknown.
+    expect(indexState(status({ expectedVersion: "v3", schemaVersion: "v3" }), "messages", "by_author", "v2")).toBe("unknown");
+    expect(indexState(status(), "messages", "by_author", "v2")).toBe("ready");
   });
 });

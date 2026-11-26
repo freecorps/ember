@@ -32,7 +32,7 @@ export function SchemaExplorer({ project, env, shard }: { project: string; env: 
           Schema <Mono>{schema.data.version}</Mono> · {fmtNum(schema.data.tables.length)} tables
         </span>
         <span className="spacer" />
-        <button type="button" onClick={() => (checked ? (counts.reload(), status.reload()) : setChecked(true))} title="Asks this shard (wakes it): row counts and index state">
+        <button type="button" onClick={() => (checked ? (schema.reload(), counts.reload(), status.reload()) : (schema.reload(), setChecked(true)))} title="Asks this shard (wakes it): row counts and index state">
           {checked ? "Refresh" : "Check"} <Mono>{shard}</Mono>
         </button>
       </div>
@@ -40,7 +40,7 @@ export function SchemaExplorer({ project, env, shard }: { project: string; env: 
       {!tables.length ? (
         <Empty>No table matches.</Empty>
       ) : (
-        tables.map((t) => <TableCard key={t.name} project={project} env={env} shard={shard} table={t} rows={checked ? (rows.get(t.name) ?? (counts.data ? 0 : null)) : null} shardStatus={shardStatus} />)
+        tables.map((t) => <TableCard key={t.name} project={project} env={env} shard={shard} table={t} rows={checked ? (rows.get(t.name) ?? (counts.data ? 0 : null)) : null} shardStatus={shardStatus} schemaVersion={schema.data!.version} />)
       )}
       {(schema.data.componentTables.length > 0 || (schema.data.internalTables?.length ?? 0) > 0) && (
         <section className="section" aria-labelledby="other-tables">
@@ -61,20 +61,24 @@ export function SchemaExplorer({ project, env, shard }: { project: string; env: 
   );
 }
 
-/** An index on the checked shard: null before a check. */
-type IndexState = "ready" | "backfilling" | "not migrated" | null;
+/** An index on the checked shard: null before a check; unknown when the status is for another schema than the one shown. */
+type IndexState = "ready" | "backfilling" | "not migrated" | "unknown" | null;
 
-/** Ready only on a shard that runs the deployed schema with no failed migration; staged = still backfilling. */
-export function indexState(status: ShardStatus | null, table: string, index: string | null): IndexState {
+/**
+ * Ready only on a shard that runs the deployed schema with no failed migration; staged = still backfilling. The status
+ * must be for the schema on screen (`schemaVersion`, when given): after a deploy the page may show the older one.
+ */
+export function indexState(status: ShardStatus | null, table: string, index: string | null, schemaVersion?: string): IndexState {
   if (!status) return null;
+  if (schemaVersion !== undefined && status.expectedVersion !== schemaVersion) return "unknown";
   if (index !== null && status.staged.some((s) => s.table === table && s.index === index)) return "backfilling";
   if (!status.ready || status.migrationError || status.schemaVersion !== status.expectedVersion) return "not migrated";
   return "ready";
 }
 
-function TableCard({ project, env, shard, table, rows, shardStatus }: { project: string; env: string; shard: string; table: SchemaTable; rows: number | null; shardStatus: ShardStatus | null }) {
+function TableCard({ project, env, shard, table, rows, shardStatus, schemaVersion }: { project: string; env: string; shard: string; table: SchemaTable; rows: number | null; shardStatus: ShardStatus | null; schemaVersion: string }) {
   const routing = table.shard === null || table.shard === undefined ? null : typeof table.shard === "string" ? table.shard : text(table.shard, 80);
-  const state = (index: string | null) => indexState(shardStatus, table.name, index);
+  const state = (index: string | null) => indexState(shardStatus, table.name, index, schemaVersion);
   const badge = (st: IndexState) => (st === null ? <span className="muted">—</span> : <Badge tone={st === "ready" ? "ok" : "warn"}>{st}</Badge>);
   return (
     <section className="card-plain schema-table" aria-label={`Table ${table.name}`}>

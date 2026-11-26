@@ -373,7 +373,10 @@ describe("dashboard → runtime (workerd)", () => {
   it("SQL Explorer: one read-only query on the shard through the dashboard, audited with its text; writes refused by the project", async () => {
     const target = { project: "files-auth-jobs", env: "test", shard: "global:main" };
     type Answer = { value: { columns: string[]; rows: unknown[][]; rowsRead: number; rowsWritten: number; truncated: boolean; ms: number; plan?: Array<{ detail: string }> } };
-    // The rates the declarative-screens test wrote (fxRates lives on global:main), by SQL with a bound parameter.
+    // Its own rates (fxRates lives on global:main; setRate upserts, so the declarative-screens test before it changes
+    // nothing): the test runs alone too. Written before the seven SQL requests the audit assertion reads.
+    for (const [base, rate] of [["USD", 5.4], ["EUR", 6.1]] as const) expect((await write("/api/dash/run", { ...target, dashboard: "", fn: "rates:setRate", args: { base, quote: "BRL", rate } })).status).toBe(200);
+    // By SQL with a bound parameter.
     const r = await write("/api/sql", { ...target, sql: "SELECT base, quote, rate FROM fxRates WHERE quote = ? ORDER BY base", params: ["BRL"] });
     expect(r.status).toBe(200);
     const answer = (r.body as unknown as Answer).value;

@@ -27,6 +27,8 @@ export interface SqlResult {
   ms: number;
   explain: boolean;
   plan?: PlanNode[];
+  /** What the rows do not show (an integer past 2^53 read rounded). */
+  warnings?: string[];
 }
 
 const KEYWORDS = [
@@ -276,6 +278,11 @@ export function SqlExplorer({ project, env, shard }: { project: string; env: str
               <strong>{fmtNum(r.rows.length)}</strong> row{r.rows.length === 1 ? "" : "s"}
             </span>
             {r.truncated && <Badge tone="warn" title="The query had more rows than the cap (or the answer budget): raise the cap or add a LIMIT">truncated</Badge>}
+            {r.warnings?.map((w) => (
+              <Badge key={w} tone="warn" title={w}>
+                rounded integers
+              </Badge>
+            ))}
             <span className="muted">
               rows read <strong className="mono">{fmtNum(r.rowsRead)}</strong>
             </span>

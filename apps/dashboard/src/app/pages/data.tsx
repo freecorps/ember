@@ -6,7 +6,7 @@
 // runtime without the data endpoints keeps the read-only browser; one before level 16 says so for range, `_id` and
 // search (runtime_outdated) and keeps the rest.
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, ApiError, path } from "../api.ts";
 import { fmtNum, text } from "../format.ts";
 import { href, useApi, useSession } from "../hooks.ts";
@@ -294,6 +294,8 @@ function QueryView({ project, env, shard, table, onChanged, initialId }: { proje
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   /** The bulk delete dialog: the ids are the ones counted when it opened (an auto-refresh does not change them). */
   const [bulk, setBulk] = useState<{ ids: string[]; busy: boolean; error: ApiError | null } | null>(null);
+  /** Which bulk delete is current: an answer for another (cancelled, then a new dialog) changes nothing. */
+  const bulkOp = useRef(0);
   const [auto, setAuto] = useState(false);
   const [n, setN] = useState(0);
   const idx = indexes.find((i) => i.name === draft.index) ?? indexes[0]!;
@@ -348,10 +350,14 @@ function QueryView({ project, env, shard, table, onChanged, initialId }: { proje
   // data kept while it reloads).
   const reload = rows.reload;
   const confirming = !!bulk;
+  // A tick while the previous rows request is still out is skipped (a new one would drop its answer: a request slower
+  // than 5 s would never land). Read through a ref, since the interval is created once per `auto`/`confirming`.
+  const rowsLoading = useRef(rows.loading);
+  rowsLoading.current = rows.loading;
   useEffect(() => {
     if (!auto || confirming) return;
     const t = setInterval(() => {
-      if (document.visibilityState === "visible") reload();
+      if (document.visibilityState === "visible" && !rowsLoading.current) reload();
     }, 5000);
     return () => clearInterval(t);
   }, [auto, reload, confirming]);
@@ -559,16 +565,22 @@ function QueryView({ project, env, shard, table, onChanged, initialId }: { proje
         expected={s.isProtected(env) ? table.name : null}
         busy={bulk?.busy ?? false}
         error={bulk?.error ?? null}
-        onCancel={() => setBulk(null)}
+        onCancel={() => {
+          // While the delete is out the dialog stays: its answer belongs to it.
+          if (bulk?.busy) return;
+          bulkOp.current++;
+          setBulk(null);
+        }}
         onConfirm={async (typed) => {
+          const op = ++bulkOp.current;
           setBulk({ ids: bulkIds, busy: true, error: null });
           try {
             const r = await api.post<{ value: { deleted: number } }>("/api/doc/delete", { project, env, shard, table: table.name, ids: bulkIds, ...(typed ? { confirm: typed } : {}) });
             s.toast({ text: `Deleted ${r.value.deleted} document${r.value.deleted === 1 ? "" : "s"} from ${table.name}` });
-            setBulk(null);
             changed();
+            if (bulkOp.current === op) setBulk(null);
           } catch (e) {
-            setBulk({ ids: bulkIds, busy: false, error: e as ApiError });
+            if (bulkOp.current === op) setBulk({ ids: bulkIds, busy: false, error: e as ApiError });
           }
         }}
       >
