@@ -221,9 +221,9 @@ export class SqliteBackend implements OfflineBackend {
     const d = s.driver;
     const close = d.close?.bind(d);
     if (!this.removeDb || !close) return false;
-    const any = (sql: string) => d.exec(sql).rows.length > 0;
-    if (any(`SELECT 1 FROM "_ember_local_queries" LIMIT 1`) || any(`SELECT 1 FROM "_ember_local_log" LIMIT 1`)) return false;
-    for (const t of Object.keys(this.schema.manifest.tables)) if (any(`SELECT 1 FROM "${t.replace(/"/g, '""')}" LIMIT 1`)) return false;
+    const hasRow = (sql: string) => d.exec(sql).rows.length > 0;
+    if (hasRow(`SELECT 1 FROM "_ember_local_queries" LIMIT 1`) || hasRow(`SELECT 1 FROM "_ember_local_log" LIMIT 1`)) return false;
+    for (const t of Object.keys(this.schema.manifest.tables)) if (hasRow(`SELECT 1 FROM "${t.replace(/"/g, '""')}" LIMIT 1`)) return false;
     for (const r of this.db.exec(`SELECT "record" FROM "_ember_local_pending"`).rows) {
       try {
         if ((decodeJson(String(r.record)) as { shard?: unknown }).shard === shard) return false;
