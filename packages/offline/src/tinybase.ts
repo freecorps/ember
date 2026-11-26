@@ -302,7 +302,6 @@ export class TinybaseBackend implements OfflineBackend {
   /** A batch of the queue in one Store transaction and one persister save. */
   async batchPending(ops: ReadonlyArray<PendingOp>) {
     if (!ops.length) return;
-    const seq = this.pendingSeq;
     try {
       await this.writeSaved((tx) => {
         for (const op of ops) {
@@ -311,8 +310,9 @@ export class TinybaseBackend implements OfflineBackend {
         }
       });
     } catch (e) {
-      // The rows went back: so do the sequence numbers they took.
-      this.pendingSeq = seq;
+      // The rows went back, but rows another writer added meanwhile stay, maybe with higher sequence numbers than the
+      // one before this batch: the next write reads the highest from the table again.
+      this.pendingSeq = null;
       throw e;
     }
   }
