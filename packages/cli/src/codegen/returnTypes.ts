@@ -90,6 +90,25 @@ export type ClaimsResult = { text: string } | { problem: string };
 /** What the claims were computed from: the files their program read, with their sizes and mtimes. */
 type ClaimsCache = { authConfig: string; files: string[]; stamp: string; result: ClaimsResult };
 
+/**
+ * The files whose size and mtime stand for `files`: each one, but for a file of an installed package (under
+ * node_modules) that package's package.json (Better Auth's types are hundreds of files; a new version rewrites it).
+ */
+function stampFiles(files: string[]): string[] {
+  const out = new Set<string>();
+  for (const f of files) {
+    const parts = f.split(/[\\/]/);
+    const nm = parts.lastIndexOf("node_modules");
+    if (nm < 0) {
+      out.add(f);
+      continue;
+    }
+    const pkg = parts.slice(0, nm + (parts[nm + 1]?.startsWith("@") ? 3 : 2));
+    out.add([...pkg, "package.json"].join("/"));
+  }
+  return [...out];
+}
+
 const stampOf = (files: string[]) =>
   files
     .map((f) => {
@@ -101,6 +120,8 @@ const stampOf = (files: string[]) =>
       }
     })
     .join("|");
+/** The stamp of a claims answer: auth.config.ts itself (always, even when its program could not read it) and what it read. */
+const claimsStamp = (authConfig: string, files: string[]) => stampOf([authConfig, ...files]);
 
 function readClaimsCache(file: string): ClaimsCache | undefined {
   try {
@@ -180,12 +201,14 @@ export class TypeOracle {
   /**
    * The claims of the identities `ember/auth.config.ts` signs in (`ClaimsOf<typeof config>` of @freecorps/ember-auth),
    * printed as a self-contained type, or why it could not be. Its own program (Better Auth's types stay out of the
-   * modules'), checked again only when a file it read changed (size or mtime). `cacheFile` (in `.ember/`) keeps the
-   * answer between processes: checking Better Auth's types takes a while.
+   * modules'), checked again only when auth.config.ts or a file it read changed (size or mtime; a package under
+   * node_modules by its package.json). `cacheFile` (in `.ember/`) keeps the answer between processes: checking Better
+   * Auth's types takes a while. A failure is never kept: what fixes it may be a file the failed program did not read (a
+   * module that did not resolve yet).
    */
   claims(o: { authConfig: string; generatedDir: string; projectDir: string; cacheFile?: string }): ClaimsResult {
     const prev = this.claimsCache ?? (o.cacheFile ? readClaimsCache(o.cacheFile) : undefined);
-    if (prev && prev.authConfig === o.authConfig && stampOf(prev.files) === prev.stamp) {
+    if (prev && "text" in prev.result && prev.authConfig === o.authConfig && claimsStamp(o.authConfig, prev.files) === prev.stamp) {
       this.claimsCache = prev;
       return prev.result;
     }
@@ -204,14 +227,24 @@ export class TypeOracle {
     else if (errors.length) result = { problem: formatDiagnostic(errors[0]!) };
     else {
       const t = c.getDeclaredTypeOfSymbol(alias);
-      const text = new TypePrinter(c, program, o, () => new Map(), true).print(t, "", false);
-      result = t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown) || /\bany\b/.test(text) ? { problem: `ClaimsOf<typeof config> is \`${text}\`` } : { text };
+      const printer = new TypePrinter(c, program, o, () => new Map(), true);
+      const text = printer.print(t, "", false);
+      // An `any` anywhere (the printer saw one), not the word in the text (`"read:any"` is a fine literal).
+      result = t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown) || printer.sawAny ? { problem: `ClaimsOf<typeof config> is \`${text}\`` } : { text };
     }
-    const files = program
-      .getSourceFiles()
-      .map((f) => f.fileName)
-      .filter((f) => resolve(f) !== probe);
-    this.claimsCache = { authConfig: o.authConfig, files, stamp: stampOf(files), result };
+    if (!("text" in result)) {
+      // Nor its program: reused, it would keep a module resolution that failed (the file is there now).
+      this.claimsCache = undefined;
+      this.claimsProgram = undefined;
+      return result;
+    }
+    const files = stampFiles(
+      program
+        .getSourceFiles()
+        .map((f) => f.fileName)
+        .filter((f) => resolve(f) !== probe && !program.isSourceFileDefaultLibrary(program.getSourceFile(f)!)),
+    );
+    this.claimsCache = { authConfig: o.authConfig, files, stamp: claimsStamp(o.authConfig, files), result };
     if (o.cacheFile) {
       try {
         mkdirSync(dirname(o.cacheFile), { recursive: true });
@@ -240,6 +273,11 @@ export class TypeOracle {
     this.last = inference.keys;
     return result;
   }
+}
+
+/** `sf` (a module) declares into the global scope or into another module. */
+function augments(sf: ts.SourceFile): boolean {
+  return sf.statements.some((st) => ts.isModuleDeclaration(st) && (!!(st.flags & ts.NodeFlags.GlobalAugmentation) || ts.isStringLiteral(st.name)));
 }
 
 // Gives the inference program the documents of the data model, to recognise them in return types.
@@ -281,7 +319,9 @@ class Inference {
     for (const sf of program.getSourceFiles()) {
       const v = (sf as VersionedSourceFile).version ?? "";
       this.versions.set(sf.fileName, v);
-      if (!ts.isExternalModule(sf) && !program.isSourceFileDefaultLibrary(sf)) globals.push(v);
+      // Global scripts, and modules that augment the global scope or another module (`declare global { ... }`,
+      // `declare module "x" { ... }`): a module may use what they declare without importing them.
+      if (!program.isSourceFileDefaultLibrary(sf) && (!ts.isExternalModule(sf) || augments(sf))) globals.push(`${sf.fileName}@${v}`);
     }
     const docs = program.getSourceFile(resolve(o.generatedDir, "__ember_docs.ts"));
     this.sharedKey = `${globals.join(",")}|${docs ? this.dependencyKey(docs) : ""}|${o.generatedDir}|${o.projectDir}`;
@@ -580,8 +620,13 @@ class TypePrinter {
   private readonly o: Pick<InferOptions, "generatedDir" | "projectDir">;
   private readonly docsOf: () => Map<string, ts.Type>;
   private docsCache: Map<string, ts.Type> | undefined;
-  /** Print every type structurally (no names from the user's modules): for a file that imports nothing. */
+  /**
+   * Print every type structurally, for a file that imports nothing: no names from the user's modules, and none of the
+   * helpers of the generated files (`Id<"t">`, `FileId`, `Doc<"t">`, `PaginationResult<X>`) either.
+   */
   private readonly inline: boolean;
+  /** An `any` was printed (or is inside a type printed by the compiler). */
+  sawAny = false;
   constructor(checker: ts.TypeChecker, program: ts.Program, o: Pick<InferOptions, "generatedDir" | "projectDir">, docs: () => Map<string, ts.Type>, inline = false) {
     this.checker = checker;
     this.program = program;
@@ -636,7 +681,10 @@ class TypePrinter {
   print(t: ts.Type, indent: string, top = false): string {
     const F = ts.TypeFlags;
     const f = t.flags;
-    if (f & F.Any) return "any";
+    if (f & F.Any) {
+      this.sawAny = true;
+      return "any";
+    }
     if (f & F.Unknown) return "unknown";
     if (f & F.Never) return "never";
     // Over the wire, `undefined` (a handler that returns nothing) arrives as null.
@@ -715,12 +763,12 @@ class TypePrinter {
     if (t.isUnion()) return this.printUnion(t.types, indent, top);
     if (t.isIntersection()) {
       // GenericId<T> = string & { __tableName: T }; FileId = string & { __file: true }.
-      const brand = t.types.find((m) => m.getProperty("__tableName"));
+      const brand = !this.inline && t.types.find((m) => m.getProperty("__tableName"));
       if (brand && t.types.some((m) => m.flags & ts.TypeFlags.String)) {
         const table = c.getTypeOfSymbol(brand.getProperty("__tableName")!);
         return `Id<${this.print(table, indent)}>`;
       }
-      if (t.types.some((m) => m.getProperty("__file")) && t.types.some((m) => m.flags & ts.TypeFlags.String)) return "FileId";
+      if (!this.inline && t.types.some((m) => m.getProperty("__file")) && t.types.some((m) => m.flags & ts.TypeFlags.String)) return "FileId";
       return t.types.map((m) => this.wrap(m, indent)).join(" & ");
     }
     if (c.isTupleType(t)) {
@@ -739,8 +787,8 @@ class TypePrinter {
       return elem ? `${this.wrap(elem, indent)}[]` : "unknown[]";
     }
     if (t.flags & ts.TypeFlags.Object) {
-      if (this.isLibType(t)) return c.typeToString(t, undefined, ts.TypeFormatFlags.NoTruncation);
-      const doc = this.documentOf(t);
+      if (this.isLibType(t)) return this.compilerText(t);
+      const doc = !this.inline && this.documentOf(t);
       if (doc) return `Doc<${JSON.stringify(doc)}>`;
       if (t.getCallSignatures().length || t.getConstructSignatures().length) return "unknown";
       const inner = indent + "  ";
@@ -769,14 +817,28 @@ class TypePrinter {
       }
       const text = lines.length ? `{\n${lines.join("\n")}\n${indent}}` : "{}";
       // A page of `.paginate()` → PaginationResult<item>.
-      if (props.length === 3 && props.every(([k]) => k === "page" || k === "isDone" || k === "continueCursor")) {
+      if (!this.inline && props.length === 3 && props.every(([k]) => k === "page" || k === "isDone" || k === "continueCursor")) {
         const page = props.find(([k]) => k === "page")![1];
         const cursor = props.find(([k]) => k === "continueCursor")![1];
         if (page.endsWith("[]") && cursor === "string") return `PaginationResult<${page.slice(0, -2).replace(/^\((.*)\)$/s, "$1")}>`;
       }
       return text;
     }
-    return c.typeToString(t, undefined, ts.TypeFormatFlags.NoTruncation);
+    return this.compilerText(t);
+  }
+
+  /** The compiler's own text for `t` (a built-in type, something not printed structurally); notes an `any` inside. */
+  private compilerText(t: ts.Type): string {
+    if (this.hasAny(t, 0)) this.sawAny = true;
+    return this.checker.typeToString(t, undefined, ts.TypeFormatFlags.NoTruncation);
+  }
+
+  private hasAny(t: ts.Type, depth: number): boolean {
+    if (t.flags & ts.TypeFlags.Any) return true;
+    if (depth > MAX_DEPTH) return false;
+    if (t.isUnionOrIntersection()) return t.types.some((m) => this.hasAny(m, depth + 1));
+    const args = [...(t.aliasTypeArguments ?? []), ...(t.flags & ts.TypeFlags.Object && (t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference ? this.checker.getTypeArguments(t as ts.TypeReference) : [])];
+    return args.some((a) => this.hasAny(a, depth + 1));
   }
 
   private printUnion(types: readonly ts.Type[], indent: string, top: boolean): string {

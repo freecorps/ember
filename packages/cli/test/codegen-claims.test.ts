@@ -1,7 +1,7 @@
 // Typed identity claims (docs/design/dx.md §3.7): codegen prints `ClaimsOf<typeof authConfig>` in
 // `_generated/claims.d.ts`; `_generated/server` types `ctx.auth` and `fromAuth` with it. Without
 // `ember/auth.config.ts`, the claims stay `Record<string, unknown>`.
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -121,6 +121,60 @@ describe("typed identity claims (ember/auth.config.ts → _generated/claims.d.ts
     writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
     await codegen(project, { oracle: new TypeOracle() });
     expect(gen(project, "claims.d.ts")).toContain('  role?: "admin" | "member";\n};');
+  });
+
+  it("a literal containing the word any is a fine claim; a brand prints structurally (claims.d.ts imports nothing)", async () => {
+    writeFileSync(
+      join(project.dir, "auth.config.ts"),
+      AUTH_CONFIG(`{ permission: "read:any" as const, tenant: user.id as string & { readonly __tableName: "orgs" } }`),
+    );
+    const r = await codegen(project, { oracle });
+    expect(r.warnings.filter((w) => w.startsWith("ember/auth.config.ts"))).toEqual([]);
+    const text = gen(project, "claims.d.ts");
+    expect(text).toContain('  permission?: "read:any";');
+    expect(text).not.toMatch(/\bId</);
+    expect(text).toMatch(/tenant\?: string & \{\n\s+__tableName: "orgs";\n\s+\};/);
+    // The file stands alone: every name it uses is declared in it.
+    const file = join(project.generatedDir, "claims.d.ts");
+    const program = ts.createProgram([file], OPTIONS);
+    expect(ts.getPreEmitDiagnostics(program).filter((d) => d.file?.fileName === file).map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n"))).toEqual([]);
+    writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
+    await codegen(project, { oracle });
+  });
+
+  it("an any in the claims leaves them untyped, and that failure is not kept (its fix may be a file it never read)", () => {
+    const authConfig = join(project.dir, "auth.config.ts");
+    const extra = join(project.dir, "claims_extra.ts");
+    const cacheFile = join(project.stateDir, "codegen", "claims-test.json");
+    const ask = (o = new TypeOracle()) => o.claims({ authConfig, generatedDir: project.generatedDir, projectDir: project.dir, cacheFile });
+    rmSync(cacheFile, { force: true });
+    writeFileSync(authConfig, `// @ts-nocheck: the helper is not written yet\nimport { plan } from "./claims_extra";\n${AUTH_CONFIG("{ plan }")}`);
+    try {
+      const failed = ask();
+      expect("problem" in failed && failed.problem).toMatch(/plan\?: any/);
+      expect(existsSync(cacheFile)).toBe(false);
+      // Only the new file changes (auth.config.ts as it was): the next run, in this process or another, sees it.
+      writeFileSync(extra, "export const plan = 3 as number;\n");
+      const session = new TypeOracle();
+      const ok = ask(session);
+      expect("text" in ok && ok.text).toContain("  plan?: number;");
+      // A file it read goes away: checked again (and the failure is not kept either).
+      rmSync(extra);
+      expect("problem" in ask(session)).toBe(true);
+      writeFileSync(extra, "export const plan = 3 as number;\n");
+      expect(ask(session)).toEqual(ok);
+      // Kept now, and stamped by auth.config.ts and what it read; Better Auth's files by their package.json.
+      const cache = JSON.parse(readFileSync(cacheFile, "utf8")) as { files: string[] };
+      expect(cache.files).toContain(extra);
+      const installed = cache.files.filter((f) => f.split(/[\\/]/).includes("node_modules"));
+      expect(installed.length).toBeGreaterThan(0);
+      expect(installed.every((f) => f.endsWith("/package.json"))).toBe(true);
+      expect(ask(new TypeOracle())).toEqual(ok);
+    } finally {
+      rmSync(extra, { force: true });
+      rmSync(cacheFile, { force: true });
+      writeFileSync(authConfig, AUTH_CONFIG(ROLE));
+    }
   });
 
   it("without ember/auth.config.ts the claims stay untyped (any name, unknown values)", async () => {

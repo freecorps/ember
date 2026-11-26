@@ -106,7 +106,8 @@ describe("incremental codegen (one TypeOracle across ember dev runs)", () => {
     const reinferred = [...new Set(inferred)].sort();
     rmSync(freshRoot, { recursive: true, force: true });
     mkdirSync(freshRoot, { recursive: true });
-    cpSync(project.root, freshRoot, { recursive: true, filter: (src) => !src.includes("_generated") && !src.includes(".ember") });
+    // By path segment: a source named like them (\`ember/not_generated.ts\`) is copied.
+    cpSync(project.root, freshRoot, { recursive: true, filter: (src) => !relative(project.root, src).split(/[\\/]/).some((seg) => seg === "_generated" || seg === ".ember") });
     const fresh = loadProject(freshRoot);
     const scratch = await codegen(fresh);
     expect(snapshot(project)).toEqual(snapshot(fresh));
@@ -174,5 +175,24 @@ describe("incremental codegen (one TypeOracle across ember dev runs)", () => {
     const { reinferred } = await step(() => rmSync(join(project.dir, "d.ts")));
     expect(reinferred).toEqual(["c", "messages"]);
     expect(readFileSync(join(project.generatedDir, "api.d.ts"), "utf8")).not.toContain("extra");
+  });
+
+  it("a global augmentation (declare global in a module) reaches the modules using it without importing it", async () => {
+    const globals = (t: string) => `export {};\ndeclare global {\n  var appTag: ${t};\n}\n`;
+    await step(() => {
+      writeFileSync(join(project.dir, "lib", "globals.ts"), globals("number"));
+      writeFileSync(join(project.dir, "tagged.ts"), 'import { query } from "./_generated/server";\n\nexport const tag = query(() => globalThis.appTag);\n');
+    });
+    expect(readFileSync(join(project.generatedDir, "api.d.ts"), "utf8")).toMatch(/tag: Query<\{\}, number, never>/);
+    const { reinferred } = await step(() => writeFileSync(join(project.dir, "lib", "globals.ts"), globals("string")));
+    expect(reinferred).toContain("tagged");
+    expect(readFileSync(join(project.generatedDir, "api.d.ts"), "utf8")).toMatch(/tag: Query<\{\}, string, never>/);
+    // Unchanged, it keeps the cache.
+    expect((await step(() => {})).reinferred).toEqual([]);
+  });
+
+  it("the from-scratch copy keeps sources whose names contain _generated or .ember", async () => {
+    await step(() => writeFileSync(join(project.dir, "not_generated.ts"), 'import { query } from "./_generated/server";\n\nexport const kept = query(() => 1 as const);\n'));
+    expect(readFileSync(join(freshRoot, "ember", "_generated", "api.d.ts"), "utf8")).toContain("kept: Query<{}, 1, never>");
   });
 });
