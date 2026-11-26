@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { createRequire, isBuiltin } from "node:module";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { constants as vmConstants, runInThisContext } from "node:vm";
 import { cronList } from "@freecorps/ember-server";
 import * as esbuild from "esbuild";
@@ -75,6 +76,77 @@ export function runtimeHasWorkerEntry(projectDir: string, cliRoot: string = CLI_
   return !j?.exports || "./worker-entry" in j.exports;
 }
 
+/**
+ * Whether the project's `@freecorps/ember-runtime` registers lazy actions (`lazyActions` in `/worker-entry`, and an
+ * `ActionRunner` that loads them): read from the entry's own file. An older copy gets every module imported statically.
+ * Unknown (not found): assume the CLI's own, which has it.
+ */
+export function runtimeHasLazyActions(projectDir: string, cliRoot: string = CLI_ROOT): boolean {
+  for (const start of [projectDir, cliRoot]) {
+    for (let d = resolve(start); ; d = dirname(d)) {
+      const dir = join(d, "node_modules", "@freecorps", "ember-runtime");
+      if (existsSync(join(dir, "package.json"))) {
+        for (const f of ["src/worker-entry.ts", "dist/worker-entry.js"]) {
+          try {
+            if (/\blazyActions\b/.test(readFileSync(join(dir, f), "utf8"))) return true;
+          } catch {
+            // not this layout
+          }
+        }
+        return false;
+      }
+      if (dirname(d) === d) break;
+    }
+  }
+  return true;
+}
+
+/** What `lazyActions` gets for one action of a lazy module (plain JSON; see `LazyActionMeta` in the server). */
+export type LazyActionMeta = Record<string, unknown>;
+
+/**
+ * Modules that export only actions (`action`/`internalAction`, at least one), as the project evaluated in Node shows
+ * them: they go in the Worker as `import()` (`lazyActions`), so a split build keeps them and what they import out of
+ * the chunks every isolate (each Shard DO) evaluates at startup. Queries and mutations stay static: the engine runs
+ * them synchronously. A module is left static when it holds functions in nested objects (the registry would name them
+ * differently) or when what the engine reads before loading it (args, returns, shard...) does not survive JSON.
+ */
+export function lazyActionModules(modules: LoadedProject["modules"]): Map<string, Record<string, LazyActionMeta>> {
+  const out = new Map<string, Record<string, LazyActionMeta>>();
+  const isFn = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && (x as Record<symbol, unknown>)[Symbol.for("ember.function")] === true;
+  const nestsFunctions = (x: unknown, depth = 0): boolean => {
+    if (typeof x !== "object" || x === null || depth > 4) return false;
+    if (isFn(x)) return true;
+    try {
+      return Object.values(x).some((y) => nestsFunctions(y, depth + 1));
+    } catch {
+      return true;
+    }
+  };
+  next: for (const [path, mod] of Object.entries(modules)) {
+    const meta: Record<string, LazyActionMeta> = {};
+    for (const [name, x] of Object.entries(mod ?? {})) {
+      if (isFn(x)) {
+        if (x.type !== "action") continue next;
+        const m: LazyActionMeta = { type: "action", visibility: x.visibility, args: x.args };
+        for (const k of ["returns", "shard", "dispatch", "leaseMs", "sensitive", "declaresErrors"] as const) if (x[k] !== undefined) m[k] = x[k];
+        const errors = Array.isArray(x.errors) ? (x.errors as Array<{ code?: unknown }>).map((e) => String(e?.code ?? "")).filter(Boolean) : [];
+        if (errors.length) m.errorCodes = errors;
+        let same = false;
+        try {
+          same = isDeepStrictEqual(JSON.parse(JSON.stringify(m)), m);
+        } catch {
+          same = false;
+        }
+        if (!same) continue next;
+        meta[name] = m;
+      } else if (typeof x === "object" && x !== null && !name.includes(":") && nestsFunctions(x)) continue next;
+    }
+    if (Object.keys(meta).length) out.set(path, meta);
+  }
+  return out;
+}
+
 /** Durable Object classes exported by every Ember Worker (PLAN D4). */
 export const DO_CLASSES = [
   { className: "Shard", binding: "SHARD" },
@@ -139,11 +211,20 @@ export const RUNTIME_WORKER_ENTRY = "@freecorps/ember-runtime/worker-entry";
  * computed it at build; null when off.
  */
 /** `runtime`: the module the entry imports the runtime from (`runtimeHasWorkerEntry`). */
-export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, authStatic: AuthStaticSettings | null | "eager" = null, replicate: unknown = null, runtime = RUNTIME_WORKER_ENTRY): string {
+/** `lazy`: modules of actions only (`lazyActionModules`), imported on first use instead of statically. */
+export function workerEntrySource(
+  files: ProjectFiles,
+  auth: AuthMode = null,
+  authStatic: AuthStaticSettings | null | "eager" = null,
+  replicate: unknown = null,
+  runtime = RUNTIME_WORKER_ENTRY,
+  lazy: ReadonlyMap<string, Record<string, LazyActionMeta>> = new Map(),
+): string {
   const outboxOpts = (a: Extract<AuthMode, { kind: "local" }>) => `{ shard: ${JSON.stringify(a.syncShard)}${replicate ? `, replicate: ${JSON.stringify(replicate)}` : ""} }`;
   // Only with `users:sync` (the outbox's function): without it every user write would journal rows nobody reads.
   const sync = (a: Extract<AuthMode, { kind: "local" }>) => (a.profileSync === false ? "" : ", onUserChange: outbox.onUserChange");
   if (!files.schema) throw new Error("ember/schema.ts is missing (it must `export default defineSchema(...)`)");
+  const lazyMods = files.modules.filter((m) => lazy.has(m.path));
   if (auth?.kind === "local" && !files.authConfig) throw new Error("internal: local auth without ember/auth.config.ts");
   const authLines: string[] =
     auth?.kind === "local" && authStatic === "eager"
@@ -186,10 +267,18 @@ export function workerEntrySource(files: ProjectFiles, auth: AuthMode = null, au
         : ["const auth = undefined;"];
   const lines = [
     "// Generated by `ember` (worker entry). Do not edit.",
-    `import { createEmberWorker${auth?.kind === "local" ? ", authOutbox" : ""} } from ${JSON.stringify(runtime)};`,
+    `import { createEmberWorker${auth?.kind === "local" ? ", authOutbox" : ""}${lazyMods.length ? ", lazyActions" : ""} } from ${JSON.stringify(runtime)};`,
     `export { ${DO_CLASSES.map((c) => c.className).join(", ")} } from ${JSON.stringify(runtime)};`,
     `import schema from ${spec(files.schema)};`,
-    ...files.modules.map((m, i) => `import * as ${ident(m.path, i)} from ${spec(m.file)};`),
+    ...files.modules.flatMap((m, i) => (lazy.has(m.path) ? [] : [`import * as ${ident(m.path, i)} from ${spec(m.file)};`])),
+    ...(lazyMods.length
+      ? [
+          "// Modules of actions only: imported on first use (a chunk of their own), so the isolates that only run queries",
+          "// and mutations (every Shard DO) never evaluate them nor the SDKs they import. What the engine reads before that",
+          "// (args, shard, dispatch...) was recorded at build.",
+          ...files.modules.flatMap((m, i) => (lazy.has(m.path) ? [`const ${ident(m.path, i)} = lazyActions(() => import(${spec(m.file)}), ${JSON.stringify(lazy.get(m.path))});`] : [])),
+        ]
+      : []),
     files.crons ? `import crons from ${spec(files.crons)};` : "const crons = undefined;",
     files.appConfig ? `import app from ${spec(files.appConfig)};` : "const app = undefined;",
     files.http ? `import http from ${spec(files.http)};` : "const http = undefined;",
@@ -524,7 +613,10 @@ export async function buildWorker(project: Project, opts: { outDir?: string; min
   // From `outDir`: esbuild resolves the entry's `@freecorps/ember-auth/remote` import from there, so both see one copy.
   const authStatic = auth?.kind === "remote" ? (authHasRemote(outDir) ? null : "eager") : auth?.kind !== "local" ? null : local ? local.settings : "eager";
   const runtime = runtimeHasWorkerEntry(project.dir) ? RUNTIME_WORKER_ENTRY : "@freecorps/ember-runtime";
-  writeFileSync(entry, workerEntrySource(files, auth, authStatic, local?.replicate ?? null, runtime));
+  // Modules of actions only, as the evaluated project shows them (codegen's, or the one local auth just loaded): without
+  // it (a bare `buildWorker`), every module stays static.
+  const lazyMods = loaded && runtime === RUNTIME_WORKER_ENTRY && project.config.build?.lazyActions !== false && runtimeHasLazyActions(project.dir) ? lazyActionModules(loaded.modules) : new Map<string, Record<string, LazyActionMeta>>();
+  writeFileSync(entry, workerEntrySource(files, auth, authStatic, local?.replicate ?? null, runtime, lazyMods));
   const outFile = join(outDir, "index.js");
   const minify = opts.minify ?? false;
   const options = {

@@ -5,7 +5,7 @@
 // front of an older runtime shows "update the runtime" instead of failing on a 404. A runtime without this endpoint
 // is level 1 (the endpoints listed in `LEGACY_ADMIN_FEATURES` of the dashboard).
 
-import { fileKey, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
+import { errorCodesOf, fileKey, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
 import { ORPHAN_PAGE_MAX, type OrphanSweepOptions, type OrphanSweepPage } from "./files.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
@@ -187,7 +187,7 @@ export function functionListing(config: EmberConfig): FunctionListing[] {
       shard: fn.shard ?? null,
       sensitive: fn.sensitive === true,
       authorize: typeof fn.authorize === "function",
-      errors: (fn.errors ?? []).map((e) => String(e.code ?? "")).filter(Boolean),
+      errors: errorCodesOf(fn),
     });
   }
   list.sort((a, b) => a.name.localeCompare(b.name));

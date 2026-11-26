@@ -10,6 +10,7 @@ import {
   failApi,
   flattenFunctions,
   isForeignId,
+  loadFunction,
   makeId,
   REPLICATED_SOURCE,
   resolveReference,
@@ -192,9 +193,15 @@ export class ActionRunner {
   private async runInner(fn: string, args: unknown, shard: string, identity: Identity | null, opts: RunActionOptions): Promise<MutationOutcome> {
     const denied = this.check(fn, !!opts.internal);
     if (denied) return { ok: false, error: denied };
-    const f = lookup(this.config).fns.get(fn) as AnyRegisteredFunction;
     const scope = lookup(this.config).scopes.scopeOfFunction(fn);
     if (!scope) return fail("FunctionNotFound", `Function ${fn} not found`);
+    let f: AnyRegisteredFunction;
+    try {
+      // A lazy action (a module of actions only, `lazyActions`): its module is imported now, on first use.
+      f = await loadFunction(lookup(this.config).fns.get(fn) as AnyRegisteredFunction);
+    } catch (e) {
+      return failWith(errInfo(e));
+    }
     if (!opts.prepared) {
       args = withDefaults(f.args, args ?? {});
       const bad = this.validate(fn, f.args, args, "arguments");
