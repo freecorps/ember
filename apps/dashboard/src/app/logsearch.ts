@@ -55,22 +55,21 @@ export interface LogSearch {
 /** The records that match a search (pure: what is shown and exported). */
 export function searchLogs<T extends LogRecord>(records: readonly T[], q: LogSearch): T[] {
   const text = q.text.trim().toLowerCase();
-  const fn = q.fn.trim();
+  const fn = q.fn.trim().toLowerCase();
   return records.filter((r) => {
     if (q.since && r.t < q.since) return false;
     if (q.level !== "any") {
       const l = levelOf(r);
       if (q.level === "error" ? l !== "error" : l === "log") return false;
     }
-    if (fn && !r.lines.some((l) => l.kind === "exec" && l.fn.includes(fn)) && !r.head.includes(fn)) return false;
+    // Case-insensitive, like the text search.
+    if (fn && !r.lines.some((l) => l.kind === "exec" && l.fn.toLowerCase().includes(fn)) && !r.head.toLowerCase().includes(fn)) return false;
     return !text || haystack(r).includes(text);
   });
 }
 
 /** One JSON object per line (the record as the dashboard received it), at most EXPORT_MAX lines. */
 export function toNdjson(records: readonly LogRecord[]): string {
-  return records
-    .slice(-EXPORT_MAX)
-    .map((r) => JSON.stringify({ t: r.t, time: new Date(r.t).toISOString(), outcome: r.outcome, head: r.head, lines: r.lines }))
-    .join("\n") + (records.length ? "\n" : "");
+  const kept = records.slice(-EXPORT_MAX);
+  return kept.map((r) => JSON.stringify({ t: r.t, time: new Date(r.t).toISOString(), outcome: r.outcome, head: r.head, lines: r.lines })).join("\n") + (kept.length ? "\n" : "");
 }
