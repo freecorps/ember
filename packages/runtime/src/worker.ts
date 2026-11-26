@@ -654,7 +654,16 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
           if (pitr) return pitr;
           // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
-          const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => runAdminAction(env, fn, args, s, identity), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), orphans: (o) => { const b = bucketOf(env); return b ? sweepOrphans(b, (s) => stub(env, s) as unknown as FileRpc, (s) => !!checkShard(s), o) : null; }, revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}) });
+          const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => runAdminAction(env, fn, args, s, identity), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), orphans: (o) => { const b = bucketOf(env); return b ? sweepOrphans(b, (s) => stub(env, s) as unknown as FileRpc, (s) => !!checkShard(s), o) : null; }, revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}), embedRoute: async (path, scope) => {
+            // Only that install's routes compete (another scope's route at the same path never shadows it), and never
+            // an auth path (as for ingress below). `path` is mount-relative, like `config.routes` and `url` here
+            // (a `basePath` is already gone): the handler sees the request as ingress would hand it.
+            if (path.startsWith("/api/auth/")) return null;
+            const own = (config.routes ?? []).filter((r) => r.scope.join("/") === scope.join("/"));
+            const hit = matchRoute(own, "GET", path);
+            if (!hit || "methodMismatch" in hit) return null;
+            return actions(env).runHttp(hit.route, new Request(new URL(path, url.origin), { headers: { accept: "text/html" } }), null);
+          } });
           if (extra) return extra;
           if (url.pathname === "/api/_ember/keys/rotate") {
             if (request.method !== "POST") return error(405, "method_not_allowed", "use POST");
