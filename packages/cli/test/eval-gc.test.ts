@@ -63,6 +63,27 @@ describe("evaluating the project's code (ember dev rebuilds)", () => {
     expect(esm.growthMiB.at(-1)!).toBeGreaterThan(esm.growthMiB[0]!);
   });
 
+  it("import.meta read as an object and a computed import() work in the CommonJS evaluation", async () => {
+    const file = join(project.dir, "messages.ts");
+    const extra = [
+      "",
+      "const { url: metaUrl } = import.meta;",
+      "export const meta = { url: metaUrl, dirname: import.meta.dirname, keys: Object.keys(import.meta).sort() };",
+      'export const dynamic = import(String("node:path")).then((m) => typeof m.join);',
+      "",
+    ].join("\n");
+    appendFileSync(file, extra);
+    try {
+      const m = (await loadProjectCode(project)).modules.messages as { meta: { url: string; dirname: string; keys: string[] }; dynamic: Promise<string> };
+      expect(m.meta.url).toMatch(/^file:.*ember-eval\.cjs$/);
+      expect(m.meta.dirname).toBe(join(project.stateDir, "build"));
+      expect(m.meta.keys).toEqual(["dirname", "filename", "resolve", "url"]);
+      await expect(m.dynamic).resolves.toBe("function");
+    } finally {
+      writeFileSync(file, readFileSync(file, "utf8").replace(extra, ""));
+    }
+  });
+
   it("code with top-level await still loads (as an ES module, which Node keeps), with one warning", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const file = join(project.dir, "messages.ts");

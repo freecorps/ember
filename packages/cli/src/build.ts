@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { createRequire } from "node:module";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { runInThisContext } from "node:vm";
+import { constants as vmConstants, runInThisContext } from "node:vm";
 import { cronList } from "@freecorps/ember-server";
 import * as esbuild from "esbuild";
 import type { AuthStaticSettings } from "@freecorps/ember-auth";
@@ -259,8 +259,9 @@ let warnedEsmEval = false;
  * Evaluated as a CommonJS function in this realm (`vm.runInThisContext`), not `import()`ed: Node never unloads an ES
  * module, so `ember dev` importing a new bundle on every save (each with its own copy of the bundled packages) grew the
  * heap with every rebuild. A function's closures are garbage once the `LoadedProject` is dropped. The bundle and its
- * resolution are the same as before (`import.meta.url`/`dirname`/`filename` are those of the bundle's path). Code with
- * top-level await cannot be a CommonJS bundle: it is imported as an ES module as before, once warned.
+ * resolution are the same as before (`import.meta` is an object with the bundle path's `url`/`dirname`/`filename` and a
+ * `resolve`, whichever way it is read), and a computed `import()` the bundle keeps goes through Node's ES module loader.
+ * Code with top-level await cannot be a CommonJS bundle: it is imported as an ES module as before, once warned.
  *
  * `virtual`: generated files served from memory instead of disk (absolute path → content), for `ember codegen --check`.
  */
@@ -284,7 +285,8 @@ export async function loadProjectCode(project: Project, files = discover(project
     const result = await esbuild.build({
       ...options,
       format: "cjs",
-      define: { "import.meta.url": "__ember_eval_url", "import.meta.filename": "__filename", "import.meta.dirname": "__dirname" },
+      // The object itself, so `const { url } = import.meta` (or passing it along) sees the bundle's path too.
+      define: { "import.meta": "__ember_import_meta" },
     });
     cjs = result.outputFiles[0]!.text;
   } catch (e) {
@@ -298,18 +300,39 @@ export async function loadProjectCode(project: Project, files = discover(project
   return { files, schema: mod.schema, crons: cronList(mod.crons), authConfig: mod.authConfig, app: mod.app, http: mod.http, triggers: mod.triggers, importConfig: mod.importConfig, modules: mod.modules };
 }
 
-/** Runs a CommonJS bundle as a function of this realm; `file` names it in stack traces and anchors `require`. */
+/** What `import.meta` reads as in the CommonJS evaluation: the bundle file's, as an ES module there would have. */
+interface EvalImportMeta {
+  url: string;
+  filename: string;
+  dirname: string;
+  resolve(specifier: string): string;
+}
+
+/**
+ * Runs a CommonJS bundle as a function of this realm; `file` names it in stack traces and anchors `require`,
+ * `import.meta` and dynamic `import()` (Node's default ES module loader, as for a module at `file`).
+ */
 function evaluateCjs(code: string, file: string): EvalExports {
-  const fn = runInThisContext(`(function (exports, require, module, __filename, __dirname, __ember_eval_url) {${code}\n})`, { filename: file }) as (
-    exports: object,
-    require: NodeJS.Require,
-    module: { exports: object },
-    filename: string,
-    dirname: string,
-    url: string,
-  ) => void;
+  const req = createRequire(file);
+  const url = pathToFileURL(file).href;
+  const resolveFrom = (specifier: string): string => {
+    if (/^[a-z][a-z0-9+.-]*:/i.test(specifier)) return specifier; // node:, file:, data: …
+    if (specifier.startsWith(".") || specifier.startsWith("/")) return new URL(specifier, url).href;
+    try {
+      return pathToFileURL(req.resolve(specifier)).href;
+    } catch {
+      return specifier; // let the loader report it
+    }
+  };
+  const meta: EvalImportMeta = { url, filename: file, dirname: dirname(file), resolve: resolveFrom };
+  const fn = runInThisContext(`(function (exports, require, module, __filename, __dirname, __ember_import_meta) {${code}\n})`, {
+    filename: file,
+    // `import()` in the script goes through the main context's ES module loader (Node >= 21.7; a callback instead
+    // would need --experimental-vm-modules). Node prints an ExperimentalWarning the first time a project uses it.
+    importModuleDynamically: vmConstants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+  }) as (exports: object, require: NodeJS.Require, module: { exports: object }, filename: string, dirname: string, meta: EvalImportMeta) => void;
   const module = { exports: {} };
-  fn(module.exports, createRequire(file), module, file, dirname(file), pathToFileURL(file).href);
+  fn(module.exports, req, module, file, dirname(file), meta);
   return module.exports as EvalExports;
 }
 
