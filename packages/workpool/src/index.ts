@@ -113,11 +113,15 @@ export type OnCompleteRef = FunctionReference<"mutation", Visibility, OnComplete
  */
 export type AcceptsResult<C, Ret> = unknown extends Ret
   ? unknown
-  : C extends { readonly _args: { result: infer A } }
-  ? [WorkResult<Ret>] extends [A]
-    ? unknown
-    : { readonly "onComplete does not accept this work's result": WorkResult<Ret> }
-  : unknown;
+  : [RejectsResult<C, Ret>] extends [never]
+  ? unknown
+  : { readonly "onComplete does not accept this work's result": WorkResult<Ret> };
+
+/**
+ * The members of `C` whose `result` does not take `WorkResult<Ret>` (distributes over a union of references, such as
+ * `cond ? a : b`: every member must accept it, not just one).
+ */
+type RejectsResult<C, Ret> = C extends { readonly _args: { result: infer A } } ? ([WorkResult<Ret>] extends [A] ? never : C) : never;
 
 export interface EnqueueOptions<Ret = unknown, C extends OnCompleteRef = OnCompleteRef> {
   /**

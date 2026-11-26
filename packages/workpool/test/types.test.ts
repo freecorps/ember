@@ -15,6 +15,7 @@ declare const anyDone: Mutation<OnCompleteArgs, null>;
 declare const wordsDone: Mutation<{ workId: string; context: { docId: string }; result: WorkResult<{ words: number }> }, null>;
 /** onComplete that expects a string result. */
 declare const stringDone: Mutation<{ workId: string; context: unknown; result: WorkResult<string> }, null>;
+declare const choose: boolean;
 
 export function typeChecks(): void {
   const pool = new Workpool(component);
@@ -30,6 +31,10 @@ export function typeChecks(): void {
   pool.enqueueActionBatch(ctx, summarize, [{ docId: "a" }], { key: "same" });
   // @ts-expect-error the batch's onComplete is checked against the work's result too
   pool.enqueueMutationBatch(ctx, write, [{ label: "x" }], { onComplete: stringDone });
+  // A union of references (`cond ? a : b`): every member must accept the result.
+  pool.enqueueAction(ctx, summarize, { docId: "d" }, { onComplete: choose ? wordsDone : anyDone, context: { docId: "d" } });
+  // @ts-expect-error one member (stringDone) does not take { words: number }
+  pool.enqueueAction(ctx, summarize, { docId: "d" }, { onComplete: choose ? wordsDone : stringDone });
   // A hand-written reference (unknown return) works with any onComplete.
   pool.enqueueAction(ctx, unsafeRef<"action">("work:call"), { label: "x" }, { onComplete: stringDone });
 }
