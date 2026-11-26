@@ -94,7 +94,7 @@ export default defineSchema({
 - A ordenação sai direto de `memcmp` no BLOB, e o `CREATE INDEX` é feito sobre essa coluna.
 - O engine calcula a chave em toda escrita.
 - Com isso: `null` e `undefined` ficam distintos, booleanos não colidem com 0/1, campos aninhados (`flags.read`) podem ser indexados, e um range vira `key >= ? AND key < ?`.
-- ✅ **Índices esparsos** (0.10): `.index(name, fields, { sparse: true })` guarda chave `NULL` quando falta um dos campos (`undefined`) e o índice SQLite é parcial (`WHERE "_k_<índice>" IS NOT NULL`): documento sem o campo opcional não paga a entrada do índice. Consultas com bounds em valores presentes não mudam; um scan sem bounds não traz os documentos sem o campo. Ligar/desligar é mudança de índice (backfill staged). Contrato em `contracts.md` ("Índices esparsos").
+- ✅ **Índices esparsos** (0.10): `.index(name, fields, { sparse: true })` guarda chave `NULL` quando falta um dos campos (`undefined`) e o índice SQLite é parcial (`WHERE "_k_<índice>" IS NOT NULL`): documento sem o campo opcional não paga a entrada do índice. A consulta só vê documentos com **todos** os campos do índice: bounds em valores presentes de todos eles dão o resultado de um índice comum; um prefixo de um índice composto (`eq` só no primeiro campo) ou um scan sem bounds deixa de fora os documentos sem algum dos campos. Ligar/desligar é mudança de índice (backfill staged). Contrato em `contracts.md` ("Índices esparsos").
 
 **Colunas no SQLite** ✅:
 - Escalares de primeiro nível viram colunas tipadas numa tabela `STRICT`.

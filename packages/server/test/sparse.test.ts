@@ -9,6 +9,8 @@ import {
   createMatchIndex,
   defineSchema,
   defineTable,
+  docKey,
+  indexKey,
   localReadSetMatches,
   localSchema,
   mutationGeneric,
@@ -316,5 +318,33 @@ describe("sparse index: local execution (client replicas)", () => {
     // a change that stays out of the index does not re-run it
     const quiet = [{ table: "items", id: ids.a!, before: { ...all[0]!, k: undefined }, after: { ...all[0]!, k: undefined, n: 1 } }] as any;
     expect(localReadSetMatches(ls, local1.readSet, quiet)).toBe(false);
+  });
+});
+
+describe("sparse key of a field named like an Object.prototype member", () => {
+  test("absent means no own property: the key is NULL (sparse) or the key of undefined (plain), never the inherited function", () => {
+    const fields = ["toString", "flags.valueOf", "_creationTime", "_id"];
+    const doc = { _id: "t_1", _creationTime: 1, flags: {} } as unknown as Doc;
+    expect(indexKey(doc, fields, true)).toBeNull();
+    expect(indexKey(doc, fields, false)).toEqual(docKey({ _id: "t_1", _creationTime: 1 } as unknown as Doc, ["missing", "flags.missing", "_creationTime", "_id"]));
+    // an own value is kept
+    const own = { _id: "t_2", _creationTime: 2, toString: "a", flags: { valueOf: "b" } } as unknown as Doc;
+    expect(indexKey(own, fields, true)).toEqual(docKey(own, fields));
+    expect(indexKey(own, fields, true)).not.toBeNull();
+  });
+});
+
+describe("sparse compound index", () => {
+  test("a prefix bound leaves out the documents missing a later field (a plain index keeps them)", () => {
+    for (const sparse of [true, false]) {
+      const schema = defineSchema({ tables: { t: defineTable({ name: v.string(), tag: v.optional(v.string()) }).index("by_name_tag", ["name", "tag"], { sparse }) } });
+      const s = fresh({ schema });
+      s.tx((db: any) => {
+        db.insert("t", { name: "a", tag: "x" });
+        db.insert("t", { name: "a" });
+      });
+      const names = (s.run((db: any) => db.query("t").withIndex("by_name_tag", (q: any) => q.eq("name", "a")).collect()).value as Doc[]).map((d) => d.tag ?? null);
+      expect(names).toEqual(sparse ? ["x"] : [null, "x"]);
+    }
   });
 });

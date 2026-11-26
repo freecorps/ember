@@ -91,8 +91,9 @@ export const send = mutation({
 - Plan limits (rows read and written, result size, timeouts) are enforced per function; see `limits.ts` and
   `defineApp({ limits })`.
 - `.index(name, fields, { sparse: true })` keeps only the documents that have every indexed field (an SQLite partial
-  index): a document without an optional field costs no index row. Bounds on present values query it as usual; a
-  scan without bounds leaves the documents without the field out. Turning it on or off rebuilds the index (staged
+  index): a document without an optional field costs no index row. A query sees only documents with every indexed
+  field: bounds on present values of all of them read as on a plain index, but a prefix of a compound index (`eq` on
+  its first field only) or a scan without bounds leaves out the documents missing any of its fields. Turning it on or off rebuilds the index (staged
   backfill).
 - `ctx.db.insert(table, (id) => doc)` builds the document from its new id (a job scheduled for it, a row that points
   back at it): one write instead of an insert and a patch. The callback and the row are one savepoint: if it throws,
