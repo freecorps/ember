@@ -65,7 +65,8 @@ export function checkChannels(channels: unknown): Readonly<ChannelsConfig> {
       const val = d[k] as { shape?: unknown } | undefined;
       if (val !== undefined && (typeof val !== "object" || val === null || typeof val.shape !== "object")) throw new Error(`defineApp: channel ${pattern}: ${k} must be a v.* validator`);
     }
-    out[pattern] = Object.freeze({ ...(d as unknown as ChannelDefinition) });
+    // An own data property: `out["__proto__"] = …` would set the prototype instead (and lose an exact `__proto__` rule).
+    Object.defineProperty(out, pattern, { value: Object.freeze({ ...(d as unknown as ChannelDefinition) }), enumerable: true, writable: false, configurable: false });
   }
   return Object.freeze(out);
 }

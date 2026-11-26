@@ -47,6 +47,17 @@ describe("channels (defineApp({ channels }))", () => {
     expect(checkChannelValue(app.channels["room:*"]!, "payload", { anything: true })).toBeNull();
   });
 
+  it("an exact __proto__ rule stays its own (not the copy's prototype): it is not left to a wildcard", () => {
+    // A computed key: an own property named "__proto__", as a config parsed from JSON has it.
+    const channels = { ["__proto__"]: { authorize: () => false }, "*": { authorize: () => true } };
+    const proto = defineApp({ channels }).channels;
+    expect(Object.getPrototypeOf(proto)).toBe(Object.prototype);
+    const match = matchChannel(proto, "__proto__");
+    expect(match?.def).toBe(proto["__proto__"]);
+    expect(authorizeChannel(match!.def, { subject: "a" }, { name: "__proto__", param: "", shard: "s" })).toBe(false);
+    expect(matchChannel(proto, "other")?.def.authorize(null, { name: "other", param: "other", shard: "s" })).toBe(true);
+  });
+
   it("refuses bad declarations", () => {
     expect(() => defineApp({ channels: { "bad name": { authorize: () => true } } })).toThrow(/channel pattern/);
     expect(() => defineApp({ channels: { "a*b": { authorize: () => true } } })).toThrow(/channel pattern/);
