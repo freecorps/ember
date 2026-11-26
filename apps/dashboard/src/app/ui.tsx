@@ -298,7 +298,7 @@ export function ConfirmDialog({
           {error && <Problem error={error} />}
         </div>
         <footer className="dialog-foot">
-          <button type="button" onClick={onCancel}>
+          <button type="button" onClick={onCancel} disabled={busy}>
             Cancel
           </button>
           <button type="submit" className={danger ? "danger" : "primary"} disabled={!ok || busy} {...(!expected ? { autoFocus: true } : {})}>

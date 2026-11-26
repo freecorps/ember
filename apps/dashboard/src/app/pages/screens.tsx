@@ -226,13 +226,13 @@ function Screen({ project, env, shard: picked, spec, tab, link }: { project: str
         </nav>
       )}
       {current?.blocks.map((b) => (
-        <BlockView key={`${current.id}/${b.id}`} c={c} b={b} />
+        <BlockView key={`${current.id}/${b.id}`} c={c} b={b} tab={current.id} />
       ))}
     </>
   );
 }
 
-function BlockView({ c, b }: { c: ScreenCtx; b: Block }) {
+function BlockView({ c, b, tab }: { c: ScreenCtx; b: Block; tab: string }) {
   const id = `blk-${b.id}`;
   const body =
     b.kind === "stats" ? (
@@ -244,7 +244,7 @@ function BlockView({ c, b }: { c: ScreenCtx; b: Block }) {
     ) : b.kind === "toggle" ? (
       <ToggleBlock c={c} b={b} />
     ) : b.kind === "embed" ? (
-      <EmbedBlock c={c} b={b} />
+      <EmbedBlock c={c} b={b} tab={tab} />
     ) : b.kind === "actions" ? (
       <ActionsBlock c={c} actions={b.actions} />
     ) : (

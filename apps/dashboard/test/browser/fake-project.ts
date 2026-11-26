@@ -85,7 +85,7 @@ export const LAB_SPEC = {
 /** The lab's page: buttons that call through the SDK and show what came back (as text). */
 export const LAB_PAGE = embedPage({
   title: "Lab",
-  body: `<h1>Lab page</h1><p id="ctx">…</p><p id="theme">…</p><button id="load">Load</button> <button id="add">Add</button> <button id="secret">Secret</button> <button id="twice">Add twice</button> <button id="action">As action</button><pre id="out">idle</pre><pre id="out2"></pre>`,
+  body: `<h1>Lab page</h1><p id="ctx">…</p><p id="theme">…</p><button id="load">Load</button> <button id="add">Add</button> <button id="secret">Secret</button> <button id="twice">Add twice</button> <button id="action">As action</button> <button id="slow">Slow add</button><pre id="out">idle</pre><pre id="out2"></pre>`,
   style: "pre{white-space:pre-wrap}",
   script: `
 const dash = EmberDashboard.connect();
@@ -96,6 +96,7 @@ $("load").addEventListener("click", () => dash.query("lib:list").then(show("out"
 $("add").addEventListener("click", () => dash.mutate("lib:add", { label: "from embed" }).then((v) => show("out")("added " + JSON.stringify(v)), fail("out")));
 $("secret").addEventListener("click", () => dash.query("lib:secret").then(show("out"), fail("out")));
 $("action").addEventListener("click", () => dash.action("lib:add", { label: "x" }).then(show("out"), fail("out")));
+$("slow").addEventListener("click", () => dash.mutate("lib:add", { label: "slow" }).then((v) => show("out")("slow " + JSON.stringify(v)), fail("out")));
 $("twice").addEventListener("click", () => {
   dash.mutate("lib:add", { label: "first" }).then((v) => show("out")("added " + JSON.stringify(v)), fail("out"));
   dash.mutate("lib:add", { label: "second" }).then(show("out2"), fail("out2"));
@@ -128,6 +129,8 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
     json({ ok: false, error: { code: "no_local_auth", message: `auth is handled by ${state.authFrom}: users, sessions, revocation and key rotation live there (remote auth, no local Auth DO)` } }, 404);
   /** Every admin call the project got (`<METHOD> <path>[?shard=...]`): the dashboard's cost to the project. */
   const calls: string[] = [];
+  /** Writes held until released (`@lab/lib:add` with label "slow"): a write in flight. */
+  const held: Array<() => void> = [];
   const svc = {
     fetch: async (r: Request | string) => {
       const req = r as Request;
@@ -171,6 +174,7 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           if (body.fn === "messages:send" && typeof (body.args as { channel?: unknown }).channel !== "string") return json({ ok: false, error: { code: "ValidationError", message: "channel: expected string" }, ms: 0.4, type: "mutation", as: null }, 400);
           return json({ ok: true, value: { who: as?.subject ?? null, args: body.args }, ms: 1.5, type: body.fn === "messages:send" ? "mutation" : "query", as: as?.subject ?? null });
         }
+        if (p === "dashboards/run" && (body.args as { label?: unknown } | undefined)?.label === "slow") await new Promise<void>((r) => held.push(r));
         if (p === "dashboards/run") return json({ ok: true, value: body.fn === "@pool/lib:cancelAll" ? 3 : body.fn === "@lab/lib:add" ? "it_2" : true, ms: 1, type: "mutation", shard: body.shard });
         if (p === "restore") return json({ ok: true, shard: body.shard, restoredTo: body.bookmark, undo: "0000000a-0000000b-0000000c-feedfacefeedface", version: 9, epoch: "e2", schemaVersion: "abc" });
       }
@@ -180,6 +184,8 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       }
       if (p === "dashboards") return json({ ok: true, dashboards: o.legacy ? [] : [POOL_SPEC, LAB_SPEC] });
       if (p === "dashboards/embed") {
+        // The admin channel: the dashboard's Worker fetches the page with the project's admin token.
+        if (req.headers.get("authorization") !== "Bearer proj-admin") return json({ ok: false, error: { code: "unauthorized", message: "admin token required" } }, 401);
         if (url.searchParams.get("dashboard") !== "lab" || url.searchParams.get("route") !== "/dashboard/page") return json({ ok: false, error: { code: "unknown_embed", message: "no such embed" } }, 404);
         return new Response(LAB_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
       }
@@ -348,5 +354,5 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
     },
   };
-  return { svc, posts, lists, dashQueries, calls, remoteAuth: (from: string | null) => void (state.authFrom = from) };
+  return { svc, posts, lists, dashQueries, calls, remoteAuth: (from: string | null) => void (state.authFrom = from), held, release: () => held.splice(0).forEach((r) => r()) };
 }

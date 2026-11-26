@@ -88,8 +88,9 @@ export function emberDashboardSdk(): DashboardSdk {
   }
 
   function connect(options: ConnectOptions = {}): DashboardBridge {
-    const win: SdkWindow | undefined = options.window ?? (globalThis as { window?: SdkWindow }).window;
-    if (!win) throw new Error("@freecorps/ember-dashboard-sdk: connect() runs in the browser, inside the dashboard's iframe");
+    const found: SdkWindow | undefined = options.window ?? (globalThis as { window?: SdkWindow }).window;
+    if (!found) throw new Error("@freecorps/ember-dashboard-sdk: connect() runs in the browser, inside the dashboard's iframe");
+    const win: SdkWindow = found;
     const parent = win.parent;
     const applyTheme = options.applyTheme !== false;
     const queryTimeout = options.queryTimeoutMs ?? 30_000;

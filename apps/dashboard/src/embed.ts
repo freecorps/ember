@@ -22,6 +22,8 @@ import { allowedOrigins } from "./security.ts";
 export const EMBED_TICKET_TTL_MS = 5 * 60_000;
 /** Largest page the dashboard serves (as the runtime's `DASHBOARD_EMBED_MAX`). */
 export const EMBED_MAX_BYTES = 1024 * 1024;
+/** Largest error answer from the project read for its message (the rest is dropped). */
+const ERROR_MAX_BYTES = 64 * 1024;
 /** Inline scripts hashed at most (a page with more is refused). */
 const MAX_SCRIPTS = 32;
 
@@ -179,8 +181,10 @@ export async function serveEmbed(request: Request, env: ProjectEnv & { REGISTRY?
     return refusal(502, `${target.worker} did not answer (${(e as Error).message})`, ancestors);
   }
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    let message = `${target.worker} answered ${res.status}`;
+    // An error is a short JSON: read as little of it as the page itself may be, at most (never the whole stream).
+    const raw = await readLimited(res.body, ERROR_MAX_BYTES).catch(() => null);
+    const text = raw ? new TextDecoder().decode(raw) : "";
+    let message = `${target.worker} answered ${res.status}${raw ? "" : ` (an error body over ${ERROR_MAX_BYTES} bytes)`}`;
     try {
       const b = JSON.parse(text) as { error?: { code?: string; message?: string } };
       if (b.error?.code === "not_found" && b.error.message === "not found") message = `${target.worker} runs an older runtime without embed pages: update the runtime (ember deploy)`;

@@ -10,7 +10,10 @@
 //     `dashboard.embed.run`, the Worker checks the block too) and only after the person confirms it here, seeing the
 //     component, the function and the args;
 //   - one confirmation at a time (another write meanwhile is refused `busy`), at most MAX_QUERIES queries in flight;
-//   - the dashboard's theme (its CSS custom properties) is sent on the handshake and whenever it changes.
+//     once confirmed, the write cannot be cancelled while it runs (the page gets its real outcome);
+//   - the dashboard's theme (its CSS custom properties) is sent on the handshake and whenever it changes;
+//   - Refresh (and a write elsewhere on the screen) or another shard loads the page again: a new ticket, iframe and
+//     bridge, so the page's context always names the shard its requests run on.
 // Replies go to the iframe's window with targetOrigin "*": an opaque origin has no name to target, and the window is
 // the one this block created (a navigated iframe gets nothing more).
 
@@ -35,6 +38,8 @@ export interface EmbedHost {
   project: string;
   env: string;
   shard: string;
+  /** Bumped by Refresh and after every write on the screen. */
+  version: number;
   spec: { key: string; label: string; component: string | null; functions: Record<string, { type: "query" | "mutation" | "action"; destructive?: true }> };
   changed: () => void;
 }
@@ -70,15 +75,32 @@ interface PendingWrite {
   destructive: boolean;
 }
 
-export function EmbedBlock({ c, b }: { c: EmbedHost; b: EmbedSpec }) {
+/** `tab`: the id of the block's tab (block ids are unique only within their tab). */
+export function EmbedBlock({ c, b, tab }: { c: EmbedHost; b: EmbedSpec; tab: string }) {
+  // Each generation is a new ticket, iframe and bridge: on Refresh or a write elsewhere on the screen (c.version), and
+  // on another shard (in the key: the old page never sends a request on the new shard). Not after the page's own
+  // confirmed write: it has the answer and keeps its state.
+  const [gen, setGen] = useState(0);
+  const seen = useRef(c.version);
+  const own = useRef<number | null>(null);
+  useEffect(() => {
+    if (c.version === seen.current) return;
+    seen.current = c.version;
+    if (own.current === c.version) return;
+    setGen((g) => g + 1);
+  }, [c.version]);
+  return <EmbedTicket key={`${c.shard}#${gen}`} c={c} b={b} tab={tab} ownWrite={() => (own.current = seen.current + 1)} />;
+}
+
+function EmbedTicket({ c, b, tab, ownWrite }: { c: EmbedHost; b: EmbedSpec; tab: string; ownWrite: () => void }) {
   const ticket = useApi<{ url: string; expires: number }>(path("/api/dash/embed", { project: c.project, env: c.env, dashboard: c.spec.key, route: b.route }));
   if (ticket.error) return <Problem error={ticket.error} onRetry={ticket.reload} />;
   if (!ticket.data) return <Loading lines={3} />;
   // A new ticket is a new iframe (and a new bridge).
-  return <EmbedFrame key={ticket.data.url} c={c} b={b} url={ticket.data.url} reload={ticket.reload} />;
+  return <EmbedFrame key={ticket.data.url} c={c} b={b} tab={tab} url={ticket.data.url} reload={ticket.reload} ownWrite={ownWrite} />;
 }
 
-function EmbedFrame({ c, b, url, reload }: { c: EmbedHost; b: EmbedSpec; url: string; reload: () => void }) {
+function EmbedFrame({ c, b, tab, url, reload, ownWrite }: { c: EmbedHost; b: EmbedSpec; tab: string; url: string; reload: () => void; ownWrite: () => void }) {
   const s = useSession();
   const frame = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(b.height === "auto" ? HEIGHT.initial : b.height);
@@ -88,7 +110,7 @@ function EmbedFrame({ c, b, url, reload }: { c: EmbedHost; b: EmbedSpec; url: st
   const [error, setError] = useState<ApiError | null>(null);
   const [expected, setExpected] = useState<string | null>(null);
   // Mutable bridge state the message handler reads (it is attached once per iframe).
-  const st = useRef({ loads: 0, alive: true, welcomed: false, queries: 0, write: null as PendingWrite | null });
+  const st = useRef({ loads: 0, alive: true, welcomed: false, queries: 0, write: null as PendingWrite | null, sending: false });
   const label = c.spec.component ? (c.spec.component === c.spec.key ? c.spec.component : `${c.spec.component} as ${c.spec.key}`) : "app";
   const prot = s.isProtected(c.env);
   const context: EmbedContext = useMemo(
@@ -199,12 +221,14 @@ function EmbedFrame({ c, b, url, reload }: { c: EmbedHost; b: EmbedSpec; url: st
   };
   const confirm = async (typed: string | null) => {
     const w = st.current.write;
-    if (!w) return;
+    if (!w || st.current.sending) return;
+    st.current.sending = true;
     setBusy(true);
     setError(null);
     try {
-      const r = await api.post<{ value?: unknown }>("/api/dash/run", { project: c.project, env: c.env, shard: c.shard, dashboard: c.spec.key, fn: w.fn, args: w.args, embed: b.id, ...(typed ? { confirm: typed } : {}) });
+      const r = await api.post<{ value?: unknown }>("/api/dash/run", { project: c.project, env: c.env, shard: c.shard, dashboard: c.spec.key, fn: w.fn, args: w.args, embed: `${tab}/${b.id}`, ...(typed ? { confirm: typed } : {}) });
       settle(() => send({ type: "response", id: w.id, ok: true, value: r.value ?? null }));
+      ownWrite();
       c.changed();
     } catch (x) {
       const e = x instanceof ApiError ? x : new ApiError(0, "error", String(x));
@@ -212,10 +236,13 @@ function EmbedFrame({ c, b, url, reload }: { c: EmbedHost; b: EmbedSpec; url: st
       if (e.code === "confirmation_required" && typeof e.data?.expected === "string") setExpected(e.data.expected);
       else settle(() => fail(w.id, e.code, e.message, e.data));
     } finally {
+      st.current.sending = false;
       setBusy(false);
     }
   };
   const cancel = () => {
+    // Confirmed and sent: the write may already run, so the page waits for its real outcome (never `cancelled`).
+    if (st.current.sending) return;
     const w = st.current.write;
     if (w) settle(() => fail(w.id, "cancelled", "the person declined"));
   };

@@ -2,7 +2,7 @@
 // (`GET /embed`: ticket checked, fetched from the project's `dashboards/embed`, served under the sandbox CSP with the
 // hashes of its inline scripts), and writes from an embed page (`POST /api/dash/run` with `embed`: the block must list
 // the function; audited as `dashboard.embed.run`).
-import { beforeEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { clearCapabilities, CSP, createDashboard, embedCsp, inlineScriptHashes, type DashboardEnv } from "../src/worker.ts";
 import { frameAncestors } from "../src/embed.ts";
 import { registry } from "./helpers.ts";
@@ -14,10 +14,15 @@ const SPEC = {
   label: "Agent",
   icon: "bot",
   scope: "shard",
-  tabs: [{ id: "lab", label: "Lab", blocks: [{ kind: "embed", id: "play", route: "/dashboard/playground", path: "/agent/dashboard/playground", height: "auto", functions: { "dashboard:threads": "@agent/dashboard:threads", "lib:send": "@agent/lib:send" } }] }],
+  tabs: [
+    { id: "lab", label: "Lab", blocks: [{ kind: "embed", id: "play", route: "/dashboard/playground", path: "/agent/dashboard/playground", height: "auto", functions: { "dashboard:threads": "@agent/dashboard:threads", "lib:send": "@agent/lib:send" } }] },
+    // Block ids are unique only within a tab: another tab's block "play" lists other functions.
+    { id: "more", label: "More", blocks: [{ kind: "embed", id: "play", route: "/dashboard/more", path: "/agent/dashboard/more", height: "auto", functions: { "lib:archive": "@agent/lib:archive" } }] },
+  ],
   functions: {
     "@agent/dashboard:threads": { type: "query", args: { kind: "object", fields: {} } },
     "@agent/lib:send": { type: "mutation", args: { kind: "object", fields: {} } },
+    "@agent/lib:archive": { type: "mutation", args: { kind: "object", fields: {} } },
     "@agent/lib:deleteThread": { type: "mutation", args: { kind: "object", fields: {} }, destructive: true },
   },
 };
@@ -49,6 +54,9 @@ function project(o: { page?: () => Response; features?: string[] } = {}) {
 
 const ORIGIN = "https://dash.example";
 function setup(o: Parameters<typeof project>[0] = {}) {
+  // The capability cache is per Worker name across registries (every setup is ember-chat-prod): each setup starts
+  // without it, so one project's features never answer for the next.
+  clearCapabilities();
   const p = project(o);
   const env: DashboardEnv = {
     DASHBOARD_TOKEN: "dash-secret",
@@ -66,8 +74,6 @@ function setup(o: Parameters<typeof project>[0] = {}) {
   };
   return { ...p, env, fetch, ticket };
 }
-
-beforeEach(() => clearCapabilities());
 
 describe("embed pages", () => {
   it("a read role gets a ticket; the page is served from the project with the sandbox CSP and its script hashes", async () => {
@@ -177,25 +183,65 @@ describe("embed pages", () => {
     const unknown = await t.fetch(`/api/dash/embed?project=nope&env=prod&dashboard=agent&route=%2Fx`, { headers: { authorization: "Bearer read-secret" } });
     expect(unknown.status).toBe(404);
     // An older runtime (no dashboards/embed): the ticket says "update the runtime".
-    clearCapabilities();
     const old = setup({ features: ["capabilities", "dashboards"] });
     const o = await old.ticket();
     expect(o.status).toBe(501);
     expect(o.body.error!.code).toBe("runtime_outdated");
     // A route answering JSON (or anything but HTML) is not served as a page.
-    clearCapabilities();
     const json = setup({ page: () => Response.json({ secret: 1 }) });
     const j = await json.fetch((await json.ticket()).body.url);
     expect(j.status).toBe(502);
     expect(await j.text()).toMatch(/not text\/html/);
     // Too large.
-    clearCapabilities();
     const big = setup({ page: () => new Response("x".repeat(1024 * 1024 + 1), { headers: { "content-type": "text/html" } }) });
     expect((await big.fetch((await big.ticket()).body.url)).status).toBe(502);
     // A page without inline scripts runs none.
-    clearCapabilities();
     const plain = setup({ page: () => new Response("<p>static</p>", { headers: { "content-type": "text/html" } }) });
     expect((await plain.fetch((await plain.ticket()).body.url)).headers.get("content-security-policy")).toContain("script-src 'none'");
+  });
+
+  it("an error answer from the project is read up to a limit, never as a whole stream", async () => {
+    let pulled = 0;
+    let cancelled = false;
+    const chunk = new TextEncoder().encode("x".repeat(16 * 1024));
+    const t = setup({
+      page: () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull(c) {
+              // 2 MiB of error body without content-length, if read to the end.
+              if (++pulled > 128) return c.close();
+              c.enqueue(chunk);
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { status: 500, headers: { "content-type": "application/json" } },
+        ),
+    });
+    const res = await t.fetch((await t.ticket()).body.url);
+    expect(res.status).toBe(502);
+    expect(await res.text()).toMatch(/answered 500 \(an error body over 65536 bytes\)/);
+    expect(cancelled).toBe(true);
+    expect(pulled).toBeLessThan(16);
+    // A short JSON error keeps its message.
+    const small = setup({ page: () => Response.json({ ok: false, error: { code: "boom", message: "it broke" } }, { status: 500 }) });
+    expect(await (await small.fetch((await small.ticket()).body.url)).text()).toMatch(/boom: it broke/);
+  });
+
+  it("HEAD answers like GET without the body: the same ticket check, type and CSP", async () => {
+    const t = setup();
+    const { url } = (await t.ticket()).body;
+    const get = await t.fetch(url);
+    const head = await t.fetch(url, { method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    expect(head.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(head.headers.get("content-security-policy")).toBe(get.headers.get("content-security-policy"));
+    expect(head.headers.get("x-frame-options")).toBe("SAMEORIGIN");
+    // Without a valid ticket HEAD is refused like GET.
+    expect((await t.fetch(url.replace(/sig=[\w-]+/, `sig=${"A".repeat(43)}`), { method: "HEAD" })).status).toBe(403);
   });
 
   it("writes from an embed page: only functions the block lists, audited as dashboard.embed.run", async () => {
@@ -203,21 +249,27 @@ describe("embed pages", () => {
     const me = (await (await t.fetch("/api/me", { headers: { authorization: "Bearer dash-secret" } })).json()) as { csrf: string };
     const run = (body: Record<string, unknown>, token = "dash-secret") =>
       t.fetch("/api/dash/run", { method: "POST", headers: { authorization: `Bearer ${token}`, origin: ORIGIN, "content-type": "application/json", "x-ember-csrf": me.csrf }, body: JSON.stringify({ project: "chat", env: "prod", shard: "org:acme", dashboard: "agent", ...body }) });
-    const ok = await run({ fn: "@agent/lib:send", args: { text: "hi" }, embed: "play" });
+    const ok = await run({ fn: "@agent/lib:send", args: { text: "hi" }, embed: "lab/play" });
     expect(ok.status).toBe(200);
     expect(t.posts).toEqual([{ shard: "org:acme", dashboard: "agent", fn: "@agent/lib:send", args: { text: "hi" }, destructive: false }]);
     // In the spec but not in the block: refused (the SPA's bridge refuses it first).
-    const outside = await run({ fn: "@agent/lib:deleteThread", args: {}, embed: "play" });
+    const outside = await run({ fn: "@agent/lib:deleteThread", args: {}, embed: "lab/play" });
     expect(outside.status).toBe(403);
-    expect(((await outside.json()) as { error: { message: string } }).error.message).toMatch(/embed block "play"/);
-    expect((await run({ fn: "@agent/lib:send", args: {}, embed: "other" })).status).toBe(403);
-    expect((await run({ fn: "@agent/lib:send", args: {}, embed: "Bad Id" })).status).toBe(400);
+    expect(((await outside.json()) as { error: { message: string } }).error.message).toMatch(/embed block "lab\/play"/);
+    expect((await run({ fn: "@agent/lib:send", args: {}, embed: "lab/other" })).status).toBe(403);
+    expect((await run({ fn: "@agent/lib:send", args: {}, embed: "nope/play" })).status).toBe(403);
+    // The block is the one of that tab: "play" of "more" allows archive, "play" of "lab" does not.
+    expect((await run({ fn: "@agent/lib:archive", args: {}, embed: "more/play" })).status).toBe(200);
+    expect((await run({ fn: "@agent/lib:archive", args: {}, embed: "lab/play" })).status).toBe(403);
+    expect((await run({ fn: "@agent/lib:send", args: {}, embed: "more/play" })).status).toBe(403);
+    // `<tab>/<block>`, each a spec id.
+    for (const embed of ["play", "Bad Id", "lab/Bad Id", "lab/play/x", "/play", 3]) expect((await run({ fn: "@agent/lib:send", args: {}, embed })).status, String(embed)).toBe(400);
     // The read role cannot write, from an embed or not (audited as a denial of the embed action).
-    expect((await run({ fn: "@agent/lib:send", args: {}, embed: "play" }, "read-secret")).status).toBe(403);
+    expect((await run({ fn: "@agent/lib:send", args: {}, embed: "lab/play" }, "read-secret")).status).toBe(403);
     const audit = (await (await t.fetch("/api/audit", { headers: { authorization: "Bearer dash-secret" } })).json()) as { entries: Array<{ action: string; outcome: string; target: string | null; args: unknown }> };
     const embedRows = audit.entries.filter((e) => e.action === "dashboard.embed.run");
     expect(embedRows.length).toBeGreaterThanOrEqual(2);
     expect(embedRows.find((e) => e.target === "@agent/lib:send" && e.outcome === "ok")).toBeTruthy();
-    expect(String(embedRows.find((e) => e.outcome === "ok")!.args)).toContain(`"embed":"play"`);
+    expect(String(embedRows.find((e) => e.target === "@agent/lib:send" && e.outcome === "ok")!.args)).toContain(`"embed":"lab/play"`);
   });
 });
