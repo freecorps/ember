@@ -12,8 +12,8 @@
 // importing them (directly or not); the others are replayed from the cache, so a save re-checks the edited module and
 // its callers, not the app. The output is the same as a run from scratch's (codegen-incremental.test.ts).
 
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import ts from "typescript";
 import { SOURCE_CONDITIONS } from "../source.ts";
 
@@ -93,14 +93,28 @@ type ClaimsCache = { authConfig: string; files: string[]; stamp: string; result:
 /**
  * The files whose size and mtime stand for `files`: each one, but for a file of an installed package (under
  * node_modules) that package's package.json (Better Auth's types are hundreds of files; a new version rewrites it).
+ * For a file of the workspace, the nearest package.json above it too: its `types`/`exports` choose the declaration
+ * an import resolves to (a sibling package's `types` changed: another file, with no read file changing).
  */
 function stampFiles(files: string[]): string[] {
   const out = new Set<string>();
+  const nearest = new Map<string, string | null>();
+  const packageJsonOf = (dir: string): string | null => {
+    const known = nearest.get(dir);
+    if (known !== undefined) return known;
+    const p = join(dir, "package.json");
+    const up = dirname(dir);
+    const found = existsSync(p) ? p : up === dir ? null : packageJsonOf(up);
+    nearest.set(dir, found);
+    return found;
+  };
   for (const f of files) {
     const parts = f.split(/[\\/]/);
     const nm = parts.lastIndexOf("node_modules");
     if (nm < 0) {
       out.add(f);
+      const pkg = packageJsonOf(dirname(f));
+      if (pkg) out.add(pkg);
       continue;
     }
     const pkg = parts.slice(0, nm + (parts[nm + 1]?.startsWith("@") ? 3 : 2));

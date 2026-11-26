@@ -1,8 +1,8 @@
 // Typed identity claims (docs/design/dx.md §3.7): codegen prints `ClaimsOf<typeof authConfig>` in
 // `_generated/claims.d.ts`; `_generated/server` types `ctx.auth` and `fromAuth` with it. Without
 // `ember/auth.config.ts`, the claims stay `Record<string, unknown>`.
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import ts from "typescript";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { codegen } from "../src/codegen/index.ts";
@@ -141,6 +141,30 @@ describe("typed identity claims (ember/auth.config.ts → _generated/claims.d.ts
     } finally {
       writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
       rmSync(join(project.root, "roles.ts"), { force: true });
+      await codegen(project, { oracle });
+    }
+  });
+
+  it("the cached claims follow a sibling package's package.json (its `types` picks another declaration)", async () => {
+    const sibling = `${project.root}-roles`;
+    mkdirSync(sibling, { recursive: true });
+    try {
+      writeFileSync(join(sibling, "v1.d.ts"), 'export type Role = "alpha";\n');
+      writeFileSync(join(sibling, "v2.d.ts"), 'export type Role = "beta";\n');
+      writeFileSync(join(sibling, "package.json"), JSON.stringify({ name: "roles", types: "v1.d.ts" }));
+      writeFileSync(
+        join(project.dir, "auth.config.ts"),
+        AUTH_CONFIG(`{ role: "alpha" as unknown as Role }`).replace("import { organization }", `import type { Role } from "../../${basename(sibling)}";\nimport { organization }`),
+      );
+      await codegen(project, { oracle: new TypeOracle() });
+      expect(gen(project, "claims.d.ts")).toContain('  role?: "alpha";');
+      // Only the package.json changes: a new process must not take the cached answer.
+      writeFileSync(join(sibling, "package.json"), JSON.stringify({ name: "roles", types: "v2.d.ts" }));
+      await codegen(project, { oracle: new TypeOracle() });
+      expect(gen(project, "claims.d.ts")).toContain('  role?: "beta";');
+    } finally {
+      writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
+      rmSync(sibling, { recursive: true, force: true });
       await codegen(project, { oracle });
     }
   });
