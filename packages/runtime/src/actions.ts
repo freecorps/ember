@@ -202,6 +202,9 @@ export class ActionRunner {
     } catch (e) {
       return failWith(errInfo(e));
     }
+    // `check` saw the stand-in; the loaded definition gets the same rule (`lazyActions` already refuses one that
+    // differs from the build's metadata: this keeps the gate here even if that check changes).
+    if (f.type !== "action" || (!opts.internal && f.visibility !== "public")) return fail("FunctionNotFound", `Function ${fn} not found`);
     if (!opts.prepared) {
       args = withDefaults(f.args, args ?? {});
       const bad = this.validate(fn, f.args, args, "arguments");

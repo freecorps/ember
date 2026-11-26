@@ -2,11 +2,12 @@
 // a split build keeps them, and the SDKs they import, out of the main module every isolate (each Shard DO) evaluates at
 // startup. The actions still run — called by a client, by another action, scheduled from a mutation — with their real
 // definition (declared errors, return validator).
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Miniflare } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildWorker, lazyActionModules, type WorkerBuild } from "../src/build.ts";
+import { buildWorker, lazyActionModules, runtimeHasLazyActions, type WorkerBuild } from "../src/build.ts";
 import { codegen } from "../src/codegen/index.ts";
 import { loadProject, type Project } from "../src/config.ts";
 import { startLocal } from "../src/local.ts";
@@ -56,6 +57,33 @@ export const record = internalAction({
 });
 `,
   );
+  // Gated by a middleware (actions have no `authorize`: their gate is a middleware, which comes with the module).
+  writeFileSync(
+    join(dir, "ember/guarded.ts"),
+    `import { defineErrors, v } from "@freecorps/ember-server";
+import { action } from "./_generated/server";
+
+const gate = defineErrors({ Denied: { message: "not for you" } });
+const signedIn = action.use({
+  errors: [gate.Denied],
+  handler: async (ctx) => {
+    if (!(await ctx.auth.getUserIdentity())) throw gate.Denied();
+  },
+});
+
+export const secret = signedIn({ args: { n: v.number() }, handler: async (_ctx, { n }) => n * 2 });
+`,
+  );
+  // A definition that depends on where it is evaluated: public in Node (where the build records it), internal in the
+  // Worker. The stand-in says public; the loaded definition must not run for a client.
+  writeFileSync(
+    join(dir, "ember/flip.ts"),
+    `import { action, internalAction } from "./_generated/server";
+
+const inWorker = (globalThis as { navigator?: { userAgent?: string } }).navigator?.userAgent === "Cloudflare-Workers";
+export const flip = (inWorker ? internalAction : action)({ args: {}, handler: async () => "ran" });
+`,
+  );
   // A module of mutations/queries: static, and it schedules the lazy internal action.
   writeFileSync(
     join(dir, "ember/mailer_log.ts"),
@@ -91,7 +119,9 @@ function startup(b: WorkerBuild): { code: string; bytes: number } {
   const walk = (name: string) => {
     if (seen.has(name)) return;
     seen.add(name);
-    for (const i of outputs[byName.get(name)!]!.imports) if (i.kind === "import-statement" && !i.external) walk(i.path.split("/").at(-1)!);
+    const out = outputs[byName.get(name) ?? ""];
+    if (!out) throw new Error(`startup: ${name} is not in the metafile's outputs (${[...byName.keys()].join(", ")})`);
+    for (const i of out.imports) if (i.kind === "import-statement" && !i.external) walk(i.path.split("/").at(-1)!);
   };
   walk("index.js");
   const parts = [...seen].map((n) => code.get(n) ?? "");
@@ -106,6 +136,8 @@ const post = async (path: string, body: unknown) => {
 describe("lazy action modules", () => {
   it("detects modules of actions only", () => {
     expect(readFileSync(lazy.entry, "utf8")).toMatch(/lazyActions\(\(\) => import\(".*mailer\.ts"\)/);
+    expect(readFileSync(lazy.entry, "utf8")).toMatch(/lazyActions\(\(\) => import\(".*guarded\.ts"\)/);
+    expect(readFileSync(lazy.entry, "utf8")).toMatch(/lazyActions\(\(\) => import\(".*flip\.ts"\)/);
     expect(readFileSync(lazy.entry, "utf8")).toMatch(/import \* as \w+ from ".*mailer_log\.ts"/);
     expect(readFileSync(lazy.entry, "utf8")).toMatch(/import \* as \w+ from ".*messages\.ts"/);
   });
@@ -133,6 +165,27 @@ describe("lazy action modules", () => {
     expect(await post("/api/action", { fn: "mailer:record", args: { to: "x" }, shard })).toMatchObject({ ok: false, error: { code: "FunctionNotFound" } });
   });
 
+  it("with build.lazyActions: false every module is static", () => {
+    const entry = readFileSync(eager.entry, "utf8");
+    expect(entry).not.toMatch(/lazyActions\(/);
+    expect(entry).toMatch(/import \* as \w+ from ".*mailer\.ts"/);
+  });
+
+  it("a lazy action's middleware gates it as a static one's would", async () => {
+    const shard = "global:main";
+    expect(await post("/api/action", { fn: "guarded:secret", args: { n: 2 }, shard })).toMatchObject({ ok: false, error: { code: "Denied" } });
+    expect(await post("/api/action", { fn: "guarded:secret", args: { n: "x" }, shard })).toMatchObject({ ok: false, error: { code: "ValidationError" } });
+  });
+
+  it("a loaded definition that differs from the build's metadata does not run (internal in the Worker, public in the build)", async () => {
+    const shard = "global:main";
+    for (let i = 0; i < 2; i++) {
+      const out = await post("/api/action", { fn: "flip:flip", args: {}, shard });
+      expect(out.ok).toBe(false);
+      expect(out.value).toBeUndefined();
+    }
+  });
+
   it("scheduled from a mutation: args checked against the recorded shape, then run by the shard", async () => {
     const shard = "global:main";
     expect(await post("/api/mutation", { fn: "mailer_log:scheduleBad", args: {}, shard })).toMatchObject({ ok: false, error: { code: "ValidationError" } });
@@ -146,14 +199,39 @@ describe("lazy action modules", () => {
   });
 
   it("lazyActionModules leaves mixed modules and nested functions static", () => {
-    const fn = (type: string) => ({ [Symbol.for("ember.function")]: true, type, visibility: "public", args: { kind: "object", fields: {} }, handler: () => 1 });
+    const fn = (type: string, extra: Record<string, unknown> = {}) => ({ [Symbol.for("ember.function")]: true, type, visibility: "public", args: { kind: "object", fields: {} }, handler: () => 1, ...extra });
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
     const out = lazyActionModules({
-      only: { a: fn("action"), helper: 3 },
+      // Plain values next to the actions: the registry never held them (only functions are registered); another module
+      // that imports them imports the file, which esbuild then keeps where that static import puts it.
+      only: { a: fn("action"), helper: 3, list: [1, 2] },
       mixed: { a: fn("action"), q: fn("query") },
       nested: { a: fn("action"), group: { b: fn("action") } },
+      // Deeper than any fixed cut: the registry (flattenFunctions) finds it, so the module stays static.
+      deep: { a: fn("action"), g: { l1: { l2: { l3: { l4: { l5: { q: fn("action") } } } } } } },
+      cycle: { a: fn("action"), cyclic },
+      // A field the build does not record (here a query-only gate): in doubt, static.
+      unknownField: { a: fn("action", { authorize: () => true }) },
+      future: { a: fn("action", { someGate: "x" }) },
+      http: { a: fn("action"), h: { [Symbol.for("ember.function")]: true, type: "httpAction", handler: () => 1 } },
       none: { x: 1 },
+      empty: {},
     });
     expect([...out.keys()]).toEqual(["only"]);
     expect(out.get("only")).toEqual({ a: { type: "action", visibility: "public", args: { kind: "object", fields: {} } } });
+  });
+
+  it("runtimeHasLazyActions: a runtime found neither from the project nor from the CLI means static modules", () => {
+    const a = mkdtempSync(join(tmpdir(), "ember-lazy-a-"));
+    const b = mkdtempSync(join(tmpdir(), "ember-lazy-b-"));
+    try {
+      expect(runtimeHasLazyActions(a, b)).toBe(false);
+      // The CLI's own runtime (this repo) has it.
+      expect(runtimeHasLazyActions(project.root)).toBe(true);
+    } finally {
+      rmSync(a, { recursive: true, force: true });
+      rmSync(b, { recursive: true, force: true });
+    }
   });
 });

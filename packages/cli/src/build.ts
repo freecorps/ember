@@ -78,8 +78,8 @@ export function runtimeHasWorkerEntry(projectDir: string, cliRoot: string = CLI_
 
 /**
  * Whether the project's `@freecorps/ember-runtime` registers lazy actions (`lazyActions` in `/worker-entry`, and an
- * `ActionRunner` that loads them): read from the entry's own file. An older copy gets every module imported statically.
- * Unknown (not found): assume the CLI's own, which has it.
+ * `ActionRunner` that loads them): read from the entry's own file. An older copy gets every module imported statically,
+ * and so does a runtime not found from the project nor from the CLI (unknown: the static entry builds with any runtime).
  */
 export function runtimeHasLazyActions(projectDir: string, cliRoot: string = CLI_ROOT): boolean {
   for (const start of [projectDir, cliRoot]) {
@@ -98,8 +98,15 @@ export function runtimeHasLazyActions(projectDir: string, cliRoot: string = CLI_
       if (dirname(d) === d) break;
     }
   }
-  return true;
+  return false;
 }
+
+/**
+ * The fields of an action the build records (`LazyActionMeta`), plus the handler and the error factories (which come
+ * with the module). An action with any other field stays static: whatever the engine reads from it must not be lost
+ * in the stand-in.
+ */
+const LAZY_ACTION_FIELDS = new Set(["type", "visibility", "args", "returns", "shard", "dispatch", "leaseMs", "sensitive", "declaresErrors", "errors", "handler"]);
 
 /** What `lazyActions` gets for one action of a lazy module (plain JSON; see `LazyActionMeta` in the server). */
 export type LazyActionMeta = Record<string, unknown>;
@@ -109,16 +116,19 @@ export type LazyActionMeta = Record<string, unknown>;
  * them: they go in the Worker as `import()` (`lazyActions`), so a split build keeps them and what they import out of
  * the chunks every isolate (each Shard DO) evaluates at startup. Queries and mutations stay static: the engine runs
  * them synchronously. A module is left static when it holds functions in nested objects (the registry would name them
- * differently) or when what the engine reads before loading it (args, returns, shard...) does not survive JSON.
+ * differently), when an action has a field the build does not record (`LAZY_ACTION_FIELDS`), or when what the engine
+ * reads before loading it (args, returns, shard...) does not survive JSON. In doubt, static. At run time, `lazyActions`
+ * refuses a loaded definition that differs from this metadata.
  */
 export function lazyActionModules(modules: LoadedProject["modules"]): Map<string, Record<string, LazyActionMeta>> {
   const out = new Map<string, Record<string, LazyActionMeta>>();
   const isFn = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && (x as Record<symbol, unknown>)[Symbol.for("ember.function")] === true;
-  const nestsFunctions = (x: unknown, depth = 0): boolean => {
-    if (typeof x !== "object" || x === null || depth > 4) return false;
+  // As deep as the registry looks (`flattenFunctions`); a cycle exhausts the stack and keeps the module static.
+  const nestsFunctions = (x: unknown): boolean => {
+    if (typeof x !== "object" || x === null) return false;
     if (isFn(x)) return true;
     try {
-      return Object.values(x).some((y) => nestsFunctions(y, depth + 1));
+      return Object.values(x).some((y) => nestsFunctions(y));
     } catch {
       return true;
     }
@@ -128,6 +138,7 @@ export function lazyActionModules(modules: LoadedProject["modules"]): Map<string
     for (const [name, x] of Object.entries(mod ?? {})) {
       if (isFn(x)) {
         if (x.type !== "action") continue next;
+        if (Object.keys(x).some((k) => !LAZY_ACTION_FIELDS.has(k))) continue next;
         const m: LazyActionMeta = { type: "action", visibility: x.visibility, args: x.args };
         for (const k of ["returns", "shard", "dispatch", "leaseMs", "sensitive", "declaresErrors"] as const) if (x[k] !== undefined) m[k] = x[k];
         const errors = Array.isArray(x.errors) ? (x.errors as Array<{ code?: unknown }>).map((e) => String(e?.code ?? "")).filter(Boolean) : [];

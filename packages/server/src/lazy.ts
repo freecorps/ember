@@ -3,7 +3,10 @@
 // the SDKs it imports in a chunk of their own, which a Shard isolate never evaluates while it only runs queries and
 // mutations. What the engine reads synchronously (type, visibility, args to check a scheduled call, shard, dispatch)
 // comes from the build, as plain data; the handler, its middlewares, declared errors and return validator come with
-// the module, and `loadFunction` hands the real definition to whoever runs it (`ActionRunner`).
+// the module, and `loadFunction` hands the real definition to whoever runs it (`ActionRunner`). Decisions taken on the
+// stand-in (visibility, the shard to route to, `sensitive`, scheduling) must hold for the real one: the loaded
+// definition is checked against the metadata, and one that differs (a definition that depends on the environment it is
+// evaluated in, a stale build) is refused before its handler runs.
 
 import type { ObjectShape, Shape, ShardSpec, Visibility } from "@freecorps/ember-values";
 import { IS_FUNCTION, isRegisteredFunction, type AnyRegisteredFunction } from "./functions.ts";
@@ -49,6 +52,8 @@ export function lazyActions(load: () => Promise<Record<string, unknown>>, meta: 
     const real = async (): Promise<AnyRegisteredFunction> => {
       const f = (await mod())[name];
       if (!isRegisteredFunction(f) || f.type !== "action") throw new Error(`lazy action ${name}: the module no longer exports it as an action (rebuild the Worker)`);
+      const differs = metaMismatch(m, f as AnyRegisteredFunction);
+      if (differs) throw new Error(`lazy action ${name}: its \`${differs}\` differs from the one the build recorded (rebuild the Worker; a definition must not depend on the environment it is evaluated in)`);
       return f as AnyRegisteredFunction;
     };
     const stub: Record<PropertyKey, unknown> = {
@@ -61,6 +66,32 @@ export function lazyActions(load: () => Promise<Record<string, unknown>>, meta: 
     out[name] = Object.freeze(stub) as unknown as AnyRegisteredFunction;
   }
   return out;
+}
+
+/** Plain-data equality (key order ignored), for the build's JSON metadata against a loaded definition. */
+function sameData(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a).filter((k) => (a as Record<string, unknown>)[k] !== undefined);
+  const kb = Object.keys(b).filter((k) => (b as Record<string, unknown>)[k] !== undefined);
+  if (ka.length !== kb.length) return false;
+  return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && sameData((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+}
+
+/**
+ * The first field in which the loaded definition `f` differs from the metadata `m` (undefined: none). Every field of
+ * the definition counts (one the build did not record, such as a future gate, differs too), except the handler and
+ * the error factories, whose codes are compared instead.
+ */
+function metaMismatch(m: LazyActionMeta, f: AnyRegisteredFunction): string | undefined {
+  const rec = f as unknown as Record<string, unknown>;
+  const meta = m as unknown as Record<string, unknown>;
+  const keys = new Set([...Object.keys(rec), ...Object.keys(meta)]);
+  for (const k of ["handler", "errors", "errorCodes"]) keys.delete(k);
+  for (const k of keys) if (!sameData(meta[k], rec[k])) return k;
+  const codes = (f.errors ?? []).map((e) => String(e.code ?? "")).filter(Boolean);
+  return sameData(m.errorCodes ?? [], codes) ? undefined : "errors";
 }
 
 /** Whether `f` is a stand-in of `lazyActions` (its module not necessarily loaded). */

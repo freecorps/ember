@@ -35,3 +35,29 @@ describe("lazyActions", () => {
     await expect(loadFunction(mod.gone)).rejects.toThrow(/no longer exports it as an action/);
   });
 });
+
+describe("lazyActions: the loaded definition must match the build's metadata", () => {
+  const internalSend = { ...send, visibility: "internal" };
+  const cases: Array<[string, LazyActionMeta, object]> = [
+    ["visibility", meta, internalSend],
+    ["args", { ...meta, args: { kind: "object", fields: {} } } as LazyActionMeta, send],
+    ["shard", meta, { ...send, shard: { kind: "org", fromArg: "to" } }],
+    ["sensitive", meta, { ...send, sensitive: true }],
+    ["dispatch", { ...meta, dispatch: undefined } as unknown as LazyActionMeta, send],
+    ["errors", { ...meta, errorCodes: ["Other"] }, send],
+    ["authorize", meta, { ...send, authorize: () => undefined }],
+  ];
+  it.each(cases)("a different %s is refused, before the handler runs", async (field, m, real) => {
+    let ran = 0;
+    const mod = lazyActions(async () => ({ send: { ...real, handler: async () => (ran++, 1) } }), { send: m });
+    await expect(loadFunction(mod.send)).rejects.toThrow(new RegExp(`\`${field}\` differs`));
+    await expect(mod.send!.handler({}, { to: "a" })).rejects.toThrow(/differs/);
+    expect(ran).toBe(0);
+  });
+
+  it("key order and undefined fields do not count as differences", async () => {
+    const reordered = { ...meta, args: { fields: send.args.fields, kind: "object" }, leaseMs: undefined } as unknown as LazyActionMeta;
+    const mod = lazyActions(async () => ({ send }), { send: reordered });
+    expect(await loadFunction(mod.send)).toBe(send);
+  });
+});

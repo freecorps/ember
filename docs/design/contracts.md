@@ -1134,10 +1134,17 @@ que um pacote do npm que "funciona no Workers" funcione igual no Ember:
   `sensitive` e os códigos dos erros declarados (listagem do dashboard). Quem roda a action (`ActionRunner`: cliente,
   `ctx.runAction`, job agendado no Worker ou no alarm do shard) chama `loadFunction`, que importa o módulo na primeira
   vez e usa a definição real (middlewares, erros declarados, validador de retorno); um import que falha é tentado de
-  novo na próxima chamada. Ficam estáticos: módulo com query/mutation, com funções em objetos aninhados, com metadado
-  que não sobrevive a JSON, um `buildWorker` sem o projeto avaliado (`loaded`), um runtime sem `lazyActions`
-  (`runtimeHasLazyActions`) e `build.lazyActions: false` no ember.json. Um módulo importado estaticamente por outro
-  continua no startup (o esbuild o põe onde o import estático o leva).
+  novo na próxima chamada. O que se decide pelo stand-in (visibility, shard e `fromArg`/`fromAuth`, `sensitive`,
+  agendamento) vale para a definição real: carregada, ela é comparada campo a campo com `meta` (todo campo dela, menos
+  o handler; os erros pelos códigos), e uma que difere (definição que depende do ambiente onde é avaliada, build velho)
+  é recusada antes do handler; o `ActionRunner` ainda aplica a regra de visibility de novo à definição carregada. O gate
+  de uma action é um middleware (`action.use`, `authorize` é só de query), que vem com o módulo e roda igual. Ficam
+  estáticos (na dúvida, estático): módulo com query/mutation/httpAction, com funções em objetos aninhados (em qualquer
+  profundidade, como o registry), com uma action que tem campo que o build não registra, com metadado que não
+  sobrevive a JSON, um `buildWorker` sem o projeto avaliado (`loaded`), um runtime sem `lazyActions` ou não encontrado
+  (`runtimeHasLazyActions`) e `build.lazyActions: false` no ember.json. O código de topo de um módulo lazy roda no
+  primeiro uso; valores que ele exporta não entram no registry (só funções entram), e um módulo importado
+  estaticamente por outro continua no startup (o esbuild o põe onde o import estático o leva).
 - Flags (`workerCompatibilityFlags`, iguais no `ember deploy` e no `ember dev`): `compatibilityFlags` do ember.json
   (padrão `["nodejs_compat"]`), mais `nodejs_compat` com auth local e `new_module_registry` num build com chunks
   quando `compatibilityDate` < 2026-11-17 (a partir dessa data o registry novo é o padrão do Workers). Com
