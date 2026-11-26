@@ -28,7 +28,10 @@ export function useApi<T>(path: string | null): Loaded<T> {
     };
   }, [path, n]);
   const reload = useCallback(() => setN((x) => x + 1), []);
-  return { data: state.data, error: state.error, loading: state.loading, reload };
+  // The answer of another path (the render before the effect above clears it) is never handed out: a page that acts on
+  // `data` (the Data Browser opening an `_id` lookup's document) would act on the previous query's rows.
+  const current = state.for === path;
+  return { data: current ? state.data : null, error: current ? state.error : null, loading: current ? state.loading : !!path, reload };
 }
 
 // ------------------------------------------------------------------------------------------- route

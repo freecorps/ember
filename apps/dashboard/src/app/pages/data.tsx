@@ -292,7 +292,8 @@ function QueryView({ project, env, shard, table, onChanged, initialId }: { proje
   const [opened, setOpened] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
-  const [bulk, setBulk] = useState<{ busy: boolean; error: ApiError | null } | null>(null);
+  /** The bulk delete dialog: the ids are the ones counted when it opened (an auto-refresh does not change them). */
+  const [bulk, setBulk] = useState<{ ids: string[]; busy: boolean; error: ApiError | null } | null>(null);
   const [auto, setAuto] = useState(false);
   const [n, setN] = useState(0);
   const idx = indexes.find((i) => i.name === draft.index) ?? indexes[0]!;
@@ -336,22 +337,24 @@ function QueryView({ project, env, shard, table, onChanged, initialId }: { proje
     const seen = page ? columnsOf(page.page) : [];
     return [...new Set(["_id", ...declared, ...seen.filter((c) => c !== "_creationTime"), "_creationTime"])].slice(0, 14);
   }, [page, table]);
-  // An `_id` lookup opens its document once it arrives.
+  // An `_id` lookup opens its document once its answer arrives (once per lookup, found or not).
   useEffect(() => {
-    if (lookup?.kind === "id" && opened !== lookup.id && page?.page[0]) {
+    if (lookup?.kind === "id" && opened !== lookup.id && page) {
       setOpened(lookup.id);
-      setOpen(page.page[0]);
+      if (page.page[0]) setOpen(page.page[0]);
     }
   }, [lookup, page, opened]);
-  // Auto-refresh: every 5 s while on, paused while the tab is hidden (the same page, data kept while it reloads).
+  // Auto-refresh: every 5 s while on, paused while the tab is hidden or the bulk delete dialog is open (the same page,
+  // data kept while it reloads).
   const reload = rows.reload;
+  const confirming = !!bulk;
   useEffect(() => {
-    if (!auto) return;
+    if (!auto || confirming) return;
     const t = setInterval(() => {
       if (document.visibilityState === "visible") reload();
     }, 5000);
     return () => clearInterval(t);
-  }, [auto, reload]);
+  }, [auto, reload, confirming]);
   const reset = () => {
     setCursors([null]);
     setSelected(new Set());
@@ -381,6 +384,7 @@ function QueryView({ project, env, shard, table, onChanged, initialId }: { proje
       }
     : undefined;
   const chosen = ids.filter((id) => selected.has(id));
+  const bulkIds = bulk?.ids ?? [];
   return (
     <div className={showSchema ? "split" : undefined}>
       <div>
@@ -510,7 +514,7 @@ function QueryView({ project, env, shard, table, onChanged, initialId }: { proje
           )}
           <span className="spacer" />
           {s.isAdmin && chosen.length > 0 && (
-            <button type="button" className="danger-text" onClick={() => setBulk({ busy: false, error: null })}>
+            <button type="button" className="danger-text" onClick={() => setBulk({ ids: chosen, busy: false, error: null })}>
               Delete {chosen.length} selected…
             </button>
           )}
@@ -549,27 +553,27 @@ function QueryView({ project, env, shard, table, onChanged, initialId }: { proje
       )}
       <ConfirmDialog
         open={!!bulk}
-        title={`Delete ${chosen.length} document${chosen.length === 1 ? "" : "s"} of ${table.name}?`}
-        confirmLabel={`Delete ${chosen.length} document${chosen.length === 1 ? "" : "s"}`}
+        title={`Delete ${bulkIds.length} document${bulkIds.length === 1 ? "" : "s"} of ${table.name}?`}
+        confirmLabel={`Delete ${bulkIds.length} document${bulkIds.length === 1 ? "" : "s"}`}
         danger
         expected={s.isProtected(env) ? table.name : null}
         busy={bulk?.busy ?? false}
         error={bulk?.error ?? null}
         onCancel={() => setBulk(null)}
         onConfirm={async (typed) => {
-          setBulk({ busy: true, error: null });
+          setBulk({ ids: bulkIds, busy: true, error: null });
           try {
-            const r = await api.post<{ value: { deleted: number } }>("/api/doc/delete", { project, env, shard, table: table.name, ids: chosen, ...(typed ? { confirm: typed } : {}) });
+            const r = await api.post<{ value: { deleted: number } }>("/api/doc/delete", { project, env, shard, table: table.name, ids: bulkIds, ...(typed ? { confirm: typed } : {}) });
             s.toast({ text: `Deleted ${r.value.deleted} document${r.value.deleted === 1 ? "" : "s"} from ${table.name}` });
             setBulk(null);
             changed();
           } catch (e) {
-            setBulk({ busy: false, error: e as ApiError });
+            setBulk({ ids: bulkIds, busy: false, error: e as ApiError });
           }
         }}
       >
         <p>
-          {chosen.length} document{chosen.length === 1 ? "" : "s"} leave <Mono>{table.name}</Mono> on <Mono>{shard}</Mono> in one mutation (all or nothing): indexes are updated and subscribed clients see them go. Recorded in the audit log.
+          {bulkIds.length} document{bulkIds.length === 1 ? "" : "s"} leave <Mono>{table.name}</Mono> on <Mono>{shard}</Mono> in one mutation (all or nothing): indexes are updated and subscribed clients see them go. Recorded in the audit log.
         </p>
       </ConfirmDialog>
     </div>
