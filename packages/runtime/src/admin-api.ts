@@ -587,7 +587,9 @@ async function handleEmbed(request: Request, url: URL, deps: AdminDeps): Promise
     await res.body?.cancel().catch(() => undefined);
     return deps.error(413, "too_large", `the embed page is over ${DASHBOARD_EMBED_MAX} bytes`);
   }
-  return new Response(bytes as Uint8Array<ArrayBuffer>, {
+  // A null-body status (204, 205, 304) keeps its null body: a Response refuses one with a body, even an empty one.
+  const nullBody = res.status === 204 || res.status === 205 || res.status === 304;
+  return new Response(nullBody ? null : (bytes as Uint8Array<ArrayBuffer>), {
     status: res.status,
     headers: {
       "content-type": res.headers.get("content-type") ?? "application/octet-stream",

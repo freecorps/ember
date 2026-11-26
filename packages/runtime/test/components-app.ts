@@ -115,6 +115,7 @@ export const tally = defineComponent({
           { kind: "embed", id: "page", route: "/dashboard/page", functions: [tallyLib.get, tallyLib.bump] },
           { kind: "embed", id: "big", route: "/dashboard/big" },
           { kind: "embed", id: "shadowed", route: "/dashboard/shadowed" },
+          { kind: "embed", id: "empty", route: "/dashboard/empty" },
         ],
       },
     ],
@@ -131,6 +132,7 @@ export const tally = defineComponent({
         return new Response(new ReadableStream<Uint8Array>({ pull: (s) => (++n > 17 ? s.close() : s.enqueue(chunk)) }), { headers: { "content-type": "text/html" } });
       }),
     })
+    .route({ path: "/dashboard/empty", method: "GET", handler: c.httpAction(async () => new Response(null, { status: 204 })) })
     .route({ path: "/dashboard/shadowed", method: "GET", handler: c.httpAction(async () => new Response("<p>tally's own page</p>", { headers: { "content-type": "text/html" } })) }),
 });
 

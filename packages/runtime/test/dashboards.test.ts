@@ -128,6 +128,12 @@ describe("dashboards (admin API)", () => {
     expect(((await big.json()) as { error: { code: string } }).error.code).toBe("too_large");
   });
 
+  it("a route answering with a null-body status (204) keeps it, with no body", async () => {
+    const res = await SELF.fetch(`http://ember/api/_ember/dashboards/embed?${new URLSearchParams({ dashboard: "tally", route: "/dashboard/empty" })}`, { headers: { authorization: "Bearer admin-secret" } });
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+  });
+
   it("an embed page is served by its own install's route, never by another scope's route at the same path", async () => {
     // The app serves a route at /tally/dashboard/shadowed, the mounted path of tally's embed: ingress picks the app's,
     // the embed always tally's own.
