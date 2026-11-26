@@ -108,7 +108,7 @@ await t.finishAllScheduledFunctions(vi.runAllTimers);
   name, email, ...claims } }` (issuer `https://convex.test`, a subject derived from the fields, as convex-test);
   `ctx.db.system` is `ctx.scheduler.get/list` and `ctx.storage.getMetadata`; Convex components
   (`t.registerComponent`) are not emulated: Ember components come in through `convexTest(schema, modules, { app })`.
-- Options: `defaultShard`, `env`, and as `emberTest`: `app` (the `ember.config.ts` default export), `triggers`,
-  `replicas`, `limits`.
+- Options: `defaultShard`, `env`, and as `emberTest`: `app` (the `ember.config.ts` default export; its
+  `defineApp({ limits })` apply, as in the Worker), `triggers`, `replicas`, `limits` (over the app's, key by key).
 - `t.close()` clears the timers of jobs not run yet and closes the `emberTest` underneath (`afterEach(() =>
   t.close())`); `using` / `await using` (which first waits for the scheduled functions in progress) work too.

@@ -152,6 +152,9 @@ export async function serveStorage(
     if (t.row.multipart) return fail(400, "bad_request", "this upload is multipart (not emulated by @freecorps/ember-testing)");
     const bytes = new Uint8Array(await request.arrayBuffer());
     if (t.row.size !== null && bytes.byteLength !== t.row.size) return fail(400, "size_mismatch", `content-length ${bytes.byteLength}, expected ${t.row.size}`);
+    // As R2's put with `sha256`: a body that does not match is refused before the write, so it never replaces the
+    // object the declared hash names (shared by content with files already ready).
+    if (t.row.sha256 && (await sha256Hex(bytes)) !== t.row.sha256) return fail(400, "checksum_mismatch", "the uploaded content does not match its sha256");
     o.bucket.objects.set(t.row.key, { bytes, contentType: t.row.contentType ?? request.headers.get("content-type") ?? "application/octet-stream" });
     return json({ ok: true, etag: null });
   }

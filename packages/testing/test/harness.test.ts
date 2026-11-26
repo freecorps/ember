@@ -29,6 +29,15 @@ const sha256 = async (s: string) => {
   return [...d].map((b) => b.toString(16).padStart(2, "0")).join("");
 };
 
+/** Waits (real time) until `cond` holds: a condition, not a fixed sleep, so a slow runner only takes longer. */
+const until = async (cond: () => boolean, what: string, ms = 5_000) => {
+  const deadline = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 2));
+  }
+};
+
 describe("ctx.storage in actions and HTTP actions", () => {
   const schema = defineSchema({
     shards: { org: defineShard({ key: v.string() }) },
@@ -51,6 +60,10 @@ describe("ctx.storage in actions and HTTP actions", () => {
     url: action({ args: { id: v.string(), download: v.optional(v.string()) }, handler: async (ctx, { id, download }) => ctx.storage.getUrl(id, download ? { download } : {}) }),
     remove: action({ args: { id: v.string() }, handler: async (ctx, { id }) => ctx.storage.delete(id) }),
     upload: action({ args: { size: v.number() }, handler: async (ctx, { size }) => ctx.storage.generateUploadUrl({ contentType: "text/plain", size }) }),
+    uploadHashed: action({
+      args: { size: v.number(), sha256: v.string() },
+      handler: async (ctx, { size, sha256 }) => ctx.storage.generateUploadUrl({ contentType: "text/plain", size, sha256 }),
+    }),
     attach: mutation({ args: { name: v.string(), file: v.file() }, handler: (ctx, a) => ctx.db.insert("docs", a) }),
     /** The mutation side sees the same `_files`. */
     metaInQuery: query({ args: { id: v.file() }, handler: (ctx, { id }) => ctx.storage.getMetadata(id) }),
@@ -128,6 +141,28 @@ describe("ctx.storage in actions and HTTP actions", () => {
     expect((await t.fetch("/api/storage/confirm", { method: "POST", body: JSON.stringify({ shard: ticket.shard, storageId: ticket.storageId, token: "bad" }) })).status).toBe(404);
   });
 
+  it("a PUT whose body does not match the declared sha256 is refused and leaves the shared object alone", async () => {
+    using t = emberTest({ schema, modules: { files } });
+    const declared = await sha256("ok");
+    const ticket = () => t.action(api.files.uploadHashed, { size: 2, sha256: declared });
+    const put = (tk: Awaited<ReturnType<typeof ticket>>, body: string) => t.fetch(tk.url!, { method: "PUT", body, headers: tk.headers! });
+    const confirm = (tk: Awaited<ReturnType<typeof ticket>>) => t.fetch("/api/storage/confirm", { method: "POST", body: JSON.stringify({ shard: tk.shard, storageId: tk.storageId, token: tk.token }) });
+    const first = await ticket();
+    const second = await ticket();
+    expect((await put(first, "ok")).status).toBe(200);
+    expect((await confirm(first)).status).toBe(200);
+    // Same length, other bytes, through the second ticket (same content-addressed key).
+    const bad = await put(second, "no");
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ error: { code: "checksum_mismatch" } });
+    expect(await t.action(api.files.read, { id: first.storageId })).toMatchObject({ text: "ok" });
+    expect(await t.action(api.files.meta, { id: second.storageId })).toMatchObject({ state: "pending" });
+    // The right bytes still go through the second ticket.
+    expect((await put(second, "ok")).status).toBe(200);
+    expect((await confirm(second)).status).toBe(200);
+    expect(await t.action(api.files.read, { id: first.storageId })).toMatchObject({ text: "ok" });
+  });
+
   it("HTTP actions get ctx.storage too", async () => {
     const http = httpRouter();
     http.route({
@@ -159,6 +194,17 @@ describe("measure / lastStats", () => {
       },
     }),
     later: mutation({ handler: (ctx) => void ctx.scheduler.runAfter(10, unsafeRef<"mutation">("items:seed"), { count: 3 }) }),
+    /** Schedules a job at once and waits (real time) until it ran, then returns. */
+    waitsForJob: action({
+      handler: async (ctx): Promise<void> => {
+        const id = await ctx.scheduler.runAfter(0, unsafeRef<"mutation">("items:seed"), { count: 3 });
+        const deadline = Date.now() + 5_000;
+        while ((await ctx.scheduler.get(id))?.state.kind !== "success") {
+          if (Date.now() > deadline) throw new Error("job did not run");
+          await new Promise((r) => setTimeout(r, 2));
+        }
+      },
+    }),
   };
   const api = anyApi as unknown as ApiFromModules<{ items: typeof items }>;
 
@@ -197,9 +243,37 @@ describe("measure / lastStats", () => {
     await c.mutation(api.items.later, {});
     const base = await c.ember();
     expect(base.lastStats()?.rowsWritten).toBe(0);
-    await new Promise((r) => setTimeout(r, 40));
+    // Its timer (10 ms) has started it once it is gone from scheduled(), however late the runner fires it.
+    await until(() => base.scheduled().length === 0, "the job's timer");
     await c.finishInProgressScheduledFunctions();
     expect(base.lastStats()?.rowsWritten).toBe(3);
+  });
+
+  it("convexTest: a job that runs while the action that scheduled it still runs stays out of that action's stats", async () => {
+    using c = convexTest(schema, { items });
+    const base = await c.ember();
+    // No measure around: the job is a call of its own; the action itself wrote nothing.
+    await c.action(api.items.waitsForJob, {});
+    expect(base.lastStats()).toEqual({ rowsRead: 0, rowsWritten: 0, documentsRead: 0 });
+    // Inside a measure, the job ran within it, so it counts there (and still not in the action's lastStats).
+    const m = await base.measure(() => c.action(api.items.waitsForJob, {}));
+    expect(base.lastStats()).toEqual({ rowsRead: 0, rowsWritten: 0, documentsRead: 0 });
+    expect(m.stats.rowsWritten).toBe(3);
+  });
+
+  it("t.run: what an async callback writes after its first await counts too (once)", async () => {
+    using t = emberTest({ schema, modules: { items } });
+    const { stats } = await t.measure(() =>
+      t.run(async (ctx) => {
+        ctx.db.insert("items", { n: 1 });
+        await Promise.resolve();
+        ctx.db.insert("items", { n: 2 });
+        ctx.db.insert("items", { n: 3 });
+      }),
+    );
+    expect(stats.rowsWritten).toBe(t.lastStats()!.rowsWritten);
+    const once = await t.measure(() => t.run((ctx) => void ctx.db.insert("items", { n: 4 })));
+    expect(stats.rowsWritten).toBe(3 * once.stats.rowsWritten);
   });
 
   it("concurrent calls do not mix", async () => {
@@ -227,7 +301,8 @@ describe("close / dispose", () => {
   const api = anyApi as unknown as ApiFromModules<{ log: typeof log }>;
 
   it("close() frees the databases and pending jobs; later calls throw", async () => {
-    const t = emberTest({ schema, modules: { log } });
+    // `using` closes it even when an assertion fails first (close() is idempotent).
+    using t = emberTest({ schema, modules: { log } });
     await t.mutation(api.log.add, { what: "x" });
     const engine = t.engine();
     expect(t.scheduled()).toHaveLength(1);
@@ -359,6 +434,15 @@ describe("convexTest forwards app / triggers / replicas / limits", () => {
     using t = convexTest(schema, { notes }, { replicas });
     await (await t.ember()).seedReplica("auth:member", [{ id: "m1", userId: "ana", role: "owner" }]);
     expect(await t.query(api.notes.member, { userId: "ana" })).toBe("owner");
+  });
+
+  it("defineApp({ limits }) applies to the engine, as in the Worker; an explicit `limits` wins key by key", async () => {
+    using t = convexTest(schema, { notes }, { app: defineApp({ limits: { rowsWritten: 5 } }) });
+    await t.mutation(api.notes.many, { n: 3 });
+    await expect(t.mutation(api.notes.many, { n: 10 })).rejects.toMatchObject({ code: "TooManyWrites" });
+    using e = emberTest({ schema, modules: { notes }, app: defineApp({ limits: { rowsWritten: 5 } }), limits: { rowsWritten: 50 } });
+    await e.mutation(api.notes.many, { n: 10 });
+    await expect(e.mutation(api.notes.many, { n: 60 })).rejects.toMatchObject({ code: "TooManyWrites" });
   });
 
   it("limits", async () => {

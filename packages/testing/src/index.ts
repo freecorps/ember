@@ -102,7 +102,10 @@ export interface EmberTestOptions {
   app?: AppDefinition;
   /** Start of the test clock (ms). Default: a fixed instant, so `_creationTime`s are reproducible. */
   now?: number;
-  /** Project limits, as `defineApp({ limits })` (functions' own `limits` apply over them). */
+  /**
+   * Project limits, as `defineApp({ limits })` (functions' own `limits` apply over them). Default: `app`'s
+   * (`defineApp({ limits })`, as the Worker uses them); set both and these win, key by key.
+   */
   limits?: Partial<Limits>;
   /**
    * An outside clock instead of the harness's own (`() => Date.now()`, so vitest fake timers drive it): `now` is
@@ -235,7 +238,8 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     }
   };
   const statsOf = (c: Collector): ExecutionStats => ({ rowsRead: c.rowsRead, rowsWritten: c.rowsWritten, documentsRead: c.documentsRead });
-  const collector = (call: boolean, parent = usageScope.getStore()): Collector => ({ rowsRead: 0, rowsWritten: 0, documentsRead: 0, call, parent });
+  // `parent` is explicit: a job whose walk found no `measure` above has none (a default would hand it the caller's).
+  const collector = (call: boolean, parent: Collector | undefined): Collector => ({ rowsRead: 0, rowsWritten: 0, documentsRead: 0, call, parent });
   /**
    * A call from the test (not one nested in a running action): its own collector, `lastStats` when it settles.
    * `job`: a scheduled job, always a call of its own, even when its timer (convexTest) carries the async context of the
@@ -307,6 +311,9 @@ export function emberTest(options: EmberTestOptions): EmberTest {
     bucket.clear();
   };
 
+  /** The app's limits (`defineApp({ limits })`), with `options.limits` over them. */
+  const limits = options.app || options.limits ? { ...options.app?.limits, ...options.limits } : undefined;
+
   const engineOf = (shard: string): Engine => {
     if (closed) throw new Error("emberTest: this harness is closed (t.close())");
     let e = engines.get(shard);
@@ -324,7 +331,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
         scheduledFunctions: readerOf(shard),
         // `ctx.storage` of queries and mutations over the shard's `_files`, with the test deployment's URLs.
         storage: { shard: () => shard, signer: testSigner },
-        ...(options.limits ? { limits: options.limits } : {}),
+        ...(limits ? { limits } : {}),
       });
       e.migrate();
       engines.set(shard, e);
@@ -576,6 +583,9 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       };
       const r = engineOf(shard).runMutation(inline as never, {}, auth);
       record(r.usage);
+      // After its first await the callback's statements still add to the engine's usage object: count only what
+      // they added, once it settles.
+      const before = r.usage ? { rowsRead: r.usage.rowsRead, rowsWritten: r.usage.rowsWritten, documentsRead: r.usage.documentsRead } : undefined;
       logChanges(shard, r.changes);
       if (!pending) {
         queue(shard, r.scheduled, r.cancelled);
@@ -586,6 +596,14 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       } finally {
         // The engine hands back its own lists: what the callback scheduled after the commit is in them too.
         queue(shard, r.scheduled, r.cancelled);
+        if (r.usage && before) {
+          record({
+            ...r.usage,
+            rowsRead: r.usage.rowsRead - before.rowsRead,
+            rowsWritten: r.usage.rowsWritten - before.rowsWritten,
+            documentsRead: r.usage.documentsRead - before.documentsRead,
+          });
+        }
       }
     };
 
@@ -689,7 +707,7 @@ export function emberTest(options: EmberTestOptions): EmberTest {
       },
       async measure(fn) {
         if (closed) throw new Error("emberTest: this harness is closed (t.close())");
-        const c = collector(false);
+        const c = collector(false, usageScope.getStore());
         const value = await usageScope.run(c, async () => fn());
         return { value, stats: statsOf(c) };
       },
