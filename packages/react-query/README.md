@@ -62,6 +62,10 @@ function Messages({ roomId }: { roomId: Id<"rooms"> }) {
 - `emberPaginatedQuery` pages are one-shot reads (the socket when one is open, else HTTP), not live: refetch or
   invalidate the key to see new rows (TanStack reads every loaded page again from its cursor). Paginated live queries
   with stable pages are `usePaginatedQuery` in `@freecorps/ember-react`.
+- Sign-out or account switch on the same `QueryClient` (`setAuth` replacing a source in use, `clearAuth`, or the token
+  source answering for someone else): `ember:paginated` queries are reset (observed ones load page 1 again as the new
+  identity) and Ember queries nobody observes are removed, so nothing read for the previous identity is shown.
+- Needs `@tanstack/react-query` 5.89.0 or later (`emberAction` reads the `QueryClient` from the `mutationFn` context).
 
 Contracts: [`docs/design/contracts.md`](https://github.com/freecorps/ember/blob/main/docs/design/contracts.md) (in
 Portuguese), "Protocolo WS v1". Tests with usage: [`packages/react-query/test`](https://github.com/freecorps/ember/tree/main/packages/react-query/test).

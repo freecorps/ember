@@ -291,4 +291,26 @@ describe("hydrate and whose read it is", () => {
     expect(c3.dehydrate()).toEqual([]);
     c3.close();
   });
+
+  it("onIdentityChange: on a switch and a sign-out; not on the first sign-in nor on a renewed token", async () => {
+    const c = new EmberClient({ url: "https://ember.test", WebSocket: null, fetch: worker().fetch, connectivity: null, heartbeat: false, defaultShard: "global:main" });
+    let n = 0;
+    const off = c.onIdentityChange(() => n++);
+    let tokens = [jwt("ana", 10), jwt("ana", 3600)];
+    let i = 0;
+    c.setAuth(() => tokens[Math.min(i++, tokens.length - 1)]!);
+    await c.query(q, { a: 1 });
+    await c.query(q, { a: 2 }); // renewed: still ana
+    expect(n).toBe(0);
+    tokens = [jwt("bob", 10)];
+    i = 0;
+    c.setAuth(() => tokens[0]!);
+    expect(n).toBe(1);
+    c.clearAuth();
+    expect(n).toBe(2);
+    off();
+    c.setAuth(() => jwt("cy", 3600));
+    expect(n).toBe(2);
+    c.close();
+  });
 });

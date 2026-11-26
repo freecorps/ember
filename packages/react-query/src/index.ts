@@ -288,6 +288,7 @@ export class EmberQueryClient {
   readonly client: EmberClient;
   private queryClient: QueryClient | null = null;
   private stopCache: (() => void) | null = null;
+  private stopIdentity: (() => void) | null = null;
   private readonly live = new Map<string, Live>();
   /** The same, by the query's key array (the very one its `queryFn` gets): found without hashing it again. */
   private readonly liveByKey = new WeakMap<QueryKey, Live>();
@@ -312,6 +313,7 @@ export class EmberQueryClient {
     const defaults = queryClient.getDefaultOptions();
     queryClient.setDefaultOptions({ ...defaults, queries: { ...defaults.queries, queryKeyHashFn: emberQueryKeyHashFn } });
     this.stopCache = queryClient.getQueryCache().subscribe((e) => this.onCacheEvent(e));
+    this.stopIdentity = this.client.onIdentityChange(() => this.identityChanged());
     for (const q of queryClient.getQueryCache().getAll()) if (q.getObserversCount() > 0) this.watch(q);
     return this;
   }
@@ -319,6 +321,8 @@ export class EmberQueryClient {
   disconnect(): void {
     this.stopCache?.();
     this.stopCache = null;
+    this.stopIdentity?.();
+    this.stopIdentity = null;
     for (const t of this.idle.values()) clearTimeout(t);
     this.idle.clear();
     const live = [...this.live.values()];
@@ -329,6 +333,23 @@ export class EmberQueryClient {
     }
     if (this.queryClient) registry.delete(this.queryClient);
     this.queryClient = null;
+  }
+
+  /**
+   * Sign-out or account switch (`client.onIdentityChange`): what the TanStack cache holds was read for the previous
+   * identity. Paginated queries (not live) are reset: no page of theirs is shown, nor extended with its cursor, under
+   * the new one (observed ones refetch from page 1). Ember queries nobody observes are removed (a live one gets the
+   * new identity's value from its subscription), with the hydration entries of a server render.
+   */
+  private identityChanged(): void {
+    const qc = this.queryClient;
+    if (!qc) return;
+    const ours = (q: Query) => {
+      const k = q.queryKey[0];
+      return k === "ember" || k === "ember:paginated" || k === "ember:hydration";
+    };
+    qc.removeQueries({ predicate: (q) => ours(q) && q.getObserversCount() === 0 });
+    qc.resetQueries({ predicate: (q) => q.queryKey[0] === "ember:paginated" }).catch(() => {});
   }
 
   /** Number of live subscriptions held for the TanStack cache. */

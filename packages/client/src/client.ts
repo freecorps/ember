@@ -672,6 +672,10 @@ export class EmberClient {
   private readonly stopConnectivity: (() => void) | undefined;
   private stateSnapshot: ConnectionState;
   private readonly stateListeners = new Set<() => void>();
+  /** `onIdentityChange` listeners. */
+  private readonly identityListeners = new Set<() => void>();
+  /** Inside `setAuth` (which tells `onIdentityChange` listeners once, at the end). */
+  private settingAuth = false;
 
   private filesApi: ClientFiles | undefined;
 
@@ -902,7 +906,12 @@ export class EmberClient {
       } catch {
         /* best effort */
       }
-      this.rememberIdentity(null);
+      this.settingAuth = true;
+      try {
+        this.rememberIdentity(null);
+      } finally {
+        this.settingAuth = false;
+      }
       // Signed out: `fromAuth` subscriptions have no shard any more. (A new fetcher keeps them where they are until
       // its token is known.)
       this.emitClaims();
@@ -910,6 +919,7 @@ export class EmberClient {
     // Local values read for the previous identity leave the screen; read again once the new one is known.
     if (replaced) this.rereadLocal();
     void this.reauthAll(true);
+    if (inUse) this.emitIdentityChange();
   }
 
   /** Same as `setAuth(undefined)`: open sockets send `{t:"auth", token:null}` and get fresh anonymous snapshots. */
@@ -1110,6 +1120,7 @@ export class EmberClient {
     this.storedIdentity = id;
     // The same fetcher now answers for someone else (or for nobody): what waits out its grace was not theirs.
     this.identityChanged(!!prev);
+    if (prev && !this.settingAuth) this.emitIdentityChange(); // setAuth emits once, at its end
     // A local value read for the previous identity is not this one's: read again (or nothing) under the new one.
     this.rereadLocal();
     const offline = this.offline;
@@ -2268,6 +2279,27 @@ export class EmberClient {
   onConnectionStateChange(cb: () => void): () => void {
     this.stateListeners.add(cb);
     return () => this.stateListeners.delete(cb);
+  }
+
+  /**
+   * Called when whoever the client runs as changes: `setAuth` replaced or removed a token source in use (sign-out,
+   * account switch), or the fetcher answered for someone else. Not on the first sign-in of a client built without one,
+   * nor on a renewed token of the same user. For caches outside the client (`@freecorps/ember-react-query`): what they
+   * hold was read for the previous identity.
+   */
+  onIdentityChange(cb: () => void): () => void {
+    this.identityListeners.add(cb);
+    return () => this.identityListeners.delete(cb);
+  }
+
+  private emitIdentityChange(): void {
+    for (const cb of [...this.identityListeners]) {
+      try {
+        cb();
+      } catch (e) {
+        console.error("ember: an onIdentityChange listener threw", e);
+      }
+    }
   }
 
   private buildState(): ConnectionState {

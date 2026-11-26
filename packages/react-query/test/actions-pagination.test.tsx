@@ -141,6 +141,37 @@ describe("emberPaginatedQuery", () => {
     ember.close();
   });
 
+  it("an account switch resets the pages: none of the previous identity's is shown or extended with its cursor", async () => {
+    const { server, ember, queryClient, wrap } = setup();
+    for (let n = 1; n <= 5; n++) server.mutateDirect("org:beta", "notes:add", { tag: "org:beta", n });
+    for (let n = 1; n <= 3; n++) server.mutateDirect("org:gamma", "notes:add", { tag: "org:gamma", n: n * 100 });
+    let q!: UseInfiniteQueryResult<InfiniteData<Page<Note>, string | null>, unknown>;
+    const shown: string[] = [];
+    function Feed() {
+      q = useInfiniteQuery(emberPaginatedQuery(feedByClaim, {}, { numItems: 2 }));
+      const text = q.status === "success" ? q.data.pages.flatMap((p) => p.page.map((d) => d.n)).join(",") : q.status;
+      shown.push(text);
+      return <div data-testid="f">{text}</div>;
+    }
+    const view = wrap(<Feed />);
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("5,4"));
+    await act(async () => void (await q.fetchNextPage()));
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("5,4,3,2"));
+    shown.length = 0;
+    // Bob (org gamma) on the same QueryClient: the observed feed starts again from page 1, as Bob.
+    await act(async () => ember.setAuth(() => jwt({ sub: "bob", org: "gamma" })));
+    await waitFor(() => expect(screen.getByTestId("f").textContent).toBe("300,200"));
+    expect(shown.filter((t) => /\b[1-5]\b/.test(t))).toEqual([]);
+    expect(q.data!.pageParams).toEqual([null]);
+    // Unobserved: the pages are dropped (nobody's to show).
+    view.unmount();
+    const key = emberPaginatedQuery(feedByClaim, {}, { numItems: 2 }).queryKey;
+    expect(queryClient.getQueryData(key)).toBeDefined();
+    await act(async () => ember.setAuth(() => jwt({ sub: "ana", org: "beta" })));
+    expect(queryClient.getQueryData(key)).toBeUndefined();
+    ember.close();
+  });
+
   it("'skip' disables it", async () => {
     const { ember, wrap } = setup({ defaultShard: "org:acme" });
     function Skipped() {
