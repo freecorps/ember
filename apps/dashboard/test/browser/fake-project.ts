@@ -68,6 +68,14 @@ const WORK = [
   { _id: "work_3", fnName: "ai:summarize", status: "running", paused: false, attempts: 1, history: [], lastError: null },
 ];
 
+/** R2 objects no `_files` row references (two pages), and the one a row got since the listing (the project keeps it). */
+export const ORPHANS = [
+  { key: `f/b3JnOmFjbWU/${"aa".repeat(32)}`, shard: "org:acme", size: 2048, uploaded: Date.now() - 3 * 86_400_000 },
+  { key: `t/b3JnOmFjbWU/_storage_01OLD`, shard: "org:acme", size: 512, uploaded: Date.now() - 2 * 86_400_000 },
+  { key: `f/Z2xvYmFsOm1haW4/${"bb".repeat(32)}`, shard: "global:main", size: 1024, uploaded: Date.now() - 86_400_000 * 5 },
+];
+export const REFERENCED_ORPHAN = ORPHANS[1]!.key;
+
 export function fakeProject(o: { legacy?: boolean } = {}) {
   const posts: Array<{ path: string; body: unknown }> = [];
   const lists: Array<Record<string, string>> = [];
@@ -134,11 +142,22 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           if (body.explain === true) return json({ ok: true, value: { columns: ["id", "parent", "notused", "detail"], rows: [[2, 0, 0, "SCAN messages"]], rowsRead: 0, rowsWritten: 0, truncated: false, ms: 0.2, explain: true, plan: [{ id: 2, detail: "SCAN messages", children: [] }] } });
           return json({ ok: true, value: { columns: ["_id", "author", "body"], rows: [["messages_1", "ana", `a, "quoted" ${XSS}`], ["messages_2", "=cmd()", null]], rowsRead: 2, rowsWritten: 0, truncated: true, ms: 0.4, explain: false } });
         }
+        if (p === "replicas/resync") return json({ ok: true, value: { [String(body.source)]: { ok: true, targets: 1 } } });
+        if (p === "files/orphans") {
+          // Two pages: the first two objects, then the last one.
+          const second = body.cursor === "page2";
+          return json({ ok: true, value: { scanned: second ? 3 : 5, foreign: second ? 0 : 1, young: second ? 1 : 1, orphans: second ? ORPHANS.slice(2) : ORPHANS.slice(0, 2), deleted: 0, skipped: [], graceMs: body.graceMs ?? 86_400_000, cursor: second ? null : "page2", done: second } });
+        }
+        if (p === "files/orphans/delete") {
+          const keys = body.keys as string[];
+          return json({ ok: true, value: { deleted: ORPHANS.filter((x) => keys.includes(x.key) && x.key !== REFERENCED_ORPHAN).map(({ key, shard, size }) => ({ key, shard, size })), refused: keys.includes(REFERENCED_ORPHAN) ? [{ key: REFERENCED_ORPHAN, reason: "referenced" }] : [], skipped: [], graceMs: body.graceMs } });
+        }
+        if (p === "files/stuck/delete") return json({ ok: true, value: { queued: (body.ids as string[]).filter((id) => id !== "_storage_used"), refused: [], graceMs: body.graceMs } });
         if (p === "restore") return json({ ok: true, shard: body.shard, restoredTo: body.bookmark, undo: "0000000a-0000000b-0000000c-feedfacefeedface", version: 9, epoch: "e2", schemaVersion: "abc" });
       }
       if (p === "capabilities") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
-        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run", "sql"], auth: !state.authFrom, ...(state.authFrom ? { authFrom: state.authFrom } : {}), files: true, system: true });
+        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run", "sql", "replicas", "replicas/resync", "replicas/lag", "files/orphans", "files/orphans/delete", "files/stuck", "files/stuck/delete"], auth: !state.authFrom, ...(state.authFrom ? { authFrom: state.authFrom } : {}), files: true, system: true });
       }
       if (p === "dashboards") return json({ ok: true, dashboards: o.legacy ? [] : [POOL_SPEC] });
       if (p === "dashboards/query") {
@@ -155,6 +174,33 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           return json({ ok: true, value: { page, isDone: start + n >= all.length, continueCursor: String(start + n) }, ms: 1, type: "query" });
         }
         return json({ ok: false, error: { code: "not_in_dashboard", message: "no" } }, 403);
+      }
+      if (p === "replicas") {
+        const now = Date.now();
+        const target = (t: Record<string, unknown>) => ({ last_seq: 0, snapshot: 0, attempts: 0, next_at: 0, dead: 0, last_error: null, delivered_at: now - 30_000, pending: 0, oldest_at: null, ...t });
+        return json({
+          ok: true,
+          tables: [{ name: "auth:member", source: "auth" }, { name: "fxRates", source: "global:main" }],
+          sources: {
+            auth: {
+              enabled: true,
+              journal: 0,
+              convert: null,
+              targets: [target({ target: "org:down", last_seq: 120, attempts: 10, dead: 1, last_error: `org:down is unreachable ${XSS}`, pending: 3, oldest_at: now - 25 * 60_000 }), target({ target: "org:acme", last_seq: 140, pending: 0 })],
+              next: null,
+              outbox: { seq: 152, depth: 3, parked: 2, oldestAt: now - 25 * 60_000 },
+              maxAttempts: 10,
+            },
+            "global:main": { enabled: true, journal: 0, seq: 77, targets: [target({ target: "org:beta", kind: "org", last_seq: 70, scan_seq: 70, attempts: 2, pending: 7, oldest_at: now - 90_000, last_error: "timeout" })], next: now + 5000, outbox: { seq: 77, depth: 7, parked: 0, oldestAt: now - 90_000 }, maxAttempts: 10 },
+          },
+        });
+      }
+      if (p === "files/stuck") {
+        const rows = [
+          { id: "_storage_abandoned", state: "pending", key: "t/x/_storage_abandoned", size: 4096, contentType: "image/png", refcount: 0, createdAt: Date.now() - 2 * 86_400_000 },
+          { id: "_storage_used", state: "failed", key: "t/x/_storage_used", size: null, contentType: null, refcount: 2, createdAt: Date.now() - 3 * 86_400_000 },
+        ];
+        return json({ ok: true, value: { rows, cursor: null, done: true, totals: { count: 2, bytes: 4096, referenced: 1 }, graceMs: Number(url.searchParams.get("graceMs") ?? 86_400_000) } });
       }
       if (p === "env") return json({ ok: true, vars: [{ name: "EMBER_ADMIN_TOKEN_DASHBOARD", managed: true }, { name: "EMBER_PROJECT", managed: true }, { name: "SMTP_PASSWORD", managed: false }] });
       if (p === "auth/users") {

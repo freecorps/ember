@@ -373,3 +373,12 @@ td.check, th.check { width: 30px; padding-right: 0; }
 /* real latency (RUM) */
 table.heat td, table.heat th[scope="row"] { white-space: nowrap; font-family: var(--mono); font-size: 12px; }
 table.heat td.warn { background: color-mix(in srgb, var(--warn) 10%, transparent); }
+
+/* Function Runner history, Replication, Storage cleanup, logs search (PR 6a-3b) */
+.clip { display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.run-history { margin-top: 16px; }
+.run-history .toolbar { margin-bottom: 6px; }
+.lag { white-space: nowrap; }
+.err-text { color: var(--bad); font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.log-search { border-top: 1px solid var(--line); padding-top: 10px; }
+.log-search input[type="search"] { min-width: 220px; }

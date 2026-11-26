@@ -1,15 +1,16 @@
 // Ember Dashboard SPA (React, no router or UI dependencies). Hash routes:
 //   #/                                       projects of the account
 //   #/audit                                  audit log, all projects
-//   #/p/<project>/<env>/<section>[/<shard>]  health | functions | cost | latency | shards | data | sql | schema | crons | ...
+//   #/p/<project>/<env>/<section>[/<shard>]  health | functions | cost | latency | shards | data | sql | schema | crons |
+//                                            replication | storage (R2 orphans, stuck uploads) | ...
 //   #/p/<project>/<env>/data/<shard>/<table>[/<id>], files/<shard>/<file id>: a table, a document, a file
 //   #/p/<project>/<env>/components[/<shard>/<install>[/<tab>]], #/p/<project>/<env>/app[/<shard>/<tab>]: declarative screens
 // The shard in the route is the one the top bar's picker selected (data, shards and crons use it).
 
-import { StrictMode, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, StrictMode, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { ApiError, path, session, type Me } from "./api.ts";
-import { href, SessionContext, useApi, useRoute, useShortcuts, useTheme, type Route, type SessionInfo, type Theme } from "./hooks.ts";
+import { href, SessionContext, useApi, useRenavigations, useRoute, useShortcuts, useTheme, type Route, type SessionInfo, type Theme } from "./hooks.ts";
 import { Audit } from "./pages/audit.tsx";
 import { DataBrowser } from "./pages/data.tsx";
 import { Health } from "./pages/health.tsx";
@@ -19,6 +20,8 @@ import { Functions } from "./pages/functions.tsx";
 import { Crons, Deployments, Projects } from "./pages/misc.tsx";
 import { Files } from "./pages/files.tsx";
 import { Logs } from "./pages/logs.tsx";
+import { Replication } from "./pages/replication.tsx";
+import { Storage } from "./pages/storage.tsx";
 import { Reactivity } from "./pages/reactivity.tsx";
 import { Settings } from "./pages/settings.tsx";
 import { Users } from "./pages/users.tsx";
@@ -44,6 +47,8 @@ const SECTIONS = [
   { id: "reactivity", label: "Reactivity", key: "r" },
   { id: "logs", label: "Logs", key: "l" },
   { id: "files", label: "Files", key: "i" },
+  { id: "storage", label: "Storage cleanup", key: "b" },
+  { id: "replication", label: "Replication", key: "o" },
   { id: "users", label: "Users", key: "u" },
   { id: "crons", label: "Schedules", key: "c" },
   { id: "deployments", label: "Deployments", key: "p" },
@@ -51,7 +56,7 @@ const SECTIONS = [
   { id: "settings", label: "Settings", key: "g" },
 ] as const;
 
-const SHARD_SECTIONS = new Set(["data", "schema", "sql", "shards", "crons", "reactivity", "files", "components", "app"]);
+const SHARD_SECTIONS = new Set(["data", "schema", "sql", "shards", "crons", "reactivity", "files", "storage", "components", "app"]);
 /** Sections whose route keeps its later segments (component, tab) when another shard is picked. */
 const KEEPS_REST = new Set(["components", "app"]);
 const DEFAULT_SHARD = "global:main";
@@ -208,6 +213,8 @@ const THEMES: Theme[] = ["auto", "light", "dark"];
 
 function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const route = useRoute();
+  // A key for the page: choosing the route already shown (palette) remounts it, so its data loads again.
+  const renav = useRenavigations();
   const projects = useApi<{ projects: Project[] }>("/api/projects");
   const [theme, setTheme] = useTheme();
   const [help, setHelp] = useState(false);
@@ -255,6 +262,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         <Logs key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "files" ? (
         <Files key={`${p.project}/${p.env}/${shard}/${route.rest?.[0] ?? ""}`} {...p} shard={shard} {...(route.rest?.[0] ? { initialFile: route.rest[0] } : {})} />
+      ) : section.id === "storage" ? (
+        <Storage key={`${p.project}/${p.env}`} {...p} shard={shard} />
+      ) : section.id === "replication" ? (
+        <Replication key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "sql" ? (
         <SqlExplorer key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
       ) : section.id === "schema" ? (
@@ -332,7 +343,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       <div className="layout">
         <Sidebar projects={projects.data?.projects ?? null} route={route} />
         <main id="content" tabIndex={-1}>
-          {projects.error && route.page !== "projects" ? <Problem error={projects.error} onRetry={projects.reload} /> : body}
+          {projects.error && route.page !== "projects" ? <Problem error={projects.error} onRetry={projects.reload} /> : <Fragment key={renav}>{body}</Fragment>}
         </main>
       </div>
       <Palette
