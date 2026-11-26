@@ -11,6 +11,8 @@
  *     args: { domain: v.string() },
  *     handler: async (step, { domain }) => {
  *       const zone = await step.runAction(internal.domains.createZone, { domain }, { retry: { maxAttempts: 5 } });
+ *       // parallel steps: one batch, the handler goes on once both settled
+ *       await Promise.all([step.runAction(internal.dns.addRecords, { zone }), step.runMutation(internal.domains.markPending, { zone })]);
  *       await step.sleep(10 * MINUTE);
  *       const dns = await step.waitForEvent<{ ok: boolean }>("dns-verified", { timeoutMs: DAY });
  *       await step.runMutation(internal.domains.activate, { zone, ok: dns.ok });
@@ -24,10 +26,27 @@
 import { createFunctionHandle, internalActionGeneric, v, type FunctionReference, type RegisteredAction } from "@freecorps/ember-server";
 import type { ArgsType, ArgsValidator } from "@freecorps/ember-server";
 import { replay, type JournalEntry, type Outcome, type RetryPolicy, type WorkflowStep } from "./replay.ts";
-import type { WorkflowStatus } from "./component.ts";
+import type { WorkflowStatus, WorkflowSummary } from "./component.ts";
 
-export { workflows, functions as workflowFunctions, type WorkflowsInstallConfig, type WorkflowStatus } from "./component.ts";
-export { replay, handleOf, StepFailed, NonDeterminism, type WorkflowStep, type StepOptions, type StepRequest, type JournalEntry, type Outcome, type RetryPolicy } from "./replay.ts";
+export { workflows, functions as workflowFunctions, type WorkflowsInstallConfig, type WorkflowStatus, type WorkflowStepState, type WorkflowSummary } from "./component.ts";
+export { replay, handleOf, StepFailed, NonDeterminism, type WorkflowStep, type StepOptions, type StepArgs, type StepResult, type StepRequest, type JournalEntry, type Outcome, type RetryPolicy } from "./replay.ts";
+
+/** `list` arguments: the page to read and, optionally, one status. */
+export type ListWorkflowsArgs = { status?: WorkflowStatus["status"]; paginationOpts: { numItems: number; cursor: string | null } };
+/** A journal row as `steps` returns it. `batchEnd`: the end of the parallel batch the step ran in. */
+export type WorkflowJournalStep = {
+  index: number;
+  kind: JournalEntry["kind"];
+  name: string;
+  status: JournalEntry["status"];
+  attempts: number;
+  result?: unknown;
+  error?: string;
+  startedAt: number;
+  completedAt?: number;
+  batchEnd?: number;
+};
+export type WorkflowPage = { page: WorkflowSummary[]; isDone: boolean; continueCursor: string };
 
 type Ref<T extends "query" | "mutation", A, R> = FunctionReference<T, "public", A, R>;
 
@@ -36,7 +55,8 @@ export interface WorkflowsComponentApi {
   lib: {
     start: Ref<"mutation", { driver: string; args?: any; onComplete?: string; context?: any }, string>;
     status: Ref<"query", { id: string }, WorkflowStatus | null>;
-    steps: Ref<"query", { id: string }, any[]>;
+    list: Ref<"query", ListWorkflowsArgs, WorkflowPage>;
+    steps: Ref<"query", { id: string }, WorkflowJournalStep[]>;
     sendEvent: Ref<"mutation", { id: string; event: string; payload?: any }, boolean>;
     cancel: Ref<"mutation", { id: string }, boolean>;
     cleanup: Ref<"mutation", { id: string }, boolean>;
@@ -105,9 +125,16 @@ export class WorkflowManager {
     return ctx.runQuery(this.component.lib.status, { id });
   }
 
+  /** Workflows of the shard, newest first, optionally of one status (paginated). Reactive in a query. */
+  list(ctx: SyncCtx, args: ListWorkflowsArgs): WorkflowPage;
+  list(ctx: AsyncCtx, args: ListWorkflowsArgs): Promise<WorkflowPage>;
+  list(ctx: SyncCtx | AsyncCtx, args: ListWorkflowsArgs) {
+    return ctx.runQuery(this.component.lib.list, args);
+  }
+
   /** The journal: one entry per step with status, attempts, result or error. */
-  steps(ctx: SyncCtx, id: string): any[];
-  steps(ctx: AsyncCtx, id: string): Promise<any[]>;
+  steps(ctx: SyncCtx, id: string): WorkflowJournalStep[];
+  steps(ctx: AsyncCtx, id: string): Promise<WorkflowJournalStep[]>;
   steps(ctx: SyncCtx | AsyncCtx, id: string) {
     return ctx.runQuery(this.component.lib.steps, { id });
   }

@@ -65,7 +65,11 @@ const schema = defineSchema({
       /** `order` of the last prompt (the next one gets +1). */
       lastOrder: v.number(),
       updatedAt: v.number(),
-    }).index("by_user", ["userId", "updatedAt"]),
+    })
+      .index("by_user", ["userId", "updatedAt"])
+      // The dashboard's thread list (`dashboard:threads`): every thread by activity, and one status by activity.
+      .index("by_updated", ["updatedAt"])
+      .index("by_status", ["status", "updatedAt"]),
     messages: defineTable({
       thread: v.id("threads"),
       userId: v.optional(v.string()),
@@ -98,8 +102,11 @@ const schema = defineSchema({
       .index("by_thread_status", ["thread", "status"])
       // Only for an install with `{ search: true }` (`omitIndexes` below): FTS5 rows on every message write otherwise.
       .searchIndex("search_text", { searchField: "text", filterFields: ["thread", "userId"] }),
-    /** Text of messages being streamed, in batches; deleted when the step finishes, fails or is aborted. */
-    deltas: defineTable({ thread: v.id("threads"), message: v.id("messages"), seq: v.number(), text: v.string() })
+    /**
+     * Text of messages being streamed, in batches; deleted when the step finishes, fails or is aborted. `reasoning`:
+     * the model's reasoning streamed in the same batch (absent when there was none).
+     */
+    deltas: defineTable({ thread: v.id("threads"), message: v.id("messages"), seq: v.number(), text: v.string(), reasoning: v.optional(v.string()) })
       // One index serves both a message's deltas (thread + message) and a thread's purge (thread alone).
       .index("by_thread", ["thread", "message", "seq"]),
   },
@@ -127,7 +134,7 @@ function checkSearch(ctx: { component: { config: AgentInstallConfig | undefined 
   if (!searchOn(ctx)) throw new EmberError("ValidationError", SEARCH_OFF);
 }
 
-const { query, mutation, internalMutation } = componentBuilders<typeof schema, AgentInstallConfig | undefined>();
+const { query, mutation, internalMutation, internalQuery } = componentBuilders<typeof schema, AgentInstallConfig | undefined>();
 
 type DM = DataModelFromSchema<typeof schema>;
 type Ctx = ComponentCtx<typeof schema, AgentInstallConfig | undefined>["mutation"];
@@ -173,8 +180,11 @@ export type AgentThread = {
   updatedAt: number;
 };
 
-/** A batch of streamed text: `text` of the deltas of a message, in `seq` order, is what has streamed so far. */
-export type StreamDelta = { _id: string; message: string; seq: number; text: string };
+/**
+ * A batch of streamed text: `text` of the deltas of a message, in `seq` order, is what has streamed so far (and
+ * `reasoning`, the model's reasoning so far, when it streams one).
+ */
+export type StreamDelta = { _id: string; message: string; seq: number; text: string; reasoning?: string };
 
 /** A message as the model sees it (context window). */
 export type ContextMessage = { _id: string; role: MessageRole; parts: MessagePart[]; order: number; stepOrder: number };
@@ -186,6 +196,25 @@ const DELETE_BATCH = 200;
  * seqs `[n + 1 - 16^k, n]` into the first one. Rows per streaming message stay under 15 per level (16^level ≥ batches).
  */
 export const DELTA_FANOUT = 16;
+
+/** At most 500 characters of a timeline detail (null when empty). */
+const clip = (s: string): string | null => (s.length > 500 ? `${s.slice(0, 500)}…` : s || null);
+
+/** A message with no text (a tool call, a tool result): its tool parts, one line each (args/result as JSON, bounded). */
+function toolSummary(parts: readonly MessagePart[]): string {
+  const json = (x: unknown) => {
+    try {
+      const s = JSON.stringify(x) ?? "";
+      return s.length > 200 ? `${s.slice(0, 200)}…` : s;
+    } catch {
+      return "…";
+    }
+  };
+  return parts
+    .map((p) => (p.type === "tool-call" ? `→ ${p.toolName}(${json(p.args)})` : p.type === "tool-result" ? `← ${p.toolName}${p.isError ? " (error)" : ""}: ${json(p.result)}` : null))
+    .filter((x): x is string => x !== null)
+    .join("\n");
+}
 
 const textOf = (parts: readonly MessagePart[]) =>
   parts
@@ -215,7 +244,7 @@ function publicThread(t: ThreadDoc): AgentThread {
   return out;
 }
 
-const publicDelta = (d: DeltaDoc): StreamDelta => ({ _id: d._id, message: d.message, seq: d.seq, text: d.text });
+const publicDelta = (d: DeltaDoc): StreamDelta => (d.reasoning ? { _id: d._id, message: d.message, seq: d.seq, text: d.text, reasoning: d.reasoning } : { _id: d._id, message: d.message, seq: d.seq, text: d.text });
 
 function thread(ctx: ReadCtx, id: string): ThreadDoc | null {
   const tid = ctx.db.normalizeId("threads", id);
@@ -234,33 +263,37 @@ const isHandle = (s: string | undefined) => s === undefined || s.startsWith("&")
 
 const deltasOf = (ctx: ReadCtx, m: { _id: MId; thread: GenericId<"threads"> }) =>
   ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", m.thread).eq("message", m._id)).collect();
-/** Deletes the deltas of `m` and returns their text (in seq order): one read for both. */
-function takeDeltas(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }): string {
+/** Deletes the deltas of `m` and returns their text and reasoning (in seq order): one read for both. */
+function takeDeltas(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }): { text: string; reasoning: string } {
   let text = "";
+  let reasoning = "";
   for (const d of deltasOf(ctx, m)) {
     text += d.text;
+    if (d.reasoning) reasoning += d.reasoning;
     ctx.db.delete(d._id);
   }
-  return text;
+  return { text, reasoning };
 }
 const clearDeltas = (ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }) => void takeDeltas(ctx, m);
 
 /** Writes batch `seq` of `m`, merging it with the batches before it on a compaction boundary (DELTA_FANOUT). */
-function writeDelta(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }, seq: number, text: string) {
+function writeDelta(ctx: Ctx, m: { _id: MId; thread: GenericId<"threads"> }, seq: number, text: string, reasoning?: string) {
   let span = 1;
   while (Number.isSafeInteger(seq) && seq >= 0 && (seq + 1) % (span * DELTA_FANOUT) === 0) span *= DELTA_FANOUT;
+  const row = { thread: m.thread, message: m._id, seq, text, ...(reasoning ? { reasoning } : {}) };
   if (span === 1) {
-    ctx.db.insert("deltas", { thread: m.thread, message: m._id, seq, text });
+    ctx.db.insert("deltas", row);
     return;
   }
   // The rows of [seq + 1 - span, seq): already merged into at most 15 per level below `span`.
   const rows = ctx.db.query("deltas").withIndex("by_thread", (q) => q.eq("thread", m.thread).eq("message", m._id).gte("seq", seq + 1 - span).lt("seq", seq)).collect();
   const [first, ...rest] = rows;
   if (!first) {
-    ctx.db.insert("deltas", { thread: m.thread, message: m._id, seq, text });
+    ctx.db.insert("deltas", row);
     return;
   }
-  ctx.db.patch(first._id, { text: rows.map((d) => d.text).join("") + text });
+  const merged = rows.map((d) => d.reasoning ?? "").join("") + (reasoning ?? "");
+  ctx.db.patch(first._id, { text: rows.map((d) => d.text).join("") + text, ...(merged ? { reasoning: merged } : {}) });
   for (const d of rest) ctx.db.delete(d._id);
 }
 
@@ -354,9 +387,13 @@ function deleteSome(ctx: Ctx, t: TId): boolean {
 function stop(ctx: Ctx, m: MessageDoc, reason: string) {
   if (m.job) ctx.scheduler.cancel(m.job);
   const patch: MessagePatch = { status: "aborted", error: reason, job: undefined };
-  const text = takeDeltas(ctx, m);
-  if (text && m.status === "streaming" && m.role === "assistant") {
-    patch.parts = [...m.parts.filter((p) => p.type !== "text"), { type: "text", text }];
+  const { text, reasoning } = takeDeltas(ctx, m);
+  if ((text || reasoning) && m.status === "streaming" && m.role === "assistant") {
+    patch.parts = [
+      ...(reasoning ? [{ type: "reasoning" as const, text: reasoning }] : []),
+      ...m.parts.filter((p) => p.type !== "text" && (!reasoning || p.type !== "reasoning")),
+      ...(text ? [{ type: "text" as const, text }] : []),
+    ];
     patch.text = text;
   }
   ctx.db.patch(m._id, patch);
@@ -626,12 +663,12 @@ export const functions = {
 
     /** A batch of streamed text. False once the message was aborted (or another run owns it): the action stops. */
     appendDelta: mutation({
-      args: { messageId: v.string(), runId: v.string(), seq: v.number(), text: v.string() },
+      args: { messageId: v.string(), runId: v.string(), seq: v.number(), text: v.string(), reasoning: v.optional(v.string()) },
       returns: v.boolean(),
       handler: (ctx, a) => {
         const m = owned(ctx, a.messageId, a.runId);
         if (!m) return false;
-        writeDelta(ctx, m, a.seq, a.text);
+        writeDelta(ctx, m, a.seq, a.text, a.reasoning);
         return true;
       },
     }),
@@ -708,8 +745,9 @@ export const functions = {
       handler: (ctx, a) => {
         const m = owned(ctx, a.messageId, a.runId);
         if (!m) return false;
-        const text = takeDeltas(ctx, m);
-        const patch: MessagePatch = { status: "failed", error: a.error, runId: undefined, parts: text ? [{ type: "text", text }] : [], text };
+        const { text, reasoning } = takeDeltas(ctx, m);
+        const parts: MessagePart[] = [...(reasoning ? [{ type: "reasoning" as const, text: reasoning }] : []), ...(text ? [{ type: "text" as const, text }] : [])];
+        const patch: MessagePatch = { status: "failed", error: a.error, runId: undefined, parts, text };
         if (a.usage) patch.usage = a.usage;
         if (a.model !== undefined) patch.model = a.model;
         if (a.provider !== undefined) patch.provider = a.provider;
@@ -721,10 +759,92 @@ export const functions = {
   },
 };
 
+// ------------------------------------------------------------------------------------------------ dashboard
+
+/** What the dashboard's screen reads (module `dashboard`, internal: never part of the component's API). */
+const dashboardFunctions = {
+  /**
+   * Threads in this shard by activity, most recent first: one user's (`by_user`; a status filters that user's), one
+   * status's (`by_status`) or all (`by_updated`). Each page is a range of an index, never a scan of the table.
+   */
+  threads: internalQuery({
+    args: { userId: v.optional(v.string()), status: v.optional(v.union(v.literal("active"), v.literal("archived"))), paginationOpts: paginationOptsValidator },
+    handler: (ctx, a) => {
+      const q =
+        a.userId !== undefined
+          ? ctx.db.query("threads").withIndex("by_user", (r) => r.eq("userId", a.userId)).order("desc")
+          : a.status !== undefined
+            ? ctx.db.query("threads").withIndex("by_status", (r) => r.eq("status", a.status!)).order("desc")
+            : ctx.db.query("threads").withIndex("by_updated").order("desc");
+      const page = (a.userId !== undefined && a.status !== undefined ? q.filter((f) => f.eq(f.field("status"), a.status!)) : q).paginate(a.paginationOpts);
+      return {
+        ...page,
+        // `lastOrder` is the order of the last prompt, -1 before the first one.
+        page: page.page.map((t) => ({ _id: t._id, userId: t.userId ?? null, title: t.title ?? null, status: t.status, prompts: t.lastOrder + 1, tokens: t.usage.totalTokens ?? null, updatedAt: t.updatedAt })),
+      };
+    },
+  }),
+  /** One thread with its last 100 messages, oldest first (a timeline); null when unknown. */
+  thread: internalQuery({
+    args: { threadId: v.string() },
+    handler: (ctx, { threadId }) => {
+      const t = thread(ctx, threadId);
+      if (!t) return null;
+      const messages = ctx.db
+        .query("messages")
+        .withIndex("by_thread", (q) => q.eq("thread", t._id))
+        .order("desc")
+        .take(100)
+        .reverse()
+        .map((m) => ({ at: m._creationTime, title: `${m.role}${m.agentName ? ` (${m.agentName})` : ""}${m.model ? ` · ${m.model}` : ""}`, status: m.status, detail: m.error ?? clip(m.text || toolSummary(m.parts)) }));
+      return { ...publicThread(t), messages };
+    },
+  }),
+};
+
 export const agent = defineComponent({
   name: "agent",
   schema,
-  functions,
+  functions: { ...functions, dashboard: dashboardFunctions },
+  // The threads' screen in the Ember Dashboard (contracts.md "Telas declarativas"): threads live per shard.
+  dashboard: {
+    label: "Agent",
+    icon: "bot",
+    description: "Threads and their messages (a timeline of prompts, steps and tool calls); archive or delete a thread.",
+    tabs: [
+      {
+        id: "threads",
+        label: "Threads",
+        blocks: [
+          {
+            kind: "table",
+            id: "threads",
+            query: dashboardFunctions.threads,
+            columns: [
+              { label: "Title", path: "title" },
+              { label: "User", path: "userId", format: "code" },
+              { label: "Status", path: "status", format: "badge" },
+              { label: "Prompts", path: "prompts", format: "number" },
+              { label: "Tokens", path: "tokens", format: "number" },
+              { label: "Updated", path: "updatedAt", format: "ago" },
+            ],
+            detail: {
+              query: dashboardFunctions.thread,
+              fromRow: { threadId: "_id" },
+              sections: [
+                { kind: "kv", items: [{ label: "Title", path: "title" }, { label: "Summary", path: "summary" }, { label: "Status", path: "status", format: "badge" }, { label: "Usage", path: "usage", format: "json" }] },
+                { kind: "timeline", label: "Messages", path: "messages", time: "at", title: "title", status: "status", detail: "detail" },
+              ],
+            },
+            rowActions: [
+              { id: "archive", label: "Archive", fn: functions.lib.updateThread, args: { patch: { status: "archived" } }, fromRow: { threadId: "_id" } },
+              { id: "delete", label: "Delete", fn: functions.lib.deleteThread, fromRow: { threadId: "_id" }, destructive: true, description: "Deletes the thread with its messages." },
+            ],
+          },
+        ],
+      },
+    ],
+  },
   config: v.optional(v.object({ workersAi: v.optional(v.boolean()), search: v.optional(v.boolean()) })),
   bindings: (config) => (config?.workersAi === false ? [] : [{ type: "ai", name: "EMBER_AI" }]),
   // The FTS5 index only where search is on (AgentInstallConfig.search).

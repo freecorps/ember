@@ -87,4 +87,22 @@ describe("workflows on workerd", () => {
     expect(runs).toEqual(["wf:21", "wf-done:1"]);
     expect((await shardStub(shard).inspect()).jobs).toEqual([]);
   });
+
+  it("parallel steps (Promise.all): one batch, each step once, the workflow goes on after the last one", async () => {
+    const shard = "wf:par";
+    const id = (await api("mutation", { fn: "official:startParallel", args: { x: 2 }, shard })).body.value as string;
+    const status = () => api("query", { fn: "official:flowStatus", args: { id }, shard }).then((r) => r.body.value);
+    const done = await until(
+      async () => {
+        await pumpActions(shard);
+        return status();
+      },
+      (st) => st?.status === "completed",
+    );
+    // fetchish(2) + fetchish(3) = 6 + 9
+    expect(done).toMatchObject({ status: "completed", result: 15, stepCount: 5 });
+    const runs = (await api("query", { fn: "runs:list", args: {}, shard })).body.value.map((r: { label: string }) => r.label);
+    expect(runs).toEqual(["wf-par", "wf-sum:15"]);
+    expect((await shardStub(shard).inspect()).jobs).toEqual([]);
+  });
 });

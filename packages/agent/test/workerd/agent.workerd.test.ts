@@ -8,7 +8,7 @@ import { SELF } from "cloudflare:test";
 import { applyValueDiff, applyRowDiff } from "@freecorps/ember-values";
 import { describe, expect, it } from "vitest";
 import { withStreams } from "../../src/index.ts";
-import { ANSWER } from "./worker.ts";
+import { ANSWER, REASONING } from "./worker.ts";
 
 const SHARD = "global:main";
 const call = async (kind: "query" | "mutation", fn: string, args: unknown) => {
@@ -113,6 +113,40 @@ describe("agent component in workerd", () => {
     // Usage reached the app's onUsage (two steps of 60 tokens).
     expect((await call("query", "chat:usageRows", {})).filter((u: any) => u.userId === "ana").map((u: any) => u.total)).toEqual([60, 60]);
     expect((await call("query", "chat:thread", { threadId })).usage.totalTokens).toBe(120);
+    c.ws.close();
+  });
+
+  it("a reasoning model: reasoning-delta streams in the delta rows and ends as a reasoning part", async () => {
+    const threadId = (await call("mutation", "chat:createThread", {})) as string;
+    const c = await socket();
+    const pageArgs = { threadId, paginationOpts: { numItems: 20, cursor: null } };
+    c.send({ t: "sub", qid: 1, fn: "chat:messages", args: pageArgs });
+    c.send({ t: "sub", qid: 2, fn: "chat:messages", args: { ...pageArgs, paginationOpts: { numItems: 0, cursor: null }, streamArgs: { kind: "list" } } });
+    await c.until(() => c.frames.filter((f) => f.m.t === "snap").length === 2);
+    const values = new Map<number, any>(c.frames.filter((f) => f.m.t === "snap").map((f) => [f.m.qid, f.m.value]));
+    const seen: string[] = [];
+    let applied = 0;
+    const done = () => {
+      for (const f of c.frames.slice(applied)) {
+        applied++;
+        if (f.m.t !== "patch") continue;
+        for (const ch of f.m.changes) values.set(ch.qid, ch.vdiff ? applyValueDiff(values.get(ch.qid), ch.vdiff) : ch.diff ? applyRowDiff(values.get(ch.qid), ch.diff) : ch.value);
+        const last = withStreams(values.get(1).page, values.get(2).streams).at(-1);
+        if (last?.streaming && last.reasoning && seen.at(-1) !== last.reasoning) seen.push(last.reasoning);
+      }
+      const page = values.get(1)?.page ?? [];
+      return page.length >= 2 && page[0].role === "assistant" && page[0].status === "success";
+    };
+    await call("mutation", "chat:send", { threadId, text: "think: when does it arrive?" });
+    await c.until(done);
+    expect(seen.length).toBeGreaterThanOrEqual(3);
+    for (let i = 1; i < seen.length; i++) expect(seen[i]!.startsWith(seen[i - 1]!)).toBe(true);
+    const ui = withStreams(values.get(1).page, values.get(2).streams);
+    expect(ui.at(-1)).toMatchObject({ text: "Friday.", reasoning: REASONING, streaming: false });
+    expect(ui.at(-1)!.parts).toEqual([
+      { type: "reasoning", text: REASONING },
+      { type: "text", text: "Friday." },
+    ]);
     c.ws.close();
   });
 

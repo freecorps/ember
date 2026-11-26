@@ -96,7 +96,10 @@ function tab(browser: FakeBrowser, shard: string, token: string) {
     httpFirst: false,
     backoff: { initialMs: 5, maxMs: 20 },
     auth: () => current,
-    multiTab: { locks: t.locks, BroadcastChannel: t.BroadcastChannel, lifecycle: false, clientIdTimeoutMs: 200 },
+    // The fallbacks on a real-time deadline (a follower with no leader's clientId by then makes its own, hence a group
+    // and a socket of its own; a virtual socket not acknowledged by then opens a direct one) never fire here: on a slow
+    // runner they did, and three sockets showed up for two identities. Everything below must work without them.
+    multiTab: { locks: t.locks, BroadcastChannel: t.BroadcastChannel, lifecycle: false, clientIdTimeoutMs: 60_000, openTimeoutMs: 60_000 },
   });
   const watch = <T,>(fn: string, args: Record<string, unknown>) => {
     const seen: Array<QuerySnapshot<T>> = [];
@@ -133,10 +136,11 @@ describe("multiTab against the real runtime", () => {
     const whos = [a, b, c].map((x) => x.watch<string>("auth:whoami", {}));
     await expect.poll(() => whos.map((w) => w.at(-1)?.value)).toEqual(["alice", "alice", "bob"]);
     await expect.poll(() => lists.every((l) => l.at(-1)?.status === "success")).toBe(true);
+    // Every tab adopted the leader's clientId (a tab with its own would get a group, and a socket, of its own).
+    expect([b.client.clientId, c.client.clientId]).toEqual([a.client.clientId, a.client.clientId]);
     // Two real sockets for three tabs: alice's (a, b) and bob's (c), both held by the leader.
     expect(SelfWebSocket.log).toHaveLength(2);
     expect(a.sockets).toHaveLength(2);
-    expect(b.client.clientId).toBe(a.client.clientId);
 
     const id = await b.client.mutation(unsafeRef("messages:send"), { channel: "mt", body: "from b" });
     await expect.poll(() => lists.map((l) => l.at(-1)?.value?.map((r) => r._id))).toEqual([[id], [id], [id]]);

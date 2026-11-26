@@ -330,7 +330,8 @@ export default defineTriggers({
   - `useQuery` (valor ou `undefined`, lança o erro para o error boundary, como hoje);
   - `useQueryState` → `{ status: "loading" } | { status: "success"; data; optimistic; source? } | { status: "error"; error: EmberErrorOf<F> }`;
   - `useSuspenseQuery`;
-  - `useMutation` devolve uma função com `.safe()` e `.withOptimisticUpdate()`, e `useMutationState` dá `{ isPending, error }`.
+  - `useMutation` devolve uma função com `.safe()` e `.withOptimisticUpdate()` (ou `{ optimisticUpdate }` nas opções), e `useMutationState` dá `{ isPending, data, error, result }`;
+  - 0.10: `useQuery(ref, args, { select })` (re-render só quando a seleção muda), `useConnectionState(select?)`, `useActionState(ref)` (com `reducer` para o `useActionState` do React 19), `<EmberHydrate state>`, `preloadQuery`/`usePreloadedQuery` (contracts.md "Hooks React e React Query").
 - **Optimistic updates tipados:** `store.update(api.messages.list, { roomId }, (prev) => …)`, com `prev`/retorno do tipo do retorno da query. Os overloads por string saem.
 - **Paginação:**
   - `usePaginatedQuery` só aceita refs cujos args têm `paginationOpts` e cujo retorno é `PaginationResult<T>`; a restrição vem com uma mensagem legível no erro de tipo;
@@ -340,7 +341,7 @@ export default defineTriggers({
   - SSR/loaders: `client.fetchForHydration(ref, args, opts?)` → `HydratedQuery<Returns<F>>` (`fn`, `args`, `shard`, `value` tipado, mais `version`, `epoch`, `ik` do shard; serializável com `encodeJson`); no navegador `client.hydrate(...entries)`: a primeira inscrição mostra o valor na hora e assina com `resume`. No React Query, `prefetchEmberQuery`/`emberQueryOneShot` e o `EmberQueryClient` em modo SSR guardam os metadados numa entrada ao lado (`emberHydrationKey(key)`, desidratada junto) e o `EmberQueryClient` do navegador hidrata o cliente antes de assinar: nada muda na API;
   - cache leve sem o motor offline: `new EmberClient({ snapshotCache: keyValueSnapshotCache(localStorage, { maxBytes?, maxAgeMs? }) })` (ou `memorySnapshotCache()`), interface `SnapshotCache` pública para outros armazenamentos;
   - `LocalQueryResult` e `QueryUpdate` ganharam campos opcionais (`version`, `epoch`, `ik`; `ik`, `identity`): adaptadores antigos continuam valendo (sem `resume`).
-- **React Query:** `emberQuery` com `TError` tipado; `emberMutation(ref, opts)` devolve `mutationOptions` completo (`mutationFn`, `TVariables`, `TError`).
+- **React Query:** `emberQuery` com `TError` tipado; `emberMutation(ref, opts)` devolve `mutationOptions` completo (`mutationFn`, `TVariables`, `TError`); 0.10: `emberAction(ref)` (o mesmo para actions) e `emberPaginatedQuery(ref, args, { numItems })` (`infiniteQueryOptions`).
 - **Offline:** o `_generated/offline.ts` (já previsto no PLAN §10) gera o mapa `queries` e o registro de optimistic updates com chaves tipadas.
 - **Fetch tipado e OpenAPI:**
   - `createEmberHttpClient<typeof api>({ url })`, para server-to-server, scripts e SSR fora do React;
