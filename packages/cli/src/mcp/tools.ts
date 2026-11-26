@@ -16,14 +16,27 @@ import { devUrl } from "../dev.ts";
 import { streamLogs, type StreamLogsOptions } from "../logs.ts";
 import { D1Registry, registryName } from "../registry.ts";
 import { DEFAULT_SHARD, normalizeFnName, resolveBaseUrl } from "../run.ts";
-import { apiUrl } from "../secure-url.ts";
-import { adminRequest, catalogShards, CatalogUnavailableError, formatShardList, formatShardReport, inspectShard, table, type AdminTarget } from "../shards.ts";
+import { apiUrl, isLoopbackHost } from "../secure-url.ts";
+import { AdminApiError, adminRequest, catalogShards, CatalogUnavailableError, formatShardList, formatShardReport, inspectShard, table, type AdminTarget } from "../shards.ts";
 import { ToolError, type JsonSchema, type McpTool, type ToolOutput } from "./server.ts";
 
 /** The environment name that means the running `ember dev` of this project. */
 export const LOCAL = "local";
 
 type Row = Record<string, unknown>;
+
+/** Where a call acts: the local `ember dev`, or a deployed environment (its requests name it in `x-ember-env`). */
+interface Target {
+  env: string;
+  url: string;
+  local: boolean;
+  headers: Record<string, string>;
+}
+
+/** Header the runtime checks against its EMBER_ENV (runtime admin-api.ts `EXPECT_ENV_HEADER`). */
+const EXPECT_ENV_HEADER = "x-ember-env";
+/** Admin API features of the runtime a deployed environment must have (ADMIN_API_LEVEL 14). */
+const REQUIRED_FEATURES = ["env-check", "run/read-only"] as const;
 
 export interface EmberMcpOptions {
   project: Project;
@@ -61,7 +74,12 @@ function sourceStamp(dir: string): string {
     for (const name of readdirSync(d)) {
       if (name === "_generated" || name === "node_modules" || name.startsWith(".")) continue;
       const p = join(d, name);
-      const st = statSync(p);
+      let st: ReturnType<typeof statSync>;
+      try {
+        st = statSync(p);
+      } catch {
+        continue; // removed between readdir and stat (an editor save, a checkout): not part of the stamp
+      }
       if (st.isDirectory()) walk(p);
       else {
         count++;
@@ -84,14 +102,14 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
   const allowEnv = new Set([...(o.allowEnv ?? []), ...(o.allowRun ?? [])]);
   const allowRun = new Set(o.allowRun ?? []);
 
-  /** The base URL of an environment, after the access check. */
-  const target = (env: string | undefined, need: "read" | "run"): { env: string; url: string; local: boolean } => {
+  /**
+   * The environment a call acts on, resolved once from its `env` argument and checked against the server's grants:
+   * `--allow-env` to read it, `--allow-run` to run functions there. Nothing else in a call (shard, fn, args) can move
+   * it to another environment.
+   */
+  const access = (env: string | undefined, need: "read" | "run"): string => {
     const name = env ?? LOCAL;
-    if (name === LOCAL) {
-      const url = (o.devUrl ?? (() => devUrl(project)))();
-      if (!url) throw new ToolError(`No \`ember dev\` is running for ${project.config.project}: start it (with EMBER_ADMIN_TOKEN set), or name a deployed environment the server may reach.`);
-      return { env: name, url: resolveBaseUrl(project, { url }), local: true };
-    }
+    if (name === LOCAL) return LOCAL;
     let resolved: string;
     try {
       resolved = resolveEnv(project, name).name;
@@ -106,16 +124,61 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
           : `The deployed environment "${resolved}" is not reachable from this server: the user must restart \`ember mcp\` with --allow-env ${resolved}. Use env "${LOCAL}" (ember dev) instead.`,
       );
     }
+    return resolved;
+  };
+
+  /**
+   * Where a call's admin requests go, after `access`. "local" is the running `ember dev`, which only ever listens on
+   * loopback: a `.ember/dev.json` naming any other host is refused (it would turn "local", which needs no grant and no
+   * confirm, into a deployment). A deployed environment's requests carry `x-ember-env`, so its Worker refuses them when
+   * the URL recorded for it (`.ember/deployments.json`) is another environment's; `checkRuntime` makes sure the Worker
+   * is one that checks.
+   */
+  const target = (env: string | undefined, need: "read" | "run"): Target => {
+    const name = access(env, need);
+    if (name === LOCAL) {
+      const url = (o.devUrl ?? (() => devUrl(project)))();
+      if (!url) throw new ToolError(`No \`ember dev\` is running for ${project.config.project}: start it (with EMBER_ADMIN_TOKEN set), or name a deployed environment the server may reach.`);
+      let host: string;
+      try {
+        host = new URL(url).hostname;
+      } catch {
+        throw new ToolError(`The \`ember dev\` URL in .ember/dev.json is not a URL (${url}): restart \`ember dev\`.`);
+      }
+      if (!isLoopbackHost(host)) throw new ToolError(`The \`ember dev\` URL in .ember/dev.json (${url}) is not on this machine: "${LOCAL}" only reaches a local \`ember dev\`. Restart \`ember dev\`, or name a deployed environment the server may reach.`);
+      try {
+        return { env: LOCAL, url: resolveBaseUrl(project, { url }), local: true, headers: {} };
+      } catch (e) {
+        throw new ToolError((e as Error).message);
+      }
+    }
     try {
-      return { env: resolved, url: resolveBaseUrl(project, { env: resolved }), local: false };
+      return { env: name, url: resolveBaseUrl(project, { env: name }), local: false, headers: { [EXPECT_ENV_HEADER]: name } };
     } catch (e) {
       throw new ToolError((e as Error).message);
     }
   };
-  const admin = (url: string): AdminTarget => ({ url, adminToken: adminToken(), ...(o.fetch ? { fetch: o.fetch } : {}) });
+  const admin = (t: Target): AdminTarget => ({ url: t.url, adminToken: adminToken(), headers: t.headers, ...(o.fetch ? { fetch: o.fetch } : {}) });
+  /**
+   * A deployed environment's runtime must enforce what this server relies on (`x-ember-env`, `run` with `readOnly`):
+   * an older one would ignore both, so it is refused, before anything else is sent to it.
+   */
+  const checkRuntime = async (t: Target): Promise<void> => {
+    if (t.local) return;
+    let caps: { features?: string[] };
+    try {
+      caps = await adminRequest<{ features?: string[] }>(admin(t), "GET", "/api/_ember/capabilities");
+    } catch (e) {
+      if (e instanceof AdminApiError && e.code === "not_found") caps = {};
+      else throw new ToolError(e instanceof AdminApiError && e.code === "wrong_environment" ? `${e.message}. Redeploy "${t.env}" (ember deploy --env ${t.env}) to record its URL again.` : (e as Error).message);
+    }
+    const missing = REQUIRED_FEATURES.filter((f) => !caps.features?.includes(f));
+    if (missing.length) throw new ToolError(`The runtime deployed on "${t.env}" is older than this \`ember mcp\` (no ${missing.join(", ")} in its admin API): it could not refuse a call meant for another environment, or a write that was not confirmed. Redeploy it (ember deploy --env ${t.env}), then try again.`);
+  };
+  /** A deployed environment's name, for the tools that read it through Cloudflare (logs, metrics, the catalog). */
   const deployedOnly = (env: string | undefined, what: string): string => {
     if (!env || env === LOCAL) throw new ToolError(`${what} come from Cloudflare: name a deployed environment (env), not the local \`ember dev\`.`);
-    return target(env, "read").env;
+    return access(env, "read");
   };
   const client = (env: string) => {
     if (o.client) return o.client(env);
@@ -138,7 +201,8 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
     } catch (e) {
       throw new ToolError(`The project does not load (codegen): ${(e as Error).message}`);
     }
-    cached = { stamp: sourceStamp(project.dir), r };
+    // The stamp read before codegen: a file saved while it ran leaves a mismatch, so the next call regenerates.
+    cached = { stamp, r };
     return r;
   };
   const findFn = async (name: string): Promise<{ fn: FunctionManifest; r: CodegenResult }> => {
@@ -239,7 +303,12 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
         const { fn } = await findFn(a.fn as string);
         if (fn.type === "httpAction") throw new ToolError(`${fn.name} is an HTTP action: call its route over HTTP instead.`);
         const t = target(a.env as string | undefined, "run");
-        if (!t.local && fn.type !== "query" && a.confirm !== t.env) {
+        // Outside the local ember dev a write runs only when the call names the environment again (confirm). The
+        // local manifest's type is only a hint: unconfirmed, the call goes with readOnly, and the deployed runtime
+        // refuses anything that is not a query in its own code (a function may be a query here and a mutation there).
+        if (!t.local && a.confirm !== undefined && a.confirm !== t.env) throw new ToolError(`confirm must be the environment's name, "${t.env}" (got ${JSON.stringify(a.confirm)}).`);
+        const confirmed = t.local || a.confirm === t.env;
+        if (!confirmed && fn.type !== "query") {
           throw new ToolError(`${fn.name} is a ${fn.type} on the deployed environment "${t.env}": it changes real data. Ask the user, then call again with confirm: "${t.env}".`);
         }
         const args = (a.args ?? {}) as Record<string, unknown>;
@@ -249,10 +318,11 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
           if (typeof v === "string" || typeof v === "number") shard = `${fn.shard.kind}:${v}`;
           else throw new ToolError(`${fn.name} runs in "${fn.shard.kind}" shards: pass shard ("${fn.shard.kind}:<key>")${fn.shard.fromArg ? ` or the ${fn.shard.fromArg} argument` : ""}.`);
         }
-        const body = { fn: fn.name, args, shard: shard ?? DEFAULT_SHARD, ...(a.as ? { as: a.as } : {}) };
+        await checkRuntime(t);
+        const body = { fn: fn.name, args, shard: shard ?? DEFAULT_SHARD, ...(a.as ? { as: a.as } : {}), ...(confirmed ? {} : { readOnly: true }) };
         const res = await (o.fetch ?? fetch)(apiUrl(t.url, "/api/_ember/run"), {
           method: "POST",
-          headers: { authorization: `Bearer ${adminToken()}`, "content-type": "application/json" },
+          headers: { ...t.headers, authorization: `Bearer ${adminToken()}`, "content-type": "application/json" },
           body: JSON.stringify(body),
         });
         const text = await res.text();
@@ -262,6 +332,8 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
         } catch {
           throw new ToolError(`POST /api/_ember/run on ${t.env}: HTTP ${res.status} ${text.slice(0, 300)}`);
         }
+        if (r.error?.code === "confirm_required") throw new ToolError(`${fn.name} is not a query in what "${t.env}" runs (${r.error.message}): it changes real data there. Ask the user, then call again with confirm: "${t.env}".`);
+        if (r.error?.code === "wrong_environment") throw new ToolError(`${r.error.message}. Redeploy "${t.env}" (ember deploy --env ${t.env}) to record its URL again.`);
         const where = `${fn.name} on ${t.env} (${body.shard})`;
         if (!r.ok) return { text: `${where} failed: ${r.error?.code ?? res.status}: ${r.error?.message ?? text.slice(0, 300)}${r.error?.data !== undefined ? `\ndata: ${json(r.error.data)}` : ""}`, structured: { ok: false, env: t.env, shard: body.shard, error: r.error ?? { code: String(res.status), message: text.slice(0, 300) } }, isError: true };
         return out(`${where} → ${r.ms !== undefined ? `${r.ms.toFixed(1)} ms` : "ok"}\n${json(r.value ?? null)}`, { ok: true, env: t.env, shard: body.shard, value: r.value ?? null, ...(r.ms !== undefined ? { ms: r.ms } : {}) });
@@ -287,13 +359,14 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
       annotations: { readOnlyHint: true },
       async call(a) {
         const t = target(a.env as string | undefined, "read");
+        await checkRuntime(t);
         const shard = (a.shard as string | undefined) ?? DEFAULT_SHARD;
         const q = new URLSearchParams({ shard });
         if (a.table) q.set("table", a.table as string);
         if (a.cursor) q.set("cursor", a.cursor as string);
         q.set("limit", String(a.limit ?? 50));
         if (a.jobs) q.set("jobs", a.jobs as string);
-        const r = await adminRequest<{ tables?: Array<{ name: string; kind: string; rows: number }>; table?: string; rows?: unknown[]; cursor?: string | null; done?: boolean }>(admin(t.url), "GET", `/api/_ember/data?${q}`).catch((e: Error) => {
+        const r = await adminRequest<{ tables?: Array<{ name: string; kind: string; rows: number }>; table?: string; rows?: unknown[]; cursor?: string | null; done?: boolean }>(admin(t), "GET", `/api/_ember/data?${q}`).catch((e: Error) => {
           throw new ToolError(e.message);
         });
         if (r.tables) return out(`${shard} on ${t.env}:\n${table(["TABLE", "KIND", "ROWS"], r.tables.map((x) => [x.name, x.kind, String(x.rows)]))}`, { env: t.env, shard, tables: r.tables });
@@ -311,7 +384,8 @@ export function emberTools(o: EmberMcpOptions): McpTool[] {
       async call(a) {
         if (a.shard) {
           const t = target(a.env as string | undefined, "read");
-          const r = await inspectShard(admin(t.url), a.shard as string).catch((e: Error) => {
+          await checkRuntime(t);
+          const r = await inspectShard(admin(t), a.shard as string).catch((e: Error) => {
             throw new ToolError(e.message);
           });
           return out(formatShardReport(r), { env: t.env, ...r });

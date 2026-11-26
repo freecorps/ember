@@ -11,6 +11,8 @@ export interface AdminTarget {
   fetch?: typeof fetch;
   /** Deadline of one call, response body included (default `ADMIN_TIMEOUT_MS`). */
   timeoutMs?: number;
+  /** Extra request headers (`x-ember-env`: the environment the caller means; another Worker refuses the call). */
+  headers?: Record<string, string>;
 }
 
 /** How long one admin call may take before it fails (a stalled Worker never hangs the CLI or `ember mcp`). */
@@ -40,7 +42,7 @@ export async function adminRequest<T>(t: AdminTarget, method: "GET" | "POST", pa
     res = await abortable(
       (t.fetch ?? fetch)(url, {
         method,
-        headers: { authorization: `Bearer ${t.adminToken}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+        headers: { ...t.headers, authorization: `Bearer ${t.adminToken}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal,
       }),

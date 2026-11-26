@@ -154,7 +154,11 @@ export class McpServer {
     switch (req.method) {
       case "initialize": {
         const asked = isObject(req.params) && typeof req.params.protocolVersion === "string" ? req.params.protocolVersion : undefined;
-        const protocolVersion = asked && (PROTOCOL_VERSIONS as readonly string[]).includes(asked) ? asked : PROTOCOL_VERSIONS[0];
+        // MCP version negotiation (lifecycle): the client's version when the server speaks it, otherwise the newest one
+        // the server speaks, and the client disconnects if it does not speak that. Said on stderr, never in silence.
+        const supported = asked !== undefined && (PROTOCOL_VERSIONS as readonly string[]).includes(asked);
+        const protocolVersion = supported ? asked : PROTOCOL_VERSIONS[0];
+        if (!supported) this.log(`ember mcp: the client asked for protocol ${asked === undefined ? "(none)" : JSON.stringify(asked)}, which this server does not speak (${PROTOCOL_VERSIONS.join(", ")}): answering ${protocolVersion}`);
         return ok({
           protocolVersion,
           capabilities: { tools: { listChanged: false } },
@@ -174,6 +178,9 @@ export class McpServer {
         const tool = this.tools.get(p.name);
         if (!tool) return fail(INVALID_PARAMS, `Unknown tool: ${p.name}`, { known: [...this.tools.keys()] });
         const args = p.arguments ?? {};
+        // A malformed request (arguments that are not an object) is a protocol error; input that does not match the
+        // tool's schema is the model's to fix (below).
+        if (!isObject(args)) return fail(INVALID_PARAMS, "Invalid params: arguments must be an object");
         // Input that does not match the schema is the model's to fix: a tool error it can read, not a protocol error.
         const problems = validate(tool.inputSchema, args);
         if (problems.length) return ok(toolResult({ text: `Invalid arguments for ${tool.name}:\n${problems.map((x) => `- ${x}`).join("\n")}`, isError: true }));
@@ -215,7 +222,8 @@ export async function serveStdio(server: McpServer, input: Readable = process.st
       pending.add(p);
       void p.finally(() => pending.delete(p));
     }
-    await Promise.all(pending);
+    // Every handler settles before the console is restored (one that throws does not cut the wait short).
+    await Promise.allSettled(pending);
   } finally {
     restore();
   }
