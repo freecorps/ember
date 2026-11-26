@@ -377,7 +377,7 @@ async function handleDashboards(request: Request, url: URL, deps: AdminDeps): Pr
   }
   const isQuery = url.pathname.endsWith("/query");
   if (request.method !== (isQuery ? "GET" : "POST")) return deps.error(405, "method_not_allowed", `use ${isQuery ? "GET" : "POST"}`);
-  let input: { dashboard: unknown; fn: unknown; shard: unknown; args: unknown };
+  let input: { dashboard: unknown; fn: unknown; shard: unknown; args: unknown; destructive?: unknown };
   if (isQuery) {
     const q = url.searchParams;
     const raw = q.get("args") ?? "{}";
@@ -392,8 +392,10 @@ async function handleDashboards(request: Request, url: URL, deps: AdminDeps): Pr
   } else {
     const b = await jsonBody(request);
     if (!b) return deps.error(400, "bad_request", "body must be a JSON object { dashboard, fn, args, shard }");
-    input = { dashboard: b.dashboard, fn: b.fn, shard: b.shard, args: b.args ?? {} };
+    input = { dashboard: b.dashboard, fn: b.fn, shard: b.shard, args: b.args ?? {}, destructive: b.destructive };
   }
+  const args = input.args;
+  if (typeof args !== "object" || args === null || Array.isArray(args)) return deps.error(400, "bad_request", "args must be a JSON object");
   const spec: DashboardManifest | undefined = typeof input.dashboard === "string" ? specs.find((d) => d.key === input.dashboard) : undefined;
   if (!spec) return deps.error(404, "unknown_dashboard", `no dashboard ${JSON.stringify(input.dashboard)} (the app's is "", a component's is its install name)`);
   const name = typeof input.fn === "string" ? input.fn : "";
@@ -408,8 +410,12 @@ async function handleDashboards(request: Request, url: URL, deps: AdminDeps): Pr
     shard = "global:main";
   }
   if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(input.shard)}`);
-  const args = input.args;
-  if (typeof args !== "object" || args === null || Array.isArray(args)) return deps.error(400, "bad_request", "args must be an object");
+  // A destructive write runs only when the caller saw it as one (`destructive: true`): the dashboard decides the typed
+  // confirmation from the spec it read, so a deploy that made the function destructive since then is refused here
+  // instead of running unconfirmed (the dashboard reads the spec again on the next try).
+  if (!isQuery && declared.destructive === true && input.destructive !== true) {
+    return deps.error(409, "dashboard_changed", `${name} is destructive in this deployment's dashboard: confirm it again (send destructive: true)`);
+  }
   // The function's own validators (ids as strings: the engine checks their table when it runs).
   const checked = validate(declared.args, withDefaults(declared.args, args));
   if (!checked.ok) return deps.json({ ok: false, error: { code: "ValidationError", message: `${name}: ${checked.message}${checked.path ? ` at ${checked.path}` : ""}` } }, 400);

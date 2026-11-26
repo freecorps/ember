@@ -30,7 +30,7 @@ const POOL_SPEC = {
 };
 
 /** A project Worker behind a service binding: answers like @freecorps/ember-runtime's admin API. */
-function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
+function fakeProject(o: { features?: string[] | null; fail?: boolean; specsDown?: boolean } = {}) {
   const calls: Call[] = [];
   const svc = {
     fetch: async (r: Request | string) => {
@@ -44,7 +44,10 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
         return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run"], auth: false, files: false, system: true });
       }
       // The specs are read before a dashboard write is audited: they answer even when the project's writes fail.
-      if (path === "/api/_ember/dashboards") return Response.json({ ok: true, dashboards: [POOL_SPEC] });
+      if (path === "/api/_ember/dashboards") {
+        if (o.specsDown) throw new Error("connection reset");
+        return Response.json({ ok: true, dashboards: [POOL_SPEC] });
+      }
       if (o.fail) return Response.json({ ok: false, error: { code: "restore_failed", message: "boom" } }, { status: 500 });
       if (path === "/api/_ember/bookmark") return Response.json({ ok: true, shard: (body as { shard: string }).shard, bookmark: { id: 1, at: 1, bookmark: BOOKMARK, reason: "manual" } });
       if (path === "/api/_ember/env/reveal") return Response.json({ ok: true, name: "SMTP_PASSWORD", value: "s3cr3t-value" });
@@ -64,7 +67,7 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean } = {}) {
   return { svc, calls };
 }
 
-function setup(o: { features?: string[] | null; fail?: boolean; env?: Partial<DashboardEnv> } = {}) {
+function setup(o: { features?: string[] | null; fail?: boolean; specsDown?: boolean; env?: Partial<DashboardEnv> } = {}) {
   const { db, binding } = seeded();
   const project = fakeProject(o);
   const env: DashboardEnv = {
@@ -359,9 +362,10 @@ describe("declarative screens", () => {
     expect((await t.post("/api/dash/run", { ...prod, fn: "@pool/lib:cancel", args: { id: "w1" } })).status).toBe(200);
     expect((await t.post("/api/dash/run", { ...prod, env: "dev", fn: "@pool/lib:cancelAll" })).status).toBe(200);
     expect(t.project.calls.filter((c) => c.method === "POST").map((c) => c.body)).toEqual([
-      { shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", args: {} },
-      { shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancel", args: { id: "w1" } },
-      { shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", args: {} },
+      // The project is told what the confirmation was for: it refuses a destructive function sent as a plain one.
+      { shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", args: {}, destructive: true },
+      { shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancel", args: { id: "w1" }, destructive: false },
+      { shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", args: {}, destructive: true },
     ]);
     expect(t.audit().map((a) => [a.action, a.target, a.env, a.outcome, a.args])).toEqual([
       ["dashboard.run", "@pool/lib:cancelAll", "prod", "ok", JSON.stringify({ dashboard: "pool", fn: "@pool/lib:cancelAll", fields: [] })],
@@ -383,6 +387,14 @@ describe("declarative screens", () => {
       const res = await t.post("/api/dash/run", body);
       expect([res.status, ((await res.json()) as { error: { code: string } }).error.code], JSON.stringify(body)).toEqual([status, code]);
     }
+    expect(t.project.calls.filter((c) => c.method === "POST")).toEqual([]);
+    expect(t.audit()).toEqual([]);
+  });
+
+  it("a project that fails while its spec is read: 502 project_unreachable, nothing audited or run", async () => {
+    const t = setup({ specsDown: true });
+    const res = await t.post("/api/dash/run", { project: "chat", env: "prod", shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", confirm: "cancelAll" });
+    expect([res.status, ((await res.json()) as { error: { code: string; message: string } }).error]).toEqual([502, { code: "project_unreachable", message: "connection reset" }]);
     expect(t.project.calls.filter((c) => c.method === "POST")).toEqual([]);
     expect(t.audit()).toEqual([]);
   });
