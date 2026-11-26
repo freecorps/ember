@@ -10,6 +10,7 @@ import { deploy, planDeploy, settingsChanges, versionMetadata, type DeployOption
 import { indexingQueueName } from "../src/deploy/ai.ts";
 import { filesQueueName } from "../src/deploy/files.ts";
 import { destroy } from "../src/destroy.ts";
+import { D1Registry } from "../src/registry.ts";
 import { envRm, envSet } from "../src/env.ts";
 import { withAuthFrom } from "../src/sso.ts";
 import { fakeAccount } from "./fake-account.ts";
@@ -273,6 +274,44 @@ describe("ember deploy --preview <branch>", () => {
     // Destroying again is a no-op, not an error.
     const again = await destroy(p, { env, yes: true, token: "t", accountId: "acc", fetch: cf.fetchImpl, log: () => {} });
     expect(again.deleted).not.toContain(`worker ${worker}`);
+  });
+
+  it("destroy refuses a Worker of the same name that another project owns (ember-chat-preview-prod: chat/preview-prod or chat-preview/prod)", async () => {
+    const cf = fakeAccount({ namespaces: true });
+    const worker = "ember-chat-preview-prod";
+    // Project "chat-preview", environment "prod": the same Worker name as chat's `--preview prod`.
+    const other = repo({ project: "chat-preview" });
+    await run(cf, other);
+    expect(cf.workers.has(worker)).toBe(true);
+    const chat = repo();
+    const env = previewEnvName("chat", "prod");
+    expect(workerName("chat", env)).toBe(worker);
+    const opts = { env, yes: true, token: "t", accountId: "acc", fetch: cf.fetchImpl, log: () => {} };
+    await expect(destroy(chat, opts)).rejects.toThrow(/refuses to delete ember-chat-preview-prod: it belongs to project "chat-preview" environment "prod".*Nothing was deleted/);
+    expect(cf.workers.has(worker)).toBe(true);
+    // A Worker with no marks at all is not a preview `ember deploy --preview` made: refused too.
+    cf.workers.add("ember-chat-preview-bare");
+    await expect(destroy(chat, { ...opts, env: "preview-bare" })).rejects.toThrow(/no EMBER_PROJECT\/EMBER_ENV/);
+    expect(cf.workers.has("ember-chat-preview-bare")).toBe(true);
+  });
+
+  it("destroy refuses what the account registry records for another project, even once the Worker is gone", async () => {
+    const cf = fakeAccount({ namespaces: true });
+    const other = repo({ project: "chat-preview" });
+    const reg = await D1Registry.open(cf.client, "reg");
+    await run(cf, other, { registry: reg });
+    // The other project's Worker is gone; its registry row stays (history).
+    cf.workers.delete("ember-chat-preview-prod");
+    expect(cf.workers.has("ember-chat-preview-prod")).toBe(false);
+    const chat = repo();
+    const opts = { yes: true, token: "t", accountId: "acc", fetch: cf.fetchImpl, registryName: "reg", log: () => {} };
+    await expect(destroy(chat, { ...opts, env: "preview-prod" })).rejects.toThrow(/registry records it for project "chat-preview" environment "prod"/);
+    // A repo whose fingerprint is not the registered one does not own the project name.
+    const thief = repo({ project: "chat-preview", fingerprint: "f".repeat(32) });
+    await expect(destroy(thief, { ...opts, env: "prod" })).rejects.toThrow(/registered in this account by another repository/);
+    // The owner destroys it, and again (idempotent).
+    await destroy(other, { ...opts, env: "prod" });
+    await destroy(other, { ...opts, env: "prod" });
   });
 });
 
