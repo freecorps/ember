@@ -146,6 +146,8 @@ export interface ComponentDefinition<
   readonly queues: Readonly<Record<string, ComponentQueueDef<Config>>> | undefined;
   /** Hook on the Worker's `email()` handler. */
   readonly email: ComponentEmailDef<Config> | undefined;
+  /** Indexes of `schema` an install leaves out for its config (`DefineComponentOptions.omitIndexes`). */
+  readonly omitIndexes: ((config: Config, installName: string) => string[]) | undefined;
   readonly children: readonly Installed[];
   /** Installs a child component (nested: its tables are `<this>$<child>$<table>`). */
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
@@ -176,6 +178,13 @@ export interface DefineComponentOptions<Name extends string, Modules extends Rec
   queues?: Record<string, ComponentQueueDef<CV extends GenericValidator ? Infer<CV> : undefined>>;
   /** Hook on the Worker's `email()` handler (`ComponentEmailDef`). */
   email?: ComponentEmailDef<CV extends GenericValidator ? Infer<CV> : undefined>;
+  /**
+   * Indexes of `schema` an install does not create, for its config: `"<table>.<index>"` of an optional feature the
+   * install does not use (the agent's full-text search), so its writes cost nothing there. The component's code must
+   * not read them for that config (a query on one fails: the index does not exist). Turning one on later is an index
+   * change like any other (a staged backfill).
+   */
+  omitIndexes?: (config: CV extends GenericValidator ? Infer<CV> : undefined, installName: string) => string[];
 }
 
 function checkName(what: string, name: string) {
@@ -227,6 +236,7 @@ export function defineComponent<const Name extends string, Modules extends Recor
     crons: def.crons as AnyComponentDefinition["crons"],
     queues: def.queues as AnyComponentDefinition["queues"],
     email: def.email as AnyComponentDefinition["email"],
+    omitIndexes: def.omitIndexes as AnyComponentDefinition["omitIndexes"],
     children: [],
   }) as any;
 }
@@ -621,12 +631,18 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
       const own: Record<string, string> = {};
       const m = c.schema?.manifest;
       for (const t of Object.keys(m?.tables ?? {})) own[t] = ns + t;
+      const omit = new Set(c.omitIndexes?.(inst.config, key.replace(/\//g, "_")) ?? []);
+      for (const o of omit) {
+        const [t, index] = o.split(".");
+        if (!m?.tables[t!]?.indexes.some((i) => i.name === index)) throw new Error(`Component ${key}: omitIndexes names unknown index ${JSON.stringify(o)}`);
+      }
       for (const [t, tm] of Object.entries(m?.tables ?? {})) {
         const physical = own[t]!;
         const idPrefix = ns + tm.idPrefix;
         if (prefixes.has(idPrefix)) throw new Error(`Component ${key}: id prefix ${idPrefix} is taken`);
         prefixes.set(idPrefix, true);
-        tables[physical] = { ...tm, idPrefix, document: rewriteIds(tm.document, own, `Component ${key}: table ${t}`) as ObjectShape };
+        const indexes = omit.size ? tm.indexes.filter((i) => !omit.has(`${t}.${i.name}`)) : tm.indexes;
+        tables[physical] = { ...tm, idPrefix, indexes, document: rewriteIds(tm.document, own, `Component ${key}: table ${t}`) as ObjectShape };
       }
       for (const [k, kind] of c.schema?.indexKinds ?? []) {
         const mine = kinds.get(k);

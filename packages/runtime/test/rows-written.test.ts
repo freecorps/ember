@@ -74,6 +74,18 @@ describe("rows written per operation", () => {
     const wide = row("insert, 3 user indexes (WS)", await perOp(shard, N, (i) => mut(c, "wide:add", { a: `a${i}`, b: i, c: `c${i}` })));
     // Read-modify-write of one of the three indexed fields: the document and that one index entry.
     const bump = row("patch 1 of 3 indexed fields, after a query (WS)", await perOp(shard, N, (i) => mut(c, "wide:bump", { a: `a${i}` })));
+    // An optional field under one index (PR 3a): absent, a plain index still holds an entry (its key is `undefined`);
+    // a sparse one holds none (NULL key, outside the partial index).
+    const plainAbsent = row("insert, optional field absent, plain index (WS)", await perOp(shard, N, (i) => mut(c, "wide:addOpt", { sparse: false, a: `p${i}` })));
+    const sparseAbsent = row("insert, optional field absent, sparse index (WS)", await perOp(shard, N, (i) => mut(c, "wide:addOpt", { sparse: true, a: `s${i}` })));
+    const plainPresent = row("insert, optional field present, plain index (WS)", await perOp(shard, N, (i) => mut(c, "wide:addOpt", { sparse: false, a: `r${i}`, k: `k${i}` })));
+    const sparsePresent = row("insert, optional field present, sparse index (WS)", await perOp(shard, N, (i) => mut(c, "wide:addOpt", { sparse: true, a: `t${i}`, k: `k${i}` })));
+    const plainIds: string[] = [];
+    const sparseIds: string[] = [];
+    for (let i = 0; i < N; i++) plainIds.push((await mut(c, "wide:addOpt", { sparse: false, a: `q${i}` })).value);
+    for (let i = 0; i < N; i++) sparseIds.push((await mut(c, "wide:addOpt", { sparse: true, a: `u${i}` })).value);
+    const plainEnter = row("patch optional field absent → present, plain index (WS)", await perOp(shard, N, (i) => mut(c, "wide:setOpt", { id: plainIds[i], k: `k${i}` })));
+    const sparseEnter = row("patch optional field absent → present, sparse index (WS)", await perOp(shard, N, (i) => mut(c, "wide:setOpt", { id: sparseIds[i], k: `k${i}` })));
     // Patch / delete on `messages` (one index; the search index is FTS5 over the body).
     const ids: string[] = [];
     for (let i = 0; i < N; i++) ids.push((await mut(c, "messages:send", { channel: "p", body: `x ${i}` })).value);
@@ -130,6 +142,11 @@ describe("rows written per operation", () => {
     // Guards at the measured budgets (docs/spikes/rows-written.md), with half a row of slack for averaging: a
     // regression to the classic-storage costs (5 / 4 / 8) fails.
     expect(wsRuns).toBeGreaterThan(0); // the counter works here; 0 would make every guard vacuous
+    // A sparse index skips the entry of a document without its field: one row less than the plain index.
+    expect(sparseAbsent).toBeLessThanOrEqual(plainAbsent - 0.5);
+    // With the field it holds the entry, as the plain index does: the same cost as a plain insert with the field.
+    expect(Math.abs(sparsePresent - plainPresent)).toBeLessThanOrEqual(0.5);
+    expect(sparseEnter).toBeLessThanOrEqual(plainEnter);
     expect(wsRuns).toBeLessThanOrEqual(3.5);
     expect(wsAcked).toBeLessThanOrEqual(2.5);
     expect(httpRuns).toBeLessThanOrEqual(2.5);

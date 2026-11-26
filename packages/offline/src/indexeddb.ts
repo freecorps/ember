@@ -13,7 +13,7 @@
 //   new EmberClient({ url, storage: indexedDbStorage({ name: "my-app", schema, queries: { messages } }) })
 
 import type { PendingMutationRecord } from "@freecorps/ember-client";
-import { dbIndexesOf, docKey, indexFields, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
+import { dbIndexesOf, indexFields, indexKey, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
 import { bytesToBase64 } from "@freecorps/ember-values";
 import { NeedData, type BackendReader, type Commit, type OfflineBackend, type QueryLogEntry, type QueryRecord } from "./backend.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
@@ -161,7 +161,11 @@ export class IndexedDbBackend implements OfflineBackend {
   private row(shard: string, table: string, doc: Doc): StoredRow {
     const t = this.schema.manifest.tables[table]!;
     const row: StoredRow = { s: shard, id: doc._id, doc };
-    for (const i of dbIndexesOf(t)) row[keyProp(i.name)] = buf(docKey(doc, indexFields(t, i.name)!));
+    for (const i of dbIndexesOf(t)) {
+      // A sparse index without the document: no key property, so the IndexedDB index leaves the record out.
+      const key = indexKey(doc, indexFields(t, i.name)!, i.sparse);
+      if (key) row[keyProp(i.name)] = buf(key);
+    }
     return row;
   }
 

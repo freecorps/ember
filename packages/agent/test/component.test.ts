@@ -2,7 +2,7 @@
 import { mutationGeneric } from "@freecorps/ember-server";
 import { beforeEach, describe, expect, test } from "vitest";
 import { mockModel, withStreams, type AgentModel, type ModelRequest } from "../src/index.ts";
-import { app, functions, models, schema, slowTool, toolCalls } from "./app.ts";
+import { app, appWithoutSearch, functions, models, schema, slowTool, toolCalls } from "./app.ts";
 import { harness } from "./harness.ts";
 
 const setup = (opts: { beforeMutation?: (name: string, args: unknown) => Promise<void> | undefined } = {}) => harness({ schema, functions, app, ...opts });
@@ -543,5 +543,73 @@ describe("agent component", () => {
     h.mutate("chat:send", { threadId, text: "q" });
     await h.tick();
     expect(withStreams(snapshot.page, snapshot.streams).at(-1)).toMatchObject({ status: "streaming", streaming: true, text: "abcdefghijklm" });
+  });
+});
+
+// PR 3a (v0.10): node:sqlite usage (rows returned / changed) before → after in the comments (main at c95ae510).
+describe("agent: fewer writes and reads (PR 3a)", () => {
+  test("send: the response is inserted once with its job, and the turn just written is not read back", () => {
+    const h = setup();
+    const threadId = h.mutate("chat:createThread", { userId: "ana" }) as string;
+    h.counters.clear();
+    const r = h.mutate("chat:send", { threadId, text: "hi" }) as any;
+    // before: 4 written (prompt, response, its patch with the job, the thread), 3 read; now 3 and 2.
+    expect(h.counters.get("chat:send")).toMatchObject({ rowsWritten: 3, rowsRead: 2 });
+    const job = h.jobs().find((j) => j.fn === "chat:generate")!;
+    expect(h.sql(`SELECT "job", "stepOrder" FROM "agent$messages" WHERE "_id" = '${r.responseId ?? (job.args as any).messageId}'`)).toEqual([{ job: job.id, stepOrder: 1 }]);
+    // Without a prompt the turn's last step is read (the response follows it).
+    h.counters.clear();
+    h.mutate("chat:save", { threadId, text: "more" });
+    expect(h.counters.get("chat:save")!.rowsWritten).toBeLessThanOrEqual(2);
+  });
+
+  test("a tool step: the next assistant step takes action and onUsage from the tool message (no read back)", async () => {
+    let clear = false;
+    let h!: H;
+    h = setup({
+      beforeMutation: (name) => {
+        // A tool message from before 0.10 (no action/onUsage on it): the step before it is read, as before.
+        if (clear && name === "@agent/lib:toolResults") h.sql(`UPDATE "agent$messages" SET "action" = NULL, "onUsage" = NULL WHERE "role" = 'tool'`);
+        return undefined;
+      },
+    });
+    h.mutate("orders:seed", { orderId: "A-1", status: "shipped" });
+    for (const old of [false, true]) {
+      clear = old;
+      const threadId = h.mutate("chat:createThread", { userId: "ana" }) as string;
+      models.current = mockModel([{ text: "Let me check.", toolCalls: [{ toolName: "lookupOrder", args: { orderId: "A-1" }, toolCallId: "c1" }] }, { text: "Shipped.", usage: { inputTokens: 1, outputTokens: 1 } }]);
+      h.mutate("chat:send", { threadId, text: "status?" });
+      h.counters.clear();
+      await h.tick();
+      // before: 2 rows read (the tool message, then the step before it); now 1 (2 for a tool message from before).
+      expect(h.counters.get("@agent/lib:toolResults")!.rowsRead).toBe(old ? 2 : 1);
+      const steps = h.sql(`SELECT "role", "action" IS NOT NULL AS a, "onUsage" IS NOT NULL AS u FROM "agent$messages" WHERE "thread" = '${threadId}' AND "role" = 'assistant' ORDER BY "stepOrder"`);
+      expect(steps).toEqual([{ role: "assistant", a: 1, u: 1 }, { role: "assistant", a: 1, u: 1 }]);
+      expect(thread(h, threadId).at(-1)).toMatchObject({ role: "assistant", status: "success", text: "Shipped." });
+    }
+    // onUsage billed both steps of both turns (the second step's handle came from the tool message, or was read)
+    expect((h.query("chat:usageRows", {}) as any[]).length).toBe(4);
+  });
+
+  test("full-text search is opt-in: the default install has no FTS5 index (no FTS rows per message) and refuses search", async () => {
+    const h = harness({ schema, functions, app: appWithoutSearch });
+    const fts = (x: H) => x.sql(`SELECT name FROM sqlite_master WHERE name LIKE 'agent$messages__search_text%'`);
+    expect(fts(h)).toEqual([]);
+    const threadId = h.mutate("chat:createThread", { userId: "ana" }) as string;
+    h.mutate("chat:save", { threadId, text: "the order shipped" });
+    expect(() => h.query("chat:search", { threadId, text: "order" })).toThrow(/full-text search is off/);
+    // an agent with contextOptions.searchOtherMessages there: the step fails with the reason before it is streamed
+    // (a throw in lib:start would leave it pending while its job is retried)
+    models.current = mockModel([{ text: "never" }]);
+    h.mutate("chat:send", { threadId, text: "where is my order?" });
+    await h.tick();
+    expect(thread(h, threadId).at(-1)).toMatchObject({ role: "assistant", status: "failed", text: "" });
+    expect(h.sql(`SELECT "error", "job", "runId" FROM "agent$messages" WHERE "role" = 'assistant'`)).toEqual([{ error: expect.stringMatching(/full-text search is off/), job: null, runId: null }]);
+    // `{ search: true }`: the same index as before 0.10 (searchable)
+    const on = setup();
+    expect(fts(on).length).toBeGreaterThan(0);
+    const t2 = on.mutate("chat:createThread", { userId: "ana" }) as string;
+    on.mutate("chat:save", { threadId: t2, text: "the order shipped" });
+    expect((on.query("chat:search", { threadId: t2, text: "order" }) as any[]).map((m) => m.text)).toEqual(["the order shipped"]);
   });
 });

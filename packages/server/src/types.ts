@@ -30,8 +30,12 @@ export type ReadSetEntry = {
 };
 export type ReadSet = ReadSetEntry[];
 
-/** An index as stored in the manifest. `fields` are the indexed paths (without the implicit tiebreakers). */
-export type IndexSpec = { kind: string; name: string; fields: string[]; config?: JSONValue };
+/**
+ * An index as stored in the manifest. `fields` are the indexed paths (without the implicit tiebreakers). `sparse` (db
+ * indexes only, `.index(name, fields, { sparse: true })`): a document enters the index only when every one of `fields`
+ * is present (not `undefined`; `null` is present); absent from the manifest when false.
+ */
+export type IndexSpec = { kind: string; name: string; fields: string[]; config?: JSONValue; sparse?: true };
 
 /** A schema object owned by a table (index, virtual table, trigger); diffed against sqlite_master by SQL text. */
 export type OwnedObject = { type: "index" | "table" | "trigger"; name: string; sql: string };

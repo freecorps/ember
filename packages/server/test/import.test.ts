@@ -302,3 +302,31 @@ describe("local execution", () => {
     expect(new Set(missing.readSet.map((r) => r.table))).toEqual(new Set(["orgs", "tasks"]));
   });
 });
+
+describe("import into a sparse index", () => {
+  const sparseSchema = defineSchema({
+    shards: {},
+    tables: { items: defineTable({ a: v.string(), k: v.optional(v.string()) }).index("by_k", ["k"], { sparse: true }) },
+  });
+  const ITEMS = 10003;
+  const byK = queryGeneric({ args: { k: v.string() }, handler: (ctx: any, { k }: any) => ctx.db.query("items").withIndex("by_k", (q: any) => q.eq("k", k)).collect() }) as any;
+  const keyed = queryGeneric({ args: {}, handler: (ctx: any) => ctx.db.query("items").withIndex("by_k", (q: any) => q.gt("k", null)).collect() }) as any;
+
+  test("a document without a declared field gets a NULL key (the tiebreakers are always there); with it, an entry", () => {
+    const driver = createNodeSqliteDriver();
+    const engine = createEngine({ schema: sparseSchema, driver, storage: { shard: () => "org:acme" } });
+    engine.migrate();
+    engine.importer.begin({ foreignIds: { convex: { [ITEMS]: "items" } }, tables: ["items"] });
+    const id = () => makeConvexId(ITEMS, rnd);
+    const docs = [
+      { _id: id(), _creationTime: 1700000000000, a: "with", k: "x" },
+      { _id: id(), _creationTime: 1700000000001, a: "without" },
+    ];
+    expect(engine.importer.documents("items", docs).written).toBe(2);
+    engine.importer.finish();
+    const keys = driver.exec(`SELECT "a", "_k_by_k" IS NULL AS absent FROM "items" ORDER BY "_creationTime"`).rows;
+    expect(keys).toEqual([{ a: "with", absent: 0 }, { a: "without", absent: 1 }]);
+    expect((engine.runQuery(byK, { k: "x" }).value as Doc[]).map((d) => d.a)).toEqual(["with"]);
+    expect((engine.runQuery(keyed).value as Doc[]).map((d) => d.a)).toEqual(["with"]);
+  });
+});

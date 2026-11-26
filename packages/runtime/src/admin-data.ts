@@ -141,7 +141,7 @@ export function adminDataFunctions(manifest: () => SchemaManifest) {
 export function schemaSummary(manifest: SchemaManifest) {
   const tables = Object.entries(manifest.tables)
     .filter(([name]) => !name.startsWith("_") && !name.includes("$"))
-    .map(([name, t]) => ({ name, document: t.document, indexes: t.indexes.map((i) => ({ name: i.name, kind: i.kind, fields: i.fields })), shard: t.shard ?? null }));
+    .map(([name, t]) => ({ name, document: t.document, indexes: t.indexes.map((i) => ({ name: i.name, kind: i.kind, fields: i.fields, ...(i.sparse ? { sparse: true } : {}) })), shard: t.shard ?? null }));
   const components = Object.keys(manifest.tables).filter((n) => n.includes("$"));
   return { version: manifest.version, tables, componentTables: components };
 }

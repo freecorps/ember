@@ -3,7 +3,7 @@
 
 import type { PendingMutationRecord } from "@freecorps/ember-client";
 import { compareBytes } from "@freecorps/ember-values";
-import { docKey, indexFields, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
+import { indexFields, indexKey, isSparseIndex, jsSearch, type Doc, type LocalSchema } from "@freecorps/ember-server";
 import type { BackendReader, Commit, OfflineBackend, QueryLogEntry, QueryRecord } from "./backend.ts";
 import { scanSorted } from "./sorted.ts";
 import { createOfflineStorage, type OfflineOptions, type OfflineStore } from "./store.ts";
@@ -89,8 +89,16 @@ export class MemoryBackend implements OfflineBackend {
       const k = `${shard}\u0000${table}\u0000${index}`;
       let rows = this.sorted.get(k);
       if (!rows) {
-        const fields = indexFields(schema.manifest.tables[table]!, index)!;
-        rows = [...this.table(shard, table).values()].map((doc) => ({ key: docKey(doc, fields), doc })).sort((a, b) => compareBytes(a.key, b.key));
+        const tm = schema.manifest.tables[table]!;
+        const fields = indexFields(tm, index)!;
+        const sparse = isSparseIndex(tm, index);
+        // A sparse index leaves out the documents missing one of its fields (no key), as the server's does.
+        const keyed: Row[] = [];
+        for (const doc of this.table(shard, table).values()) {
+          const key = indexKey(doc, fields, sparse);
+          if (key) keyed.push({ key, doc });
+        }
+        rows = keyed.sort((a, b) => compareBytes(a.key, b.key));
         this.sorted.set(k, rows);
       }
       return rows;

@@ -128,4 +128,7 @@ export const functions = {
   },
 };
 
-export const app = defineApp().use(agent).use(rateLimit);
+// Full-text search is opt-in (AgentInstallConfig.search): these tests use it (contextOptions.searchOtherMessages).
+export const app = defineApp().use(agent, { config: { search: true } }).use(rateLimit);
+/** The default install: no search index. */
+export const appWithoutSearch = defineApp().use(agent).use(rateLimit);

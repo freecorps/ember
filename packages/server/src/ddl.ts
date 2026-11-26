@@ -60,6 +60,24 @@ export function readSetFields(m: SchemaManifest, table: string, index: string): 
 /** The encoded index key of a document. */
 export const docKey = (doc: Doc, fields: readonly string[]): Uint8Array => encodeKey(fields.map((f) => fieldOf(doc, f)));
 
+/** Whether a table's db index is sparse (`.index(name, fields, { sparse: true })`). */
+export const isSparseIndex = (t: TableManifest | undefined, index: string): boolean =>
+  t !== undefined && t.indexes.some((i) => i.name === index && i.kind === "db" && i.sparse === true);
+
+/** Whether a read-set entry's index (readSetFields) is a sparse table index. */
+export const readSetSparse = (m: SchemaManifest, table: string, index: string): boolean => isSparseIndex(m.tables[table], index);
+
+/**
+ * The stored key of a db index: `docKey`, or null for a sparse index when one of `fields` is absent (`undefined`): the
+ * document is not in the index (the key column holds NULL, outside the partial SQLite index and every key range).
+ * Callers pass `indexFields` (the declared fields plus the `_creationTime`/`_id` tiebreakers): every document has those,
+ * so the test is the declared fields' presence, the same in the engine, migrations, the importer, matchIndex, offline.
+ */
+export function indexKey(doc: Doc, fields: readonly string[], sparse: boolean | undefined): Uint8Array | null {
+  if (sparse) for (const f of fields) if (fieldOf(doc, f) === undefined) return null;
+  return docKey(doc, fields);
+}
+
 /**
  * CREATE TABLE of a user table. `compact`: the compact format (storage.ts), or false for classic storage. No default
  * format: a format 3 table needs the shard's storage marker set with it (migrate.ts `applyMigration`), so callers
@@ -90,7 +108,10 @@ export function ownedObjects(table: string, t: TableManifest, kinds: ReadonlyMap
       out.push({ index: spec, objects: [] });
     } else if (spec.kind === "db") {
       const name = `${table}__${spec.name}`;
-      out.push({ index: spec, objects: [{ type: "index", name, sql: `CREATE INDEX ${q(name)} ON ${q(table)} (${q(keyColumn(spec.name))})` }] });
+      // Sparse: a partial index over the documents that have every field (the others keep a NULL key).
+      const col = q(keyColumn(spec.name));
+      const where = spec.sparse ? ` WHERE ${col} IS NOT NULL` : "";
+      out.push({ index: spec, objects: [{ type: "index", name, sql: `CREATE INDEX ${q(name)} ON ${q(table)} (${col})${where}` }] });
     } else {
       const kind = kinds.get(spec.kind);
       if (!kind) throw new Error(`Unknown index kind ${spec.kind} (table ${table}, index ${spec.name})`);
