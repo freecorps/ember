@@ -26,6 +26,20 @@ describe("agent dashboard", () => {
     expect(engine.runQuery("@agent/dashboard:thread", { threadId: a }).value).toBeNull();
   });
 
+  test("the timeline shows a tool call and a tool result (no text) by their parts, bounded", () => {
+    const composed = composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(agent, { config: { workersAi: false } }) });
+    let now = 1_700_000_000_000;
+    const engine = createEngine({ schema: composed.schema, functions: composed.functions, driver: createNodeSqliteDriver(), now: () => now++ });
+    engine.migrate();
+    const t = engine.runMutation("@agent/lib:createThread", { userId: "ana" }).value as string;
+    engine.runMutation("@agent/lib:send", { threadId: t, prompt: { role: "assistant", parts: [{ type: "tool-call", toolCallId: "c1", toolName: "weather", args: { city: "Lisbon" } }] } });
+    engine.runMutation("@agent/lib:send", { threadId: t, prompt: { role: "tool", parts: [{ type: "tool-result", toolCallId: "c1", toolName: "weather", result: { temp: 21, sky: "x".repeat(400) } }] } });
+    const { messages } = engine.runQuery("@agent/dashboard:thread", { threadId: t }).value as { messages: Array<{ detail: string | null }> };
+    expect(messages[0]!.detail).toBe('→ weather({"city":"Lisbon"})');
+    expect(messages[1]!.detail).toMatch(/^← weather: \{"temp":21,"sky":"x+…$/);
+    expect(messages[1]!.detail!.length).toBeLessThan(260);
+  });
+
   test("threads by activity through an index (no scan for a status), prompts counted from 0", () => {
     const composed = composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(agent, { config: { workersAi: false } }) });
     let now = 1_700_000_000_000;

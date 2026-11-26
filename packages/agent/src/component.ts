@@ -197,6 +197,25 @@ const DELETE_BATCH = 200;
  */
 export const DELTA_FANOUT = 16;
 
+/** At most 500 characters of a timeline detail (null when empty). */
+const clip = (s: string): string | null => (s.length > 500 ? `${s.slice(0, 500)}…` : s || null);
+
+/** A message with no text (a tool call, a tool result): its tool parts, one line each (args/result as JSON, bounded). */
+function toolSummary(parts: readonly MessagePart[]): string {
+  const json = (x: unknown) => {
+    try {
+      const s = JSON.stringify(x) ?? "";
+      return s.length > 200 ? `${s.slice(0, 200)}…` : s;
+    } catch {
+      return "…";
+    }
+  };
+  return parts
+    .map((p) => (p.type === "tool-call" ? `→ ${p.toolName}(${json(p.args)})` : p.type === "tool-result" ? `← ${p.toolName}${p.isError ? " (error)" : ""}: ${json(p.result)}` : null))
+    .filter((x): x is string => x !== null)
+    .join("\n");
+}
+
 const textOf = (parts: readonly MessagePart[]) =>
   parts
     .filter((p): p is Extract<MessagePart, { type: "text" }> => p.type === "text")
@@ -777,7 +796,7 @@ const dashboardFunctions = {
         .order("desc")
         .take(100)
         .reverse()
-        .map((m) => ({ at: m._creationTime, title: `${m.role}${m.agentName ? ` (${m.agentName})` : ""}${m.model ? ` · ${m.model}` : ""}`, status: m.status, detail: m.error ?? (m.text.length > 500 ? `${m.text.slice(0, 500)}…` : m.text || null) }));
+        .map((m) => ({ at: m._creationTime, title: `${m.role}${m.agentName ? ` (${m.agentName})` : ""}${m.model ? ` · ${m.model}` : ""}`, status: m.status, detail: m.error ?? clip(m.text || toolSummary(m.parts)) }));
       return { ...publicThread(t), messages };
     },
   }),

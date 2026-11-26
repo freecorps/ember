@@ -756,7 +756,8 @@ const dashboardFunctions = {
         .map((x) => ({
           at: x.startedAt,
           title: `#${x.index} ${x.kind} ${x.name}`,
-          status: x.status === "pending" ? "running" : x.status,
+          // A step left pending by a workflow that ended (canceled while it slept or waited): the workflow's status, not "running".
+          status: x.status === "pending" ? (w.status === "running" ? "running" : w.status) : x.status,
           detail: x.error ?? (x.attempts > 1 ? `${x.attempts} attempts` : null),
         }));
       return { _id: w._id, driver: w.driver.startsWith("&") ? w.driver.slice(1) : w.driver, status: w.status, stepCount: w.stepCount, startedAt: w.startedAt, finishedAt: w.finishedAt ?? null, args: w.args, result: w.result ?? null, error: w.error ?? null, steps };
