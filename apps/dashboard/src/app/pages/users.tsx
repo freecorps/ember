@@ -26,9 +26,10 @@ interface Session {
   active: boolean;
 }
 
-export function Users({ project, env }: { project: string; env: string }) {
-  const [draft, setDraft] = useState("");
-  const [q, setQ] = useState("");
+export function Users({ project, env, initialQuery }: { project: string; env: string; initialQuery?: string }) {
+  // `initialQuery`: the route's search (`users/<email>`, the command palette's link).
+  const [draft, setDraft] = useState(initialQuery ?? "");
+  const [q, setQ] = useState(initialQuery ?? "");
   const [cursor, setCursor] = useState(0);
   useEffect(() => {
     const t = setTimeout(() => {

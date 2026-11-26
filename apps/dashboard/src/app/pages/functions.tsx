@@ -8,7 +8,7 @@ import { TimeChart } from "../chart.tsx";
 import { ago, fmtBytes, fmtNum, fmtPct, fmtTime, windowLabel, windows } from "../format.ts";
 import { href, useApi, useSession } from "../hooks.ts";
 import { Badge, ConfirmDialog, Empty, JsonView, Loading, Mono, Problem, Section, Table } from "../ui.tsx";
-import { limitWarnings } from "../../metrics-sql.ts";
+import { limitWarnings, seriesPeaks } from "../../metrics-sql.ts";
 import type { FunctionRow } from "./types.ts";
 import { argsFromForm, fieldKind, type Shape } from "../forms.ts";
 
@@ -128,13 +128,13 @@ function FunctionPage({ project, env, fn }: { project: string; env: string; fn: 
   const [hours, setHours] = useState(24);
   const list = useApi<{ functions: FunctionInfo[] }>(path("/api/fn/list", { project, env }));
   const info = list.data?.functions.find((f) => f.name === fn);
-  const series = useApi<{ points: Array<{ t: number; calls: number; errors: number; p50: number; p95: number; rowsRead: number; rowsWritten: number }>; bucketMinutes: number }>(
+  const series = useApi<{ points: Array<{ t: number; calls: number; errors: number; p50: number; p95: number; rowsRead: number; rowsWritten: number; limitPeaks?: { rowsRead: number; documentsRead: number; rowsWritten: number } }>; bucketMinutes: number }>(
     s.me.metrics ? path("/api/fn/series", { project, env, fn, hours }) : null,
   );
   const errors = useApi<{ errors: Array<{ t: number; code: string; shard: string; kind: string; ms: number }> }>(s.me.metrics ? path("/api/fn/errors", { project, env, fn, hours }) : null);
-  // Peaks of this function's per-transaction limits in the window: the same warning `ember dev` prints at 70%.
-  const stats = useApi<{ functions: FunctionRow[] }>(s.me.metrics ? path("/api/functions", { project, env, hours }) : null);
-  const warnings = (stats.data?.functions ?? []).filter((r) => r.fn === fn).flatMap((r) => limitWarnings(r.limitPeaks ?? {}));
+  // Peaks of this function's per-transaction limits in the window (from its own series, no query over every
+  // function): the same warning `ember dev` prints at 70%.
+  const warnings = useMemo(() => limitWarnings(seriesPeaks(series.data?.points ?? [])), [series.data]);
   const p = series.data?.points ?? [];
   const times = p.map((x) => x.t);
   return (

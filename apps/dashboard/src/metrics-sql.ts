@@ -93,6 +93,37 @@ export function functionStatsSql(o: { dataset: string; project?: string; env?: s
   ].join("\n");
 }
 
+/**
+ * The whole environment's usage by kind and timing (no ranking, no per-function limit): what the cost estimate's
+ * totals are computed from, while its tables show the ranked lists.
+ */
+export function usageTotalsSql(o: { dataset: string; project: string; env: string; sinceHours?: number }): string {
+  if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
+  const where = [...scopeWhere(o), "blob5 != 'rum'"];
+  const w = "_sample_interval * double5";
+  return [
+    "SELECT blob5 AS kind, blob9 AS timing,",
+    `  SUM(${w}) AS calls,`,
+    `  SUM(double2 * ${w}) AS rows_read,`,
+    `  SUM(double3 * ${w}) AS rows_written,`,
+    `  SUM(double4 * ${w}) AS bytes_out`,
+    `FROM ${o.dataset}`,
+    `WHERE ${where.join(" AND ")}`,
+    "GROUP BY kind, timing",
+  ].join("\n");
+}
+
+export function parseUsageTotals(body: { data?: Array<Record<string, unknown>> }): Array<{ kind: string; timing: string; calls: number; rowsRead: number; rowsWritten: number; bytesOut: number }> {
+  return (body.data ?? []).map((r) => ({
+    kind: String(r.kind ?? ""),
+    timing: String(r.timing ?? ""),
+    calls: Number(r.calls) || 0,
+    rowsRead: Number(r.rows_read) || 0,
+    rowsWritten: Number(r.rows_written) || 0,
+    bytesOut: Number(r.bytes_out) || 0,
+  }));
+}
+
 export function parseFunctionStats(body: { data?: Array<Record<string, unknown>> }): FunctionStats[] {
   return (body.data ?? []).map((r) => {
     const calls = Number(r.calls) || 0;
@@ -187,9 +218,14 @@ export interface FunctionPoint {
   p95: number;
   rowsRead: number;
   rowsWritten: number;
+  /** Highest fraction of each per-transaction limit one call used in the bucket (the function page's warning). */
+  limitPeaks: LimitPeaks;
 }
 
-/** One function over time: calls, errors, p50/p95, rows read and written per bucket. */
+/**
+ * One function over time: calls, errors, p50/p95, rows read and written per bucket, and the limit peaks (so the
+ * function page needs no second query over every function for its "near a limit" warning).
+ */
 export function functionSeriesSql(o: { dataset: string; project: string; env: string; fn: string; sinceHours: number }): string {
   if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
   if (!FN.test(o.fn)) throw new Error("invalid function name");
@@ -202,7 +238,10 @@ export function functionSeriesSql(o: { dataset: string; project: string; env: st
     "  quantileExactWeighted(0.5)(double1, _sample_interval) AS p50,",
     "  quantileExactWeighted(0.95)(double1, _sample_interval) AS p95,",
     `  SUM(double2 * ${w}) AS rows_read,`,
-    `  SUM(double3 * ${w}) AS rows_written`,
+    `  SUM(double3 * ${w}) AS rows_written,`,
+    "  MAX(double7) AS peak_rows_read,",
+    "  MAX(double8) AS peak_docs_read,",
+    "  MAX(double9) AS peak_rows_written",
     `FROM ${o.dataset}`,
     `WHERE ${where.join(" AND ")}`,
     "GROUP BY t",
@@ -227,7 +266,15 @@ export function parseFunctionSeries(body: { data?: Array<Record<string, unknown>
     p95: Number(r.p95) || 0,
     rowsRead: Number(r.rows_read) || 0,
     rowsWritten: Number(r.rows_written) || 0,
+    limitPeaks: { rowsRead: Number(r.peak_rows_read) || 0, documentsRead: Number(r.peak_docs_read) || 0, rowsWritten: Number(r.peak_rows_written) || 0 },
   }));
+}
+
+/** The highest of each limit peak over a series (0 when empty). */
+export function seriesPeaks(points: Array<{ limitPeaks?: Partial<LimitPeaks> }>): LimitPeaks {
+  const out: LimitPeaks = { rowsRead: 0, documentsRead: 0, rowsWritten: 0 };
+  for (const p of points) for (const k of ["rowsRead", "documentsRead", "rowsWritten"] as const) out[k] = Math.max(out[k], p.limitPeaks?.[k] ?? 0);
+  return out;
 }
 
 /** The last errors of one function (Analytics Engine keeps the error code and shard; messages are in the logs). */

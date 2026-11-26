@@ -82,11 +82,14 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
   const state: { authFrom: string | null } = { authFrom: null };
   const noLocalAuth = () =>
     json({ ok: false, error: { code: "no_local_auth", message: `auth is handled by ${state.authFrom}: users, sessions, revocation and key rotation live there (remote auth, no local Auth DO)` } }, 404);
+  /** Every admin call the project got (`<METHOD> <path>[?shard=...]`): the dashboard's cost to the project. */
+  const calls: string[] = [];
   const svc = {
     fetch: async (r: Request | string) => {
       const req = r as Request;
       const url = new URL(req.url);
       const p = url.pathname.replace("/api/_ember/", "");
+      calls.push(`${req.method} ${p}${url.searchParams.getAll("shard").length ? `?${url.searchParams.getAll("shard").join(",")}` : ""}`);
       if (state.authFrom && (p === "keys/rotate" || (p.startsWith("auth/") && p !== "auth/revoke-sockets"))) return noLocalAuth();
       if (req.method === "POST" && p === "files/upload") {
         const bytes = await req.text();
@@ -296,5 +299,5 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
     },
   };
-  return { svc, posts, lists, dashQueries, remoteAuth: (from: string | null) => void (state.authFrom = from) };
+  return { svc, posts, lists, dashQueries, calls, remoteAuth: (from: string | null) => void (state.authFrom = from) };
 }

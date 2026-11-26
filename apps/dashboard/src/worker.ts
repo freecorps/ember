@@ -25,6 +25,8 @@ import {
   bucketMinutes,
   jobHistorySql,
   parseJobHistory,
+  parseUsageTotals,
+  usageTotalsSql,
 } from "./metrics-sql.ts";
 import { relayTail, workersTailConnector, type TailConnector } from "./tail.ts";
 import { environment, pass, probeCapabilities, projectAdmin, projectAdminRaw, requireFeature, type ProjectEnv, type Target } from "./projects.ts";
@@ -57,7 +59,7 @@ export interface Assets {
 }
 
 /** Back-compat name: who the caller is, or the refusal. */
-export async function authorize(request: Request, env: DashboardEnv, fetchImpl?: typeof fetch): Promise<{ via: "access" | "token"; who?: string; role: Role } | Response> {
+export async function authorize(request: Request, env: DashboardEnv, fetchImpl?: typeof fetch): Promise<{ via: Principal["via"]; who?: string; role: Role } | Response> {
   const p = await authenticate(request, env, fetchImpl);
   if (p instanceof Response) return p;
   return { via: p.via, role: p.role, ...(p.via === "access" ? { who: p.actor } : {}) };
@@ -375,26 +377,33 @@ export const ROUTES: Route[] = [
     method: "GET",
     path: "/api/shards",
     role: "read",
-    summary: "the shard catalog (?q= filters by name; &status=1 adds the live status of the first 50)",
+    summary: "the shard catalog and the deployed schema (?q= filters by name; &status=1 adds the live status of the first 50, on demand)",
     async run(c) {
       const s = scope(c.q);
       if (s instanceof Response) return s;
       const term = (c.q.get("q") ?? "").trim().slice(0, 100);
       const filter = term ? " AND shard LIKE ? ESCAPE '\\'" : "";
       const params: unknown[] = [s.project, s.env, ...(term ? [`%${likeEscape(term)}%`] : [])];
-      const rows = (await c.env.REGISTRY!.prepare(`SELECT * FROM shards WHERE project = ? AND env = ?${filter} ORDER BY db_size DESC LIMIT 500`).bind(...params).all<Record<string, unknown> & { shard: string }>())
-        .results;
+      const db = c.env.REGISTRY!;
+      // The catalog only (D1): no shard is woken up. The live status (`status=1`) asks the project, which wakes each
+      // shard it names (up to 50 Durable Objects): the SPA asks for it only on demand (a button), never per keystroke.
+      const [rows, envRow] = await allOf(db, [
+        db.prepare(`SELECT * FROM shards WHERE project = ? AND env = ?${filter} ORDER BY db_size DESC LIMIT 500`).bind(...params),
+        db.prepare("SELECT schema_version FROM environments WHERE project = ? AND env = ?").bind(s.project, s.env),
+      ]);
+      const shards = (rows ?? []) as Array<Record<string, unknown> & { shard: string }>;
+      const expected = (envRow?.[0]?.schema_version as string | null | undefined) ?? null;
       let status: unknown = null;
-      if (c.q.get("status") === "1" && rows.length) {
-        const target = await environment(c.env.REGISTRY!, s.project, s.env);
+      if (c.q.get("status") === "1" && shards.length) {
+        const target = await environment(db, s.project, s.env);
         if (target) {
           const qs = new URLSearchParams();
-          for (const r of rows.slice(0, 50)) qs.append("shard", r.shard);
+          for (const r of shards.slice(0, 50)) qs.append("shard", r.shard);
           const res = await projectAdmin(c.env, target, `/api/_ember/status?${qs}`, c.fetch);
           status = res.ok ? await res.json() : { ok: false, status: res.status, error: (await res.text()).slice(0, 500) };
         }
       }
-      return json({ ok: true, shards: rows, status });
+      return json({ ok: true, shards, expected, status });
     },
   },
   adminGet("/api/status", "status", ["shard"], "live shard status: schema version, migrations, staged indexes"),
@@ -859,6 +868,20 @@ export const ROUTES: Route[] = [
       if (s instanceof Response) return s;
       const r = await analytics(c, () => shardStatsSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", project: s.project, env: s.env, sinceHours: hoursOf(c.q) }));
       return r instanceof Response ? r : json({ ok: true, shards: parseShardStats(r) });
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/cost",
+    role: "read",
+    summary: "the whole environment's usage by kind and timing (Analytics Engine) and SQLite storage (catalog): the cost estimate's totals",
+    async run(c) {
+      const s = scope(c.q);
+      if (s instanceof Response) return s;
+      const r = await analytics(c, () => usageTotalsSql({ dataset: c.env.METRICS_DATASET ?? "ember_metrics", ...s, sinceHours: hoursOf(c.q) }));
+      if (r instanceof Response) return r;
+      const rows = (await c.env.REGISTRY!.prepare("SELECT COUNT(*) AS shards, COALESCE(SUM(db_size), 0) AS bytes FROM shards WHERE project = ? AND env = ?").bind(s.project, s.env).all<{ shards: number; bytes: number }>()).results;
+      return json({ ok: true, usage: parseUsageTotals(r), storage: { shards: Number(rows[0]?.shards) || 0, bytes: Number(rows[0]?.bytes) || 0 } });
     },
   },
   {

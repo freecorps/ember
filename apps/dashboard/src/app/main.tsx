@@ -1,7 +1,7 @@
 // Ember Dashboard SPA (React, no router or UI dependencies). Hash routes:
 //   #/                                       projects of the account
 //   #/audit                                  audit log, all projects
-//   #/p/<project>/<env>/<section>[/<shard>]  health | functions | shards | data | crons | deployments | audit
+//   #/p/<project>/<env>/<section>[/<shard>]  health | functions | cost | shards | data | crons | deployments | audit
 //   #/p/<project>/<env>/components[/<shard>/<install>[/<tab>]], #/p/<project>/<env>/app[/<shard>/<tab>]: declarative screens
 // The shard in the route is the one the top bar's picker selected (data, shards and crons use it).
 
@@ -12,6 +12,7 @@ import { href, SessionContext, useApi, useRoute, useShortcuts, useTheme, type Ro
 import { Audit } from "./pages/audit.tsx";
 import { DataBrowser } from "./pages/data.tsx";
 import { Health } from "./pages/health.tsx";
+import { Cost } from "./pages/cost.tsx";
 import { Functions } from "./pages/functions.tsx";
 import { Crons, Deployments, Projects } from "./pages/misc.tsx";
 import { Files } from "./pages/files.tsx";
@@ -23,10 +24,12 @@ import { Shards } from "./pages/shards.tsx";
 import { Screens } from "./pages/screens.tsx";
 import type { Project, ShardRow } from "./pages/types.ts";
 import { Dialog, Loading, Mono, Problem, Toasts, type ToastItem } from "./ui.tsx";
+import { Palette, usePaletteShortcut } from "./palette.tsx";
 
 const SECTIONS = [
   { id: "health", label: "Health", key: "h" },
   { id: "functions", label: "Functions", key: "f" },
+  { id: "cost", label: "Estimated cost", key: "e" },
   { id: "app", label: "App screens", key: "x" },
   { id: "components", label: "Components", key: "k" },
   { id: "shards", label: "Shards", key: "s" },
@@ -201,6 +204,11 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
   const projects = useApi<{ projects: Project[] }>("/api/projects");
   const [theme, setTheme] = useTheme();
   const [help, setHelp] = useState(false);
+  const [palette, setPalette] = useState(false);
+  usePaletteShortcut(() => {
+    setHelp(false);
+    setPalette(true);
+  });
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const seq = useRef(0);
   const toast = useCallback<SessionInfo["toast"]>((t) => {
@@ -228,8 +236,10 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         <Functions {...p} fn={route.fn} />
       ) : section.id === "components" || section.id === "app" ? (
         <Screens key={`${p.project}/${p.env}/${section.id}`} {...p} shard={shard} kind={section.id} rest={route.rest ?? []} />
+      ) : section.id === "cost" ? (
+        <Cost key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "users" ? (
-        <Users key={`${p.project}/${p.env}`} {...p} />
+        <Users key={`${p.project}/${p.env}/${route.user ?? ""}`} {...p} {...(route.user ? { initialQuery: route.user } : {})} />
       ) : section.id === "settings" ? (
         <Settings key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "logs" ? (
@@ -239,9 +249,9 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       ) : section.id === "reactivity" ? (
         <Reactivity key={shard} {...p} shard={shard} />
       ) : section.id === "shards" ? (
-        <Shards {...p} {...(route.shard ? { shard: route.shard } : {})} />
+        <Shards key={`${p.project}/${p.env}`} {...p} {...(route.shard ? { shard: route.shard } : {})} />
       ) : section.id === "data" ? (
-        <DataBrowser key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
+        <DataBrowser key={`${p.project}/${p.env}/${shard}/${route.rest?.[0] ?? ""}`} {...p} shard={shard} {...(route.rest?.[0] ? { initialTable: route.rest[0] } : {})} />
       ) : section.id === "crons" ? (
         <Crons {...p} shard={shard} />
       ) : section.id === "deployments" ? (
@@ -249,7 +259,7 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       ) : section.id === "audit" ? (
         <Audit {...p} />
       ) : (
-        <Health {...p} />
+        <Health key={`${p.project}/${p.env}`} {...p} />
       );
   }
 
@@ -280,7 +290,11 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
         </div>
         {inEnv && SHARD_SECTIONS.has(section.id) && <ShardPicker project={route.project!} env={route.env!} current={shard} section={section.id} rest={route.rest} />}
         <span className="spacer" />
-        <span className="who" title={`Signed in through ${me.via === "access" ? "Cloudflare Access" : "a dashboard token"}`}>
+        <button type="button" className="palette-open" onClick={() => setPalette(true)} aria-label="Go to… (⌘K or Ctrl+K)" title="Go to… (⌘K or Ctrl+K)">
+          <span>Go to…</span>
+          <kbd>⌘K</kbd>
+        </button>
+        <span className="who" title={me.via === "dev" ? "ember dev --dashboard: local, no login (loopback only)" : `Signed in through ${me.via === "access" ? "Cloudflare Access" : "a dashboard token"}`}>
           {me.actor}
           <span className={`role ${me.role}`}>{me.role}</span>
         </span>
@@ -302,6 +316,14 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
           {projects.error && route.page !== "projects" ? <Problem error={projects.error} onRetry={projects.reload} /> : body}
         </main>
       </div>
+      <Palette
+        open={palette}
+        onClose={() => setPalette(false)}
+        projects={projects.data?.projects ?? null}
+        scope={inEnv ? { project: route.project!, env: route.env! } : null}
+        sections={SECTIONS}
+        shard={shard}
+      />
       <Toasts items={toasts} dismiss={(id) => setToasts((x) => x.filter((t) => t.id !== id))} />
       <Dialog open={help} onClose={() => setHelp(false)} title="Keyboard">
         <div className="dialog-body">
@@ -314,6 +336,12 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
                 <dd>{s.label}</dd>
               </div>
             ))}
+            <div>
+              <dt>
+                <kbd>⌘K</kbd> <kbd>Ctrl+K</kbd>
+              </dt>
+              <dd>Go to an environment, section, screen, shard, table, function or user</dd>
+            </div>
             <div>
               <dt>
                 <kbd>/</kbd>

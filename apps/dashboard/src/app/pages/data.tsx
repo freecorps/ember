@@ -97,10 +97,11 @@ function parseValue(raw: string): unknown {
 const SYSTEM = new Set(["_id", "_creationTime"]);
 const withoutSystem = (d: Doc) => Object.fromEntries(Object.entries(d).filter(([k]) => !SYSTEM.has(k)));
 
-export function DataBrowser({ project, env, shard }: { project: string; env: string; shard: string }) {
-  const [table, setTable] = useState<string | null>(null);
-  // main.tsx keys this component by project/env/shard; the reset also holds for any other mount.
-  useEffect(() => setTable(null), [project, env, shard]);
+export function DataBrowser({ project, env, shard, initialTable }: { project: string; env: string; shard: string; initialTable?: string }) {
+  // `initialTable`: the route's table (`data/<shard>/<table>`, the command palette's link).
+  const [table, setTable] = useState<string | null>(initialTable ?? null);
+  // main.tsx keys this component by project/env/shard/table; the reset also holds for any other mount.
+  useEffect(() => setTable(initialTable ?? null), [project, env, shard, initialTable]);
   const scope = { project, env, shard };
   const tables = useApi<{ tables: TableInfo[] }>(path("/api/data", scope));
   const schema = useApi<{ tables: SchemaTable[] }>(path("/api/schema", { project, env }));
