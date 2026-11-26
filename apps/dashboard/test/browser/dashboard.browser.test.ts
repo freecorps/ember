@@ -513,6 +513,85 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     }
   });
 
+  it("declarative screens: a component's spec rendered generically — stats, filters from v.*, pages, detail, inline toggle, actions, typed confirmation", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/components/org%3Aacme");
+    const list = page.getByRole("table", { name: "Components with screens" });
+    await list.getByText("Work pool").click();
+    await page.getByRole("heading", { name: "Work pool" }).waitFor();
+    expect(page.url()).toContain("/components/org%3Aacme/pool");
+    // Stats from the declared query, on the picked shard.
+    await page.locator(".stat", { hasText: "Succeeded" }).getByText("12").waitFor();
+    expect(prod.dashQueries.find((q) => q.fn === "@pool/lib:stats")).toMatchObject({ shard: "org:acme", args: {} });
+    // The table: a page of 2, user data as text, the next page through the cursor.
+    const t = page.getByRole("table", { name: "Work" });
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(2);
+    await t.locator("td", { hasText: "<img" }).first().waitFor();
+    expect(await page.locator("img").count()).toBe(0);
+    await page.getByRole("button", { name: "Next →" }).click();
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(1);
+    await t.getByText("ai:summarize").waitFor();
+    // A filter generated from the query's v.union of literals.
+    await page.getByLabel("status").selectOption("failed");
+    await page.getByRole("button", { name: "Filter" }).click();
+    await t.getByText("emails:send").waitFor();
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(1);
+    expect(prod.dashQueries.at(-1)).toMatchObject({ fn: "@pool/lib:listWork", args: { status: "failed", paginationOpts: { numItems: 2, cursor: null } } });
+    await shot(page, "screens-component");
+    // A row opens its detail: key/values, a timeline and the stack trace.
+    await t.getByText("emails:send").click();
+    const detail = page.getByRole("dialog");
+    await detail.getByText("attempt 2").waitFor();
+    await detail.locator("pre.stacktrace", { hasText: "SMTP down" }).waitFor();
+    await shot(page, "screens-detail");
+    await page.keyboard.press("Escape");
+    // Inline toggle: the declared mutation with the row's id and the new value.
+    await t.getByRole("switch", { name: "Paused" }).click();
+    await expect.poll(() => prod.posts.filter((x) => x.path === "dashboards/run").length).toBe(1);
+    expect(prod.posts.at(-1)!.body).toMatchObject({ dashboard: "pool", fn: "@pool/lib:pause", args: { id: "work_2", paused: false }, shard: "org:acme" });
+    // A row action on prod: a plain confirmation (not destructive).
+    await t.getByRole("button", { name: "Cancel" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Cancel", exact: true }).last().click();
+    await expect.poll(() => prod.posts.filter((x) => x.path === "dashboards/run").length).toBe(2);
+    expect(prod.posts.at(-1)!.body).toMatchObject({ fn: "@pool/lib:cancel", args: { id: "work_2" } });
+    // A destructive action on prod: the function's name must be typed.
+    await page.getByRole("button", { name: "Cancel all" }).click();
+    const confirm = page.getByRole("dialog");
+    const go = confirm.getByRole("button", { name: "Cancel all" });
+    expect(await go.isDisabled()).toBe(true);
+    await confirm.getByRole("textbox").fill("cancelAll");
+    await go.click();
+    await page.getByText("Cancel all: done").waitFor();
+    // The Worker checked the typed text (it answers 428 without it); the project only gets the call.
+    expect(prod.posts.at(-1)!.body).toEqual({ shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancelAll", args: {} });
+    // An action form generated from the action's args.
+    await page.getByRole("button", { name: "Enqueue" }).click();
+    await page.getByRole("dialog").getByLabel("label").fill("nightly");
+    await page.getByRole("dialog").getByRole("button", { name: "Enqueue" }).click();
+    await expect.poll(() => (prod.posts.at(-1)!.body as { fn: string }).fn).toBe("@pool/lib:enqueueTest");
+    expect(prod.posts.at(-1)!.body).toMatchObject({ args: { label: "nightly" } });
+    await page.getByText("Enqueue: done").waitFor();
+    // The audit log has every write as dashboard.run.
+    await page.keyboard.press("a");
+    const audit = page.getByRole("table", { name: "Audit log" });
+    await expect.poll(async () => (await audit.locator("tbody tr").allTextContents()).filter((x) => x.includes("dashboard.run")).length).toBe(4);
+    expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)).toBeUndefined();
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("declarative screens for the read role: the queries render, every write control is disabled", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/components/org%3Aacme/pool", { token: "read-token-for-tests" });
+    const t = page.getByRole("table", { name: "Work" });
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(2);
+    expect(await page.getByRole("button", { name: "Cancel all" }).isDisabled()).toBe(true);
+    expect(await t.getByRole("switch").first().isDisabled()).toBe(true);
+    // The app has no screens of its own: the section says how to add them.
+    await page.goto(`${origin}/#/p/chat/prod/app`);
+    await page.getByText(/This app has no screens yet/).waitFor();
+    expect(problems).toEqual([]);
+    await close();
+  });
+
   it("read role sees no write controls; the Worker refuses its writes anyway", async () => {
     const { page, close } = await open("#/p/chat/prod/shards/org%3Abeta", { token: "read-token-for-tests" });
     await page.getByText("Re-runs since boot").waitFor();

@@ -14,9 +14,64 @@ export const FILES = [
   file("_storage_svg", "image/svg+xml", `<svg xmlns="http://www.w3.org/2000/svg" onload="window.__xss=3"/>`),
 ];
 
+const str = { shape: { kind: "string" }, optional: false };
+const status = { shape: { kind: "union", members: [{ kind: "literal", value: "pending" }, { kind: "literal", value: "running" }, { kind: "literal", value: "failed" }] }, optional: true };
+/** A component's screens as the runtime lists them (`GET /api/_ember/dashboards`): a work pool. */
+export const POOL_SPEC = {
+  key: "pool",
+  component: "workpool",
+  label: "Work pool",
+  icon: "queue",
+  description: "Items by status; cancel one or all.",
+  scope: "shard",
+  tabs: [
+    {
+      id: "items",
+      label: "Items",
+      blocks: [
+        { kind: "stats", id: "stats", query: "@pool/lib:stats", items: [{ label: "Pending", path: "pending", format: "number" }, { label: "Running", path: "running", format: "number" }, { label: "Succeeded", path: "totals.succeeded", format: "number" }] },
+        {
+          kind: "table",
+          id: "work",
+          label: "Work",
+          query: "@pool/lib:listWork",
+          filters: ["status"],
+          pageSize: 2,
+          rowKey: "_id",
+          columns: [
+            { label: "Function", path: "fnName", format: "code" },
+            { label: "Status", path: "status", format: "badge" },
+            { label: "Paused", path: "paused", format: "boolean", toggle: { mutation: "@pool/lib:pause", arg: "paused", fromRow: { id: "_id" } } },
+          ],
+          detail: { query: "@pool/lib:item", fromRow: { id: "_id" }, sections: [{ kind: "kv", items: [{ label: "Function", path: "fnName" }, { label: "Attempts", path: "attempts", format: "number" }] }, { kind: "timeline", label: "Attempts", path: "history", time: "at", title: "event", status: "outcome" }, { kind: "stacktrace", label: "Last error", path: "lastError" }] },
+          rowActions: [{ id: "cancel", label: "Cancel", fn: "@pool/lib:cancel", fromRow: { id: "_id" } }],
+        },
+        { kind: "actions", id: "bulk", actions: [{ id: "cancelAll", label: "Cancel all", fn: "@pool/lib:cancelAll", destructive: true }, { id: "enqueue", label: "Enqueue", fn: "@pool/lib:enqueueTest" }] },
+      ],
+    },
+  ],
+  functions: {
+    "@pool/lib:stats": { type: "query", args: { kind: "object", fields: {} } },
+    "@pool/lib:listWork": { type: "query", args: { kind: "object", fields: { status, paginationOpts: { shape: { kind: "object", fields: { numItems: { shape: { kind: "number" }, optional: false }, cursor: { shape: { kind: "union", members: [{ kind: "string" }, { kind: "null" }] }, optional: false } } }, optional: false } } } },
+    "@pool/lib:item": { type: "query", args: { kind: "object", fields: { id: str } } },
+    "@pool/lib:pause": { type: "mutation", args: { kind: "object", fields: { id: str, paused: { shape: { kind: "boolean" }, optional: false } } } },
+    "@pool/lib:cancel": { type: "mutation", args: { kind: "object", fields: { id: str } } },
+    "@pool/lib:cancelAll": { type: "mutation", args: { kind: "object", fields: {} }, destructive: true },
+    "@pool/lib:enqueueTest": { type: "action", args: { kind: "object", fields: { label: str } } },
+  },
+};
+
+const WORK = [
+  { _id: "work_1", fnName: XSS, status: "pending", paused: false, attempts: 0, history: [], lastError: null },
+  { _id: "work_2", fnName: "emails:send", status: "failed", paused: true, attempts: 2, history: [{ at: Date.now() - 60_000, event: "attempt 1", outcome: "failed" }, { at: Date.now() - 30_000, event: "attempt 2", outcome: "failed" }], lastError: "Error: SMTP down\n    at send (emails.ts:12)" },
+  { _id: "work_3", fnName: "ai:summarize", status: "running", paused: false, attempts: 1, history: [], lastError: null },
+];
+
 export function fakeProject(o: { legacy?: boolean } = {}) {
   const posts: Array<{ path: string; body: unknown }> = [];
   const lists: Array<Record<string, string>> = [];
+  /** Dashboard queries the project ran (`dashboards/query`), with their args. */
+  const dashQueries: Array<{ fn: string; args: unknown; shard: string | null }> = [];
   const bookmarks = [
     { id: 1, at: Date.now() - 7_200_000, bookmark: BOOKMARK, reason: "deploy:v1" },
     { id: 2, at: Date.now() - 3_600_000, bookmark: BOOKMARK.replace(/f$/, "e"), reason: "hourly" },
@@ -68,11 +123,28 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
           if (body.fn === "messages:send" && typeof (body.args as { channel?: unknown }).channel !== "string") return json({ ok: false, error: { code: "ValidationError", message: "channel: expected string" }, ms: 0.4, type: "mutation", as: null }, 400);
           return json({ ok: true, value: { who: as?.subject ?? null, args: body.args }, ms: 1.5, type: body.fn === "messages:send" ? "mutation" : "query", as: as?.subject ?? null });
         }
+        if (p === "dashboards/run") return json({ ok: true, value: body.fn === "@pool/lib:cancelAll" ? 3 : true, ms: 1, type: "mutation", shard: body.shard });
         if (p === "restore") return json({ ok: true, shard: body.shard, restoredTo: body.bookmark, undo: "0000000a-0000000b-0000000c-feedfacefeedface", version: 9, epoch: "e2", schemaVersion: "abc" });
       }
       if (p === "capabilities") {
         if (o.legacy) return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
-        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke"], auth: !state.authFrom, ...(state.authFrom ? { authFrom: state.authFrom } : {}), files: true, system: true });
+        return json({ ok: true, level: 3, features: ["capabilities", "status", "data", "crons", "inspect", "bookmarks", "bookmark", "restore", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run"], auth: !state.authFrom, ...(state.authFrom ? { authFrom: state.authFrom } : {}), files: true, system: true });
+      }
+      if (p === "dashboards") return json({ ok: true, dashboards: o.legacy ? [] : [POOL_SPEC] });
+      if (p === "dashboards/query") {
+        const fn = url.searchParams.get("fn")!;
+        const args = JSON.parse(url.searchParams.get("args") ?? "{}") as { status?: string; id?: string; paginationOpts?: { numItems: number; cursor: string | null } };
+        dashQueries.push({ fn, args, shard: url.searchParams.get("shard") });
+        if (fn === "@pool/lib:stats") return json({ ok: true, value: { pending: 1, running: 1, totals: { succeeded: 12 } }, ms: 1, type: "query" });
+        if (fn === "@pool/lib:item") return json({ ok: true, value: WORK.find((w) => w._id === args.id) ?? null, ms: 1, type: "query" });
+        if (fn === "@pool/lib:listWork") {
+          const all = WORK.filter((w) => !args.status || w.status === args.status);
+          const start = Number(args.paginationOpts?.cursor ?? 0);
+          const n = args.paginationOpts?.numItems ?? 25;
+          const page = all.slice(start, start + n);
+          return json({ ok: true, value: { page, isDone: start + n >= all.length, continueCursor: String(start + n) }, ms: 1, type: "query" });
+        }
+        return json({ ok: false, error: { code: "not_in_dashboard", message: "no" } }, 403);
       }
       if (p === "env") return json({ ok: true, vars: [{ name: "EMBER_ADMIN_TOKEN_DASHBOARD", managed: true }, { name: "EMBER_PROJECT", managed: true }, { name: "SMTP_PASSWORD", managed: false }] });
       if (p === "auth/users") {
@@ -223,5 +295,5 @@ export function fakeProject(o: { legacy?: boolean } = {}) {
       return json({ ok: false, error: { code: "not_found", message: "not found" } }, 404);
     },
   };
-  return { svc, posts, lists, remoteAuth: (from: string | null) => void (state.authFrom = from) };
+  return { svc, posts, lists, dashQueries, remoteAuth: (from: string | null) => void (state.authFrom = from) };
 }
