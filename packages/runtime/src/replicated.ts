@@ -187,19 +187,49 @@ export type BroadcastTargetRow = {
   delivered_at: number | null;
   /** Log rows the drain has not read for this target yet (some may be of tables its kind does not receive). */
   pending: number;
+  /** `at` of the oldest log row this target has not read yet (null: none). */
+  oldest_at: number | null;
 };
 
+/** What `broadcastStatus` answers (the shape of the other sources' `replicaStatus`). */
+export interface BroadcastStatus {
+  enabled: boolean;
+  journal: number;
+  seq: number;
+  targets: BroadcastTargetRow[];
+  next: number | null;
+  /** Admin API level 18: the log as the outbox (rows kept, parked targets, oldest row, the last seq). */
+  outbox: { seq: number; depth: number; parked: number; oldestAt: number | null };
+  /** Attempts before a failing target is resynced (deltas) or parked (a resync). */
+  maxAttempts: number;
+}
+
+/** The default of `BroadcastOptions.maxAttempts`. */
+export const BROADCAST_MAX_ATTEMPTS = 10;
+
 /** The source's state for the admin endpoint (the shape of the other sources' `replicaStatus`). */
-export function broadcastStatus(db: Db, o: { target?: string; limit?: number } = {}): { enabled: boolean; journal: number; seq: number; targets: BroadcastTargetRow[]; next: number | null } {
+export function broadcastStatus(db: Db, o: { target?: string; limit?: number; maxAttempts?: number } = {}): BroadcastStatus {
   ensureBroadcastTables(db);
   const where = o.target !== undefined ? "WHERE t.target = ?" : "";
   const params: Array<string | number> = o.target !== undefined ? [o.target] : [];
   const targets = rows(
     db,
-    `SELECT t.*, (SELECT COUNT(*) FROM ${BROADCAST_LOG} l WHERE l.seq > t.scan_seq) AS pending FROM ${BROADCAST_TARGETS} t ${where} ORDER BY t.dead DESC, t.attempts DESC, t.target LIMIT ?`,
+    `SELECT t.*, (SELECT COUNT(*) FROM ${BROADCAST_LOG} l WHERE l.seq > t.scan_seq) AS pending, (SELECT l.at FROM ${BROADCAST_LOG} l WHERE l.seq > t.scan_seq ORDER BY l.seq LIMIT 1) AS oldest_at FROM ${BROADCAST_TARGETS} t ${where} ORDER BY t.dead DESC, t.attempts DESC, t.target LIMIT ?`,
     ...params, o.limit ?? 100,
   ) as unknown as BroadcastTargetRow[];
-  return { enabled: true, journal: 0, seq: currentSeq(db), targets, next: nextBroadcastAt(db) };
+  const seq = currentSeq(db);
+  const log = rows(db, `SELECT COUNT(*) AS n, (SELECT at FROM ${BROADCAST_LOG} ORDER BY seq LIMIT 1) AS oldest FROM ${BROADCAST_LOG}`)[0];
+  const parked = rows(db, `SELECT COUNT(*) AS n FROM ${BROADCAST_TARGETS} WHERE dead = 1`)[0];
+  const oldest = log?.oldest;
+  return {
+    enabled: true,
+    journal: 0,
+    seq,
+    targets,
+    next: nextBroadcastAt(db),
+    outbox: { seq, depth: Number(log?.n ?? 0), parked: Number(parked?.n ?? 0), oldestAt: oldest === null || oldest === undefined ? null : Number(oldest) },
+    maxAttempts: o.maxAttempts ?? BROADCAST_MAX_ATTEMPTS,
+  };
 }
 
 /** A page of the catalog: shards of `kind` in key order after `cursor`. */
@@ -246,7 +276,7 @@ export async function drainBroadcast(db: Db, m: Pick<SchemaManifest, "tables">, 
     ensureBroadcastTables(db);
     drainReady.add(db);
   }
-  const maxAttempts = opts.maxAttempts ?? 10;
+  const maxAttempts = opts.maxAttempts ?? BROADCAST_MAX_ATTEMPTS;
   const base = opts.backoffBaseMs ?? 1_000;
   const cap = opts.backoffMaxMs ?? 5 * 60_000;
   const batch = opts.batch ?? 100;

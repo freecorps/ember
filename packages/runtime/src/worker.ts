@@ -646,7 +646,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         const matched = admins.map((a) => !!token && sameSecret(token, a)).some(Boolean);
         if (!matched) return error(401, "unauthenticated", "invalid admin token");
         try {
-          const [{ handleRestoreRequest }, { handleAdminApi, noLocalAuth, REFUSED_CODES, wrongEnvironment }, { sweepOrphans }] = await Promise.all([restoreApi(), adminApi(), filesApi()]);
+          const [{ handleRestoreRequest }, { handleAdminApi, noLocalAuth, REFUSED_CODES, wrongEnvironment }, { sweepOrphans, deleteOrphanKeys }] = await Promise.all([restoreApi(), adminApi(), filesApi()]);
           // A caller that names its environment (`x-ember-env`, `ember mcp`) is refused by a Worker of another one.
           const elsewhere = wrongEnvironment(request, env, error);
           if (elsewhere) return elsewhere;
@@ -654,7 +654,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
           const pitr = await handleRestoreRequest(request, url, (s) => stub(env, s) as unknown as RestoreRpc, isValidShardName, systemStub(env));
           if (pitr) return pitr;
           // Endpoints added for the dashboard (admin-api.ts: capabilities, ...).
-          const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => runAdminAction(env, fn, args, s, identity), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), orphans: (o) => { const b = bucketOf(env); return b ? sweepOrphans(b, (s) => stub(env, s) as unknown as FileRpc, (s) => !!checkShard(s), o) : null; }, revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}), embedRoute: async (path, scope) => {
+          const extra = await handleAdminApi(request, url, { config, env, json, error, stub: (s) => stub(env, s) as unknown as AdminShardRpc, validShard: (s) => !!checkShard(s), runAction: (fn, args, s, identity) => runAdminAction(env, fn, args, s, identity), files: (s) => (bucketOf(env) ? actionStorage(env, s, () => stub(env, s) as unknown as FileRpc) : null), bucket: () => bucketOf(env), orphans: (o) => { const b = bucketOf(env); return b ? sweepOrphans(b, (s) => stub(env, s) as unknown as FileRpc, (s) => !!checkShard(s), o) : null; }, deleteOrphans: (keys, o) => { const b = bucketOf(env); return b ? deleteOrphanKeys(b, (s) => stub(env, s) as unknown as FileRpc, (s) => !!checkShard(s), keys, o) : null; }, revokeSockets: (s, match, o) => (stub(env, s) as unknown as { revokeSockets(shard: string, m: RevokeMatch, o: object): Promise<{ sockets: number }> }).revokeSockets(s, match, o ?? {}), embedRoute: async (path, scope) => {
             // Only that install's routes compete (another scope's route at the same path never shadows it), and never
             // an auth path (as for ingress below). `path` is mount-relative, like `config.routes` and `url` here
             // (a `basePath` is already gone): the handler sees the request as ingress would hand it.

@@ -5,9 +5,9 @@
 // front of an older runtime shows "update the runtime" instead of failing on a 404. A runtime without this endpoint
 // is level 1 (the endpoints listed in `LEGACY_ADMIN_FEATURES` of the dashboard).
 
-import { checkReadOnlySql, errorCodesOf, fileKey, SQL_PARAMS_MAX, SQL_ROWS_MAX, SQL_TEXT_MAX, type DashboardManifest, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
+import { checkReadOnlySql, errorCodesOf, fileKey, STUCK_PAGE_MAX, type StuckPage, SQL_PARAMS_MAX, SQL_ROWS_MAX, SQL_TEXT_MAX, type DashboardManifest, flattenFunctions, manifestProblem, type PreflightResult, replicatedTablesOf, REPLICATED_SOURCE, type ActionStorage, type ForeignIds, type Identity, type ImportBatchResult, type ImportFileRow, type ImportFinishResult, type ImportHashPage, type ImportExportPage, type ImportMeta } from "@freecorps/ember-server";
 import { resolvedCrons, type EmberConfig, type EmberEnv } from "./config.ts";
-import { ORPHAN_PAGE_MAX, type OrphanSweepOptions, type OrphanSweepPage } from "./files.ts";
+import { ORPHAN_DELETE_MAX, ORPHAN_GRACE_MS, ORPHAN_PAGE_MAX, type OrphanDeleteResult, type OrphanSweepOptions, type OrphanSweepPage, type FileResult, type StuckCollectResult } from "./files.ts";
 import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
 import type { SqlParam, SqlQueryInput, SqlQueryOutcome } from "./admin-sql.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
@@ -17,7 +17,7 @@ import { parse } from "./wire.ts";
 import { validate, withDefaults } from "@freecorps/ember-values";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 17;
+export const ADMIN_API_LEVEL = 18;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -96,6 +96,14 @@ export const ADMIN_FEATURES = [
   // level 17: an embed block's page (`{ kind: "embed", route }`): the route's response, fetched by the dashboard's
   // Worker (which serves it in a sandboxed iframe under its own CSP); only routes an embed block names
   "dashboards/embed",
+  // level 18: the dashboard's Replication & Outbox screen and storage cleanup. `replicas` also answers, per source,
+  // `outbox` (depth, parked rows, oldest waiting row, the source's seq) and `maxAttempts`, and per target `oldest_at`
+  // (`replicas/lag` says so); deleting orphans an admin picked (each key checked again); `_files` rows stuck short of
+  // `ready` (failed, abandoned pending) and queueing the unreferenced ones for the GC
+  "replicas/lag",
+  "files/orphans/delete",
+  "files/stuck",
+  "files/stuck/delete",
 ] as const;
 
 /** Id of the running Worker version (`version_metadata` binding EMBER_VERSION, set by `ember deploy`), or null. */
@@ -163,6 +171,8 @@ export interface AdminShardRpc {
   importExport(shard: string, table: string, after: number, limit: number): Promise<ImportOutcome<ImportExportPage>>;
   preflight(shard: string, schema: unknown): Promise<ShardPreflight>;
   sqlQuery(shard: string, input: SqlQueryInput): Promise<SqlQueryOutcome>;
+  fileStuck(shard: string, o: { graceMs: number; cursor?: string | null; limit?: number }): Promise<FileResult<StuckPage>>;
+  fileStuckCollect(shard: string, ids: string[], o: { graceMs: number }): Promise<FileResult<StuckCollectResult>>;
 }
 
 /** `POST /api/_ember/preflight`: one shard's answer (the plan runs in the shard, against its data, and is rolled back). */
@@ -201,6 +211,8 @@ export interface AdminDeps {
   bucket?: () => R2Bucket | null;
   /** One page of the orphan sweep (files.ts `sweepOrphans`); null without an EMBER_FILES bucket. */
   orphans?: (o: OrphanSweepOptions) => Promise<OrphanSweepPage> | null;
+  /** Deletes orphans an admin picked, each checked again (files.ts `deleteOrphanKeys`); null without a bucket. */
+  deleteOrphans?: (keys: string[], o: { graceMs?: number }) => Promise<OrphanDeleteResult> | null;
   /**
    * Runs the app's GET route at `path` anonymously (no identity) and returns its Response, or null when no route of
    * the install `scope` (`[]`: the app's own) serves that path. For `dashboards/embed`.
@@ -725,6 +737,41 @@ async function handleOps(request: Request, url: URL, deps: AdminDeps, reply: (r:
     });
     if (!page) return deps.error(501, "files_unavailable", "this deployment has no files bucket (resources.files in ember.json)");
     return deps.json({ ok: true, value: await page });
+  }
+  if (p === "/api/_ember/files/orphans/delete") {
+    // `{ keys: [...], graceMs? }`: the orphans an admin picked from a listing. Each key is checked again (files.ts).
+    if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
+    const b = await jsonBody(request);
+    const keys = Array.isArray(b?.keys) ? (b!.keys as unknown[]) : null;
+    if (!keys || !keys.length || keys.length > ORPHAN_DELETE_MAX || !keys.every((k): k is string => typeof k === "string" && k.length > 0 && k.length <= 512)) return deps.error(400, "bad_request", `body must be { keys: [1..${ORPHAN_DELETE_MAX} object keys], graceMs? }`);
+    if (b!.graceMs !== undefined && (!Number.isSafeInteger(b!.graceMs) || (b!.graceMs as number) < 0)) return deps.error(400, "bad_request", "graceMs must be a non-negative integer");
+    const done = deps.deleteOrphans?.(keys, b!.graceMs !== undefined ? { graceMs: b!.graceMs as number } : {});
+    if (!done) return deps.error(501, "files_unavailable", "this deployment has no files bucket (resources.files in ember.json)");
+    return deps.json({ ok: true, value: await done });
+  }
+  if (p === "/api/_ember/files/stuck" || p === "/api/_ember/files/stuck/delete") {
+    // `GET ?shard&cursor&limit&graceMs`: a page of `_files` rows stuck short of `ready`; `POST { shard, ids, graceMs? }`:
+    // queue the unreferenced ones for the shard's GC (re-checked in the shard's transaction).
+    const list = p.endsWith("/stuck");
+    if (request.method !== (list ? "GET" : "POST")) return deps.error(405, "method_not_allowed", `use ${list ? "GET" : "POST"}`);
+    const b = list ? null : await jsonBody(request);
+    const q = url.searchParams;
+    const shard = list ? (q.get("shard") ?? "") : typeof b?.shard === "string" ? b.shard : "";
+    if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(shard)}`);
+    const graceRaw = list ? (q.get("graceMs") === null ? undefined : Number(q.get("graceMs"))) : b?.graceMs;
+    if (graceRaw !== undefined && (!Number.isSafeInteger(graceRaw) || (graceRaw as number) < 0)) return deps.error(400, "bad_request", "graceMs must be a non-negative integer");
+    const graceMs = (graceRaw as number | undefined) ?? ORPHAN_GRACE_MS;
+    const stub = deps.stub(shard);
+    if (list) {
+      const limit = q.get("limit") === null ? undefined : Number(q.get("limit"));
+      if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > STUCK_PAGE_MAX)) return deps.error(400, "bad_request", `limit must be an integer in 1..${STUCK_PAGE_MAX}`);
+      const r = await stub.fileStuck(shard, { graceMs, ...(q.get("cursor") ? { cursor: q.get("cursor") } : {}), ...(limit !== undefined ? { limit } : {}) });
+      return r.ok ? deps.json({ ok: true, value: { ...r.value, graceMs } }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, 409);
+    }
+    const ids = Array.isArray(b?.ids) ? (b!.ids as unknown[]) : null;
+    if (!ids || !ids.length || ids.length > ORPHAN_DELETE_MAX || !ids.every((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 200)) return deps.error(400, "bad_request", `body must be { shard, ids: [1..${ORPHAN_DELETE_MAX} file ids], graceMs? }`);
+    const r = await stub.fileStuckCollect(shard, ids, { graceMs });
+    return r.ok ? deps.json({ ok: true, value: { ...r.value, graceMs } }) : deps.json({ ok: false, error: { code: r.code, message: r.message } }, 409);
   }
   if (p === "/api/_ember/files/content" || p === "/api/_ember/files/upload" || p === "/api/_ember/files/delete") {
     const shard = url.searchParams.get("shard") ?? "";

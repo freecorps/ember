@@ -4,7 +4,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import type { ReplicaApplyArgs, ReplicaApplyResult } from "@freecorps/ember-server";
 import { describe, expect, it } from "vitest";
-import { drainReplication, enqueueReplica, ensureReplicationTables, nextReplicationAt, replicationTargets, requestSnapshot, type ReplicationOptions } from "../src/index.ts";
+import { drainReplication, enqueueReplica, ensureReplicationTables, nextReplicationAt, replicationOutbox, replicationTargets, requestSnapshot, type ReplicationOptions } from "../src/index.ts";
 import { probes } from "./worker.ts";
 
 const box = () => env.OUTBOX.get(env.OUTBOX.idFromName(`replication-${crypto.randomUUID()}`));
@@ -105,12 +105,18 @@ describe("replication outbox", () => {
       expect(t.state.get("org:up")!.seq).toBe(2);
       const [down] = replicationTargets(sql, { target: "org:down" });
       expect(down).toMatchObject({ attempts: 1, pending: 1, last_error: "org:down is down" });
+      // What the dashboard's Replication screen shows: the oldest waiting row, the outbox depth, the source's seq.
+      const enqueuedAt = Number(sql.exec(`SELECT created_at FROM _ember_replication WHERE target = 'org:down'`).one().created_at);
+      expect(down!.oldest_at).toBe(enqueuedAt);
+      expect(replicationTargets(sql, { target: "org:up" })[0]).toMatchObject({ last_seq: 2, pending: 0, oldest_at: null });
+      expect(replicationOutbox(sql)).toEqual({ seq: 2, depth: 1, parked: 0, oldestAt: enqueuedAt });
       expect(first.next).toBe(down!.next_at);
       // Due again (the backoff passed): the second failure parks the row and asks for a resync.
       sql.exec(`UPDATE _ember_replication_targets SET next_at = 0`);
       await drainReplication(state.storage, env as never, opts(t));
       expect(replicationTargets(sql, { target: "org:down" })[0]).toMatchObject({ snapshot: 1, attempts: 0, pending: 0 });
       expect(sql.exec(`SELECT dead FROM _ember_replication WHERE target = 'org:down'`).toArray()).toEqual([{ dead: 1 }]);
+      expect(replicationOutbox(sql)).toMatchObject({ seq: 2, depth: 0, parked: 1, oldestAt: null });
       // The target is back: the resync carries the current rows, cut at the source's last seq.
       t.failing.delete("org:down");
       await drainReplication(state.storage, env as never, opts(t, () => [{ table: "auth:member", id: "m1", doc: { role: "now" } }]));

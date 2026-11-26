@@ -8,7 +8,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { path } from "./api.ts";
-import { href, useApi } from "./hooks.ts";
+import { href, navigate, useApi } from "./hooks.ts";
 import type { Project, ShardRow } from "./pages/types.ts";
 
 export interface PaletteItem {
@@ -272,7 +272,8 @@ function PaletteBody({
   const go = (item: PaletteItem | undefined) => {
     if (!item) return;
     onClose();
-    location.hash = item.href;
+    // The route already shown navigates again too (its page reloads), instead of a hash that does not change.
+    navigate(item.href);
   };
   const loading =
     specs.loading ||

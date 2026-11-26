@@ -14,7 +14,7 @@ import { chromium, type Browser, type Page } from "playwright-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { clearCapabilities, createDashboard, type DashboardEnv } from "../../src/worker.ts";
 import { seeded } from "../helpers.ts";
-import { fakeProject, XSS } from "./fake-project.ts";
+import { fakeProject, ORPHANS, REFERENCED_ORPHAN, XSS } from "./fake-project.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const executable = (() => {
@@ -1087,6 +1087,226 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     // The app has no screens of its own: the section says how to add them.
     await page.goto(`${origin}/#/p/chat/prod/app`);
     await page.getByText(/This app has no screens yet/).waitFor();
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("replication & outbox: each source's outbox and per-target lag, parked state; resync confirmed and audited; read role read-only", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/replication");
+    const auth = page.getByRole("table", { name: "Targets of auth" });
+    const down = auth.locator("tr", { hasText: "org:down" });
+    await down.getByText("parked").waitFor();
+    // Lag: the target's acked seq against the source's, what waits and since when; the error as text.
+    // A resync that failed and waits to retry says so (it keeps `snapshot = 1`), with its attempts.
+    await auth.locator("tr", { hasText: "org:rebuild" }).getByText("resync retrying 3/10").waitFor();
+    await expect.poll(() => down.textContent()).toContain("120 / 152");
+    expect(await down.textContent()).toContain("3 pending · oldest 25m");
+    await down.getByText(`org:down is unreachable ${XSS}`).waitFor();
+    expect(await page.locator("main img").count()).toBe(0);
+    const outbox = await page.getByLabel("Outbox of auth").textContent();
+    expect(outbox).toMatch(/Outbox depth3/);
+    expect(outbox).toMatch(/Oldest pending25m/);
+    expect(outbox).toMatch(/maxAttempts10/);
+    expect(outbox).toMatch(/Parked targets1/);
+    const beta = page.getByRole("table", { name: "Targets of global:main" }).locator("tr", { hasText: "org:beta" });
+    await beta.getByText("retrying 2/10").waitFor();
+    expect(await beta.textContent()).toContain("7 pending · oldest 1m");
+    await shot(page, "replication");
+    // Resync: confirmed, then sent to the project and audited.
+    await down.getByRole("button", { name: "Resync org:down" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Resync", exact: true }).click();
+    await page.getByText("Resync of org:down queued").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "replicas/resync", body: { shard: "org:down", source: "auth" } });
+    // While a resync is in flight its dialog stays, Esc included: the answer never lands in another target's dialog.
+    await auth.locator("tr", { hasText: "org:acme" }).getByRole("button", { name: "Resync org:acme" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Resync", exact: true }).click();
+    await expect.poll(() => prod.held.length).toBe(1);
+    await page.keyboard.press("Escape");
+    expect(await page.getByRole("dialog", { name: "Resync org:acme?" }).isVisible()).toBe(true);
+    prod.release();
+    await page.getByText("Resync of org:acme queued").waitFor();
+    await expect.poll(() => page.getByRole("dialog").count()).toBe(0);
+    await page.goto(`${origin}/#/p/chat/prod/audit`);
+    await expect.poll(() => page.getByRole("table", { name: "Audit log" }).getByText("replica.resync").count()).toBe(2);
+    expect(problems).toEqual([]);
+    await close();
+    // The read role sees the same screen, without the resync.
+    const r = await open("#/p/chat/prod/replication", { token: "read-token-for-tests" });
+    await r.page.getByRole("table", { name: "Targets of auth" }).getByText("org:down", { exact: true }).waitFor();
+    expect(await r.page.getByRole("button", { name: /^Resync/ }).count()).toBe(0);
+    expect(r.problems).toEqual([]);
+    await r.close();
+  });
+
+  it("storage cleanup: R2 orphans scanned page by page with totals, selected ones deleted after the typed confirmation; stuck uploads queued for GC", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/storage");
+    const before = prod.posts.length;
+    await page.getByRole("button", { name: "Scan bucket" }).click();
+    const table = page.getByRole("table", { name: "Orphans" });
+    await table.getByText(ORPHANS[0]!.key).waitFor();
+    await expect.poll(() => page.getByLabel("Orphan totals").textContent()).toMatch(/Orphans found2.*Orphan size2\.5 KiB.*Objects scanned5/);
+    await page.getByRole("button", { name: "Scan next page" }).click();
+    await table.getByText(ORPHANS[2]!.key).waitFor();
+    await expect.poll(() => page.getByLabel("Orphan totals").textContent()).toMatch(/Orphans found3.*Orphan size3\.5 KiB.*Objects scanned8.*whole bucket/);
+    // Listing never deletes: each scan is a dry run, one bounded page of the bucket.
+    const scans = prod.posts.slice(before).filter((x) => x.path === "files/orphans");
+    expect(scans.map((x) => x.body)).toEqual([
+      { limit: 500, graceMs: 86_400_000, delete: false },
+      { cursor: "page2", limit: 500, graceMs: 86_400_000, delete: false },
+    ]);
+    // Two picked; one of them got a `_files` row since the listing: the project keeps it and says why.
+    await page.getByLabel(`Select ${ORPHANS[0]!.key}`).check();
+    await page.getByLabel(`Select ${REFERENCED_ORPHAN}`).check();
+    await page.getByRole("button", { name: "Delete selected…" }).click();
+    const dialog = page.getByRole("dialog");
+    const confirm = dialog.getByRole("button", { name: "Delete objects" });
+    expect(await confirm.isDisabled()).toBe(true);
+    await dialog.getByLabel("Type orphans to confirm").fill("orphans");
+    await confirm.click();
+    await page.getByText("Deleted 1 object (2.0 KiB)").waitFor();
+    await page.getByText("kept: a file row has it").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "files/orphans/delete", body: { keys: [ORPHANS[0]!.key, REFERENCED_ORPHAN], graceMs: 86_400_000 } });
+    await expect.poll(() => table.getByText(ORPHANS[0]!.key).count()).toBe(0);
+    await table.getByText(REFERENCED_ORPHAN).waitFor();
+    // Stuck uploads of the route's shard: a referenced one cannot be picked.
+    const stuck = page.getByRole("table", { name: "Stuck files" });
+    await stuck.getByText("_storage_abandoned").waitFor();
+    expect(await page.getByLabel("Select _storage_used").isDisabled()).toBe(true);
+    expect(await page.getByLabel("Stuck totals").textContent()).toMatch(/Stuck rows2.*1 referenced/);
+    await page.getByLabel("Select _storage_abandoned").check();
+    await page.getByRole("button", { name: "Queue 1 for GC…" }).click();
+    await dialog.getByLabel("Type global:main to confirm").fill("global:main");
+    await dialog.getByRole("button", { name: "Queue for GC" }).click();
+    await page.getByText("Queued 1 for GC").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "files/stuck/delete", body: { shard: "global:main", ids: ["_storage_abandoned"], graceMs: 86_400_000 } });
+    await shot(page, "storage");
+    await page.goto(`${origin}/#/p/chat/prod/audit`);
+    const audit = page.getByRole("table", { name: "Audit log" });
+    await audit.getByText("file.orphans_delete").waitFor();
+    await audit.getByText("file.stuck_delete").waitFor();
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("storage cleanup: a scan with a silent shard confirms nothing; stuck uploads page by page, the selection per page, totals fresh after a GC", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/storage/org:pages");
+    await page.getByLabel("Grace period").selectOption({ label: "1 hour" });
+    await page.getByRole("button", { name: "Scan bucket" }).click();
+    await page.getByText("org:down could not answer (unreachable)").waitFor();
+    await page.getByText("No orphans confirmed: some shards did not answer (above).").waitFor();
+    expect(await page.getByText("No orphans in the bucket.").count()).toBe(0);
+    const stuck = page.getByRole("table", { name: "Stuck files" });
+    await stuck.getByText("_storage_p00").waitFor();
+    await expect.poll(() => page.getByLabel("Stuck totals").textContent()).toMatch(/Stuck rows51/);
+    // Picked on page one, then the page changes: the pick does not travel to a page where it is not shown.
+    await page.getByLabel("Select _storage_p00").check();
+    await page.getByRole("button", { name: "Next →" }).click();
+    await stuck.getByText("_storage_p50").waitFor();
+    await page.getByLabel("Select _storage_p50").check();
+    await page.getByRole("button", { name: "Queue 1 for GC…" }).click();
+    await page.getByRole("dialog").getByLabel("Type org:pages to confirm").fill("org:pages");
+    await page.getByRole("dialog").getByRole("button", { name: "Queue for GC" }).click();
+    await page.getByText("Queued 1 for GC").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "files/stuck/delete", body: { shard: "org:pages", ids: ["_storage_p50"], graceMs: 3_600_000 } });
+    // Back on page one with fresh totals (the later page has none and is empty now).
+    await page.getByText("page 1", { exact: true }).waitFor();
+    await expect.poll(() => page.getByLabel("Stuck totals").textContent()).toMatch(/Stuck rows50/);
+    await stuck.getByText("_storage_p00").waitFor();
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("logs: text search, level, function and time range over the received window, and the NDJSON export of the matches", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/logs");
+    await page.getByText(/cannot be searched server-side/).waitFor();
+    await page.getByRole("button", { name: "Start" }).click();
+    const log = page.getByRole("log", { name: "Log events" });
+    await log.getByText("rooms:list").waitFor();
+    await log.getByText("messages:send", { exact: true }).waitFor();
+    const count = page.getByRole("search", { name: "Search the received logs" }).locator("[aria-live]");
+    await page.getByLabel("Search logs").fill("ROOMS");
+    await expect.poll(() => count.textContent()).toBe("1 of 2 events");
+    expect(await log.getByText("messages:send", { exact: true }).count()).toBe(0);
+    await page.getByLabel("Search logs").fill("");
+    await page.getByLabel("Level").selectOption("error");
+    await expect.poll(() => count.textContent()).toBe("1 of 2 events");
+    await log.getByText(`messages:send failed for ${XSS}`).waitFor();
+    expect(await log.getByText("rooms:list").count()).toBe(0);
+    await page.getByLabel("Level").selectOption("any");
+    await page.getByLabel("Search by function").fill("rooms:");
+    await expect.poll(() => count.textContent()).toBe("1 of 2 events");
+    await page.getByLabel("Search by function").fill("");
+    await page.getByLabel("Time range").selectOption("1m");
+    await expect.poll(() => count.textContent()).toBe("2 of 2 events");
+    // Export what the search matches: the errors, one JSON object per line, as text (no query-string secrets).
+    await page.getByLabel("Level").selectOption("error");
+    const [dl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Export NDJSON" }).click()]);
+    expect(dl.suggestedFilename()).toMatch(/^logs-chat-prod-.+\.ndjson$/);
+    const text = readFileSync((await dl.path())!, "utf8");
+    const lines = text.trimEnd().split("\n").map((l) => JSON.parse(l) as { outcome: string; head: string; lines: Array<{ message?: string }> });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.lines.some((l) => l.message === `messages:send failed for ${XSS}`)).toBe(true);
+    expect(text).not.toContain("SECRET");
+    await shot(page, "logs-search");
+    await page.getByRole("button", { name: "Stop" }).click();
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("function runner: history in this browser, re-run, copy as cURL (no real token) and as TypeScript", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/functions/auth%3Awhoami");
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin });
+    await page.getByText("No runs of this function from this browser yet.").waitFor();
+    await page.getByLabel("Arguments JSON").fill(`{"q": "it's \\"quoted\\""}`);
+    await page.getByRole("button", { name: "Run query" }).click();
+    await page.locator(".result").waitFor();
+    const hist = page.getByRole("table", { name: "Run history" });
+    await hist.getByText(`{"q":"it's \\"quoted\\""}`).first().waitFor();
+    const stored = (await page.evaluate(() => localStorage.getItem("ember-dashboard-runs"))) ?? "";
+    expect(stored).toContain("auth:whoami");
+    for (const secret of ["admin-token-for-tests", "proj-admin", "csrf"]) expect(stored).not.toContain(secret);
+    // Other args in the form; re-running the entry sends the entry's.
+    await page.getByLabel("Arguments JSON").fill(`{"other": 1}`);
+    const before = prod.posts.length;
+    await hist.getByRole("button", { name: /^Re-run/ }).first().click();
+    await expect.poll(() => prod.posts.length).toBe(before + 1);
+    expect(prod.posts.at(-1)).toEqual({ path: "run", body: { shard: "global:main", fn: "auth:whoami", args: { q: `it's "quoted"` } } });
+    await expect.poll(() => hist.locator("tbody tr").count()).toBe(2);
+    expect(JSON.parse(await page.getByLabel("Arguments JSON").inputValue())).toEqual({ q: `it's "quoted"` });
+    // Copy as cURL: the environment's URL, the admin token as a placeholder.
+    await page.getByRole("button", { name: "Copy as cURL" }).click();
+    const curl = (await page.getByLabel("cURL snippet").textContent()) ?? "";
+    expect(curl).toContain("'https://ember-chat-prod.acme.workers.dev/api/_ember/run'");
+    expect(curl).toContain(`Bearer $EMBER_ADMIN_TOKEN`);
+    for (const secret of ["admin-token-for-tests", "proj-admin", "read-token-for-tests"]) expect(curl).not.toContain(secret);
+    expect(curl).toContain(`--data-raw '{"shard":"global:main","fn":"auth:whoami","args":{"q":"it'\\''s \\"quoted\\""}}'`);
+    await page.getByRole("dialog").getByRole("button", { name: "Copy", exact: true }).click();
+    await page.getByText("Copied cURL").first().waitFor();
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(curl);
+    await page.keyboard.press("Escape");
+    await page.getByRole("button", { name: "Copy as TypeScript" }).click();
+    expect(await page.getByLabel("TypeScript snippet").textContent()).toContain(`await client.query(api.auth.whoami, {\n  q: "it's \\"quoted\\"",\n});`);
+    await shot(page, "runner-history");
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("command palette: choosing the route already shown reloads its data and closes", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/replication");
+    await page.getByRole("table", { name: "Targets of auth" }).waitFor();
+    const loads = () => prod.calls.filter((c) => c === "GET replicas").length;
+    const before = loads();
+    const dialog = page.getByRole("dialog", { name: "Command palette" });
+    const box = dialog.getByRole("combobox", { name: "Go to" });
+    await page.keyboard.press("Control+k");
+    await box.waitFor();
+    await box.pressSequentially("Replication");
+    await dialog.getByRole("option", { name: /^Replication/ }).first().waitFor();
+    await page.keyboard.press("Enter");
+    await dialog.waitFor({ state: "hidden" });
+    await expect.poll(loads).toBe(before + 1);
+    expect(page.url()).toMatch(/#\/p\/chat\/prod\/replication$/);
+    await page.getByRole("table", { name: "Targets of auth" }).waitFor();
     expect(problems).toEqual([]);
     await close();
   });

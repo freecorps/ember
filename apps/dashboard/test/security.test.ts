@@ -44,7 +44,7 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean; specsDown?
       if (path === "/api/_ember/capabilities") {
         if (o.capsDown) return Response.json({ ok: false, error: { code: "internal", message: "boom" } }, { status: 500 });
         if (o.features === null) return Response.json({ ok: false, error: { code: "not_found", message: "not found" } }, { status: 404 });
-        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run", "sql"], auth: false, files: false, system: true });
+        return Response.json({ ok: true, level: 3, features: o.features ?? ["capabilities", "status", "bookmark", "bookmarks", "restore", "inspect", "data", "crons", "schema", "data/list", "data/insert", "data/patch", "data/replace", "data/delete", "functions", "run", "reactivity", "reactivity/profile", "jobs/run", "jobs/cancel", "crons/run", "files/content", "files/upload", "files/delete", "env/reveal", "keys/rotate", "env", "auth/users", "auth/sessions", "auth/revoke", "dashboards", "dashboards/query", "dashboards/run", "sql", "replicas", "replicas/resync", "replicas/lag", "files/orphans", "files/orphans/delete", "files/stuck", "files/stuck/delete"], auth: false, files: false, system: true });
       }
       // The specs are read before a dashboard write is audited: they answer even when the project's writes fail.
       if (path === "/api/_ember/dashboards") {
@@ -58,6 +58,12 @@ function fakeProject(o: { features?: string[] | null; fail?: boolean; specsDown?
       if (path === "/api/_ember/auth/revoke") return Response.json({ ok: true, value: { revoked: 1, sockets: 2, shards: (body as { shards: string[] }).shards.length } });
       if (path === "/api/_ember/files/upload") return Response.json({ ok: true, value: { id: "_storage_new", size: 10 } });
       if (path === "/api/_ember/files/delete" || path === "/api/_ember/jobs/cancel" || path === "/api/_ember/jobs/run" || path === "/api/_ember/crons/run") return Response.json({ ok: true, value: "job_2" });
+      if (path === "/api/_ember/replicas/resync") return Response.json({ ok: true, value: { [(body as { source?: string }).source ?? "auth"]: { ok: true, targets: 1 } } });
+      if (path === "/api/_ember/replicas") return Response.json({ ok: true, tables: [], sources: { auth: { enabled: true, journal: 0, convert: null, targets: [], next: null, outbox: { seq: 4, depth: 0, parked: 0, oldestAt: null }, maxAttempts: 10 } } });
+      if (path === "/api/_ember/files/orphans") return Response.json({ ok: true, value: { scanned: 1, foreign: 0, young: 0, orphans: [], deleted: 0, skipped: [], graceMs: 0, cursor: null, done: true } });
+      if (path === "/api/_ember/files/orphans/delete") return Response.json({ ok: true, value: { deleted: [], refused: [], skipped: [], graceMs: 0 } });
+      if (path === "/api/_ember/files/stuck") return Response.json({ ok: true, value: { rows: [], cursor: null, done: true, totals: { count: 0, bytes: 0, referenced: 0 }, graceMs: 0 } });
+      if (path === "/api/_ember/files/stuck/delete") return Response.json({ ok: true, value: { queued: [], refused: [], graceMs: 0 } });
       if (path === "/api/_ember/sql") return Response.json({ ok: true, value: { columns: ["n"], rows: [[1]], rowsRead: 1, rowsWritten: 0, truncated: false, ms: 1, explain: false } });
       if (path === "/api/_ember/data/list") return Response.json({ ok: true, value: { page: [], isDone: true, continueCursor: "" } });
       if (path === "/api/_ember/dashboards/run") return Response.json({ ok: true, value: 1, ms: 1, type: "mutation", shard: (body as { shard: string }).shard });
@@ -131,6 +137,9 @@ const bodies: Record<string, Record<string, unknown>> = {
   "/api/users/revoke": { project: "chat", env: "dev", userId: "user_1", sessionId: "sess_1" },
   "/api/dash/run": { project: "chat", env: "dev", shard: "org:acme", dashboard: "pool", fn: "@pool/lib:cancel", args: { id: "secret plans" } },
   "/api/sql": { project: "chat", env: "dev", shard: "org:acme", sql: "SELECT count(*) FROM messages WHERE channel = ?", params: ["secret plans"] },
+  "/api/replicas/resync": { project: "chat", env: "dev", shard: "org:acme", source: "auth" },
+  "/api/files/orphans/delete": { project: "chat", env: "dev", keys: ["f/b3JnOmFjbWU/" + "ab".repeat(32)] },
+  "/api/files/stuck/delete": { project: "chat", env: "dev", shard: "org:acme", ids: ["_storage_01ABC"] },
 };
 
 describe("roles", () => {
@@ -716,5 +725,88 @@ describe("local dev mode (`ember dev --dashboard`, DASHBOARD_DEV)", () => {
     };
     expect((await post({ origin: o })).status).toBe(403);
     expect((await post({ origin: "http://localhost:9999", [CSRF_HEADER]: csrf })).status).toBe(403);
+  });
+});
+
+describe("replication and storage cleanup (admin API level 18)", () => {
+  const h = { headers: { authorization: "Bearer read-secret" } };
+  /**
+   * Features of a runtime at level 17 (before the Replication screen and storage cleanup): `replicas` and
+   * `replicas/resync` are level 10, the orphan listing `files/orphans` level 12, `dashboards/embed` level 17.
+   */
+  const level17 = ["capabilities", "status", "data", "replicas", "replicas/resync", "files/orphans", "files/delete", "sql", "dashboards", "dashboards/embed"];
+
+  it("the read role sees replication and the orphan listing; the listing never asks the project to delete", async () => {
+    const t = setup();
+    const rep = await t.call("GET", "/api/replicas?project=chat&env=prod&source=auth&shard=org:acme", h);
+    expect(rep.status).toBe(200);
+    expect((await rep.json()) as unknown).toMatchObject({ sources: { auth: { outbox: { seq: 4 }, maxAttempts: 10 } } });
+    expect(new URL(t.project.calls.at(-1)!.url).search).toBe("?source=auth&shard=org%3Aacme");
+    const orphans = await t.call("GET", "/api/files/orphans?project=chat&env=prod&cursor=c1&limit=200&graceMs=0", h);
+    expect(orphans.status).toBe(200);
+    expect(t.project.calls.at(-1)).toMatchObject({ method: "POST", body: { cursor: "c1", limit: 200, graceMs: 0, delete: false } });
+    // `delete` given by the caller is not forwarded (the read route only lists).
+    await t.call("GET", "/api/files/orphans?project=chat&env=prod&delete=true", h);
+    expect(t.project.calls.at(-1)!.body).toEqual({ delete: false });
+    for (const qs of ["&limit=abc", "&graceMs=-1", "&cursor="]) expect((await t.call("GET", `/api/files/orphans?project=chat&env=prod${qs}`, h)).status, qs).toBe(400);
+    const stuck = await t.call("GET", "/api/files/stuck?project=chat&env=prod&shard=org:acme&graceMs=0", h);
+    expect(stuck.status).toBe(200);
+    expect(new URL(t.project.calls.at(-1)!.url).searchParams.get("graceMs")).toBe("0");
+    // Reads: nothing was audited (the log's table is created by the first write).
+    expect(t.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name = 'audit_log'").get()).toEqual({ n: 0 });
+  });
+
+  it("deleting orphans and stuck rows is destructive: the typed confirmation on prod, the keys in the audit log", async () => {
+    const t = setup();
+    const key = `f/b3JnOmFjbWU/${"cd".repeat(32)}`;
+    const need = await t.post("/api/files/orphans/delete", { project: "chat", env: "prod", keys: [key, key] });
+    expect(need.status).toBe(428);
+    expect((await need.json()) as unknown).toMatchObject({ error: { data: { expected: "orphans" } } });
+    const ok = await t.post("/api/files/orphans/delete", { project: "chat", env: "prod", keys: [key, key], graceMs: 0, confirm: "orphans" });
+    expect(ok.status).toBe(200);
+    expect(t.project.calls.at(-1)!.body).toEqual({ keys: [key], graceMs: 0 });
+    const stuck = await t.post("/api/files/stuck/delete", { project: "chat", env: "prod", shard: "org:acme", ids: ["_storage_1", "_storage_2"], confirm: "org:acme" });
+    expect(stuck.status).toBe(200);
+    expect(t.project.calls.at(-1)!.body).toEqual({ shard: "org:acme", ids: ["_storage_1", "_storage_2"] });
+    const rows = t.audit().filter((r) => r.outcome === "ok");
+    expect(rows.map((r) => [r.action, r.target])).toEqual([["file.orphans_delete", key], ["file.stuck_delete", "2 files"]]);
+    expect(JSON.parse(String(rows[0]!.args))).toEqual({ count: 1, keys: [key], graceMs: 0 });
+    // Bad bodies never reach the project.
+    const before = t.project.calls.length;
+    for (const keys of [[], ["a b"], Array.from({ length: 101 }, (_, i) => `k${i}`)]) expect((await t.post("/api/files/orphans/delete", { project: "chat", env: "dev", keys })).status).toBe(400);
+    expect((await t.post("/api/files/stuck/delete", { project: "chat", env: "dev", shard: "org:acme", ids: ["../x"] })).status).toBe(400);
+    expect((await t.post("/api/replicas/resync", { project: "chat", env: "dev", shard: "org:acme", source: "a b" })).status).toBe(400);
+    expect(t.project.calls.slice(before).filter((c) => c.method === "POST")).toEqual([]);
+  });
+
+  it("stuck ids are `_files` ids as the runtime makes them: `_storage_<ULID>`, or a Convex id kept by `ember import`", async () => {
+    const t = setup();
+    const ids = ["_storage_01JDZ8Q6Y2K3M4N5P6Q7R8S9TV", "jd7c6x5mbkxd2w6k3f0b0n9q9h6y2r1a"];
+    const res = await t.post("/api/files/stuck/delete", { project: "chat", env: "dev", shard: "org:acme", ids, confirm: "org:acme" });
+    expect(res.status).toBe(200);
+    expect(t.project.calls.at(-1)!.body).toEqual({ shard: "org:acme", ids });
+  });
+
+  it("a resync is audited as replica.resync with its source, and asks for no typed confirmation", async () => {
+    const t = setup();
+    const res = await t.post("/api/replicas/resync", { project: "chat", env: "prod", shard: "org:acme", source: "global:main" });
+    expect(res.status).toBe(200);
+    expect(t.project.calls.at(-1)!.body).toEqual({ shard: "org:acme", source: "global:main" });
+    expect(t.audit()).toMatchObject([{ action: "replica.resync", target: "org:acme", shard: "org:acme", outcome: "ok" }]);
+    expect(JSON.parse(String(t.audit()[0]!.args))).toEqual({ source: "global:main" });
+  });
+
+  it("a runtime before level 18: runtime_outdated for the orphan delete and stuck rows, the rest still answers", async () => {
+    const t = setup({ features: level17 });
+    expect((await t.call("GET", "/api/replicas?project=chat&env=prod", h)).status).toBe(200);
+    expect((await t.call("GET", "/api/files/orphans?project=chat&env=prod", h)).status).toBe(200);
+    const stuck = await t.call("GET", "/api/files/stuck?project=chat&env=prod&shard=org:acme", h);
+    expect(stuck.status).toBe(501);
+    expect((await stuck.json()) as unknown).toMatchObject({ error: { code: "runtime_outdated", data: { feature: "files/stuck" } } });
+    for (const [path, body] of [["/api/files/orphans/delete", { project: "chat", env: "dev", keys: ["k"] }], ["/api/files/stuck/delete", { project: "chat", env: "dev", shard: "org:acme", ids: ["_storage_1"] }]] as const) {
+      const res = await t.post(path, body);
+      expect([path, res.status]).toEqual([path, 501]);
+    }
+    expect(t.audit()).toEqual([]);
   });
 });

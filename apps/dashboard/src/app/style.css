@@ -377,3 +377,11 @@ table.heat td.warn { background: color-mix(in srgb, var(--warn) 10%, transparent
 
 /* Embed blocks: a component's own page in a sandboxed iframe (embed.tsx). */
 .embed-frame { display: block; width: 100%; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+/* Function Runner history, Replication, Storage cleanup, logs search (PR 6a-3b) */
+.clip { display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.run-history { margin-top: 16px; }
+.run-history .toolbar { margin-bottom: 6px; }
+.lag { white-space: nowrap; }
+.err-text { color: var(--bad); font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.log-search { border-top: 1px solid var(--line); padding-top: 10px; }
+.log-search input[type="search"] { min-width: 220px; }
