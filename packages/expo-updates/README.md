@@ -141,7 +141,9 @@ ember expo list
 - **Pointing a channel elsewhere** (`setChannel`, or clearing its branch rollout) serves the other branch's current
   head as it is: installs only move to a newer `createdAt`, so one already running a newer update from the previous
   branch keeps it. To bring those back, republish the target update on the target branch after the switch
-  (`ember expo publish` of the same export there), which gives it a newer `createdAt`. A rollback on the previous
+  (`ember expo publish` of the same export there), which gives it a newer `createdAt`. If the target branch has an
+  unfinished rollout, that publish is refused (`RolloutInProgress`): finish it first (`ember expo rollout` to 100,
+  which serves its update to every install) or roll it back, then publish. A rollback on the previous
   branch does not help: it changes that branch (and the other channels still on it), not the target's head.
 - **Rollback** takes the head out (`rolledBack`) and republishes the previous update as a new one (clients only move
   to a newer `createdAt`), or publishes `rollBackToEmbedded` with `--to-embedded` or when there is no previous update.

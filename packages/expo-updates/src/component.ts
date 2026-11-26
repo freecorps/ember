@@ -167,8 +167,36 @@ const liveRows = (ctx: ReadCtx, branch: string, platform: Platform, runtimeVersi
 
 /** The release a row serves: its own id, or the one a rollback republished (`republishOf`). */
 const releaseOf = (r: { uuid: string; republishOf?: string }) => r.republishOf ?? r.uuid;
-/** How many live rows a rollback looks at to find the previous release. */
+/** Live rows a rollback reads per step, and at most in all, looking for the previous release. */
 const ROLLBACK_WINDOW = 50;
+const ROLLBACK_SCAN_MAX = 1000;
+
+/**
+ * The head of (branch, platform, runtime version), the newest live row of another release (`prev`, or null: none), and
+ * the rows read up to it (the head's release among them: what the rollback takes out). Reads in steps of
+ * `ROLLBACK_WINDOW` until another release shows up; past `ROLLBACK_SCAN_MAX` copies of the head's release it refuses
+ * (a rollback there must say `toEmbedded`, or the copies be rolled back first) rather than guess.
+ */
+function previousRelease(ctx: ReadCtx, branch: string, platform: Platform, runtimeVersion: string) {
+  const rows: ReturnType<typeof liveRows> = [];
+  for (;;) {
+    const last = rows[rows.length - 1];
+    const step = ctx.db
+      .query("updates")
+      .withIndex("by_head", (q) => {
+        const live = q.eq("branch", branch).eq("platform", platform).eq("runtimeVersion", runtimeVersion).eq("rolledBack", false);
+        return last ? live.lt("createdAt", last.createdAt) : live;
+      })
+      .order("desc")
+      .take(ROLLBACK_WINDOW);
+    rows.push(...step);
+    const head = rows[0];
+    if (!head) return null;
+    const prev = rows.find((r) => releaseOf(r) !== releaseOf(head)) ?? null;
+    if (prev || step.length < ROLLBACK_WINDOW) return { head, prev, rows: prev ? rows.slice(0, rows.indexOf(prev)) : rows };
+    if (rows.length >= ROLLBACK_SCAN_MAX) throw new EmberError("ValidationError", `${branch} ${platform} ${runtimeVersion}: more than ${ROLLBACK_SCAN_MAX} live copies of ${releaseOf(head)}; roll back with toEmbedded`);
+  }
+}
 
 /** The channels that serve `branch` (as their branch or their rollout branch): at most `limit` per index. */
 function channelsServing(ctx: ReadCtx, branch: string, limit: number) {
@@ -269,18 +297,36 @@ function promoteReady(ctx: Ctx["mutation"], row: AssetRow): boolean {
   if (fileState(ctx, row.file) === "ready") return true;
   const file = [row.file, ...(row.pending ?? []).map((u) => u.file)].find((f) => fileState(ctx, f) === "ready");
   if (!file) return false;
-  const pending = uploadsInFlight(ctx, row).filter((u) => u.file !== file);
+  const pending = pendingUploads(ctx, row).filter((u) => u.file !== file);
   ctx.db.patch(row._id, { file, fileExpiresAt: undefined, pending: pending.length ? pending : undefined });
   return true;
 }
 
 /**
- * The row's uploads still in flight: pending files whose ticket has not expired (an expired one can no longer be
- * confirmed: it stops counting, and the row lets it go on its next write, so storage collects it).
+ * The row's uploads in flight: pending files whose ticket has not expired. They count toward `MAX_PENDING_UPLOADS`;
+ * an expired one stops counting but stays referenced for `CONFIRM_GRACE_MS` (`pendingUploads`).
  */
 function uploadsInFlight(ctx: ReadCtx, row: AssetRow): Array<{ file: AssetRow["file"]; expiresAt: number }> {
+  return pendingUploads(ctx, row).filter((u) => u.expiresAt > ctx.now);
+}
+
+/**
+ * How long past its ticket's expiry a pending upload stays referenced. Storage still confirms an upload whose PUT
+ * finished in time (confirm has no deadline: a long multipart upload completes late), and the CLI confirms right
+ * after the PUT: a day covers that. Past it the reference goes (storage collects the file); a later confirm finds
+ * the asset not uploaded, and `prepareAssets` again issues a ticket.
+ */
+const CONFIRM_GRACE_MS = 24 * 3600_000;
+/** At most this many expired uploads kept referenced in their grace period (the oldest go first). */
+const MAX_GRACED_UPLOADS = 64;
+
+/** The row's pending uploads still referenced: in flight, or expired within `CONFIRM_GRACE_MS`. */
+function pendingUploads(ctx: ReadCtx, row: AssetRow): Array<{ file: AssetRow["file"]; expiresAt: number }> {
   const all = [...(row.fileExpiresAt !== undefined ? [{ file: row.file, expiresAt: row.fileExpiresAt }] : []), ...(row.pending ?? [])];
-  return all.filter((u) => u.expiresAt > ctx.now && fileState(ctx, u.file) === "pending");
+  const kept = all.filter((u) => u.expiresAt + CONFIRM_GRACE_MS > ctx.now && fileState(ctx, u.file) === "pending");
+  const live = kept.filter((u) => u.expiresAt > ctx.now);
+  const graced = kept.filter((u) => u.expiresAt <= ctx.now).sort((x, y) => y.expiresAt - x.expiresAt).slice(0, MAX_GRACED_UPLOADS);
+  return [...live, ...graced];
 }
 
 /** At most this many uploads of one content in flight at once (each keeps its file referenced until it is used). */
@@ -326,7 +372,8 @@ export const functions = {
           // The row references the file from now on (refcount): a pending upload is not collected while it is here. An
           // upload of the same content already in flight keeps its place (its publisher confirms it, and either serves);
           // expired tickets are let go.
-          const pending = inFlight.filter((u) => u.file !== ticket.storageId);
+          // Kept: the uploads in flight and those in their grace period (their PUT may have finished in time).
+          const pending = (row ? pendingUploads(ctx, row) : []).filter((u) => u.file !== ticket.storageId);
           const fileExpiresAt = ticket.exists ? undefined : ticket.expiresAt;
           if (row) ctx.db.patch(row._id, { file: ticket.storageId as never, fileExpiresAt, pending: pending.length ? pending : undefined, contentType: a.contentType, size: a.size });
           else ctx.db.insert("assets", { sha256: a.sha256, file: ticket.storageId as never, ...(fileExpiresAt !== undefined ? { fileExpiresAt } : {}), contentType: a.contentType, size: a.size, createdAt: ctx.now });
@@ -424,11 +471,10 @@ export const functions = {
         for (const p of pairsOf(ctx, a.branch, a.platform, a.runtimeVersion)) {
           // A rollback takes out the head's release (the head and the live copies of it a rollback republished) and
           // goes back to the newest live row of another release: rolling back B' (a republish of B) reaches A, not B.
-          const rows = liveRows(ctx, a.branch, p.platform, p.runtimeVersion, ROLLBACK_WINDOW);
-          const head = rows[0];
-          if (!head) continue;
+          const scan = previousRelease(ctx, a.branch, p.platform, p.runtimeVersion);
+          if (!scan) continue;
+          const { head, prev, rows } = scan;
           const bad = releaseOf(head);
-          const prev = rows.find((r) => releaseOf(r) !== bad);
           if (head.kind === "rollBackToEmbedded" && (a.toEmbedded || !prev)) continue; // already on the embedded update
           for (const r of rows) if (releaseOf(r) === bad) ctx.db.patch(r._id, { rolledBack: true });
           const uuid = uuidOf(ctx.random);

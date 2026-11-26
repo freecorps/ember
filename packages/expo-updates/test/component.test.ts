@@ -198,6 +198,38 @@ describe("expo updates component", () => {
     await expect(prep()).rejects.toThrow(/already in flight/);
   });
 
+  test("an upload whose PUT finished in time is still confirmed after its ticket expired (grace), though another prepare ran", async () => {
+    const t = harness();
+    const body = "late-confirm";
+    const prep = async () =>
+      ((await t.mutation(m("prepareAssets"), { assets: [{ sha256: hex(body), size: body.length, contentType: "application/javascript" }] })) as Array<{ upload?: { url: string; headers: Record<string, string>; storageId: string; shard: string; token: string } }>)[0]!.upload!;
+    const first = await prep();
+    expect((await t.fetch(first.url, { method: "PUT", headers: first.headers, body })).status).toBe(200);
+    await t.advance(2 * 3600_000); // past the ticket's expiry, within the grace
+    await prep(); // another publisher writes the row
+    const c = await t.fetch("/api/storage/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shard: first.shard, storageId: first.storageId, token: first.token }) });
+    expect(c.status).toBe(200);
+    const r = (await t.mutation(m("publish"), { branch: "production", updates: [{ platform: "ios", runtimeVersion: "1.0.0", launchAsset: asset(body, "b", "application/javascript"), assets: [] }] })) as { updates: unknown[] };
+    expect(r.updates).toHaveLength(1);
+  });
+
+  test("a rollback finds the previous release past many copies of the current one", async () => {
+    const t = harness();
+    const h = (b: string) => createHash("sha256").update(b).digest("base64url");
+    await publish(t, { bundle: "A" });
+    await publish(t, { bundle: "B" });
+    // 55 temporary updates, each rolled back: B is republished every time (55 live copies of B above A).
+    for (let i = 0; i < 55; i++) {
+      await publish(t, { bundle: `tmp-${i}` });
+      await t.mutation(m("rollback"), { branch: "production" });
+    }
+    expect((await ask(t)).manifest.launchAsset.hash).toBe(h("B"));
+    await t.mutation(m("rollback"), { branch: "production" });
+    expect((await ask(t)).manifest.launchAsset.hash).toBe(h("A"));
+    // Every copy of B went out with it: the next rollback goes to the embedded update, not back to B.
+    expect(((await t.mutation(m("rollback"), { branch: "production" })) as Array<{ kind: string }>)[0]!.kind).toBe("rollBackToEmbedded");
+  }, 60_000);
+
   test("branch-wide commands find every live platform and runtime version, however many rows other ones have", async () => {
     const t = harness();
     await publish(t, { bundle: "ios-1", platforms: ["ios"] });
