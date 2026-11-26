@@ -226,4 +226,31 @@ describe("HTTP queries of one turn go out as one batch per shard", () => {
     expect(paths(server)).toEqual([]);
     client.close();
   });
+
+  it("queries asked before any token are bound to the identity their batch went as: a 413 after the user changed sends none as the new one", async () => {
+    const server = await seeded();
+    let who = "ana";
+    let client!: ReturnType<typeof makeClient>;
+    const real = server.fetch;
+    const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+    let refused = false;
+    client = makeClient(server, {
+      WebSocket: null,
+      auth: () => jwt(who),
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (new URL(String(input)).pathname !== "/api/query/batch" || refused) return real(input, init);
+        refused = true;
+        // While the batch (sent as ana) is on its way, the same source now answers for bob (no setAuth): the client
+        // learns it on a refresh. Then the runtime answers 413 (one by one).
+        who = "bob";
+        await (client as unknown as { fetchToken(): Promise<unknown> }).fetchToken();
+        return json(413, { ok: false, error: { code: "too_large", message: "too large" } });
+      }) as typeof fetch,
+    });
+    // Both asked in the same turn, before the first token is known.
+    const out = await Promise.allSettled([client.query(me, {}), client.query(list, { channel: "x" })]);
+    expect(out.map((r) => r.status === "rejected" && (r.reason as { code: string }).code)).toEqual(["identity_changed", "identity_changed"]);
+    expect(paths(server).filter((p) => p !== "/api/query/batch")).toEqual([]);
+    client.close();
+  });
 });

@@ -473,7 +473,8 @@ interface HttpFirstItem {
 }
 
 /** An HTTP call's answer: status, parsed body, whose token it went with (`ownerKey`), the `authGen` it started under. */
-type HttpAnswer = { status: number; body: unknown; owner: string; authGen: number };
+/** `identityGen`: the identity it was sent as (after its token was read; null when no token was known yet). */
+type HttpAnswer = { status: number; body: unknown; owner: string; authGen: number; identityGen: number | null };
 
 /** One query of `query()` / `fetchForHydration` waiting for the end of its turn (`flushQueries`). */
 interface QueuedQuery {
@@ -2187,7 +2188,7 @@ export class EmberClient {
           continue;
         }
       }
-      return { status: res.status, body, owner: ownerKey(token), authGen: gen };
+      return { status: res.status, body, owner: ownerKey(token), authGen: gen, identityGen: this.tokenKnown ? idGen : null };
     }
   }
 
@@ -2249,6 +2250,9 @@ export class EmberClient {
             const body = b && typeof b.error === "object" && b.error !== null ? { ok: false, error: b.error } : { ok: false };
             return chunk.forEach((i) => i.resolve({ ...r, body }));
           }
+          // One by one as the identity the batch went as: a query asked before any token was known is bound to it now,
+          // so an identity that changed while the batch was in flight is refused, not sent as the new one.
+          for (const i of chunk) if (i.identityGen === null) i.identityGen = r.identityGen;
           if (r.status === 413) return alone(chunk);
           this.queryBatch = false;
           alone(chunk);
