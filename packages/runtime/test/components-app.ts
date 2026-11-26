@@ -151,7 +151,18 @@ export const hooksComponent = defineComponent({
 });
 
 // Project limits (PLAN §3, L6): documents raised above the default, so metrics.test.ts sees them reach the shard.
-export const app = defineApp({ limits: { documentsRead: 20_000 } })
+export const app = defineApp({
+  limits: { documentsRead: 20_000 },
+  // Ephemeral channels (ephemeral.test.ts): signed-in rooms, a "vip" room only ana may join, rooms of the active
+  // organization (the `org` claim), typed payloads and member state, and a channel tied to its shard.
+  channels: {
+    "room:*": { authorize: (identity, { param }) => identity !== null && (param !== "vip" || identity.subject === "ana") },
+    "org:*": { authorize: (identity, { param }) => identity?.claims?.org === param },
+    "typed:*": { authorize: () => true, payload: v.object({ x: v.number(), y: v.number() }), state: v.optional(v.object({ name: v.string() })) },
+    "here:*": { authorize: (_identity, { param, shard }) => shard === `eph:${param}` },
+    "open": { authorize: () => true },
+  },
+})
   .use(tally, { config: { label: "tallies" } })
   .use(rateLimit)
   .use(workflows)

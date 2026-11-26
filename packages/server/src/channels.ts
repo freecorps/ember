@@ -98,6 +98,10 @@ export function authorizeChannel(def: ChannelDefinition, identity: Identity | nu
 export function checkChannelValue(def: ChannelDefinition, which: "payload" | "state", value: unknown): string | null {
   const val = def[which];
   if (!val) return null;
+  // `v.optional(...)`: none given is fine.
+  if (value === undefined && val.isOptional === "optional") return null;
   const r = validate(val.shape, value);
-  return r.ok ? null : `${which}${r.path ? `.${r.path}` : ""}: ${r.message}`;
+  if (r.ok) return null;
+  const path = r.path.replace(/^\$\.?/, "");
+  return `${which}${path ? (path.startsWith("[") ? path : `.${path}`) : ""}: ${r.message}`;
 }
