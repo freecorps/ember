@@ -631,9 +631,12 @@ function canonicalClaim(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(canonicalClaim);
   if (v && typeof v === "object") {
     const o = v as Record<string, unknown>;
-    return Object.keys(o)
-      .sort()
-      .map((k) => [k, canonicalClaim(o[k])]);
+    // Tagged, so an object never serializes like an array of pairs (`{a: 1}` vs `[["a", 1]]`, `{}` vs `[]`).
+    return {
+      o: Object.keys(o)
+        .sort()
+        .map((k) => [k, canonicalClaim(o[k])]),
+    };
   }
   return v;
 }
