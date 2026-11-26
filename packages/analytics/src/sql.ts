@@ -50,14 +50,20 @@ function from(s: Scope): { table: string; where: string[] } {
   return { table: s.dataset, where: [`blob6 = ${lit(s.install)}`] };
 }
 
-/** The user a row counts for: its userId, else its anonymous id. */
-const UID = "if(blob2 != '', blob2, blob3)";
+/**
+ * The user a row counts for: its userId, else its anonymous id, each in its own namespace (`u:`/`a:`), so a signed-in
+ * subject and an anonymous id that happen to be the same text are two users (`format` is the SQL's only way to build
+ * a string).
+ */
+const UID = "if(blob2 != '', format('u:{}', blob2), format('a:{}', blob3))";
 const HAS_UID = "(blob2 != '' OR blob3 != '')";
 /**
  * Distinct users. Rows with neither id have UID '': `count(DISTINCT)` would count them as one more user, and the SQL
  * has no conditional distinct count, so that one value is taken off when there is such a row.
  */
 const USERS = `count(DISTINCT ${UID}) - if(countIf(NOT ${HAS_UID}) > 0, 1, 0)`;
+/** Rows a counts query returns at most: the newest buckets (the parse puts them back oldest first). */
+export const MAX_COUNT_ROWS = 10_000;
 /**
  * When the event happened (unix seconds): `double1`, the `ts` the batch carried (checked by the server), not
  * `timestamp`, which is when the point was written. Funnel order, windows, buckets and cohorts all use it.
@@ -116,8 +122,9 @@ export function countsSql(s: Scope, o: CountsOptions = {}): string {
     `FROM ${table}`,
     `WHERE ${where.join(" AND ")}`,
     "GROUP BY t, name",
-    "ORDER BY t, name",
-    "LIMIT 10000",
+    // Newest first, so a range with more groups than the limit loses its oldest buckets, never the recent ones.
+    "ORDER BY t DESC, name",
+    `LIMIT ${MAX_COUNT_ROWS}`,
   ].join("\n");
 }
 
@@ -229,6 +236,8 @@ export function parseFunnel(body: SqlResponse, o: FunnelOptions): FunnelResult {
 // ------------------------------------------------------------------------------------------------ retention
 
 export type Period = "day" | "week";
+/** Most periods of a retention run (the current one included): up to `MAX_PERIODS - 1` returns per cohort. */
+export const MAX_PERIODS = 13;
 export const PERIOD_SECONDS: Record<Period, number> = { day: 86400, week: 7 * 86400 };
 
 export interface RetentionOptions {
@@ -246,7 +255,7 @@ export interface RetentionOptions {
 export function retentionStart(o: RetentionOptions): number {
   const period = o.period ?? "week";
   checkPeriod(period);
-  const n = int(o.periods ?? 8, 2, 13, "periods");
+  const n = int(o.periods ?? 8, 2, MAX_PERIODS, "periods");
   const nowS = Math.floor((o.now ?? Date.now()) / 1000);
   const day = Math.floor(nowS / 86400) * 86400;
   // 1970-01-01 (day 0) was a Thursday: day d is (d + 3) % 7 days after a Monday.
@@ -269,7 +278,7 @@ export function retentionSql(s: Scope, o: RetentionOptions = {}): string {
   const { table, where } = from(s);
   const period = o.period ?? "week";
   checkPeriod(period);
-  const n = int(o.periods ?? 8, 2, 13, "periods");
+  const n = int(o.periods ?? 8, 2, MAX_PERIODS, "periods");
   const p = PERIOD_SECONDS[period];
   const start = retentionStart(o);
   where.push(`toUnixTimestamp(timestamp) >= ${start - AHEAD_HOURS * 3600}`, `${ET} >= ${start}`, HAS_UID);
@@ -316,7 +325,7 @@ export interface RetentionResult {
 export function parseRetention(body: SqlResponse, o: RetentionOptions = {}): RetentionResult {
   const period = o.period ?? "week";
   checkPeriod(period);
-  const n = int(o.periods ?? 8, 2, 13, "periods");
+  const n = int(o.periods ?? 8, 2, MAX_PERIODS, "periods");
   const start = retentionStart(o);
   const p = PERIOD_SECONDS[period];
   const cohorts: RetentionCohort[] = [];
@@ -382,7 +391,9 @@ export async function runSql(api: SqlApi, sql: string): Promise<SqlResponse> {
   const f = api.fetch ?? fetch;
   const base = checkBase(api.base ?? SQL_API_BASE);
   const url = `${base.replace(/\/$/, "")}/accounts/${encodeURIComponent(api.accountId)}/analytics_engine/sql`;
-  const res = await f(url, { method: "POST", headers: { authorization: `Bearer ${api.token}`, "content-type": "text/plain" }, body: sql });
+  // `redirect: "manual"`: the bearer token never follows a redirect to another origin (older compatibility dates
+  // forward `Authorization`); a 3xx is a non-2xx, so an error.
+  const res = await f(url, { method: "POST", redirect: "manual", headers: { authorization: `Bearer ${api.token}`, "content-type": "text/plain" }, body: sql });
   const text = await res.text();
   if (!res.ok) throw new SqlApiError(`Analytics Engine SQL API: ${res.status} ${text.slice(0, 300)}`, res.status);
   try {

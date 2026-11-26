@@ -96,7 +96,9 @@ the **first** time of each step (in order, within the window from step 1); reten
 their first event in the range (the range is the cohort horizon; Analytics Engine keeps three months). On a sampled
 dataset, per-user numbers are estimates. Every query uses the event's own time (`double1`, the `ts` the batch carried),
 not when the point was written: a batch sent late (offline, a beacon) keeps its order. Events with neither a user nor
-an anonymous id count as events, not as a user. `sql.base` must be `https:` (plain `http:` only to the loopback).
+an anonymous id count as events, not as a user. `sql.base` must be `https:` (plain `http:` only to the loopback), and redirects are not followed. A user is
+`u:<userId>` or `a:<anonymousId>`: a subject and an anonymous id with the same text are two users. `counts` returns at
+most 10 000 rows, the newest buckets.
 
 ## Raw archive
 

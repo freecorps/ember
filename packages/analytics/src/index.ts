@@ -64,6 +64,8 @@ export {
   DATASET,
   INSTALL,
   NEVER,
+  MAX_COUNT_ROWS,
+  MAX_PERIODS,
   PERIOD_SECONDS,
   SQL_API_BASE,
   SqlApiError,

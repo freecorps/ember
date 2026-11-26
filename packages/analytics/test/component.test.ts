@@ -53,7 +53,8 @@ describe("server-side tracking", () => {
     const { t, ds } = setup();
     const r = await t.withIdentity({ subject: "user_1" }).action(unsafeRef<"action">("events:signup"), { plan: "pro" });
     expect(r).toMatchObject({ accepted: 1, written: true });
-    expect(t.lastStats()?.rowsWritten ?? 0).toBe(0);
+    // A measured zero, not a missing measurement.
+    expect(t.lastStats()).toMatchObject({ rowsWritten: 0 });
     expect(ds.points).toHaveLength(1);
     const p = ds.points[0]!;
     expect(p.indexes).toEqual(["signed_up"]);
@@ -222,6 +223,30 @@ describe("queries", () => {
     expect(((await read("overview")) as { at: number }).at).toBeGreaterThan(before);
   });
 
+  test("credentials removed after a refresh: the saved overview stops showing the old numbers as configured", async () => {
+    sqlApi((sql) => (sql.includes("GROUP BY name") ? { data: [] } : { data: [{ events: "30", users: "7" }] }));
+    const env: Record<string, unknown> = { EMBER_ANALYTICS: fakeDataset(), ...CREDS };
+    const t = emberTest({ schema, modules: { events }, app, env });
+    const run = () => (t as unknown as { _action(n: string, a: unknown, s: string): Promise<unknown> })._action("@analytics/dashboard:refresh", {}, "global:main");
+    const read = () => t.query(unsafeRef<"query">("@analytics/dashboard:overview"), {});
+    await run();
+    expect(await read()).toMatchObject({ eventsToday: 30, configured: true });
+    delete env.EMBER_ANALYTICS_API_TOKEN;
+    expect(await run()).toMatchObject({ configured: false });
+    expect(await read()).toEqual({ eventsToday: 0, usersToday: 0, top: [], at: null, configured: false });
+  });
+
+  test("counts: oldest first, from the newest-first statement (a long range keeps its recent buckets)", async () => {
+    const calls = sqlApi(() => ({ data: [{ t: "2026-11-26 10:00:00", name: "b", events: "1" }, { t: "2026-11-26 10:00:00", name: "a", events: "2" }, { t: "2026-11-26 09:00:00", name: "a", events: "3" }] }));
+    const t = emberTest({ schema, modules: { events: { ...events, counts: actionGeneric({ args: {}, handler: (ctx: any) => tracker.counts(ctx, { bucket: "hour" }) }) } }, app, env: { EMBER_ANALYTICS: fakeDataset(), ...CREDS } });
+    expect(await t.action(unsafeRef<"action">("events:counts"), {})).toEqual([
+      { t: "2026-11-26 09:00:00", name: "a", events: 3 },
+      { t: "2026-11-26 10:00:00", name: "a", events: 2 },
+      { t: "2026-11-26 10:00:00", name: "b", events: 1 },
+    ]);
+    expect(calls[0]).toContain("ORDER BY t DESC, name");
+  });
+
   test("refresh without the SQL API: nothing queried, nothing written", async () => {
     const calls = sqlApi(() => ({ data: [] }));
     const { t } = setup();
@@ -252,6 +277,9 @@ describe("the install", () => {
       "@analytics/dashboard:refresh",
       "@analytics/dashboard:retention",
     ]);
+    // The retention table has a column for every return a run can have (13 periods: +1..+12).
+    const cohorts = spec!.tabs.find((x) => x.id === "retention")!.blocks.find((b) => b.id === "cohorts") as { columns: Array<{ label: string }> };
+    expect(cohorts.columns.map((c) => c.label).slice(2)).toEqual(Array.from({ length: 12 }, (_, i) => `+${i + 1}`));
     expect(composeApp({ schema, functions: {}, app: defineApp().use(analytics, { config: { summary: false } }) }).crons).toEqual([]);
     expect(() => composeApp({ schema, functions: {}, app: defineApp().use(analytics, { config: { binding: "bad-name" } }) })).toThrow(/binding/);
     expect(() => composeApp({ schema, functions: {}, app: defineApp().use(analytics, { config: { rateLimit: { binding: "RL", limit: 5 } } }) })).toThrow(/limit and period/);

@@ -25,6 +25,7 @@ import {
   cachedSql,
   countsSql,
   funnelSql,
+  MAX_PERIODS,
   overviewSql,
   parseFunnel,
   parseRetention,
@@ -292,8 +293,13 @@ const vPeriod = v.union(v.literal("day"), v.literal("week"));
 const vProps = v.record(v.union(v.string(), v.number(), v.boolean()));
 const vEvent = v.object({ name: v.string(), props: v.optional(vProps), ts: v.optional(v.number()), anonymousId: v.optional(v.string()), userId: v.optional(v.string()) });
 
+/** Oldest first; at most `MAX_COUNT_ROWS` rows, the newest buckets of the range (a longer range loses its oldest). */
 const counts = (ctx: ActCtx, a: { names?: string[]; sinceHours?: number; bucket?: Bucket }) =>
-  query(ctx, () => countsSql(scopeOf(ctx), a)).then((r) => (r.data ?? []).map((x): CountRow => ({ t: String(x.t ?? ""), name: String(x.name ?? ""), events: n(x.events) })));
+  query(ctx, () => countsSql(scopeOf(ctx), a)).then((r) =>
+    (r.data ?? [])
+      .map((x): CountRow => ({ t: String(x.t ?? ""), name: String(x.name ?? ""), events: n(x.events) }))
+      .sort((x, y) => (x.t < y.t ? -1 : x.t > y.t ? 1 : x.name < y.name ? -1 : x.name > y.name ? 1 : 0)),
+  );
 const topEvents = (ctx: ActCtx, a: { sinceHours?: number; limit?: number }) =>
   query(ctx, () => topEventsSql(scopeOf(ctx), a)).then((r) => (r.data ?? []).map((x): TopEvent => ({ name: String(x.name ?? ""), events: n(x.events), users: n(x.users) })));
 const funnelOpts = (a: { steps: string[]; windowHours?: number; days?: number }) => ({
@@ -314,7 +320,13 @@ const saveReport = unsafeRef<"mutation">("lib:saveReport");
 
 /** Today's events and users, and the top events of the last 24 h: what the dashboard's overview shows. */
 async function refresh(ctx: ActCtx): Promise<Overview> {
-  if (!configured(ctx)) return { eventsToday: 0, usersToday: 0, top: [], at: null, configured: false };
+  if (!configured(ctx)) {
+    const value: Overview = { eventsToday: 0, usersToday: 0, top: [], at: null, configured: false };
+    // The credentials went away: the saved overview must not keep showing the old numbers as configured. Only an
+    // existing report is replaced (an install that never had one still writes nothing).
+    await ctx.runMutation(saveReport, { key: "overview", value, onlyIfExists: true });
+    return value;
+  }
   const [today, top] = await Promise.all([query(ctx, () => overviewSql(scopeOf(ctx))), topEvents(ctx, { sinceHours: 24, limit: 20 })]);
   const row = today.data?.[0] ?? {};
   const value: Overview = { eventsToday: n(row.events), usersToday: n(row.users), top, at: ctx.now, configured: true };
@@ -370,9 +382,10 @@ export const functions = {
     /** Recomputes the dashboard overview (the summary cron). Without the SQL API configured: nothing, no write. */
     refresh: internalAction({ args: {}, handler: (ctx) => refresh(ctx) }),
     saveReport: internalMutation({
-      args: { key: v.string(), value: v.any() },
+      args: { key: v.string(), value: v.any(), onlyIfExists: v.optional(v.boolean()) },
       handler: (ctx, a) => {
         const row = ctx.db.query("reports").withIndex("by_key", (q) => q.eq("key", a.key)).first();
+        if (!row && a.onlyIfExists) return;
         if (row) ctx.db.replace(row._id, { key: a.key, at: ctx.now, value: a.value });
         else ctx.db.insert("reports", { key: a.key, at: ctx.now, value: a.value });
       },
@@ -423,7 +436,8 @@ export const dashboardFunctions = {
 
 const http = httpRouter().route({ path: "/track", method: "POST", handler: trackHttp }).route({ path: "/track", method: "OPTIONS", handler: trackHttp });
 
-const PERIOD_COLUMNS = Array.from({ length: 8 }, (_, i) => ({ label: `+${i + 1}`, path: `rates.${i}`, format: "percent" as const }));
+// Every return a retention run can have (`MAX_PERIODS - 1`); a cohort without one leaves the column blank.
+const PERIOD_COLUMNS = Array.from({ length: MAX_PERIODS - 1 }, (_, i) => ({ label: `+${i + 1}`, path: `rates.${i}`, format: "percent" as const }));
 
 export const analytics = defineComponent({
   name: "analytics",

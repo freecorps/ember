@@ -128,8 +128,14 @@ describe("statement shapes", () => {
     expect(overviewSql(scope)).toContain("timestamp >= toStartOfDay(NOW()) - INTERVAL '1' HOUR AND " + ET + " >= toUnixTimestamp(toStartOfDay(NOW()))");
   });
 
+  test("users: a signed-in subject and an anonymous id with the same text are two users", () => {
+    for (const sql of [topEventsSql(scope), overviewSql(scope), funnelSql(scope, { steps: ["a", "b"] }), retentionSql(scope, {})]) {
+      expect(sql).toContain("if(blob2 != '', format('u:{}', blob2), format('a:{}', blob3))");
+    }
+  });
+
   test("users: rows with neither userId nor anonymousId are not one more user (they still count as events)", () => {
-    const users = "count(DISTINCT if(blob2 != '', blob2, blob3)) - if(countIf(NOT (blob2 != '' OR blob3 != '')) > 0, 1, 0) AS users";
+    const users = "count(DISTINCT if(blob2 != '', format('u:{}', blob2), format('a:{}', blob3))) - if(countIf(NOT (blob2 != '' OR blob3 != '')) > 0, 1, 0) AS users";
     expect(topEventsSql(scope)).toContain(`SUM(_sample_interval) AS events, ${users}`);
     expect(overviewSql(scope)).toContain(`SUM(_sample_interval) AS events, ${users}`);
   });
@@ -141,7 +147,7 @@ describe("statement shapes", () => {
         "FROM ember_analytics",
         `WHERE blob6 = 'analytics' AND timestamp > NOW() - INTERVAL '49' HOUR AND ${ET} > toUnixTimestamp(NOW()) - 172800 AND index1 IN ('a', 'b')`,
         "GROUP BY t, name",
-        "ORDER BY t, name",
+        "ORDER BY t DESC, name",
         "LIMIT 10000",
       ].join("\n"),
     );
@@ -156,7 +162,7 @@ describe("statement shapes", () => {
         `  countIf(t0 < ${NEVER} AND t1 >= t0 AND t1 - t0 <= 3600) AS step1,`,
         `  countIf(t0 < ${NEVER} AND t1 >= t0 AND t2 >= t1 AND t2 - t0 <= 3600) AS step2`,
         "FROM (",
-        "  SELECT if(blob2 != '', blob2, blob3) AS uid,",
+        "  SELECT if(blob2 != '', format('u:{}', blob2), format('a:{}', blob3)) AS uid,",
         `    min(if(blob1 = 'view', ${ET}, ${NEVER})) AS t0,`,
         `    min(if(blob1 = 'cart', ${ET}, ${NEVER})) AS t1,`,
         `    min(if(blob1 = 'paid', ${ET}, ${NEVER})) AS t2`,
@@ -182,7 +188,7 @@ describe("statement shapes", () => {
         "  countIf((cohort = 0 AND a1 > 0) OR (cohort = 1 AND a2 > 0)) AS r1,",
         "  countIf((cohort = 0 AND a2 > 0)) AS r2",
         "FROM (",
-        "  SELECT if(blob2 != '', blob2, blob3) AS uid,",
+        "  SELECT if(blob2 != '', format('u:{}', blob2), format('a:{}', blob3)) AS uid,",
         `    min(${idx}) AS cohort,`,
         `    countIf(${idx} = 0) AS a0,`,
         `    countIf(${idx} = 1) AS a1,`,
@@ -205,9 +211,9 @@ const ET = "toUnixTimestamp(toDateTime(double1 / 1000))";
 
 /** A recorded SQL API exchange: the fetch sees the URL, the token and the statement; answers what was recorded. */
 function recorded(answer: unknown, status = 200) {
-  const calls: Array<{ url: string; auth: string | null; body: string }> = [];
+  const calls: Array<{ url: string; auth: string | null; body: string; redirect?: string }> = [];
   const f = (async (url: string, init: RequestInit) => {
-    calls.push({ url, auth: new Headers(init.headers).get("authorization"), body: String(init.body) });
+    calls.push({ url, auth: new Headers(init.headers).get("authorization"), body: String(init.body), ...(init.redirect ? { redirect: init.redirect } : {}) });
     return new Response(typeof answer === "string" ? answer : JSON.stringify(answer), { status });
   }) as unknown as typeof fetch;
   return { calls, api: { accountId: "acc123", token: "tok", fetch: f } };
@@ -223,6 +229,7 @@ describe("the SQL API and results", () => {
     const r = parseFunnel(await runSql(api, funnelSql(scope, o)), o);
     expect(calls[0]!.url).toBe("https://api.cloudflare.com/client/v4/accounts/acc123/analytics_engine/sql");
     expect(calls[0]!.auth).toBe("Bearer tok");
+    expect(calls[0]!.redirect).toBe("manual"); // the token never follows a redirect
     expect(calls[0]!.body).toBe(funnelSql(scope, o));
     expect(r.steps).toEqual([
       { step: 1, name: "view", users: 200, conversion: 1, fromPrevious: 1 },
