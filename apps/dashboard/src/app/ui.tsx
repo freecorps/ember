@@ -5,7 +5,8 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { ApiError } from "./api.ts";
 
 export interface Col {
-  h: string;
+  /** The header: text, or a control (the select-all checkbox of a bulk action). */
+  h: ReactNode;
   num?: boolean;
   /** Extra class for the column cells. */
   cls?: string;

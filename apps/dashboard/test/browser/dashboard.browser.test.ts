@@ -399,6 +399,158 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await close();
   });
 
+  it("data v2: open by _id, links of v.id() and v.file() fields, range bounds, full-text search, bulk delete (typed on prod), auto-refresh", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/data/global%3Amain/messages");
+    const t = page.getByRole("table", { name: "messages rows" });
+    await t.waitFor();
+    // _id search: a direct get, and its document opens.
+    await page.getByLabel("Document _id").fill("messages_3");
+    await page.getByRole("button", { name: "Open", exact: true }).click();
+    await page.getByRole("dialog").locator("pre", { hasText: "deploy finished" }).waitFor();
+    expect(prod.lists.at(-1)).toMatchObject({ table: "messages", id: "messages_3" });
+    await page.keyboard.press("Escape");
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(1);
+    await page.getByRole("button", { name: "Clear" }).click();
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(3);
+
+    // A v.id() value links to its document; a v.file() value to the Files screen.
+    await t.getByRole("link", { name: "messages_1" }).click();
+    await expect.poll(() => page.url()).toContain("/data/global%3Amain/messages/messages_1");
+    await page.getByRole("dialog").getByText("messages_1").first().waitFor();
+    expect(prod.lists.at(-1)).toMatchObject({ id: "messages_1" });
+    await page.keyboard.press("Escape");
+    await page.getByRole("button", { name: "Clear" }).click();
+    await page.getByRole("table", { name: "messages rows" }).getByRole("link", { name: "_storage_png" }).click();
+    await expect.poll(() => page.url()).toContain("/files/global%3Amain/_storage_png");
+    await page.getByRole("dialog").locator("img").waitFor();
+    await page.keyboard.press("Escape");
+    await page.evaluate(() => void (location.hash = "#/p/chat/prod/data/global%3Amain/messages"));
+    await t.waitFor();
+
+    // Range on the field after the fixed prefix (by_author: author itself), as JSON values.
+    await page.getByLabel("Index").selectOption("by_author");
+    await page.getByLabel("author from").fill("b");
+    await page.getByLabel("author upper bound").selectOption("lte");
+    await page.getByLabel("author to").fill('"m"');
+    await page.getByRole("button", { name: "Apply" }).click();
+    await expect.poll(() => prod.lists.at(-1)).toMatchObject({ index: "by_author", gte: '"b"', lte: '"m"' });
+    // Full-text search through the table's searchIndex.
+    await page.getByLabel("Full-text search").fill("deploy");
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(1);
+    expect(prod.lists.at(-1)).toMatchObject({ index: "search_body", search: "deploy" });
+    await page.getByRole("button", { name: "Clear" }).click();
+    await page.getByLabel("Index").selectOption("by_creation_time");
+    await page.getByRole("button", { name: "Apply" }).click();
+    await expect.poll(() => t.locator("tbody tr").count()).toBe(3);
+
+    // Bulk delete: select two rows, one confirmation with the count (prod: type the table name).
+    await page.getByLabel("Select messages_1").check();
+    await page.getByLabel("Select messages_3").check();
+    await page.getByRole("button", { name: "Delete 2 selected…" }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByText("Delete 2 documents of messages?").waitFor();
+    const confirm = dialog.getByRole("button", { name: "Delete 2 documents" });
+    expect(await confirm.isDisabled()).toBe(true);
+    await dialog.getByRole("textbox").fill("messages");
+    await confirm.click();
+    await page.getByText("Deleted 2 documents from messages").waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "data/delete", body: { shard: "global:main", table: "messages", ids: ["messages_3", "messages_1"] } });
+
+    // Auto-refresh: the same page again every 5 s.
+    const before = prod.lists.length;
+    await page.getByLabel("Auto-refresh every 5 seconds").check();
+    await expect.poll(() => prod.lists.length, { timeout: 8_000 }).toBeGreaterThan(before);
+    await page.getByLabel("Auto-refresh every 5 seconds").uncheck();
+    await shot(page, "data-v2");
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("SQL explorer: completion, run with ⌘↵, results as text, CSV and JSON export, EXPLAIN tree, audited; read role cannot run", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/sql/global%3Amain");
+    const editor = page.getByRole("textbox", { name: "SQL", exact: true });
+    await editor.waitFor();
+    await editor.fill("SELECT * FROM mess");
+    const completions = page.getByRole("listbox", { name: "Completions" });
+    await completions.getByRole("option", { name: /^messages table/ }).waitFor();
+    await editor.press("Tab");
+    await expect.poll(() => editor.inputValue()).toBe("SELECT * FROM messages");
+    await editor.press("ControlOrMeta+Enter");
+    const result = page.getByRole("table", { name: "SQL result" });
+    await result.waitFor();
+    expect(prod.posts.at(-1)).toEqual({ path: "sql", body: { shard: "global:main", sql: "SELECT * FROM messages", params: [], limit: 500 } });
+    await page.getByText("truncated").waitFor();
+    // User data is text.
+    await expect.poll(() => result.locator("td", { hasText: "<img" }).count()).toBe(1);
+    expect(await page.locator("img").count()).toBe(0);
+    expect(await page.evaluate(() => (window as unknown as { __xss?: number }).__xss)).toBeUndefined();
+
+    // Exports, built in the page from the result.
+    const save = async (name: string) => {
+      const [d] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name }).click()]);
+      return { file: d.suggestedFilename(), text: readFileSync((await d.path())!, "utf8") };
+    };
+    const csv = await save("Export CSV");
+    expect(csv.file).toBe("chat-prod-global_main.csv");
+    expect(csv.text).toBe(`_id,author,body\r\nmessages_1,ana,"a, ""quoted"" ${XSS.replace(/"/g, '""')}"\r\nmessages_2,'=cmd(),\r\n`);
+    const js = await save("Export JSON");
+    expect(JSON.parse(js.text)).toEqual([
+      { _id: "messages_1", author: "ana", body: `a, "quoted" ${XSS}` },
+      { _id: "messages_2", author: "=cmd()", body: null },
+    ]);
+
+    // EXPLAIN QUERY PLAN as a tree; a refused statement shows the project's reason.
+    await page.getByLabel("EXPLAIN QUERY PLAN").check();
+    await page.getByRole("button", { name: /^Run/ }).click();
+    await page.getByRole("list", { name: "Query plan" }).getByText("SCAN messages").waitFor();
+    expect(prod.posts.at(-1)).toMatchObject({ path: "sql", body: { explain: true } });
+    await page.getByLabel("EXPLAIN QUERY PLAN").uncheck();
+    await editor.fill("DELETE FROM messages");
+    await editor.press("Escape");
+    await editor.press("ControlOrMeta+Enter");
+    await page.getByText("SqlRefused").waitFor();
+    await shot(page, "sql");
+    // Every run is in the audit log with its text.
+    const rows = reg.db.prepare("SELECT action, target, args, outcome FROM audit_log WHERE action = 'sql.run' ORDER BY id").all() as Array<{ args: string; outcome: string }>;
+    expect(rows.map((r) => [JSON.parse(r.args).sql, r.outcome])).toEqual([
+      ["SELECT * FROM messages", "ok"],
+      ["SELECT * FROM messages", "ok"],
+      ["DELETE FROM messages", "error"],
+    ]);
+    expect(problems).toEqual([]);
+    await close();
+
+    // The read role sees why it cannot run SQL.
+    const r = await open("#/p/chat/prod/sql/global%3Amain", { token: "read-token-for-tests" });
+    await r.page.getByText("Admins only").waitFor();
+    expect(await r.page.getByRole("button", { name: /^Run/ }).isDisabled()).toBe(true);
+    await r.close();
+  });
+
+  it("schema explorer: tables, shapes, indexes and flags from the deployed schema; counts and index state on demand", async () => {
+    const before = prod.calls.length;
+    const { page, problems, close } = await open("#/p/chat/prod/schema/org%3Abeta");
+    const card = page.getByRole("region", { name: "Table messages" });
+    await card.waitFor();
+    await card.getByText("replicated → org").waitFor();
+    await card.getByText("id<messages>").first().waitFor();
+    await card.getByRole("table", { name: "Indexes of messages" }).getByText("search_body").waitFor();
+    await page.getByText("pool$work").waitFor();
+    // Opening the screen woke no shard; "Check" asks the picked one for counts and staged indexes.
+    expect(prod.calls.slice(before).filter((c) => c.startsWith("GET status") || c.startsWith("GET data"))).toEqual([]);
+    await page.getByRole("button", { name: /^Check/ }).click();
+    await card.getByText("2 rows on this shard").waitFor();
+    await card.getByRole("table", { name: "Indexes of messages" }).getByText("backfilling").waitFor();
+    expect(prod.calls.slice(before).filter((c) => c.startsWith("GET status") || c.startsWith("GET data")).sort()).toEqual(["GET data?org:beta", "GET status?org:beta"]);
+    // A table opens in the Data Browser.
+    await card.getByRole("link", { name: "messages" }).click();
+    await expect.poll(() => page.url()).toContain("/data/org%3Abeta/messages");
+    await shot(page, "schema");
+    expect(problems).toEqual([]);
+    await close();
+  });
+
   it("functions: charts and errors from Analytics Engine, the runner (form, JSON, run as a user), reactivity with the ember dev advice", async () => {
     env.CF_API_TOKEN = "cf";
     globalThis.fetch = fakeAnalytics();

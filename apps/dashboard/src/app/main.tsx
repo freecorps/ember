@@ -1,7 +1,8 @@
 // Ember Dashboard SPA (React, no router or UI dependencies). Hash routes:
 //   #/                                       projects of the account
 //   #/audit                                  audit log, all projects
-//   #/p/<project>/<env>/<section>[/<shard>]  health | functions | cost | shards | data | crons | deployments | audit
+//   #/p/<project>/<env>/<section>[/<shard>]  health | functions | cost | shards | data | sql | schema | crons | ...
+//   #/p/<project>/<env>/data/<shard>/<table>[/<id>], files/<shard>/<file id>: a table, a document, a file
 //   #/p/<project>/<env>/components[/<shard>/<install>[/<tab>]], #/p/<project>/<env>/app[/<shard>/<tab>]: declarative screens
 // The shard in the route is the one the top bar's picker selected (data, shards and crons use it).
 
@@ -22,6 +23,8 @@ import { Settings } from "./pages/settings.tsx";
 import { Users } from "./pages/users.tsx";
 import { Shards } from "./pages/shards.tsx";
 import { Screens } from "./pages/screens.tsx";
+import { SchemaExplorer } from "./pages/schema.tsx";
+import { SqlExplorer } from "./pages/sql.tsx";
 import type { Project, ShardRow } from "./pages/types.ts";
 import { Dialog, Loading, Mono, Problem, Toasts, type ToastItem } from "./ui.tsx";
 import { Palette, usePaletteShortcut } from "./palette.tsx";
@@ -34,6 +37,8 @@ const SECTIONS = [
   { id: "components", label: "Components", key: "k" },
   { id: "shards", label: "Shards", key: "s" },
   { id: "data", label: "Data", key: "d" },
+  { id: "schema", label: "Schema", key: "m" },
+  { id: "sql", label: "SQL", key: "q" },
   { id: "reactivity", label: "Reactivity", key: "r" },
   { id: "logs", label: "Logs", key: "l" },
   { id: "files", label: "Files", key: "i" },
@@ -44,7 +49,7 @@ const SECTIONS = [
   { id: "settings", label: "Settings", key: "g" },
 ] as const;
 
-const SHARD_SECTIONS = new Set(["data", "shards", "crons", "reactivity", "files", "components", "app"]);
+const SHARD_SECTIONS = new Set(["data", "schema", "sql", "shards", "crons", "reactivity", "files", "components", "app"]);
 /** Sections whose route keeps its later segments (component, tab) when another shard is picked. */
 const KEEPS_REST = new Set(["components", "app"]);
 const DEFAULT_SHARD = "global:main";
@@ -245,13 +250,23 @@ function Shell({ me, onSignOut }: { me: Me; onSignOut: () => void }) {
       ) : section.id === "logs" ? (
         <Logs key={`${p.project}/${p.env}`} {...p} />
       ) : section.id === "files" ? (
-        <Files key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
+        <Files key={`${p.project}/${p.env}/${shard}/${route.rest?.[0] ?? ""}`} {...p} shard={shard} {...(route.rest?.[0] ? { initialFile: route.rest[0] } : {})} />
+      ) : section.id === "sql" ? (
+        <SqlExplorer key={`${p.project}/${p.env}`} {...p} shard={shard} />
+      ) : section.id === "schema" ? (
+        <SchemaExplorer key={`${p.project}/${p.env}/${shard}`} {...p} shard={shard} />
       ) : section.id === "reactivity" ? (
         <Reactivity key={shard} {...p} shard={shard} />
       ) : section.id === "shards" ? (
         <Shards key={`${p.project}/${p.env}`} {...p} {...(route.shard ? { shard: route.shard } : {})} />
       ) : section.id === "data" ? (
-        <DataBrowser key={`${p.project}/${p.env}/${shard}/${route.rest?.[0] ?? ""}`} {...p} shard={shard} {...(route.rest?.[0] ? { initialTable: route.rest[0] } : {})} />
+        <DataBrowser
+          key={`${p.project}/${p.env}/${shard}/${route.rest?.[0] ?? ""}/${route.rest?.[1] ?? ""}`}
+          {...p}
+          shard={shard}
+          {...(route.rest?.[0] ? { initialTable: route.rest[0] } : {})}
+          {...(route.rest?.[1] ? { initialId: route.rest[1] } : {})}
+        />
       ) : section.id === "crons" ? (
         <Crons {...p} shard={shard} />
       ) : section.id === "deployments" ? (
