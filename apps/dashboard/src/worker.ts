@@ -85,7 +85,7 @@ const DASH_ARGS_MAX = 8192;
 const SQL_AUDIT_CHARS = 2048;
 const SQL_ROWS_MAX = 5000;
 const SQL_PARAMS_MAX = 100;
-/** `data/list` arguments of admin API level 14 (`id`, range bounds, `search`): older runtimes would ignore them. */
+/** `data/list` arguments of admin API level 15 (`id`, range bounds, `search`): older runtimes would ignore them. */
 const ROWS_V2 = ["id", "gt", "gte", "lt", "lte", "search"];
 
 interface Ctx {
@@ -839,7 +839,7 @@ export const ROUTES: Route[] = [
     feature: "data/list",
     summary: "a page of an app table through an index (eq on a prefix of its fields, then gt/gte/lt/lte on the next), asc or desc; `id` gets one document, `search` runs a searchIndex",
     async run(c) {
-      // Bounds, a direct get and full-text search are level 14 (feature `sql` marks it): an older runtime would ignore
+      // Bounds, a direct get and full-text search are level 15 (feature `sql` marks it): an older runtime would ignore
       // them and answer the unfiltered page, so it is refused as outdated instead.
       const v2 = ROWS_V2.some((k) => c.q.has(k));
       const t = await targetOf(c, v2 ? "sql" : "data/list");

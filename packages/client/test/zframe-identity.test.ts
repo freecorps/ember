@@ -2,7 +2,7 @@
 // that the client sent meanwhile: the socket's `FrameQueue` hands each frame the tag it arrived with (who the socket
 // ran as then), and the client drops the subscription deliveries of a frame that arrived as someone else.
 import { describe, expect, it } from "vitest";
-import { FrameQueue, withoutDeliveries } from "../src/zframe.ts";
+import { FrameQueue, withoutStale } from "../src/zframe.ts";
 
 const deflate = async (text: string): Promise<ArrayBuffer> => {
   const cs = new CompressionStream("deflate-raw");
@@ -30,15 +30,32 @@ describe("zframe: frames keep the identity they arrived under", () => {
     ]);
   });
 
-  it("withoutDeliveries keeps everything but snap/patch (null when nothing is left)", () => {
-    expect(withoutDeliveries(JSON.stringify({ t: "snap", qid: 1, value: 1 }))).toBeNull();
-    expect(withoutDeliveries(JSON.stringify({ t: "patch", version: 2, changes: [] }))).toBeNull();
+  it("withoutStale drops snap/patch and channel traffic, naming the channels whose member list went (null when nothing is left)", () => {
+    expect(withoutStale(JSON.stringify({ t: "snap", qid: 1, value: 1 }))).toEqual({ text: null, channels: [] });
+    expect(withoutStale(JSON.stringify({ t: "patch", version: 2, changes: [] }))).toEqual({ text: null, channels: [] });
     const mres = JSON.stringify({ t: "mres", mid: "m1", ok: true });
-    expect(withoutDeliveries(mres)).toBe(mres);
-    expect(JSON.parse(withoutDeliveries(JSON.stringify([{ t: "patch", version: 2 }, { t: "mres", mid: "m1", ok: true }, { t: "qres", qid: 3, ok: true }]))!)).toEqual([
+    expect(withoutStale(mres)).toEqual({ text: mres, channels: [] });
+    expect(JSON.parse(withoutStale(JSON.stringify([{ t: "patch", version: 2 }, { t: "mres", mid: "m1", ok: true }, { t: "qres", qid: 3, ok: true }])).text!)).toEqual([
       { t: "mres", mid: "m1", ok: true },
       { t: "qres", qid: 3, ok: true },
     ]);
-    expect(withoutDeliveries(JSON.stringify([{ t: "snap" }, { t: "patch" }]))).toBeNull();
+    expect(withoutStale(JSON.stringify([{ t: "snap" }, { t: "patch" }])).text).toBeNull();
+    // Channel frames of the identity before: its messages and member lists go; what only drives the join stays.
+    const left = { t: "left", ch: "room:b", code: "channel_denied", message: "no" };
+    const err = { t: "err", code: "rate_limited", message: "slow", ch: "room:a" };
+    const published = { t: "published", ch: "room:a", ref: 3 };
+    const out = withoutStale(
+      JSON.stringify([
+        { t: "msg", ch: "room:a", from: "x", user: "ana", data: "secret" },
+        { t: "members", ch: "room:a", join: [{ id: "y", user: "bia" }] },
+        { t: "joined", ch: "room:c", self: "x", members: [{ id: "x", user: "ana" }] },
+        left,
+        err,
+        published,
+      ]),
+    );
+    expect(JSON.parse(out.text!)).toEqual([left, err, published]);
+    expect(out.channels.sort()).toEqual(["room:a", "room:c"]);
+    expect(withoutStale(JSON.stringify({ t: "msg", ch: "room:a", from: "x", user: "ana", data: 1 }))).toEqual({ text: null, channels: [] });
   });
 });

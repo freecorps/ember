@@ -21,6 +21,7 @@ import {
   makeFunctionReference,
   v,
   type AppDefinition,
+  type ChannelsConfig,
   type DashboardSpecInput,
 } from "@freecorps/ember-server";
 import { MINUTE, rateLimit, RateLimiter } from "@freecorps/ember-rate-limit";
@@ -187,9 +188,18 @@ const installs = (base: AppDefinition) =>
     .use(rateLimit)
     .use(workflows)
     .use(hooksComponent, { config: { domain: "hooks.test", shard: "hooks:main" } });
-export const app = installs(defineApp({ limits: { documentsRead: 20_000 }, dashboard: appScreens }));
+// Ephemeral channels (ephemeral.test.ts): signed-in rooms, a "vip" room only ana may join, rooms of the active
+// organization (the `org` claim), typed payloads and member state, and a channel tied to its shard.
+const channels = {
+  "room:*": { authorize: (identity, { param }) => identity !== null && (param !== "vip" || identity.subject === "ana") },
+  "org:*": { authorize: (identity, { param }) => identity?.claims?.org === param },
+  "typed:*": { authorize: () => true, payload: v.object({ x: v.number(), y: v.number() }), state: v.optional(v.object({ name: v.string() })) },
+  "here:*": { authorize: (_identity, { param, shard }) => shard === `eph:${param}` },
+  open: { authorize: () => true },
+} satisfies ChannelsConfig;
+export const app = installs(defineApp({ limits: { documentsRead: 20_000 }, dashboard: appScreens, channels }));
 /** The same installs without the app's screen: for configs with other app functions (ai-indexes.test.ts). */
-export const appWithoutScreens = installs(defineApp({ limits: { documentsRead: 20_000 } }));
+export const appWithoutScreens = installs(defineApp({ limits: { documentsRead: 20_000 }, channels }));
 
 // ------------------------------------------------------------------ official components (rateLimit, workflows)
 

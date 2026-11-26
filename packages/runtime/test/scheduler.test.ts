@@ -25,10 +25,11 @@ describe("scheduler", () => {
     await hello(c);
     c.send({ t: "sub", qid: 1, fn: "runs:list", args: {} });
     await c.waitFor(is("snap"));
+    // Far enough out that a slow runner still sees all three pending and the alarm armed (not already running) below.
     const items = [
-      { label: "c", delayMs: 150 },
-      { label: "a", delayMs: 30 },
-      { label: "b", delayMs: 90 },
+      { label: "c", delayMs: 1_400 },
+      { label: "a", delayMs: 1_000 },
+      { label: "b", delayMs: 1_200 },
     ];
     expect((await api("mutation", { fn: "jobs:schedule", args: { items }, shard })).body.ok).toBe(true);
     const stub = shardStub(shard);
@@ -38,6 +39,7 @@ describe("scheduler", () => {
     const runs = await until(
       () => api("query", { fn: "runs:list", args: {}, shard }),
       (r) => r.body.value.length === 3,
+      8000,
     );
     expect(runs.body.value.map((r: { label: string }) => r.label)).toEqual(["a", "b", "c"]);
     const info = await stub.inspect();

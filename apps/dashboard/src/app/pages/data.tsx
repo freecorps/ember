@@ -3,7 +3,7 @@
 // admins — create, edit, delete and bulk-delete documents; every write runs through the engine on the project
 // (validated, indexed, in the change log, seen by subscribers) and is audited. `v.id()` fields link to their document,
 // `v.file()` fields to the Files screen. Internal tables (`_jobs`, `_files`, ...) are read-only pages by row id. A
-// runtime without the data endpoints keeps the read-only browser; one before level 14 says so for range, `_id` and
+// runtime without the data endpoints keeps the read-only browser; one before level 15 says so for range, `_id` and
 // search (runtime_outdated) and keeps the rest.
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
@@ -266,7 +266,7 @@ interface Filter {
   index: string;
   eq: string[];
   order: "asc" | "desc";
-  /** A range on the index field after the `eq` prefix (level 14). */
+  /** A range on the index field after the `eq` prefix (level 15). */
   lower: { op: LowerOp; value: string };
   upper: { op: UpperOp; value: string };
 }

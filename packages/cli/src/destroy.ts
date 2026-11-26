@@ -7,8 +7,12 @@
 // only when it is empty: R2 refuses otherwise, and objects are not deleted here). Resources of other projects or
 // environments are never matched (see deploy/ai.ts). The account registry row is kept (history). Before any of that,
 // the Ember Dashboard (when it exists and knows this Worker) drops its service binding and its admin token for it.
+//
+// Ownership comes first of all (`checkOwner`): Worker names are `ember-<project>-<env>`, so project "chat" env
+// "preview-prod" and project "chat-preview" env "prod" share one. Nothing is touched unless the Worker's own marks
+// (EMBER_PROJECT/EMBER_ENV, set by every deploy) and the account registry agree that it is this project's environment.
 
-import { resolveEnv, workerName, type Project } from "./config.ts";
+import { isDerivedPreview, resolveEnv, workerName, type Project } from "./config.ts";
 import { CfClient, resolveToken } from "./deploy/cf.ts";
 import { detachQueueConsumer, findQueue, indexingQueueName, pruneAiResources } from "./deploy/ai.ts";
 import { clearAiState } from "./deploy/index.ts";
@@ -44,6 +48,7 @@ export async function destroy(project: Project, opts: DestroyOptions = {}): Prom
   const client = new CfClient({ accountId, token: opts.token ?? resolveToken(), ...(opts.fetch ? { fetch: opts.fetch } : {}) });
   const deleted: string[] = [];
   const warnings: string[] = [];
+  await checkOwner(client, project, env.name, worker, opts.registryName);
 
   // Best effort: the dashboard is optional and must not block a destroy (its next deploy drops the binding anyway).
   const unlinked = await unlinkDashboard(client, worker, {
@@ -87,4 +92,46 @@ export async function destroy(project: Project, opts: DestroyOptions = {}): Prom
   for (const d of deleted) log(`  deleted ${d}`);
   for (const x of warnings) log(`  warning: ${x}`);
   return { deleted, warnings };
+}
+
+/**
+ * Refuses to destroy `worker` unless it is `project`'s environment `env`:
+ * - the Worker, when it exists, carries EMBER_PROJECT/EMBER_ENV (every `ember deploy` sets both) naming them. A
+ *   derived preview (`preview-<slug>`) without those marks is refused too (it was not deployed by `ember deploy
+ *   --preview`); a declared environment without them (a Worker from before the marks) is allowed;
+ * - the account registry, when there is one, does not record the Worker name or the project name for another project
+ *   (another environment, or a fingerprint that is not ember.json's).
+ * A Worker already deleted (a repeated destroy) passes when the registry does not name another owner: idempotent.
+ */
+export async function checkOwner(client: CfClient, project: Project, env: string, worker: string, registry?: string): Promise<void> {
+  const c = project.config;
+  const refuse = (why: string): never => {
+    throw new Error(`ember destroy refuses to delete ${worker}: ${why}. Nothing was deleted.`);
+  };
+  const s = await client.request<{ bindings?: Array<{ type: string; name: string; text?: string }> }>("GET", `/workers/scripts/${worker}/settings`);
+  const absent = !s.success && (s.status === 404 || s.errors.some((e) => e.code === 10007));
+  if (!s.success && !absent) refuse(`its settings could not be read to check who owns it (GET settings → ${s.status} ${s.errors.map((e) => e.message).join("; ")})`);
+  if (s.success) {
+    const plain = new Map((s.result?.bindings ?? []).filter((b) => b.type === "plain_text").map((b) => [b.name, b.text]));
+    const [p, e] = [plain.get("EMBER_PROJECT"), plain.get("EMBER_ENV")];
+    if ((p !== undefined && p !== c.project) || (e !== undefined && e !== env)) {
+      refuse(`it belongs to project ${JSON.stringify(p ?? "?")} environment ${JSON.stringify(e ?? "?")} (its EMBER_PROJECT/EMBER_ENV), not ${JSON.stringify(c.project)}/${JSON.stringify(env)}`);
+    }
+    if ((p === undefined || e === undefined) && isDerivedPreview(project, env)) {
+      refuse(`it has no EMBER_PROJECT/EMBER_ENV naming ${JSON.stringify(c.project)}/${JSON.stringify(env)}, so it is not a preview \`ember deploy --preview\` created for this project`);
+    }
+  }
+  const reg = await D1Registry.open(client, registryName(registry), { create: false, ddl: false }).catch(() => null);
+  if (!reg) return;
+  // A registry that cannot answer is not a "no": only a database without the tables yet is (nothing recorded).
+  const rows = (sql: string, ...params: unknown[]) =>
+    reg.exec(sql, ...params).catch((e: Error) => (/no such table/i.test(e.message) ? [] : refuse(`the account registry could not be read to check who owns it (${e.message})`)));
+  const [byWorker] = await rows("SELECT project, env FROM environments WHERE worker = ?", worker);
+  if (byWorker && (byWorker.project !== c.project || byWorker.env !== env)) {
+    refuse(`the account registry records it for project ${JSON.stringify(byWorker.project)} environment ${JSON.stringify(byWorker.env)}`);
+  }
+  const [owner] = await rows("SELECT fingerprint, repo FROM projects WHERE name = ?", c.project);
+  if (owner && owner.fingerprint !== c.fingerprint) {
+    refuse(`project ${JSON.stringify(c.project)} is registered in this account by another repository${owner.repo ? ` (${String(owner.repo)})` : ""} (fingerprint)`);
+  }
 }

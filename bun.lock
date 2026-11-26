@@ -343,6 +343,35 @@
         "tinybase",
       ],
     },
+    "packages/presence": {
+      "name": "@freecorps/ember-presence",
+      "version": "0.9.0",
+      "dependencies": {
+        "@freecorps/ember-client": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-react": "workspace:*",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@testing-library/react": "^16.3.3",
+        "@types/react": "19",
+        "happy-dom": "^21.0.4",
+        "react": "19",
+        "react-dom": "19",
+        "wrangler": "^4.157.0",
+      },
+      "peerDependencies": {
+        "@freecorps/ember-react": "workspace:^",
+        "react": ">=18",
+      },
+      "optionalPeers": [
+        "@freecorps/ember-react",
+        "react",
+      ],
+    },
     "packages/push": {
       "name": "@freecorps/ember-push",
       "version": "0.9.0",
@@ -873,6 +902,8 @@
     "@freecorps/ember-migrations": ["@freecorps/ember-migrations@workspace:packages/migrations"],
 
     "@freecorps/ember-offline": ["@freecorps/ember-offline@workspace:packages/offline"],
+
+    "@freecorps/ember-presence": ["@freecorps/ember-presence@workspace:packages/presence"],
 
     "@freecorps/ember-push": ["@freecorps/ember-push@workspace:packages/push"],
 

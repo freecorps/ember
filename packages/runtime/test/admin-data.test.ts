@@ -97,7 +97,7 @@ describe("dashboard data endpoints", () => {
     expect(second.body.value.page.map((d: { label: string }) => d.label)).toEqual(["r2", "r1"]);
   });
 
-  it("level 14: a direct get by _id, range bounds on the next index field, full-text search, bulk delete", async () => {
+  it("level 15: a direct get by _id, range bounds on the next index field, full-text search, bulk delete", async () => {
     const shard = "dash:v2";
     const ids: string[] = [];
     for (let i = 1; i <= 5; i++) ids.push((await admin("data/insert", { shard, table: "wide", doc: { a: i % 2 ? "odd" : "even", b: i, c: `c${i}` } })).body.value);
