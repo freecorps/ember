@@ -807,10 +807,13 @@ class TypePrinter {
       return elem ? `${this.wrap(elem, indent)}[]` : "unknown[]";
     }
     if (t.flags & ts.TypeFlags.Object) {
-      // A built-in (`Date`, `Map<string, number>`) prints as the compiler names it, but in inline mode (claims.d.ts,
-      // which imports nothing) not one whose type arguments may name the project's types (`Record<string, Role>`):
-      // that one is expanded structurally, its arguments printed as everything else.
-      if (this.isLibType(t) && !(this.inline && this.hasTypeArguments(t))) return this.compilerText(t);
+      // A built-in (`Date`, `Map<string, number>`) prints as the compiler names it. In inline mode (claims.d.ts, which
+      // imports nothing) its type arguments may name the project's types (`Record<string, Role>`): the name stays, and
+      // the arguments are printed as everything else (so `Role` is spelled out).
+      if (this.isLibType(t)) {
+        const generic = this.inline ? this.libGeneric(t, indent) : null;
+        return generic ?? this.compilerText(t);
+      }
       const doc = !this.inline && this.documentOf(t);
       if (doc) return `Doc<${JSON.stringify(doc)}>`;
       if (t.getCallSignatures().length || t.getConstructSignatures().length) return "unknown";
@@ -890,9 +893,15 @@ class TypePrinter {
   }
 
   /** Built-in types (Uint8Array, Date, Map...) are printed by name. */
-  private hasTypeArguments(t: ts.Type): boolean {
-    if (t.aliasTypeArguments?.length) return true;
-    return (t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference ? this.checker.getTypeArguments(t as ts.TypeReference).length > 0 : false;
+  /** `Name<args>` of a built-in generic (alias `Record<…>` or interface `Map<…>`), its args by this printer; null if not one. */
+  private libGeneric(t: ts.Type, indent: string): string | null {
+    if (t.aliasSymbol && t.aliasTypeArguments?.length) return `${t.aliasSymbol.getName()}<${t.aliasTypeArguments.map((a) => this.print(a, indent)).join(", ")}>`;
+    if ((t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference) {
+      const args = this.checker.getTypeArguments(t as ts.TypeReference);
+      const name = t.getSymbol()?.getName();
+      if (args.length && name) return `${name}<${args.map((a) => this.print(a, indent)).join(", ")}>`;
+    }
+    return null;
   }
 
   private isLibType(t: ts.Type): boolean {

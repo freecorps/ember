@@ -177,19 +177,21 @@ describe("typed identity claims (ember/auth.config.ts → _generated/claims.d.ts
     }
   });
 
-  it("a built-in generic over a project type (Record<string, Role>) is expanded: claims.d.ts still stands alone", async () => {
+  it("a built-in generic over a project type keeps its name (Record, Map) with the arguments spelled out: claims.d.ts stands alone", async () => {
     writeFileSync(
       join(project.dir, "auth.config.ts"),
-      AUTH_CONFIG(`{ roles: {} as Record<string, Role>, at: new Date() }`).replace("import { organization }", 'type Role = "admin" | "member";\nimport { organization }'),
+      AUTH_CONFIG(`{ roles: {} as Record<string, Role>, seen: new Map<string, Role>(), at: new Date() }`).replace("import { organization }", 'type Role = "admin" | "member";\nimport { organization }'),
     );
     try {
       await codegen(project, { oracle });
       const text = gen(project, "claims.d.ts");
       expect(text).not.toMatch(/\bRole\b/);
-      expect(text).toContain('"admin" | "member"');
+      expect(text).toContain('roles?: Record<string, "admin" | "member">;');
+      expect(text).toContain('seen?: Map<string, "admin" | "member">;');
       expect(text).toContain("at?: Date;");
       const file = join(project.generatedDir, "claims.d.ts");
-      const program = ts.createProgram([file], OPTIONS);
+      // skipLibCheck off: a .d.ts is otherwise not checked at all (an unknown name in it would pass).
+      const program = ts.createProgram([file], { ...OPTIONS, skipLibCheck: false });
       expect(ts.getPreEmitDiagnostics(program).filter((d) => d.file?.fileName === file).map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n"))).toEqual([]);
     } finally {
       writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
@@ -210,7 +212,7 @@ describe("typed identity claims (ember/auth.config.ts → _generated/claims.d.ts
     expect(text).toMatch(/tenant\?: string & \{\n\s+__tableName: "orgs";\n\s+\};/);
     // The file stands alone: every name it uses is declared in it.
     const file = join(project.generatedDir, "claims.d.ts");
-    const program = ts.createProgram([file], OPTIONS);
+    const program = ts.createProgram([file], { ...OPTIONS, skipLibCheck: false });
     expect(ts.getPreEmitDiagnostics(program).filter((d) => d.file?.fileName === file).map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n"))).toEqual([]);
     writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
     await codegen(project, { oracle });
