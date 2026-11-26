@@ -2895,6 +2895,7 @@ export class EmberClient {
     conn.authRefused = undefined; // the next socket subscribes everything again
     conn.batchPipelined = undefined;
     conn.lastToken = undefined;
+    conn.colo = undefined; // RUM: the next socket may land in another colo; samples wait for its `ready`
     // Waiting acks stay: the next socket of the same identity sends them (`onReady`).
     if (conn.ackTimer) clearTimeout(conn.ackTimer);
     conn.ackTimer = null;
@@ -3540,7 +3541,7 @@ export class EmberClient {
         return;
       case "colo":
         // Feature "rum": the shard learned where it runs after `ready`.
-        conn.colo = m.colo;
+        conn.colo = m.colo || undefined;
         return;
       default:
         return;
