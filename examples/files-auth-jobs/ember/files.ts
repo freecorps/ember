@@ -2,6 +2,7 @@ import { v } from "@freecorps/ember-server";
 import { internal } from "./_generated/api";
 import { internalAction, internalMutation, internalQuery, mutation, query, type MutationCtx } from "./_generated/server";
 import { describe, metadata } from "./_metadata";
+import { errors } from "./errors";
 
 const MAX_SIZE = 5 * 1024 * 1024;
 /** How long an upload may stay `processing` before the cron schedules its job again. */
@@ -24,8 +25,8 @@ export const generateUploadUrl = mutation({
   args: { contentType: v.string(), size: v.number(), sha256: v.optional(v.string()), multipart: v.optional(v.boolean()) },
   handler: (ctx, args) => {
     requireUser(ctx);
-    if (!Number.isFinite(args.size) || args.size < 0) throw new Error("Invalid file size");
-    if (args.size > MAX_SIZE) throw new Error("Files are limited to 5 MiB in this example");
+    if (!Number.isFinite(args.size) || args.size < 0) throw errors.InvalidFileSize();
+    if (args.size > MAX_SIZE) throw errors.FileTooLarge({ max: MAX_SIZE });
     return ctx.storage.generateUploadUrl(args);
   },
 });
@@ -36,7 +37,7 @@ export const save = mutation({
   handler: (ctx, { storageId, name }) => {
     const userId = requireUser(ctx);
     const file = ctx.storage.getMetadata(storageId);
-    if (!file || file.state !== "ready") throw new Error("The file was not uploaded");
+    if (!file || file.state !== "ready") throw errors.NotUploaded();
     const id = ctx.db.insert("uploads", {
       userId,
       name: name.trim() || "untitled",
@@ -72,7 +73,7 @@ export const remove = mutation({
   handler: (ctx, { id }) => {
     const userId = requireUser(ctx);
     const upload = ctx.db.get(id);
-    if (!upload || upload.userId !== userId) throw new Error("No such upload");
+    if (!upload || upload.userId !== userId) throw errors.UploadNotFound();
     ctx.db.delete(id); // the file's reference count drops; R2 is cleaned up by the garbage collector
   },
 });
