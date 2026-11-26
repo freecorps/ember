@@ -42,7 +42,10 @@ export interface FunctionManifest {
   shard?: { kind: string; fromArg?: string; fromClaim?: string };
   /** Public queries: anonymous `GET /api/query/<fn>` is edge-cached (`query({ cache })`, seconds). */
   cache?: { maxAge: number; swr?: number };
-  /** Mutations and actions: finished scheduled runs keep no `_jobs` row (`retainMs: 0`). */
+  /**
+   * Mutations and actions (`retainMs: 0`): a scheduled run that succeeds or is cancelled keeps no `_jobs` row; one that
+   * exhausts its attempts keeps its `failed` row until maintenance removes it (`scheduler.retainMs`), as any job.
+   */
   retainMs?: 0;
 }
 
