@@ -540,6 +540,22 @@
         "fast-check": "^4",
       },
     },
+    "packages/webhooks": {
+      "name": "@freecorps/ember-webhooks",
+      "version": "0.9.0",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+        "@freecorps/ember-workpool": "workspace:*",
+      },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@freecorps/ember-testing": "workspace:*",
+        "wrangler": "^4.157.0",
+      },
+    },
     "packages/workflows": {
       "name": "@freecorps/ember-workflows",
       "version": "0.9.0",
@@ -954,6 +970,8 @@
     "@freecorps/ember-testing": ["@freecorps/ember-testing@workspace:packages/testing"],
 
     "@freecorps/ember-values": ["@freecorps/ember-values@workspace:packages/values"],
+
+    "@freecorps/ember-webhooks": ["@freecorps/ember-webhooks@workspace:packages/webhooks"],
 
     "@freecorps/ember-workflows": ["@freecorps/ember-workflows@workspace:packages/workflows"],
 
