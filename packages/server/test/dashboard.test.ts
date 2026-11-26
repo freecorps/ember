@@ -8,6 +8,9 @@ import {
   defineComponent,
   defineSchema,
   defineTable,
+  httpAction,
+  httpRouter,
+  isDashboardEmbedRoute,
   makeFunctionReference,
   mutationGeneric,
   paginationOptsValidator,
@@ -233,5 +236,67 @@ describe("composeApp: dashboards in the manifest", () => {
     expect(() => composeApp({ schema: appSchema, functions: pinned, app: spec("global") })).toThrow(/orgs:get runs in "org" shards, but a scope "global" screen runs on global:main/);
     expect(composeApp({ schema: appSchema, functions: pinned, app: spec("shard") }).dashboards).toHaveLength(1);
     expect(() => defineApp({ dashboard: { label: "J", tabs: [{ id: "t", label: "T", blocks: [{ kind: "stats", query: "jobs:list" as never, items: [{ label: "n", path: "x" }] }] }] } })).toThrow(/not a string/);
+  });
+});
+
+describe("embed blocks", () => {
+  const page = httpAction(async () => new Response("<!doctype html><p>hi</p>", { headers: { "content-type": "text/html" } }));
+  const http = httpRouter()
+    .route({ path: "/dashboard/page", method: "GET", handler: page })
+    .route({ path: "/hook", method: "POST", handler: page })
+    .route({ pathPrefix: "/static/", method: "GET", handler: page });
+  const withEmbed = (block: Record<string, unknown>) => spec({ tabs: [{ id: "lab", label: "Lab", blocks: [{ kind: "embed", ...block } as never] }] });
+
+  test("resolves the route, the height and the functions the page may call (local names), into the allowlist", () => {
+    const c = defineComponent({ name: "items", schema, functions, http, dashboard: withEmbed({ id: "play", label: "Playground", route: "/dashboard/page", functions: [lib.stats, lib.remove, lib.ping] }) });
+    expect(c.dashboard!.tabs[0]!.blocks[0]).toEqual({ kind: "embed", id: "play", label: "Playground", route: "/dashboard/page", height: "auto", functions: { "lib:stats": "lib:stats", "lib:remove": "lib:remove", "lib:ping": "lib:ping" } });
+    expect(c.dashboard!.functions).toMatchObject({ "lib:stats": { type: "query" }, "lib:remove": { type: "mutation" }, "lib:ping": { type: "action" } });
+    // Under a pathPrefix route, with a fixed height; no functions is a page that only shows.
+    const fixed = defineComponent({ name: "items", schema, functions, http, dashboard: withEmbed({ route: "/static/x.html", height: 320 }) });
+    expect(fixed.dashboard!.tabs[0]!.blocks[0]).toMatchObject({ id: "b0", route: "/static/x.html", height: 320, functions: {} });
+  });
+
+  test("composeApp mounts the route under the install's prefix and prefixes the functions; the app's own at /", () => {
+    const items = defineComponent({ name: "items", schema, functions, http, dashboard: withEmbed({ route: "/dashboard/page", functions: [lib.stats] }) });
+    const outer = defineComponent({ name: "outer", functions: {} }).use(items, { name: "inner" });
+    const appHttp = httpRouter().route({ path: "/admin/page", method: "GET", handler: page });
+    const appFns = { jobs: { list: queryGeneric({ args: {}, handler: () => [] }) } };
+    const app = defineApp({ dashboard: { label: "App", tabs: [{ id: "t", label: "T", blocks: [{ kind: "embed", route: "/admin/page", functions: [makeFunctionReference<"query">("jobs:list")] }] }] } })
+      .use(items, { name: "pool", httpPrefix: "/p" })
+      .use(outer);
+    const composed = composeApp({ schema: defineSchema({ tables: {} }), functions: appFns, app, http: appHttp });
+    const blocks = composed.dashboards.map((d) => d.tabs[0]!.blocks[0]);
+    expect(blocks).toEqual([
+      { kind: "embed", id: "b0", route: "/admin/page", path: "/admin/page", height: "auto", functions: { "jobs:list": "jobs:list" } },
+      { kind: "embed", id: "b0", route: "/dashboard/page", path: "/p/dashboard/page", height: "auto", functions: { "lib:stats": "@pool/lib:stats" } },
+      { kind: "embed", id: "b0", route: "/dashboard/page", path: "/outer/inner/dashboard/page", height: "auto", functions: { "lib:stats": "@outer/@inner/lib:stats" } },
+    ]);
+    // The mounted path is a route of the composed app.
+    for (const b of blocks) expect(composed.routes.some((r) => r.path === (b as { path: string }).path && r.method === "GET")).toBe(true);
+    expect(composed.dashboards[1]!.functions).toHaveProperty(["@pool/lib:stats"]);
+    // An app embed must name one of the app's routes.
+    const bad = defineApp({ dashboard: { label: "App", tabs: [{ id: "t", label: "T", blocks: [{ kind: "embed", route: "/nope" }] }] } });
+    expect(() => composeApp({ schema: defineSchema({ tables: {} }), functions: appFns, app: bad, http: appHttp })).toThrow(/route \/nope: not a GET route of this app's http router/);
+  });
+
+  test("refuses routes that are not plain paths of a GET route, bad heights and unknown functions", () => {
+    const def = (block: Record<string, unknown>) => () => defineComponent({ name: "items", schema, functions, http, dashboard: withEmbed(block) });
+    for (const route of ["dashboard/page", "https://evil.test/x", "//evil.test/x", "/a/../dashboard/page", "/./x", "/a//b", "/dashboard/page?x=1", "/dashboard/page#x", "/%2e%2e/x", "/a\\b", "", 3]) {
+      expect(def({ route }), JSON.stringify(route)).toThrow(/route must be a path/);
+    }
+    expect(def({ route: "/missing" })).toThrow(/route \/missing: not a GET route of this component's http router/);
+    expect(def({ route: "/hook" })).toThrow(/not a GET route/);
+    expect(def({ route: "/dashboard/page", height: 10 })).toThrow(/height must be "auto" or an integer in 40\.\.4000/);
+    expect(def({ route: "/dashboard/page", height: 1.5 })).toThrow(/height/);
+    expect(def({ route: "/dashboard/page", functions: ["lib:stats"] })).toThrow(/functions\[0\]: a function reference/);
+    const other = componentBuilders<typeof schema, undefined>().query({ args: {}, handler: () => 1 });
+    expect(def({ route: "/dashboard/page", functions: [other] })).toThrow(/not one of this component's functions/);
+    expect(def({ route: "/dashboard/page", src: "x" })).toThrow(/src: unknown key/);
+    // Without an http router, no route exists.
+    expect(() => defineComponent({ name: "items", schema, functions, dashboard: withEmbed({ route: "/dashboard/page" }) })).toThrow(/not a GET route/);
+    // The shape-only check (defineApp) checks the path itself.
+    expect(() => defineApp({ dashboard: { label: "A", tabs: [{ id: "t", label: "T", blocks: [{ kind: "embed", route: "/../x" }] }] } })).toThrow(/route must be a path/);
+    expect(isDashboardEmbedRoute("/ok/page.html")).toBe(true);
+    expect(isDashboardEmbedRoute("/a/..")).toBe(false);
   });
 });
