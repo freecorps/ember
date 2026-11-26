@@ -107,6 +107,8 @@ describe("dashboard data endpoints", () => {
     // `id`: that document, or nothing (another table's id, a malformed one).
     expect((await list(`id=${ids[2]}`)).body.value).toMatchObject({ page: [{ _id: ids[2], b: 3 }], isDone: true });
     expect((await list("id=nope")).body.value.page).toEqual([]);
+    // An empty id is a get that finds nothing, not the whole table.
+    expect((await list("id=")).body.value).toMatchObject({ page: [], isDone: true });
     const other = (await admin("data/insert", { shard, table: "runs", doc: { label: "r", at: 1 } })).body.value as string;
     expect((await list(`id=${other}`)).body.value.page).toEqual([]);
 
@@ -120,6 +122,8 @@ describe("dashboard data endpoints", () => {
     expect(bs(await list(`index=by_a&eq=${j(["odd"])}&gte=${j(all[1]!._creationTime)}`))).toEqual([3, 5]);
     // Refused: two lower bounds, an unknown bound, a value no index key holds, a bound past the index's fields.
     expect((await list(`index=by_b&gt=${j(1)}&gte=${j(1)}`)).status).toBe(400);
+    expect((await list(`index=by_b&lt=${j(5)}&lte=${j(5)}`)).status).toBe(400);
+    expect((await list(`index=by_b&eq=${j([1, 2])}`)).status).toBe(400);
     expect((await admin(`data/list?shard=${shard}&table=wide&index=by_b&gt=notjson`)).status).toBe(400);
     expect((await list(`index=by_b&gt=${j({ $int64: "5" })}`)).status).toBe(200);
     expect((await list(`index=nope&gt=${j(1)}`)).status).toBe(404);
@@ -130,6 +134,7 @@ describe("dashboard data endpoints", () => {
     const found = await admin(`data/list?shard=${shard}&table=messages&index=search_body&search=deploy`);
     expect(found.body.value.page.map((d: { body: string }) => d.body)).toEqual(["the deploy finished"]);
     expect((await admin(`data/list?shard=${shard}&table=messages&index=by_channel&search=deploy`)).status).toBe(404);
+    expect((await admin(`data/list?shard=${shard}&table=messages&index=search_body&search=${"a".repeat(1001)}`)).status).toBe(400);
 
     // Bulk delete: one call, all or nothing.
     expect((await admin("data/delete", { shard, table: "wide", ids: ids.slice(0, 3) })).body.value).toEqual({ deleted: 3 });

@@ -12,7 +12,7 @@ import { ADMIN_MODULE, schemaSummary } from "./admin-data.ts";
 import type { SqlParam, SqlQueryInput, SqlQueryOutcome } from "./admin-sql.ts";
 import type { ProfileResult, ReactivityReport } from "./reactivity.ts";
 import { revokeMatchError, type RevokeMatch } from "./shard.ts";
-import { readLimited } from "./body.ts";
+import { readLimited, readLimitedText } from "./body.ts";
 import { parse } from "./wire.ts";
 import { validate, withDefaults } from "@freecorps/ember-values";
 
@@ -330,7 +330,8 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
       ...(q.get("index") ? { index: q.get("index")! } : {}),
       ...(eq !== undefined ? { eq } : {}),
       ...(Object.keys(bounds).length ? { range: bounds } : {}),
-      ...(q.get("id") ? { id: q.get("id")! } : {}),
+      // An empty `id` is still a get (it finds nothing), never the unfiltered page.
+      ...(q.has("id") ? { id: q.get("id")! } : {}),
       ...(q.has("search") ? { search: q.get("search")! } : {}),
       ...(order === "asc" || order === "desc" ? { order } : {}),
       ...(q.get("cursor") ? { cursor: q.get("cursor")! } : {}),
@@ -427,11 +428,22 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
  * checked here too, so a refused one never wakes the shard. Parameters: strings, numbers, null, booleans (1/0) and
  * `{"$bytes": ...}`.
  */
+/** Largest body of `POST sql`: the text (up to SQL_TEXT_MAX characters, up to 4 bytes each in UTF-8) and its parameters. */
+const SQL_BODY_MAX = SQL_TEXT_MAX * 4;
+
 async function handleSql(request: Request, deps: AdminDeps): Promise<Response> {
   if (request.method !== "POST") return deps.error(405, "method_not_allowed", "use POST");
   const usage = "body must be { shard, sql, params?, explain?, limit? }";
-  if (Number(request.headers.get("content-length") ?? "0") > SQL_TEXT_MAX * 4) return deps.error(413, "too_large", `SQL up to ${SQL_TEXT_MAX} characters`);
-  const b = await jsonBody(request);
+  // The body is read with a cap whether or not it declares a content-length (a chunked one is bounded while read).
+  const textBody = await readLimitedText(request, SQL_BODY_MAX);
+  if (textBody === null) return deps.error(413, "too_large", `SQL up to ${SQL_TEXT_MAX} characters (body up to ${SQL_BODY_MAX} bytes)`);
+  let b: Record<string, unknown> | null = null;
+  try {
+    const v = parse(textBody);
+    if (v && typeof v === "object" && !Array.isArray(v)) b = v as Record<string, unknown>;
+  } catch {
+    // b stays null
+  }
   if (!b) return deps.error(400, "bad_request", usage);
   const shard = typeof b.shard === "string" ? b.shard : "";
   if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(b.shard)}`);
