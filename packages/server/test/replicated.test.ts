@@ -217,7 +217,13 @@ describe(".replicated() tables of a component", () => {
   // A component's table can be `.replicated()` (e.g. @freecorps/ember-flags): it is `<install>$<table>` in the composed
   // schema, written by the component's mutations in global:main, and copied by the applier, which sees every table
   // (component tables included) while every other function keeps its own scope.
-  const cschema = defineSchema({ tables: { items: defineTable({ key: v.string(), n: v.number() }).index("by_key", ["key"]).replicated() } });
+  const cschema = defineSchema({
+    tables: {
+      items: defineTable({ key: v.string(), n: v.number() }).index("by_key", ["key"]).replicated(),
+      /** Shard-local (not replicated): the applier must never reach it. */
+      local: defineTable({ key: v.string(), n: v.number() }),
+    },
+  });
   const b = componentBuilders<typeof cschema, undefined>();
   const comp = defineComponent({
     name: "cfg",
@@ -227,6 +233,8 @@ describe(".replicated() tables of a component", () => {
         put: b.mutation({ args: { key: v.string(), n: v.number() }, handler: (ctx, a) => ctx.db.insert("items", a) }),
         get: b.query({ args: { key: v.string() }, handler: (ctx, a) => ctx.db.query("items").withIndex("by_key", (q) => q.eq("key", a.key)).first() }),
         status: b.query({ args: {}, handler: (ctx) => ctx.db.replicaStatus("items") }),
+        keep: b.mutation({ args: { key: v.string(), n: v.number() }, handler: (ctx, a) => ctx.db.insert("local", a) }),
+        local: b.query({ args: { id: v.string() }, handler: (ctx, a) => ctx.db.get(a.id as never) }),
       },
     },
   });
@@ -257,6 +265,17 @@ describe(".replicated() tables of a component", () => {
     expect(o.engine.runQuery("@cfg/lib:get", { key: "a" }).value).toMatchObject({ n: 5 });
     o.engine.runMutation("_ember:replicaApply", { source: REPLICATED_SOURCE, prev: 2, rows: [{ seq: 3, table: "cfg$items", id, op: "delete" }] });
     expect(o.engine.runQuery("@cfg/lib:get", { key: "a" }).value).toBeNull();
+  });
+
+  test("a row whose _id belongs to another table is refused: the applier's wider scope never reaches it", () => {
+    const o = engineOn("org:acme");
+    const own = o.engine.runMutation("@cfg/lib:keep", { key: "mine", n: 1 }).value as string;
+    o.engine.runMutation("_ember:replicaApply", { source: REPLICATED_SOURCE, snapshot: { id: "s1", first: true, rows: [], end: { cut: 0 } } });
+    for (const op of ["delete", "upsert"] as const) {
+      const row = { seq: 1, table: "cfg$items", id: own, op, ...(op === "upsert" ? { doc: { key: "x", n: 9 } } : {}) };
+      expect(() => o.engine.runMutation("_ember:replicaApply", { source: REPLICATED_SOURCE, prev: 0, rows: [row] })).toThrow(expect.objectContaining({ code: "ValidationError", message: expect.stringContaining(`is not an id of cfg$items`) }));
+    }
+    expect(o.engine.runQuery("@cfg/lib:local", { id: own }).value).toMatchObject({ key: "mine", n: 1 });
   });
 });
 
