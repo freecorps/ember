@@ -359,9 +359,6 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         console.log(`preview: ${values.preview} → environment ${name} (${workerName(project.config.project, name)}, from environments.preview)`);
         values.env = name;
       }
-      // A preview is not linked to the Ember Dashboard unless asked for (one service binding per branch otherwise), and
-      // that default is not saved: ember.json's "dashboard" is the project's choice for its declared environments.
-      const skipDashboard = values.preview !== undefined && !values.dashboard && !values["no-dashboard"];
       if (values.preflight && values["allow-missing-env"]) throw new Error("--preflight uploads nothing: it does not take --allow-missing-env");
       if (values.preflight) {
         const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "no-dashboard"] as const).filter((k) => values[k] !== undefined);
@@ -411,9 +408,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const dryRun = !!values["dry-run"];
       // The Ember Dashboard (dashboard-link.ts): decided before the upload, which carries this project's token for it.
       const io = cliIo();
+      // A derived preview (by --preview or --env preview-<slug>) is not linked unless asked for (deployWithDashboard).
       const result = await deployWithDashboard(project, {
         flag: values.dashboard ? true : values["no-dashboard"] ? false : undefined,
-        ...(skipDashboard ? { skip: true } : {}),
         env: resolveEnv(project, values.env).name,
         dryRun,
         io,

@@ -117,6 +117,33 @@ describe("whether to deploy the dashboard", () => {
     expect(cf.workers.has("ember-dashboard")).toBe(false);
   }, 60_000);
 
+  it('a derived preview (`--env preview-<slug>` as well as `--preview`) is skipped by default, even with "dashboard": true', async () => {
+    const cf = fakeAccount();
+    const p = repo({ project: "prev", dashboard: true, environments: { prod: {}, preview: {} } });
+    const go = async (env: string, flag?: boolean) => {
+      const out = io({ interactive: false });
+      let linked = false;
+      const token = await deployWithDashboard(p, {
+        flag,
+        env,
+        dryRun: false,
+        io: out,
+        client: () => {
+          linked = true;
+          return cf.client;
+        },
+        registry: () => Promise.reject(new Error("unused")),
+        deploy: async (t) => t ?? null,
+      });
+      return { linked, token, asked: out.asked };
+    };
+    expect(await go("preview-feat-x")).toEqual({ linked: false, token: null, asked: [] });
+    // --dashboard still links it; a declared environment keeps the saved choice.
+    expect((await go("preview-feat-x", true)).linked).toBe(true);
+    expect((await go("prod")).linked).toBe(true);
+    expect(JSON.parse(readFileSync(p.configPath, "utf8")).dashboard).toBe(true);
+  }, 60_000);
+
   it('"dashboard": true without a terminal updates an existing dashboard but never creates one', async () => {
     const cf = fakeAccount();
     const p = repo({ dashboard: true });

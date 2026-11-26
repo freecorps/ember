@@ -19,7 +19,7 @@ import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { adminTokenKey } from "@freecorps/ember-dashboard/projects";
 import { ensureAccessApp } from "./access.ts";
-import { writeConfigKey, workerName, type Project } from "./config.ts";
+import { isDerivedPreview, writeConfigKey, workerName, type Project } from "./config.ts";
 import { DEFAULT_DASHBOARD_NAME, deployDashboard, type DashboardDeployResult } from "./dashboard.ts";
 import type { CfClient } from "./deploy/cf.ts";
 import type { Prompter } from "./prompt.ts";
@@ -256,7 +256,11 @@ export async function deployWithDashboard<T>(
   project: Project,
   o: {
     flag: boolean | undefined;
-    /** Not linked this time, and nothing saved (a preview's default): `flag` and the saved choice are not consulted. */
+    /**
+     * Not linked this time, and nothing saved: `flag` and the saved choice are not consulted. Default: a derived preview
+     * environment (`preview-<slug>`, by `--preview` or `--env`) without `flag` is skipped (one service binding per
+     * branch otherwise); ember.json's "dashboard" is the project's choice for its declared environments.
+     */
     skip?: boolean;
     env: string;
     dryRun: boolean;
@@ -269,7 +273,8 @@ export async function deployWithDashboard<T>(
 ): Promise<T> {
   let link: DashboardLink | null = null;
   let client: CfClient | null = null;
-  if (!o.dryRun && !o.skip) {
+  const skip = o.skip ?? (o.flag === undefined && isDerivedPreview(project, o.env));
+  if (!o.dryRun && !skip) {
     const choice = await dashboardChoice(project, o.flag, o.io);
     if (choice.enabled) {
       client = o.client();
