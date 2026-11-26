@@ -817,14 +817,15 @@ function strictDecode(raw: string): ClientMessage {
     ack: [["t", "mids"], []],
     mut: [["t", "mid", "fn", "args"], []],
     auth: [["t", "token"], []],
-    join: [["t", "ch"], ["state"]],
+    join: [["t", "ch"], ["state", "ref"]],
     leave: [["t", "ch"], []],
-    pub: [["t", "ch", "data"], []],
+    pub: [["t", "ch", "data"], ["ref"]],
   };
   const spec = allowed[m.t as string] ?? bad(`unknown frame type ${JSON.stringify(m.t)}`);
   for (const k of spec[0]) if (!(k in m)) bad(`missing field "${k}"`);
   for (const k of Object.keys(m)) if (!spec[0].includes(k) && !spec[1].includes(k)) bad(`unknown field "${k}"`);
   if (m.t === "hello" && m.protocol !== 1) bad("protocol must be 1");
+  if ("ref" in m && !(typeof m.ref === "number" && Number.isSafeInteger(m.ref) && m.ref >= 0)) bad(`"ref" must be a non-negative integer`);
   if ("args" in m && (!m.args || typeof m.args !== "object" || Array.isArray(m.args))) bad(`"args" must be an object`);
   return m as unknown as ClientMessage;
 }
