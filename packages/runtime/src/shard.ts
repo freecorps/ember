@@ -2524,10 +2524,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private sendCompressed(ws: WebSocket, frame: string): void {
     const bytes = frame.length > ZFRAME_MIN_CHARS ? deflateFrame(frame).catch(() => null) : null;
     const before = this.zsending.get(ws);
+    const cut = this.zcut.get(ws) ?? 0;
     const sent = (before ?? Promise.resolve()).then(async () => {
       const z = bytes && (await bytes);
-      // Closed meanwhile (revoked, restored): what was being compressed for it is dropped, never sent after the close.
-      if (this.zclosed.has(ws)) return;
+      // Closed meanwhile (revoked, restored), or its access expired (`revokeSockets` without `close`): what was being
+      // compressed for it before is dropped, never sent after; what was queued after (`authExpired`) still goes.
+      if (this.zclosed.has(ws) || (this.zcut.get(ws) ?? 0) !== cut) return;
       try {
         if (z && z.byteLength < frame.length) {
           ws.send(z);
@@ -2572,6 +2574,11 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
 
   /** Sockets closed by the shard or by the client: a compression still running for one is never sent (`closeNow`). */
   private readonly zclosed = new WeakSet<WebSocket>();
+  /**
+   * Per socket, bumped when its access expires without a close (`revokeSockets`): a frame whose compression started
+   * under an earlier count was produced for the identity that just lost access, and is dropped (`sendCompressed`).
+   */
+  private readonly zcut = new WeakMap<WebSocket, number>();
 
   /** Frames waiting for the end of the turn, per batching socket. */
   private readonly outbox = new Map<WebSocket, { frames: string[]; bytes: number }>();
@@ -4420,7 +4427,9 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
         this.dropSocket(att.sid);
         continue;
       }
-      // Expired from now on: its patches stop and its frames are refused until a fresh token arrives (`auth`).
+      // Expired from now on: its patches stop and its frames are refused until a fresh token arrives (`auth`). A frame
+      // still being compressed for it (feature "zframe") was produced before: dropped, never sent after this.
+      if (this.zsending.has(ws)) this.zcut.set(ws, (this.zcut.get(ws) ?? 0) + 1);
       const { token: _drop, ...rest } = att;
       const expired: Attachment = { ...rest, identity: { ...att.identity, exp: 0 } };
       this.saveAttachment(ws, expired);
