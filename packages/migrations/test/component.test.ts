@@ -464,3 +464,51 @@ describe("migrations component", () => {
   const later: Promise<boolean> = m.cancel(ac, "defs:addPlan");
   return [s, started, later];
 };
+
+describe("migrations dashboard", () => {
+  test("Resume (lib:start with the row's name and handle only) keeps the chain a failed migration was queued with", () => {
+    const h = harness();
+    h.mutate("api:seed", { n: 4 });
+    probe.failOn = "org2";
+    h.mutate("api:serial", { names: ["addPlan", "seats"] });
+    h.tick();
+    probe.failOn = "";
+    expect(h.status("addPlan")).toMatchObject({ status: "failed", next: ["defs:seats"] });
+    const row = (h.engine.runQuery("@migrations/lib:runs", { paginationOpts: { numItems: 10, cursor: null } }).value as { page: Array<{ name: string; fn: string }> }).page[0]!;
+    // As the dashboard's Resume calls it: no `next` of its own.
+    h.mutate("@migrations/lib:start", { name: row.name, fn: row.fn });
+    h.tick();
+    expect(h.status("addPlan")).toMatchObject({ status: "done" });
+    expect(h.status("seats")).toMatchObject({ status: "done" });
+  });
+
+  test("the spec names the component's own functions; runs/cancel/start do what the screen shows", () => {
+    const [spec] = composeApp({ schema, functions: { defs, api }, app }).dashboards;
+    expect(spec).toMatchObject({ key: "migrations", component: "migrations", scope: "shard" });
+    expect(Object.keys(spec!.functions).sort()).toEqual(["@migrations/lib:cancel", "@migrations/lib:runs", "@migrations/lib:start", "@migrations/lib:status"]);
+    // `Start over` is destructive, so is every action running lib:start (the confirmation is per function).
+    expect(spec!.functions["@migrations/lib:start"]).toMatchObject({ type: "mutation", destructive: true });
+    const h = harness();
+    h.mutate("api:seed", { n: 6 });
+    probe.failOn = "org4";
+    h.mutate("api:run", { name: "addPlan" });
+    h.tick();
+    const runsOf = (args: object) => (h.engine.runQuery("@migrations/lib:runs", { paginationOpts: { numItems: 10, cursor: null }, ...args }).value as { page: Array<{ name: string; status: string; fn: string; function: string }> }).page;
+    const runs = runsOf({});
+    // `fn` is the raw handle lib:start takes (the screen's Resume passes it); `function` only shows the name.
+    expect(runs.map((r) => [r.name, r.status, r.fn, r.function])).toEqual([["defs:addPlan", "failed", "&defs:addPlan", "defs:addPlan"]]);
+    expect(runsOf({ status: "done" })).toHaveLength(0);
+    expect(runsOf({ status: "failed" }).map((r) => r.name)).toEqual(["defs:addPlan"]);
+    expect(spec!.tabs[0]!.blocks[0]).toMatchObject({ kind: "table", pageSize: 25 });
+    // "Resume" is lib:start with the row's name and handle: it continues from the cursor.
+    probe.failOn = "";
+    h.mutate("@migrations/lib:start", { name: runs[0]!.name, fn: runs[0]!.fn });
+    h.tick();
+    expect(h.status("addPlan")).toMatchObject({ status: "done", processed: 6 });
+    // "Start over": reset.
+    h.mutate("@migrations/lib:start", { name: runs[0]!.name, fn: runs[0]!.fn, reset: true });
+    expect(h.status("addPlan")).toMatchObject({ status: "running", processed: 0 });
+    expect(h.mutate("@migrations/lib:cancel", { name: runs[0]!.name })).toBe(true);
+    expect(h.status("addPlan")).toMatchObject({ status: "canceled" });
+  });
+});
