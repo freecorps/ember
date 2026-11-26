@@ -64,17 +64,23 @@ export function Health({ project, env }: { project: string; env: string }) {
   const expensive = f.filter((x) => (x.kind === "query" || x.kind === "subscription") && x.avgRowsRead >= EXPENSIVE_ROWS).sort((a, b) => b.avgRowsRead - a.avgRowsRead).slice(0, 8);
   const failing = f.filter((x) => x.errors > 0).sort((a, b) => b.errors - a.errors).slice(0, 8);
   const status = live.data;
-  const pending = (status?.shards ?? []).filter((s) => !s.ready);
+  // A live answer for another deployed schema (a Refresh that overlapped a deploy) says nothing about the current one:
+  // only the live results expecting the schema the catalog expects count; the others keep their catalog warning.
+  const expected = shards.data?.expected;
+  const current = (status?.shards ?? []).filter((s) => !expected || s.expectedVersion === expected);
+  // No live result for the deployed schema left: the screen says what the catalog says (never "all checked ready").
+  const liveNow = status && current.length ? status : undefined;
+  const pending = current.filter((s) => !s.ready);
   // Catalog-behind shards the live check did not cover (more than 50 behind) keep their catalog warning.
-  const checked = new Set((status?.shards ?? []).map((s) => s.shard));
-  const unchecked = status ? behind.filter((r) => !checked.has(r.shard)) : behind;
+  const checked = new Set(current.map((s) => s.shard));
+  const unchecked = liveNow ? behind.filter((r) => !checked.has(r.shard)) : behind;
   /** Without the deployed schema in the registry nothing can be compared: unknown, not "all current". */
   const known = !!shards.data?.expected;
   const checkLive = () => setCheck((behind.length ? behind : (shards.data?.shards ?? [])).slice(0, 50).map((r) => r.shard));
 
   const attention: Array<{ tone: "bad" | "warn"; text: ReactNode }> = [];
   if (caps.data && caps.data.level < 2) attention.push({ tone: "warn", text: <>This project runs an older runtime (admin API level {caps.data.level}). Update <code>@freecorps/ember-runtime</code> and redeploy for every screen.</> });
-  if (status) for (const s of pending) attention.push({ tone: s.migrationError ? "bad" : "warn", text: <><Mono>{s.shard}</Mono> migration {migrationState(s).text}</> });
+  if (liveNow) for (const s of pending) attention.push({ tone: s.migrationError ? "bad" : "warn", text: <><Mono>{s.shard}</Mono> migration {migrationState(s).text}</> });
   for (const r of unchecked.slice(0, 5)) attention.push({ tone: "warn", text: <><Mono>{r.shard}</Mono> reported an older schema ({short(r.schema_version)}): check its live status</> });
   for (const x of failing.filter((x) => x.errorRate >= BAD_ERROR_RATE).slice(0, 3)) attention.push({ tone: "bad", text: <><Mono>{x.fn}</Mono> fails {fmtPct(x.errorRate)} of {fmtNum(x.calls)} calls</> });
   // Functions that came within 70% of a per-transaction limit (the `ember dev` warning, from the metrics' peaks).
@@ -125,7 +131,7 @@ export function Health({ project, env }: { project: string; env: string }) {
         <Stat
           label="Migrations"
           value={
-            status
+            liveNow
               ? pending.length
                 ? `${pending.length} pending`
                 : unchecked.length
@@ -137,8 +143,8 @@ export function Health({ project, env }: { project: string; env: string }) {
                   : "all current"
                 : "—"
           }
-          tone={status ? (pending.some((s) => s.migrationError) ? "bad" : pending.length || unchecked.length ? "warn" : "ok") : shards.data && known ? (behind.length ? "warn" : "ok") : undefined}
-          hint={status ? `live status of ${fmtNum(checked.size)} shard(s)` : known ? "from the catalog" : "no deployed schema in the registry"}
+          tone={liveNow ? (pending.some((s) => s.migrationError) ? "bad" : pending.length || unchecked.length ? "warn" : "ok") : shards.data && known ? (behind.length ? "warn" : "ok") : undefined}
+          hint={liveNow ? `live status of ${fmtNum(checked.size)} shard(s)` : known ? "from the catalog" : "no deployed schema in the registry"}
         />
       </div>
 
@@ -235,10 +241,10 @@ export function Health({ project, env }: { project: string; env: string }) {
             <Problem error={live.error} onRetry={live.reload} />
           ) : live.loading ? (
             <Loading />
-          ) : status ? (
+          ) : liveNow ? (
             <Table
               label="Pending migrations"
-              empty={`All ${fmtNum(status.shards.length)} checked shards are on the deployed schema.`}
+              empty={`All ${fmtNum(current.length)} checked shards are on the deployed schema.`}
               cols={[{ h: "Shard" }, { h: "State" }]}
               rows={pending.map((s) => {
                 const m = migrationState(s);
