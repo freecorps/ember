@@ -554,9 +554,17 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     // row's id and the new value.
     await t.getByRole("switch", { name: "Paused" }).focus();
     await page.keyboard.press("Enter");
+    // `pause` is destructive on prod: the Worker's 428 opens the typed confirmation (never the row's detail).
+    const typed = page.getByRole("dialog");
+    await typed.getByRole("textbox").waitFor();
+    expect(await typed.getByText("attempt 2").count()).toBe(0);
+    await typed.getByRole("textbox").fill("pause");
+    await typed.getByRole("button", { name: "Turn off" }).click();
     await expect.poll(() => prod.posts.filter((x) => x.path === "dashboards/run").length).toBe(1);
-    expect(await page.getByRole("dialog").count()).toBe(0);
-    expect(prod.posts.at(-1)!.body).toMatchObject({ dashboard: "pool", fn: "@pool/lib:pause", args: { id: "work_2", paused: false }, shard: "org:acme" });
+    await expect.poll(() => page.getByRole("dialog").count()).toBe(0);
+    // The project still says paused (this fake never changes it): once the reload arrives, the switch shows that.
+    await expect.poll(() => t.getByRole("switch", { name: "Paused" }).getAttribute("aria-checked")).toBe("true");
+    expect(prod.posts.at(-1)!.body).toMatchObject({ dashboard: "pool", fn: "@pool/lib:pause", args: { id: "work_2", paused: false }, shard: "org:acme", destructive: true });
     // A row action on prod: a plain confirmation (not destructive).
     await t.getByRole("button", { name: "Cancel" }).click();
     await page.getByRole("dialog").getByRole("button", { name: "Cancel", exact: true }).last().click();

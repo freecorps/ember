@@ -338,7 +338,7 @@ function TableBlock({ c, b }: { c: ScreenCtx; b: Extract<Block, { kind: "table" 
           {...(b.detail ? { onRow: (i: number) => setOpen(list[i]) } : {})}
           cols={[...b.columns.map((col) => ({ h: col.label, ...(col.format === "number" || col.format === "bytes" || col.format === "ms" ? { num: true } : {}) })), ...(hasActions ? [{ h: "" }] : [])]}
           rows={list.map((row) => [
-            ...b.columns.map((col) => (col.toggle ? <Toggle c={c} value={!!at(row, col.path)} label={col.label} mutation={col.toggle.mutation} args={{ ...(col.toggle.args ?? {}), ...fromRow(row, col.toggle.fromRow) }} arg={col.toggle.arg} disabled={!s.isAdmin} /> : show(at(row, col.path), col.format))),
+            ...b.columns.map((col) => (col.toggle ? <Toggle c={c} value={!!at(row, col.path)} loaded={q.data} label={col.label} mutation={col.toggle.mutation} args={{ ...(col.toggle.args ?? {}), ...fromRow(row, col.toggle.fromRow) }} arg={col.toggle.arg} disabled={!s.isAdmin} /> : show(at(row, col.path), col.format))),
             ...(hasActions
               ? [
                   <span className="row-actions" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
@@ -503,7 +503,7 @@ function ToggleBlock({ c, b }: { c: ScreenCtx; b: Extract<Block, { kind: "toggle
   if (!q.data) return <Loading lines={1} />;
   return (
     <div className="toolbar">
-      <Toggle c={c} value={!!at(q.data.value, b.path)} label={b.label} mutation={b.mutation} args={b.mutationArgs ?? {}} arg={b.arg} disabled={!s.isAdmin} />
+      <Toggle c={c} value={!!at(q.data.value, b.path)} loaded={q.data} label={b.label} mutation={b.mutation} args={b.mutationArgs ?? {}} arg={b.arg} disabled={!s.isAdmin} />
       <span>{b.label}</span>
     </div>
   );
@@ -525,39 +525,72 @@ async function runWrite(c: ScreenCtx, fn: string, args: Record<string, unknown>,
   return api.post("/api/dash/run", { project: c.project, env: c.env, shard: c.shard, dashboard: c.spec.key, fn, args, ...(confirm ? { confirm } : {}) });
 }
 
-/** A switch for a boolean (inline in a table, or a toggle block): flipping it runs the mutation with the new value. */
-function Toggle({ c, value, label, mutation, args, arg, disabled }: { c: ScreenCtx; value: boolean; label: string; mutation: string; args: Record<string, unknown>; arg: string; disabled: boolean }) {
+/**
+ * A switch for a boolean (inline in a table, or a toggle block): flipping it runs the mutation with the new value. It
+ * shows the flipped value until the next load of its query arrives (`loaded`: a new result object per completed
+ * load), and from then on what that load says, even when the value did not change (another writer flipped it back).
+ * A mutation the Worker asks to confirm (a destructive one on a protected environment) asks for the text it names.
+ */
+function Toggle({ c, value, loaded, label, mutation, args, arg, disabled }: { c: ScreenCtx; value: boolean; loaded: unknown; label: string; mutation: string; args: Record<string, unknown>; arg: string; disabled: boolean }) {
   const s = useSession();
   const [busy, setBusy] = useState(false);
-  const [shown, setShown] = useState(value);
-  useEffect(() => setShown(value), [value]);
+  const [flipped, setFlipped] = useState<boolean | null>(null);
+  const [expected, setExpected] = useState<string | null>(null);
+  const [error, setError] = useState<ApiError | null>(null);
+  useEffect(() => setFlipped(null), [loaded]);
+  const shown = flipped ?? value;
+  const run = async (typed: string | null) => {
+    const next = !shown;
+    setBusy(true);
+    setError(null);
+    try {
+      await runWrite(c, mutation, { ...args, [arg]: next }, typed);
+      setExpected(null);
+      setFlipped(next);
+      c.changed();
+    } catch (x) {
+      const e = x instanceof ApiError ? x : new ApiError(0, "error", String(x));
+      if (e.code === "confirmation_required" && typeof e.data?.expected === "string") setExpected(e.data.expected);
+      else if (expected !== null) setError(e);
+      else s.toast({ kind: "bad", text: `${label}: ${e.message}`, detail: e.code });
+    } finally {
+      setBusy(false);
+    }
+  };
+  // Clicks and keys inside (the switch, its confirmation) stay here: in a table they would also open the row's detail.
   return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={shown}
-      aria-label={label}
-      className={`switch${shown ? " on" : ""}`}
-      disabled={disabled || busy}
-      title={disabled ? "Needs the admin role" : undefined}
-      // Enter/Space on the switch flips it, never the row under it (a table row with a detail opens on those keys).
-      onKeyDown={(e) => e.stopPropagation()}
-      onClick={async (e) => {
-        e.stopPropagation();
-        setBusy(true);
-        try {
-          await runWrite(c, mutation, { ...args, [arg]: !shown }, null);
-          setShown(!shown);
-          c.changed();
-        } catch (x) {
-          s.toast({ kind: "bad", text: `${label}: ${(x as Error).message}`, detail: x instanceof ApiError ? x.code : "" });
-        } finally {
-          setBusy(false);
-        }
-      }}
-    >
-      <span className="switch-knob" />
-    </button>
+    <span className="switch-wrap" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={shown}
+        aria-label={label}
+        className={`switch${shown ? " on" : ""}`}
+        disabled={disabled || busy}
+        title={disabled ? "Needs the admin role" : undefined}
+        onClick={() => void run(null)}
+      >
+        <span className="switch-knob" />
+      </button>
+      <ConfirmDialog
+        open={expected !== null}
+        title={`${label}: turn ${shown ? "off" : "on"} on ${c.env}?`}
+        confirmLabel={shown ? "Turn off" : "Turn on"}
+        danger
+        expected={expected}
+        busy={busy}
+        error={error}
+        onCancel={() => {
+          setExpected(null);
+          setError(null);
+        }}
+        onConfirm={(typed) => void run(typed)}
+      >
+        <p className="muted small">
+          Runs <Mono>{mutation}</Mono> on <Mono>{c.shard}</Mono>. Recorded in the audit log.
+        </p>
+      </ConfirmDialog>
+    </span>
   );
 }
 
