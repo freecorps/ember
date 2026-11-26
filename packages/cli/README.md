@@ -20,7 +20,7 @@ Node >= 22. `wrangler` (>= 4.40) is an optional peer: `ember dev --remote` needs
 | Command | What it does |
 |---|---|
 | `init [dir] [--auth]` | `ember.json` and a sample app in `ember/` that passes `tsc` as generated: `defineErrors`, a per-channel `.aggregate()` count, a cron on `internal.messages.trim`; `--auth` adds Better Auth, typed profile sync and `ctx.auth.require()` |
-| `dev [--port 8787] [--no-persist] [--remote]` | runs locally in Miniflare/workerd and rebuilds on change (incremental bundle; an `ember.json` edit reloads the config and rebuilds, a `.dev.vars` edit reloads the values without a rebuild); `--remote` binds the env's real Workers AI, Vectorize, Browser Rendering and Images |
+| `dev [--port 8787] [--no-persist] [--remote] [--dashboard [--dashboard-port 8788]]` | runs locally in Miniflare/workerd and rebuilds on change (incremental bundle; an `ember.json` edit reloads the config and rebuilds, a `.dev.vars` edit reloads the values without a rebuild); `--remote` binds the env's real Workers AI, Vectorize, Browser Rendering and Images; `--dashboard` also serves the Ember Dashboard on `http://127.0.0.1:8788` for this runtime (below) |
 | `codegen [--check] [--strict]` | writes `ember/_generated` (types + manifest; `claims.d.ts`: the identity's claims from `ember/auth.config.ts`); `--check` fails in CI when it is out of date. In `ember dev` it is incremental: a save re-infers the edited modules and the ones importing them |
 | `types <module:fn>`, `openapi [--out file]` | a function's contract; OpenAPI 3.1 of the public functions and typed HTTP routes (both read `ember/_generated/manifest.json` and `api.d.ts` when they are current, else run codegen in memory) |
 | `deploy [--env prod] [--wait] [--gradual N] [--dry-run] [--preflight] [--allow-schema-rollback] [--allow-missing-env]` | deploys `ember-<project>-<env>` through the Cloudflare API; `--wait` polls until shards have migrated; `--preflight` asks the live shards what the migration would do, uploading nothing. Stops before uploading when the app schema is one this environment already left for a newer one (registry deploy history), says what that rollback costs, and needs `--allow-schema-rollback` to go ahead. When the history cannot be read, the deploy warns and goes ahead unchecked. Also stops when a required var of `defineApp({ env })` is neither a secret on the Worker nor a var in `ember.json`, naming them (`--allow-missing-env` deploys anyway; a first deploy only warns, since secrets need the Worker). A redeploy reads the Worker's state in parallel and skips the workers.dev, R2 CORS and lifecycle writes that would change nothing, and the `limits`/`placement` write when the Worker already has them |
@@ -39,6 +39,18 @@ Node >= 22. `wrangler` (>= 4.40) is an optional peer: `ember dev --remote` needs
 | `migrations run\|status\|cancel <name> [--all]` | drive `@freecorps/ember-migrations` data migrations across shards |
 | `migrate convex [--src convex] [--out ember] [--strict]` | codemod: port a Convex functions folder (queries and mutations become synchronous). First checks the libraries the functions import (and the `package.json` next to them) against what runs in an Ember action (workerd + `nodejs_compat`), warning about the ones that do not; `--strict` stops there |
 | `dashboard deploy\|token\|destroy` | the Ember Dashboard in your account |
+
+### `ember dev --dashboard`
+
+The same Ember Dashboard you deploy, on this machine, in front of the `ember dev` runtime: health, shards, data,
+functions (the runner too), reactivity, files, schedules, the declarative screens of the app and its components, the
+command palette (`⌘K`). It runs in the CLI's Node process on `127.0.0.1` only, in an explicit dev mode: **no login**
+(you are the local admin), and only for requests to a loopback host — any other peer, or a page reaching it through
+DNS rebinding with its own `Host`, is refused, and the mode is never accepted on Cloudflare. Nothing of your account
+is touched: the registry is a local D1 of the session (the runtime reports its shards there, the dashboard keeps its
+audit log there), and the runtime's admin endpoints open with a token made for the session, in memory only. No
+Analytics Engine and no live logs locally (those screens say how to turn them on in a deployed dashboard). Writes keep
+every rule of a deployed dashboard (Origin, CSRF token, audit).
 
 `ember --help` lists every option. Environment: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `EMBER_ADMIN_TOKEN`
 (admin endpoints, `--wait`, imports, migrations).

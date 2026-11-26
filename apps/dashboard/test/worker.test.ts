@@ -81,6 +81,9 @@ describe("dashboard API", () => {
       EMBER_SERVICES: JSON.stringify({ "ember-chat-prod": "EMBER_SVC_0" }),
       EMBER_SVC_0: svc,
     };
+    // The catalog alone wakes no shard: nothing reaches the project, and the deployed schema comes with it.
+    const cat = (await (await get("/api/shards?project=chat&env=prod&q=acme", env, auth)).json()) as any;
+    expect([cat.shards.map((r: any) => r.shard), cat.expected, cat.status, seen.length]).toEqual([["org:acme"], "abc", null, 0]);
     const s = (await (await get("/api/shards?project=chat&env=prod&status=1", env, auth)).json()) as any;
     expect(s.status.shards[0].ready).toBe(true);
     const data = await get("/api/data?project=chat&env=prod&shard=org:acme&table=messages&cursor=5&evil=1", env, auth);
@@ -128,7 +131,8 @@ describe("dashboard API", () => {
   });
 
   it("per-function series and errors: bucketed by window, the function name checked", async () => {
-    const { functionSeriesSql, functionErrorsSql, parseFunctionSeries, bucketMinutes } = await import("../src/metrics-sql.ts");
+    const { functionSeriesSql, functionErrorsSql, parseFunctionSeries,
+  seriesPeaks, bucketMinutes } = await import("../src/metrics-sql.ts");
     const sql = functionSeriesSql({ dataset: "ember_metrics", project: "chat", env: "prod", fn: "messages:send", sinceHours: 24 });
     expect(sql).toContain("toStartOfInterval(timestamp, INTERVAL '15' MINUTE) AS t");
     expect(sql).toContain("blob4 = 'messages:send'");
@@ -136,8 +140,12 @@ describe("dashboard API", () => {
     expect(() => functionSeriesSql({ dataset: "ember_metrics", project: "chat", env: "prod", fn: "x' OR 1=1 --", sinceHours: 1 })).toThrow();
     expect(functionErrorsSql({ dataset: "ember_metrics", project: "chat", env: "prod", fn: "a:b", sinceHours: 6 })).toContain("blob6 = 'error'");
     expect(parseFunctionSeries({ data: [{ t: "2026-11-14 10:15:00", calls: "3", errors: 1, p50: 2, p95: 9, rows_read: 4, rows_written: 1 }] })).toEqual([
-      { t: Date.UTC(2026, 10, 14, 10, 15), calls: 3, errors: 1, p50: 2, p95: 9, rowsRead: 4, rowsWritten: 1 },
+      { t: Date.UTC(2026, 10, 14, 10, 15), calls: 3, errors: 1, p50: 2, p95: 9, rowsRead: 4, rowsWritten: 1, limitPeaks: { rowsRead: 0, documentsRead: 0, rowsWritten: 0 } },
     ]);
+    // The function page's "near a limit" warning comes from its own series (no second query over every function).
+    expect(sql).toContain("MAX(double9) AS peak_rows_written");
+    const pts = parseFunctionSeries({ data: [{ t: 1, peak_rows_read: 0.4 }, { t: 2, peak_rows_read: 0.8, peak_docs_read: 0.1 }] });
+    expect(seriesPeaks(pts)).toEqual({ rowsRead: 0.8, documentsRead: 0.1, rowsWritten: 0 });
   });
 
   it("limit peaks: MAX of double7..9 per function, warned at 70% with the text ember dev prints", () => {
@@ -165,5 +173,24 @@ describe("dashboard API", () => {
     expect((await app.fetch(new Request("https://dash.example/app.js"), {})).headers.get("content-type")).toMatch(/javascript/);
     expect((await app.fetch(new Request("https://dash.example/api/projects", { method: "POST" }), {})).status).toBe(405);
     expect((await app.fetch(new Request("https://dash.example/api/projects", { method: "OPTIONS" }), {})).status).toBe(405);
+  });
+});
+
+describe("cost totals (GET /api/cost)", () => {
+  it("the environment's usage by kind and timing (no ranking limit) and the catalog's whole storage", async () => {
+    const { usageTotalsSql } = await import("../src/metrics-sql.ts");
+    const sql = usageTotalsSql({ dataset: "ember_metrics", project: "chat", env: "prod", sinceHours: 24 });
+    expect(sql).toContain("GROUP BY kind, timing");
+    expect(sql).not.toContain("LIMIT");
+    expect(sql).toContain("blob5 != 'rum'");
+    const seen: string[] = [];
+    const fetchImpl = (async (_u: string, init?: RequestInit) => {
+      seen.push(String(init?.body));
+      return Response.json({ data: [{ kind: "mutation", timing: "rpc", calls: 5, rows_read: 1, rows_written: 2, bytes_out: 3 }] });
+    }) as unknown as typeof fetch;
+    const env: DashboardEnv = { DASHBOARD_TOKEN: "dash-secret", REGISTRY: registry(), CF_API_TOKEN: "cf", CF_ACCOUNT_ID: "acc" };
+    const r = (await (await get("/api/cost?project=chat&env=prod&hours=24", env, auth, fetchImpl)).json()) as any;
+    expect(r).toEqual({ ok: true, usage: [{ kind: "mutation", timing: "rpc", calls: 5, rowsRead: 1, rowsWritten: 2, bytesOut: 3 }], storage: { shards: 1, bytes: 8192 } });
+    expect(seen[0]).toContain("GROUP BY kind, timing");
   });
 });

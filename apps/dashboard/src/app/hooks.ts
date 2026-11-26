@@ -43,6 +43,8 @@ export interface Route {
   shard?: string;
   /** The function (functions section): the same route segment, never read as a shard. */
   fn?: string;
+  /** The users section's search (`users/<email>`): the same segment, never read as a shard. */
+  user?: string;
   /** Segments after the shard (declarative screens: the component, then the tab). */
   rest?: string[];
 }
@@ -63,7 +65,7 @@ export function parseHash(hash: string): Route {
     const section = parts[3] ?? "health";
     const arg = parts[4];
     const rest = parts.slice(5);
-    return { page: "env", project: parts[1], env: parts[2], section, ...(arg ? (section === "functions" ? { fn: arg } : { shard: arg }) : {}), ...(rest.length ? { rest } : {}) };
+    return { page: "env", project: parts[1], env: parts[2], section, ...(arg ? (section === "functions" ? { fn: arg } : section === "users" ? { user: arg } : { shard: arg }) : {}), ...(rest.length ? { rest } : {}) };
   }
   if (parts[0] === "audit") return { page: "audit" };
   return { page: "projects" };

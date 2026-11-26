@@ -531,3 +531,49 @@ describe("relaying a project's answer", () => {
     expect([res.status, res.headers.get("content-type"), res.headers.get("x-content-type-options")]).toEqual([404, "application/json", "nosniff"]);
   });
 });
+
+describe("local dev mode (`ember dev --dashboard`, DASHBOARD_DEV)", () => {
+  const me = (url: string, env: DashboardEnv) => handleApi(new Request(url), env, new URL(url));
+  const devEnv = (extra: Partial<DashboardEnv> = {}): DashboardEnv => ({ DASHBOARD_DEV: "1", REGISTRY: seeded().binding, ...extra });
+
+  it("no login on a loopback host: the local admin", async () => {
+    for (const host of ["http://127.0.0.1:8788", "http://localhost:8788", "http://[::1]:8788", "http://127.1.2.3"]) {
+      const r = await me(`${host}/api/me`, devEnv());
+      expect([host, r.status]).toEqual([host, 200]);
+      expect(await r.json()).toMatchObject({ via: "dev", actor: "local-dev", role: "admin" });
+    }
+  });
+
+  it("any other host is refused (a DNS-rebound page), and so is any other value", async () => {
+    for (const host of ["http://evil.example", "http://127.0.0.1.evil.example", "https://dash.example", "http://10.0.0.2:8788"]) expect((await me(`${host}/api/me`, devEnv())).status).toBe(403);
+    expect(await (await me("http://evil.example/api/me", devEnv())).json()).toMatchObject({ error: { code: "dev_loopback_only" } });
+    expect((await me("http://127.0.0.1/api/me", devEnv({ DASHBOARD_DEV: "true" }))).status).toBe(403);
+    // Unset (every deployed dashboard): the usual login.
+    expect((await me("http://127.0.0.1/api/me", { REGISTRY: seeded().binding, DASHBOARD_TOKEN: "t" })).status).toBe(401);
+  });
+
+  it("never on Cloudflare (inside workerd), even on a loopback host", async () => {
+    const nav = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    Object.defineProperty(globalThis, "navigator", { value: { userAgent: "Cloudflare-Workers" }, configurable: true });
+    try {
+      const r = await me("http://127.0.0.1/api/me", devEnv({ DASHBOARD_TOKEN: "t" }));
+      expect(r.status).toBe(403);
+      expect(await r.json()).toMatchObject({ error: { code: "dashboard_locked" } });
+    } finally {
+      if (nav) Object.defineProperty(globalThis, "navigator", nav);
+      else delete (globalThis as { navigator?: unknown }).navigator;
+    }
+  });
+
+  it("writes still need the Origin, the content type and the CSRF token", async () => {
+    const env = devEnv();
+    const o = "http://127.0.0.1:8788";
+    const csrf = ((await (await me(`${o}/api/me`, env)).json()) as { csrf: string }).csrf;
+    const post = (headers: Record<string, string>) => {
+      const url = `${o}/api/bookmark`;
+      return handleApi(new Request(url, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ project: "chat", env: "dev", shard: "global:main" }) }), env, new URL(url));
+    };
+    expect((await post({ origin: o })).status).toBe(403);
+    expect((await post({ origin: "http://localhost:9999", [CSRF_HEADER]: csrf })).status).toBe(403);
+  });
+});

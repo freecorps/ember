@@ -6,13 +6,19 @@
 //                                                    ("ana@x.com", "@x.com" for a domain, "*" for everyone Access
 //                                                    lets in), read otherwise
 // Neither Access nor a token configured → 403 (the dashboard is never open without a login).
+//
+// Local development (`ember dev --dashboard`) is the one exception, and an explicit one: DASHBOARD_DEV = "1", which
+// only the CLI's local server sets (never an upload), and only outside workerd (refused on Cloudflare), and only for
+// a request addressed to a loopback host (`127.0.0.1`, `localhost`, `[::1]`: a DNS-rebound page reaches the server
+// with its own Host and is refused) → admin, actor "local-dev", via "dev". The CLI's server also listens on loopback
+// only and refuses any other peer.
 
 import { err, fromB64url, sameSecret } from "./http.ts";
 
 export type Role = "read" | "admin";
 
 export interface Principal {
-  via: "access" | "token";
+  via: "access" | "token" | "dev";
   /** Email (Access), or "token" / "read-token". Written to the audit log. */
   actor: string;
   role: Role;
@@ -25,6 +31,8 @@ export interface AuthEnv {
   ACCESS_AUD?: string;
   /** Comma- or space-separated: emails, `@domain`, or `*`. */
   DASHBOARD_ADMINS?: string;
+  /** "1": `ember dev --dashboard`'s local server (no login on loopback; refused on Cloudflare). */
+  DASHBOARD_DEV?: string;
   [k: string]: unknown;
 }
 
@@ -92,7 +100,21 @@ export function accessConfigured(env: AuthEnv): boolean {
   return nonEmpty(env.ACCESS_TEAM_DOMAIN) && nonEmpty(env.ACCESS_AUD);
 }
 
+/** A hostname that can only be this machine. */
+export function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return h === "localhost" || h === "::1" || /^127(?:\.\d{1,3}){3}$/.test(h);
+}
+
+/** Running inside workerd (Cloudflare, Miniflare): where dev mode is never accepted. */
+const onWorkers = () => (globalThis as { navigator?: { userAgent?: string } }).navigator?.userAgent === "Cloudflare-Workers";
+
 export async function authenticate(request: Request, env: AuthEnv, fetchImpl?: typeof fetch): Promise<Principal | Response> {
+  if (env.DASHBOARD_DEV !== undefined && env.DASHBOARD_DEV !== "") {
+    if (env.DASHBOARD_DEV !== "1" || onWorkers()) return err(403, "dashboard_locked", "DASHBOARD_DEV is only for `ember dev --dashboard` on this machine");
+    if (!isLoopbackHost(new URL(request.url).hostname)) return err(403, "dev_loopback_only", "the local dev dashboard answers loopback hosts only (127.0.0.1, localhost)");
+    return { via: "dev", actor: "local-dev", role: "admin" };
+  }
   const accessOn = accessConfigured(env);
   const tokenOn = nonEmpty(env.DASHBOARD_TOKEN) || nonEmpty(env.DASHBOARD_READ_TOKEN);
   if (!accessOn && !tokenOn) return err(403, "dashboard_locked", "configure Cloudflare Access (ACCESS_TEAM_DOMAIN + ACCESS_AUD) or the DASHBOARD_TOKEN secret");

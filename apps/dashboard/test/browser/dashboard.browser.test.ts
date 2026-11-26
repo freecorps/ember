@@ -44,7 +44,7 @@ function fakeAnalytics(): typeof fetch {
     const sql = String(init?.body ?? "");
     let data: Array<Record<string, unknown>> = [];
     if (sql.includes("toStartOfInterval")) data = Array.from({ length: 12 }, (_, i) => ({ t: at(i), calls: 10 + i * 3, errors: i % 4 === 0 ? 2 : 0, p50: 3 + (i % 3), p95: 12 + i, rows_read: 40 + i * 5, rows_written: i }));
-    else if (sql.includes("blob6 = 'error'")) data = [{ t: at(11), code: "MessageTooLong", shard: "org:acme", kind: "mutation", ms: 4.2 }];
+    else if (sql.includes("blob7 AS code")) data = [{ t: at(11), code: "MessageTooLong", shard: "org:acme", kind: "mutation", ms: 4.2 }];
     else if (sql.includes("blob8 AS shard")) data = [{ shard: "org:acme", calls: 300, errors: 3, rows_read: 900, rows_written: 40 }];
     else data = [{ project: "chat", env: "prod", fn: "messages:send", kind: "mutation", timing: "rpc", calls: 120, errors: 6, p50: 4, p95: 18, rows_read: 240, rows_written: 120, bytes_out: 9000 }];
     return new Response(JSON.stringify({ data, rows: data.length }));
@@ -171,8 +171,10 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await page.getByText("Needs attention").waitFor();
     // Analytics is not configured: one notice says how to connect it.
     await page.getByText("Connect Analytics Engine").waitFor();
-    // org:beta is still backfilling an index.
+    // The catalog says org:beta reported an older schema; its live status (backfilling an index) is asked on demand.
     await page.locator(".attention li", { hasText: "org:beta" }).waitFor();
+    await page.getByText("behind (catalog)").first().waitFor();
+    await page.getByRole("button", { name: "Check live status" }).click();
     await page.locator("text=backfilling 1").first().waitFor();
     const storage = await page.evaluate(() => JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } }));
     expect(storage).not.toContain("admin-token-for-tests");
@@ -180,6 +182,104 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await shot(page, "health");
     expect(problems).toEqual([]);
     await close();
+  });
+
+  it("costs the project little: health and the shard search read the catalog; live status only on demand", async () => {
+    const before = prod.calls.length;
+    const { page, problems, close } = await open("#/p/chat/prod/health");
+    await page.getByText("Needs attention").waitFor();
+    await page.getByText("behind (catalog)").first().waitFor();
+    // Opening Health asks the project for its capabilities only: no shard woken.
+    const status = () => prod.calls.slice(before).filter((c) => c.startsWith("GET status"));
+    expect(status()).toEqual([]);
+    await page.keyboard.press("s");
+    await page.getByRole("table", { name: "Shards" }).waitFor();
+    // Typing in the filter: catalog queries (D1, debounced), never the live status of 50 shards per keystroke.
+    await page.getByLabel("Filter shards").pressSequentially("org:b", { delay: 30 });
+    await page.getByRole("table", { name: "Shards" }).getByText("org:beta").waitFor();
+    await page.waitForTimeout(400);
+    expect(status()).toEqual([]);
+    // The button asks once for the listed shards.
+    await page.getByRole("button", { name: "Check live status" }).click();
+    await page.getByRole("table", { name: "Shards" }).getByText("backfilling 1").waitFor();
+    expect(status()).toEqual(["GET status?org:beta"]);
+    // Selecting a shard asks for that one only.
+    await page.getByRole("table", { name: "Shards" }).getByText("org:beta").click();
+    await page.getByRole("complementary", { name: "Shard org:beta" }).waitFor();
+    await page.getByText("Re-runs since boot").waitFor();
+    expect(status()).toEqual(["GET status?org:beta", "GET status?org:beta"]);
+    expect(prod.calls.slice(before).filter((c) => c.startsWith("GET status") || c.startsWith("GET inspect")).every((c) => !c.includes(","))).toBe(true);
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("command palette (⌘K / Ctrl+K): environments, sections, screens, shards, tables, functions, users", async () => {
+    const { page, problems, close } = await open("#/p/chat/prod/health");
+    await page.getByText("Needs attention").waitFor();
+    const dialog = page.getByRole("dialog", { name: "Command palette" });
+    const box = dialog.getByRole("combobox", { name: "Go to" });
+    const openPalette = async (combo: string) => {
+      await page.keyboard.press(combo);
+      await box.waitFor();
+      await expect.poll(() => box.evaluate((el) => el === document.activeElement)).toBe(true);
+    };
+    // A function, by keyboard only. Typing "s" or "f" in the box is text, not a section shortcut.
+    await openPalette("Control+k");
+    await box.pressSequentially("send");
+    await dialog.getByRole("option", { name: /messages:send/ }).waitFor();
+    expect(await dialog.getByRole("listbox").getAttribute("aria-label")).toBe("Results");
+    await page.keyboard.press("Enter");
+    await expect.poll(() => page.url()).toContain("/functions/messages%3Asend");
+    await dialog.waitFor({ state: "hidden" });
+
+    // A shard, then a table (opened on the route's shard), arrows move the selection.
+    await openPalette("Meta+k");
+    await box.pressSequentially("org:be");
+    const beta = dialog.getByRole("option", { name: /org:beta/ });
+    await beta.waitFor();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => page.url()).toContain("/shards/org%3Abeta");
+    await page.getByRole("complementary", { name: "Shard org:beta" }).waitFor();
+
+    await openPalette("Control+k");
+    await box.pressSequentially("messages");
+    await dialog.getByRole("option", { name: /^messages.*data on/ }).waitFor();
+    // Tables come after sections and screens: move to it with the arrows.
+    const options = dialog.getByRole("option");
+    const names = await options.allTextContents();
+    const at = names.findIndex((n) => n.startsWith("messages") && n.includes("data on"));
+    for (let i = 0; i < at; i++) await page.keyboard.press("ArrowDown");
+    expect(await options.nth(at).getAttribute("aria-selected")).toBe("true");
+    expect(await box.getAttribute("aria-activedescendant")).toBe(`palette-${at}`);
+    await page.keyboard.press("Enter");
+    await expect.poll(() => page.url()).toContain("/data/org%3Abeta/messages");
+    await expect.poll(() => page.locator(".table-list button.active").textContent()).toContain("messages");
+
+    // A declarative screen and a user (searched from 3 characters on).
+    await openPalette("Control+k");
+    await box.pressSequentially("work pool items");
+    await dialog.getByRole("option", { name: /Work pool › Items/ }).click();
+    await expect.poll(() => page.url()).toContain("/components/org%3Abeta/pool/items");
+    await openPalette("Control+k");
+    await box.pressSequentially("ana@");
+    await dialog.getByRole("option", { name: /ana@acme\.test/ }).waitFor();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => page.url()).toContain("/users/ana%40acme.test");
+    await expect.poll(() => page.getByLabel("Search users").inputValue()).toBe("ana@acme.test");
+
+    // An environment from anywhere; Esc closes and hands the keyboard back to the page.
+    await openPalette("Control+k");
+    await box.pressSequentially("chat/dev");
+    await dialog.getByRole("option", { name: /chat\/dev/ }).waitFor();
+    await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "hidden" });
+    await page.keyboard.press("h");
+    await expect.poll(() => page.url()).toContain("/p/chat/prod/health");
+    await shot(page, "palette");
+    expect(problems).toEqual([]);
+    await close();
+    // The screen it opened ran its queries: the declarative screens' tests below count theirs from zero.
+    prod.dashQueries.length = 0;
   });
 
   it("keyboard: section keys, shard search, row navigation; destructive restore needs the typed name", async () => {
@@ -355,6 +455,37 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
       await rx.locator("tr", { hasText: "messages:mine" }).getByRole("button", { name: "Profile" }).click();
       await page.getByRole("dialog").getByText(/narrow the scan with withIndex/).waitFor();
       await shot(page, "reactivity-profile");
+      expect(problems).toEqual([]);
+      await close();
+    } finally {
+      delete env.CF_API_TOKEN;
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("estimated cost: a month projected from the metrics, by function and by shard, labelled as an estimate", async () => {
+    env.CF_API_TOKEN = "cf";
+    globalThis.fetch = fakeAnalytics();
+    try {
+      const { page, problems, close } = await open("#/p/chat/prod/health");
+      await page.getByText("Needs attention").waitFor();
+      await page.keyboard.press("e");
+      await expect.poll(() => page.url()).toMatch(/\/cost$/);
+      await page.getByRole("note").getByText("Estimate, not a bill").waitFor();
+      await page.getByRole("note").getByRole("link", { name: "Durable Objects" }).waitFor();
+      const byFn = page.getByRole("table", { name: "Estimated cost by function" });
+      await byFn.getByText("messages:send").waitFor();
+      // 120 calls in 7 days → ×730/168 a month; prices as small as these show as <$0.01.
+      await byFn.getByText("<$0.01").waitFor();
+      const byShard = page.getByRole("table", { name: "Estimated cost by shard" });
+      // From the metrics (org:acme) and from the catalog's storage (idle shards too).
+      await byShard.getByText("org:acme").waitFor();
+      await byShard.getByText("org:beta").waitFor();
+      await page.getByRole("table", { name: "Cost breakdown" }).getByText("SQLite rows written").waitFor();
+      await page.locator(".stat", { hasText: "With included usage" }).getByText("$5.00").waitFor();
+      await shot(page, "cost");
+      await byFn.locator("tr", { hasText: "messages:send" }).click();
+      await expect.poll(() => page.url()).toContain("/functions/messages%3Asend");
       expect(problems).toEqual([]);
       await close();
     } finally {

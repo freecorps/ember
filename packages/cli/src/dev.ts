@@ -12,6 +12,7 @@ import { DEV_VARS_FILE, loadDevVars } from "./env.ts";
 import { planRemote, remoteEnv, remoteFingerprint, startRemote, type RemoteSession } from "./remote.ts";
 import type { SchemaManifestLike } from "./deploy/ai.ts";
 import { miniflareOptions, startLocal, type LocalOptions } from "./local.ts";
+import { devDashboardToken, startDevDashboard, type DevDashboard, type DevRegistry } from "./dev-dashboard.ts";
 
 export interface DevOptions {
   port?: number;
@@ -22,6 +23,11 @@ export interface DevOptions {
    * Rendering and Images are the real ones; shards, auth and files stay local. `env` default: "dev".
    */
   remote?: { env?: string };
+  /**
+   * `ember dev --dashboard`: also serve the Ember Dashboard on this machine (dev-dashboard.ts), in front of this
+   * session's runtime, with no login and no account registry. `port` default 8788 (0: any free port).
+   */
+  dashboard?: { port?: number };
 }
 
 const devFile = (project: Project) => join(project.stateDir, "dev.json");
@@ -35,6 +41,8 @@ export interface DevSession {
   reload(kind: "code" | "config" | "vars"): Promise<void>;
   /** Builds of the session and the esbuild contexts they used (one, until ember.json changes the build options). */
   readonly stats: { builds: number; contexts: number };
+  /** `dashboard` option: where the local dashboard answers. */
+  readonly dashboard: { url: URL } | null;
 }
 
 export async function dev(project: Project, opts: DevOptions = {}): Promise<DevSession> {
@@ -48,7 +56,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
   // One TypeScript program for the whole session: each save re-checks incrementally.
   const oracle = new TypeOracle();
   /** A build of `p` and what the session takes from it once it is running (`adopt`). */
-  type Built = { build: WorkerBuild; schema: SchemaManifestLike; env: typeof declaredEnv; components: LocalOptions["components"] };
+  type Built = { build: WorkerBuild; schema: SchemaManifestLike; schemaVersion: string | null; env: typeof declaredEnv; components: LocalOptions["components"] };
   const rebuild = async (p: Project): Promise<Built> => {
     const t = Date.now();
     const gen = await codegen(p, { oracle });
@@ -58,12 +66,15 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
     return {
       build,
       schema: gen.manifest.schema as unknown as SchemaManifestLike,
+      schemaVersion: (gen.manifest.schema as { version?: string }).version ?? null,
       env: gen.manifest.env ?? [],
       components: (gen.manifest.schema as { components?: LocalOptions["components"] }).components,
     };
   };
+  let schemaVersion: string | null = null;
   const adopt = (b: Built) => {
     schema = b.schema;
+    schemaVersion = b.schemaVersion;
     declaredEnv = b.env;
     components = b.components;
   };
@@ -106,9 +117,14 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
   // Binding names and the indexes behind them: a renamed index (same binding) needs a new session too.
   const remoteKeys = () => remoteFingerprint(planRemote(project, remote!.plan.env, schema));
   const boundKeys = remote ? remoteFingerprint(remote.plan) : "";
+  // `--dashboard`: a session token opens the runtime's admin endpoints to the local dashboard, and a local D1 is the
+  // registry (the runtime fills its shard catalog; the dashboard keeps its audit log there).
+  const dashToken = opts.dashboard ? devDashboardToken() : null;
+  // The session's own values win over `.dev.vars`.
+  const sessionVars = (vars: Record<string, string>) => ({ ...vars, EMBER_DEV_PERF: "1", ...(dashToken ? { EMBER_ADMIN_TOKEN_DASHBOARD: dashToken } : {}) });
   let local: Awaited<ReturnType<typeof startLocal>>;
   try {
-    local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true, vars: { EMBER_DEV_PERF: "1", ...dv.vars }, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) });
+    local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true, vars: sessionVars(dv.vars), ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}), ...(dashToken ? { registry: true } : {}) });
   } catch (e) {
     await remote?.dispose();
     await buildContext.dispose();
@@ -121,12 +137,27 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
   const removeMarker = () => rmSync(devFile(project), { force: true });
   process.once("exit", removeMarker);
   log(`ember dev: ${url.href}  (state in ${join(project.stateDir, "state")})`);
+  let dashboard: DevDashboard | null = null;
+  if (opts.dashboard && dashToken) {
+    try {
+      const registry = (await local.mf.getD1Database("EMBER_REGISTRY")) as unknown as DevRegistry;
+      dashboard = await startDevDashboard({ project: project.config.project, runtime: url, registry, adminToken: dashToken, ...(opts.dashboard.port !== undefined ? { port: opts.dashboard.port } : {}), schemaVersion, log });
+    } catch (e) {
+      await local.mf.dispose();
+      await remote?.dispose();
+      await buildContext.dispose();
+      removeMarker();
+      throw e;
+    }
+  }
 
   // `current` is the running build and `project` the config it was built from: `.dev.vars` reloads apply both.
   let current = first;
   const apply = async (p: Project, build: WorkerBuild, vars: Record<string, string>, comps: LocalOptions["components"]) => {
-    await local.mf.setOptions(miniflareOptions(p, build, { port: Number(url.port), persist: opts.persist ?? true, vars: { EMBER_DEV_PERF: "1", ...vars }, ...(remote ? { remote: remote.bindings } : {}), ...(comps ? { components: comps } : {}) }));
+    await local.mf.setOptions(miniflareOptions(p, build, { port: Number(url.port), persist: opts.persist ?? true, vars: sessionVars(vars), ...(remote ? { remote: remote.bindings } : {}), ...(comps ? { components: comps } : {}), ...(dashToken ? { registry: true } : {}) }));
     current = build;
+    // setOptions() invalidates what getD1Database() returned: the local dashboard gets the new handle.
+    if (dashboard) dashboard.setRegistry((await local.mf.getD1Database("EMBER_REGISTRY")) as unknown as DevRegistry);
   };
   /** An ember.json read but not built yet (its rebuild failed): code changes build it until one succeeds. */
   let pending: Project | null = null;
@@ -157,6 +188,8 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
       adopt(b);
       project = target;
       pending = null;
+      // The local dashboard compares each shard's reported schema with the running build's.
+      if (dashboard) await dashboard.sync({ schemaVersion }).catch((e: unknown) => log(`warning: the local dashboard's registry still has the previous schema (${(e as Error).message}): its "behind" states may be wrong until the next reload`));
       if (remote && remoteKeys() !== boundKeys) log("warning: the schema's external indexes changed (added, removed or now a different index): restart `ember dev --remote` to bind (and create) them remotely");
       log(kind === "config" ? `${CONFIG_FILE}: reloaded` : "reloaded");
     } catch (e) {
@@ -210,6 +243,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
         return buildContext.stats.contexts;
       },
     },
+    dashboard: dashboard ? { url: dashboard.url } : null,
     reload,
     idle: async () => {
       await running;
@@ -220,6 +254,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
       watcher?.close();
       rootWatcher.close();
       await running;
+      await dashboard?.close();
       await local.mf.dispose();
       await remote?.dispose();
       await buildContext.dispose();
