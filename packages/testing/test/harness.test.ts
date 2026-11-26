@@ -463,7 +463,7 @@ describe("convexTest forwards app / triggers / replicas / limits", () => {
   });
 
   it("an `undefined` limit in the test's options keeps the app's value", async () => {
-    using e = emberTest({ schema, modules: { notes }, app: defineApp({ limits: { rowsWritten: 5 } }), limits: { rowsWritten: undefined } });
+    using e = emberTest({ schema, modules: { notes }, app: defineApp({ limits: { rowsWritten: 5 } }), limits: { rowsWritten: undefined } as never }); // as from JS, or a spread of optional values
     await expect(e.mutation(api.notes.many, { n: 10 })).rejects.toMatchObject({ code: "TooManyWrites" });
   });
 
