@@ -215,10 +215,14 @@ describe("convexTest: scheduled functions with fake timers", () => {
   it("close() clears the real timers of jobs not run yet: they never run after the test", async () => {
     const t = convexTest(schema, modules);
     await t.mutation(api.jobs.later, { delayMs: 30, what: "late" });
+    const base = await t.ember();
+    const run = vi.spyOn(base, "runScheduled");
     t.close();
     await new Promise((r) => setTimeout(r, 60));
     await t.finishInProgressScheduledFunctions();
-    expect(await t.query(api.jobs.log, {})).toEqual([]);
+    expect(run).not.toHaveBeenCalled();
+    // close() also closed the harness underneath (its databases).
+    await expect(t.query(api.jobs.log, {})).rejects.toThrow(/closed/);
   });
 });
 

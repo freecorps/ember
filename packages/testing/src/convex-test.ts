@@ -16,12 +16,13 @@
 //   be; `t.run(async (ctx) => ...)` runs up to its first real `await` inside the mutation, the rest after it;
 // - one shard per name (`<kind>:<key>`), as in `emberTest`: calls route by the function's shard argument, else
 //   `global:main`;
-// - `ctx.storage.store` and Convex components are not emulated; `ctx.db.system` does not exist
-//   (`ctx.scheduler.get/list`, `ctx.storage.getMetadata`);
+// - files are in memory (`ctx.storage.store/get/getUrl/getMetadata/delete` in actions, as `emberTest`); Convex
+//   components (`registerComponent`) are not emulated: pass Ember components as `app`; `ctx.db.system` does not
+//   exist (`ctx.scheduler.get/list`, `ctx.storage.getMetadata`);
 // - identities: `withIdentity({ subject, issuer, tokenIdentifier, name, email, ...claims })` becomes an Ember
 //   identity `{ subject, issuer, claims: { tokenIdentifier, name, email, ...claims } }` (the shape the server sees).
 
-import type { GenericShards, GenericTables, HttpRouter, Identity, MutationCtx, SchedulerReader, SchemaDefinition } from "@freecorps/ember-server";
+import type { AppDefinition, GenericShards, GenericTables, HttpRouter, Identity, Limits, MutationCtx, ReplicaTableSpec, SchedulerReader, SchemaDefinition, TriggersDefinition } from "@freecorps/ember-server";
 import type { ArgsAndOptions, ErrorSpec, FunctionReference, ShardSpec, Visibility } from "@freecorps/ember-values";
 import { emberTest, type EmberTest } from "./index.ts";
 
@@ -67,11 +68,14 @@ export interface TestConvex {
   /** The `emberTest` underneath (`scheduled()`, `engine(shard)`, ...), once the modules are loaded. */
   ember(): Promise<EmberTest>;
   /**
-   * Clears the timers of jobs not run yet; a job's timer that fires afterwards runs nothing (e.g. `afterEach(() =>
-   * t.close())` when real timers are on). Optional: timers never keep the process alive (`unref`). Also `using t = ...`.
+   * Clears the timers of jobs not run yet (a job's timer that fires afterwards runs nothing) and closes the harness
+   * underneath (`EmberTest.close`: its SQLite databases); later calls throw. E.g. `afterEach(() => t.close())`.
+   * Timers never keep the process alive (`unref`). Also `using t = ...`, or `await using` to wait for the scheduled
+   * functions already in progress first.
    */
   close(): void;
   [Symbol.dispose](): void;
+  [Symbol.asyncDispose](): Promise<void>;
 }
 
 export interface ConvexTestOptions {
@@ -79,6 +83,14 @@ export interface ConvexTestOptions {
   defaultShard?: string;
   /** `ctx.env` of actions. */
   env?: Record<string, unknown>;
+  /** `ember/ember.config.ts`'s default export: its components are composed in (`EmberTestOptions.app`). */
+  app?: AppDefinition;
+  /** `ember/triggers.ts`'s default export. Default: the `triggers` module's, when `modules` has it. */
+  triggers?: TriggersDefinition;
+  /** Replica tables (`EmberTestOptions.replicas`), e.g. `authReplicaTables(authConfig)`. */
+  replicas?: ReplicaTableSpec[];
+  /** Project limits, as `defineApp({ limits })`. */
+  limits?: Partial<Limits>;
 }
 
 /** Module paths that are not function modules. */
@@ -138,6 +150,7 @@ export function convexTest(schema: SchemaDefinition<GenericTables, GenericShards
     closed = true;
     for (const t of timers) clearTimeout(t);
     timers.clear();
+    base?.close();
   };
   const start = (id: string) => {
     // Started on the next microtask, not inside the timer callback: `vi.runAllTimers()` then fires only the timers
@@ -172,6 +185,10 @@ export function convexTest(schema: SchemaDefinition<GenericTables, GenericShards
       ...(http ? { http } : {}),
       ...(opts.defaultShard ? { defaultShard: opts.defaultShard } : {}),
       ...(opts.env ? { env: opts.env } : {}),
+      ...(opts.app ? { app: opts.app } : {}),
+      ...(opts.triggers ? { triggers: opts.triggers } : {}),
+      ...(opts.replicas ? { replicas: opts.replicas } : {}),
+      ...(opts.limits ? { limits: opts.limits } : {}),
       onSchedule: (job) => {
         if (closed) return;
         const timer = setTimeout(() => {
@@ -185,6 +202,7 @@ export function convexTest(schema: SchemaDefinition<GenericTables, GenericShards
         timers.add(timer);
       },
     });
+    if (closed) base.close();
     return base;
   })();
 
@@ -220,6 +238,12 @@ export function convexTest(schema: SchemaDefinition<GenericTables, GenericShards
       ember: () => loading,
       close,
       [Symbol.dispose]: close,
+      async [Symbol.asyncDispose]() {
+        // A harness closed while its modules still load closes once they are.
+        await loading.catch(() => undefined);
+        await finishInProgress();
+        close();
+      },
     };
   };
   return make(null);
