@@ -369,4 +369,50 @@ describe("dashboard → runtime (workerd)", () => {
     // Argument values are user data: names only.
     expect(log.body.entries[4]!.args).toBe(JSON.stringify({ dashboard: "", fn: "rates:setRate", fields: ["base", "quote", "rate"] }));
   });
+
+  it("SQL Explorer: one read-only query on the shard through the dashboard, audited with its text; writes refused by the project", async () => {
+    const target = { project: "files-auth-jobs", env: "test", shard: "global:main" };
+    type Answer = { value: { columns: string[]; rows: unknown[][]; rowsRead: number; rowsWritten: number; truncated: boolean; ms: number; plan?: Array<{ detail: string }> } };
+    // Its own rates (fxRates lives on global:main; setRate upserts, so the declarative-screens test before it changes
+    // nothing): the test runs alone too. Written before the seven SQL requests the audit assertion reads.
+    for (const [base, rate] of [["USD", 5.4], ["EUR", 6.1]] as const) expect((await write("/api/dash/run", { ...target, dashboard: "", fn: "rates:setRate", args: { base, quote: "BRL", rate } })).status).toBe(200);
+    // By SQL with a bound parameter.
+    const r = await write("/api/sql", { ...target, sql: "SELECT base, quote, rate FROM fxRates WHERE quote = ? ORDER BY base", params: ["BRL"] });
+    expect(r.status).toBe(200);
+    const answer = (r.body as unknown as Answer).value;
+    expect(answer).toMatchObject({ columns: ["base", "quote", "rate"], rows: [["EUR", "BRL", 6.1], ["USD", "BRL", 5.4]], rowsWritten: 0, truncated: false });
+    expect(answer.rowsRead).toBeGreaterThan(0);
+    // The row cap: one row asked, the query had more.
+    const capped = await write("/api/sql", { ...target, sql: "SELECT _id FROM fxRates", limit: 1 });
+    expect((capped.body as unknown as Answer).value).toMatchObject({ truncated: true, rows: [expect.any(Array)] });
+    // EXPLAIN QUERY PLAN as a tree.
+    const plan = await write("/api/sql", { ...target, sql: "SELECT * FROM fxRates WHERE base = 'USD'", explain: true });
+    expect((plan.body as unknown as Answer).value.plan![0]!.detail).toMatch(/SCAN|SEARCH/);
+    // A write is refused by the project (the dashboard forwards the text; the runtime decides), and nothing changes.
+    const refused = await write("/api/sql", { ...target, sql: "DELETE FROM fxRates" });
+    expect([refused.status, refused.body.error?.code]).toEqual([400, "SqlRefused"]);
+    const chained = await write("/api/sql", { ...target, sql: "SELECT 1; DROP TABLE fxRates" });
+    expect(chained.body.error?.code).toBe("SqlRefused");
+    const count = await write("/api/sql", { ...target, sql: "SELECT count(*) AS n FROM fxRates" });
+    expect((count.body as unknown as Answer).value.rows).toEqual([[2]]);
+    // Read role: refused before the project is called.
+    expect((await write("/api/sql", { ...target, sql: "SELECT 1" }, "dash-read")).status).toBe(403);
+
+    const log = await read<{ entries: Array<{ actor: string; action: string; outcome: string; target: string | null; args: string | null }> }>("/api/audit?project=files-auth-jobs&env=test&limit=7");
+    expect(log.body.entries.map((e) => [e.actor, e.action, e.outcome])).toEqual([
+      ["read-token", "sql.run", "denied"],
+      ["token", "sql.run", "ok"],
+      ["token", "sql.run", "error"],
+      ["token", "sql.run", "error"],
+      ["token", "sql.run", "ok"],
+      ["token", "sql.run", "ok"],
+      ["token", "sql.run", "ok"],
+    ]);
+    // The text is what ran (the point of the log); parameter values are user data, only their count. Found by text.
+    const bySql = (text: string) => log.body.entries.find((e) => e.args !== null && (JSON.parse(e.args) as { sql?: string }).sql === text);
+    const first = bySql("SELECT base, quote, rate FROM fxRates WHERE quote = ? ORDER BY base");
+    expect(JSON.parse(first!.args!)).toEqual({ sql: "SELECT base, quote, rate FROM fxRates WHERE quote = ? ORDER BY base", params: 1, explain: false, limit: null });
+    expect(first).toMatchObject({ outcome: "ok", target: "global:main" });
+    expect(bySql("DELETE FROM fxRates")).toMatchObject({ action: "sql.run", outcome: "error" });
+  });
 });

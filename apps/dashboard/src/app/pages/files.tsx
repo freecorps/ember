@@ -25,12 +25,20 @@ const TEXT = /^(text\/plain|text\/csv|text\/markdown|application\/json|applicati
 const MAX_IMAGE = 10 * 1024 * 1024;
 const MAX_TEXT = 256 * 1024;
 
-export function Files({ project, env, shard }: { project: string; env: string; shard: string }) {
+export function Files({ project, env, shard, initialFile }: { project: string; env: string; shard: string; initialFile?: string }) {
   const s = useSession();
   const [cursors, setCursors] = useState<Array<string | null>>([null]);
   const cursor = cursors[cursors.length - 1] ?? null;
   const list = useApi<{ rows: FileRow[]; cursor: string | null; done: boolean }>(path("/api/files", { project, env, shard, cursor, limit: 50 }));
   const [open, setOpen] = useState<FileRow | null>(null);
+  // `files/<shard>/<id>` (a `v.file()` link of the Data Browser): that file's dialog, from the list when it is on the
+  // page, else by id alone (download only until its type is known).
+  const [linked, setLinked] = useState(false);
+  useEffect(() => {
+    if (!initialFile || linked || !list.data) return;
+    setLinked(true);
+    setOpen(list.data.rows.find((f) => f.id === initialFile) ?? { id: initialFile, sha256: "", size: 0, content_type: null, refcount: 0, state: "ready", created_at: 0 });
+  }, [initialFile, linked, list.data]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<ApiError | null>(null);
   const input = useRef<HTMLInputElement>(null);
@@ -160,13 +168,13 @@ function FileDialog({ project, env, shard, file, onClose, onDeleted }: { project
             <dt>Type</dt>
             <dd className="mono">{file.content_type ?? "—"}</dd>
             <dt>Size</dt>
-            <dd>{fmtBytes(file.size)}</dd>
+            <dd>{file.sha256 ? fmtBytes(file.size) : "—"}</dd>
             <dt>State</dt>
             <dd>{file.state}</dd>
             <dt>References</dt>
-            <dd>{fmtNum(file.refcount)}</dd>
+            <dd>{file.sha256 ? fmtNum(file.refcount) : "—"}</dd>
             <dt>sha256</dt>
-            <dd className="mono small">{file.sha256}</dd>
+            <dd className="mono small">{file.sha256 || "—"}</dd>
           </dl>
           <div className="preview">
             {error ? (
