@@ -5,7 +5,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { projectFrom, type EmberConfigFile } from "../src/config.ts";
-import { CORS_RULES, deploy, EVENT_ACTIONS, LIFECYCLE_RULES, sameRules, type DeployOptions } from "../src/deploy/index.ts";
+import { CORS_RULES, deploy, EVENT_ACTIONS, LIFECYCLE_RULES, sameLifecycle, sameRules, type DeployOptions } from "../src/deploy/index.ts";
 import { miniflareOptions } from "../src/local.ts";
 import { TMP } from "./helpers.ts";
 
@@ -61,7 +61,7 @@ function fakeCloudflare(state: {
       state.workerExists = true;
       return ok({ id: "v2" });
     }
-    if (m === `GET ${W}/subdomain`) return state.subdomain ? ok(state.subdomain) : no(404, 10007, "no worker");
+    if (m === `GET ${W}/subdomain`) return state.workerExists && state.subdomain ? ok(state.subdomain) : no(404, 10007, "no worker");
     if (m === `POST ${W}/subdomain`) {
       state.subdomain = call.json;
       return ok({});
@@ -199,6 +199,26 @@ describe("ember deploy: files resources (mocked)", () => {
     expect(w2).not.toContain("PUT /r2/buckets/ember-pics-prod/cors");
     expect(w2).toContain("POST /workers/scripts/ember-pics-prod/subdomain");
     expect(drift.state.lifecycle).toEqual(LIFECYCLE_RULES);
+
+    // An action added to an Ember rule (every field Ember sets still matches): `ember-abort-multipart` (prefix "")
+    // with a delete would remove every object after a day. The PUT puts the rules back.
+    const withDelete = { rules: lifecycle.rules.map((r) => (r.id === "ember-abort-multipart" ? { ...r, deleteObjectsTransition: { condition: { type: "Age", maxAge: 86400 } } } : r)) };
+    const extra = fakeCloudflare({
+      workerExists: true, bucket: true, queue: true, consumer: true, notification: true,
+      secrets: ["EMBER_STORAGE_SECRET", "EMBER_R2_ACCESS_KEY_ID", "EMBER_R2_SECRET_ACCESS_KEY"],
+      cors, lifecycle: withDelete, subdomain: { enabled: true, previews_enabled: false },
+    });
+    await run(extra.fetchImpl);
+    expect(extra.calls.some((c) => c.method === "PUT" && c.path === "/r2/buckets/ember-pics-prod/lifecycle")).toBe(true);
+    expect(extra.state.lifecycle).toEqual(LIFECYCLE_RULES);
+  });
+
+  it("sameLifecycle: an extra action on an Ember rule differs; empty default actions do not", () => {
+    const listed = LIFECYCLE_RULES.rules.map((r) => ({ ...r, storageClassTransitions: [] }));
+    expect(sameLifecycle(LIFECYCLE_RULES.rules, listed)).toBe(true);
+    expect(sameLifecycle(LIFECYCLE_RULES.rules, listed.map((r) => ({ ...r, deleteObjectsTransition: (r as { deleteObjectsTransition?: unknown }).deleteObjectsTransition ?? { condition: { type: "Age", maxAge: 86400 } } })))).toBe(false);
+    expect(sameLifecycle(LIFECYCLE_RULES.rules, listed.map((r) => ({ ...r, storageClassTransitions: [{ condition: { type: "Age", maxAge: 86400 }, storageClass: "InfrequentAccess" }] })))).toBe(false);
+    expect(sameLifecycle(LIFECYCLE_RULES.rules, undefined)).toBe(false);
   });
 
   it("sameRules: a subset match, lifecycle rules by id, extra or missing rules differ", () => {

@@ -67,7 +67,10 @@ function fakeCloudflare(state: { exists: boolean; classes: string[]; versions?: 
     }
     if (call.method === "POST" && path === `${W}/deployments`) return ok({ id: "d2" });
     if (call.method === "PUT" && path === `${W}/schedules`) return ok({ schedules: call.json });
-    if (call.method === "POST" && path === `${W}/subdomain`) return ok({ enabled: true });
+    if (call.method === "POST" && path === `${W}/subdomain`) {
+      state.subdomain = call.json;
+      return ok({ enabled: true });
+    }
     if (call.method === "GET" && path === `${W}/subdomain`)
       return state.exists && state.subdomain ? ok(state.subdomain) : new Response(JSON.stringify({ success: false, errors: [{ code: 10007, message: "no route" }], result: null }), { status: 404 });
     if (call.method === "GET" && path === "/workers/subdomain") return ok({ subdomain: "acme" });
@@ -232,6 +235,9 @@ describe("ember deploy (mocked Cloudflare API)", () => {
     // The route off (or unreadable): set as before.
     for (const subdomain of [{ enabled: false, previews_enabled: false }, { enabled: true, previews_enabled: true }, undefined]) {
       const again = fakeCloudflare({ exists: true, classes: ["Shard", "System"], ...(subdomain ? { subdomain } : {}) });
+      await run(again.fetchImpl);
+      expect(again.calls.filter((c) => c.method === "POST" && c.path.endsWith("/subdomain"))).toHaveLength(1);
+      // The route it set is read back by the next deploy, which leaves it.
       await run(again.fetchImpl);
       expect(again.calls.filter((c) => c.method === "POST" && c.path.endsWith("/subdomain"))).toHaveLength(1);
     }

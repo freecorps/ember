@@ -65,6 +65,23 @@ export function sameRules(want: unknown, have: unknown): boolean {
   return want === have;
 }
 
+/** An action of a lifecycle rule (`deleteObjectsTransition`, `abortMultipartUploadsTransition`, `storageClassTransitions`). */
+const LIFECYCLE_ACTION = /Transitions?$/;
+const isEmptyAction = (v: unknown) => v === undefined || v === null || (Array.isArray(v) && v.length === 0);
+
+/**
+ * `sameRules` for lifecycle rules, plus: no rule of `have` carries an action its rule in `want` lacks (a
+ * `deleteObjectsTransition` added to `ember-abort-multipart`, prefix "", would delete every object). Empty actions
+ * the API lists by default (`storageClassTransitions: []`) are ignored.
+ */
+export function sameLifecycle(want: ReadonlyArray<{ id: string } & Record<string, unknown>>, have: unknown): boolean {
+  if (!sameRules(want, have) || !Array.isArray(have)) return false;
+  return want.every((w) => {
+    const h = have.find((x) => (x as { id?: unknown })?.id === w.id) as Record<string, unknown>;
+    return Object.entries(h).every(([k, v]) => !LIFECYCLE_ACTION.test(k) || isEmptyAction(v) || k in w);
+  });
+}
+
 /** Bucket + CORS + lifecycle + queue (before the Worker upload, which binds them). */
 export async function ensureFilesResources(client: CfClient, project: string, env: string, log: (l: string) => void): Promise<FilesState> {
   const bucket = filesBucketName(project, env);
@@ -88,7 +105,7 @@ export async function ensureFilesResources(client: CfClient, project: string, en
   }
   const fresh = created.bucket || !head.success;
   const corsSame = !fresh && !!cors?.success && sameRules(CORS_RULES.rules, cors.result?.rules);
-  const lifecycleSame = !fresh && !!lifecycle?.success && sameRules(LIFECYCLE_RULES.rules, lifecycle.result?.rules);
+  const lifecycleSame = !fresh && !!lifecycle?.success && sameLifecycle(LIFECYCLE_RULES.rules, lifecycle.result?.rules);
   await Promise.all([
     corsSame ? null : client.call("PUT", `/r2/buckets/${bucket}/cors`, CORS_RULES),
     lifecycleSame ? null : client.call("PUT", `/r2/buckets/${bucket}/lifecycle`, LIFECYCLE_RULES),
