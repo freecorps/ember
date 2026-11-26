@@ -43,7 +43,7 @@ import type { SqlReader } from "./sqlQuery.ts";
 import type { ReplicaStatus } from "./replica.ts";
 import type { SqlValue } from "@freecorps/ember-values";
 import type { AnyDataModel, GenericDataModel } from "./schema.ts";
-import type { AuthCtx, Identity } from "./types.ts";
+import type { AnyClaims, AuthCtx, ClaimName, Identity } from "./types.ts";
 import type { VectorSearchQuery, VectorSearchResult } from "./vector.ts";
 import type { AiSearchQuery, AiSearchResult } from "./aiSearch.ts";
 
@@ -122,10 +122,16 @@ export interface DatabaseWriter<DM extends GenericDataModel> extends DatabaseRea
   ): NonNullable<DM[T]["document"][F]>;
 }
 
-export interface Auth {
-  getUserIdentity(): Identity | null;
+/** `ctx.auth` of queries and mutations; `Claims`: the identity's claims (`_generated/claims.d.ts`). */
+export interface Auth<Claims = AnyClaims> {
+  getUserIdentity(): Identity<Claims> | null;
   /** The caller's identity; throws `Unauthenticated` (a system error) when nobody is signed in. */
-  require(): Identity;
+  require(): Identity<Claims>;
+}
+/** `ctx.auth` of actions (it may ask the Auth DO, so it is async). */
+export interface ActionAuth<Claims = AnyClaims> {
+  getUserIdentity(): Promise<Identity<Claims> | null>;
+  require(): Promise<Identity<Claims>>;
 }
 
 /**
@@ -154,9 +160,9 @@ export interface ComponentInfo<Config = unknown> {
   config: Config;
 }
 
-export interface QueryCtx<DM extends GenericDataModel = AnyDataModel> {
+export interface QueryCtx<DM extends GenericDataModel = AnyDataModel, Claims = AnyClaims> {
   db: DatabaseReader<DM>;
-  auth: Auth;
+  auth: Auth<Claims>;
   /** Fixed for the whole function (deterministic). */
   now: number;
   /** File metadata and short-lived download URLs (PLAN §7). */
@@ -172,9 +178,9 @@ export interface QueryCtx<DM extends GenericDataModel = AnyDataModel> {
   /** Set inside component functions. */
   component?: ComponentInfo;
 }
-export interface MutationCtx<DM extends GenericDataModel = AnyDataModel> {
+export interface MutationCtx<DM extends GenericDataModel = AnyDataModel, Claims = AnyClaims> {
   db: DatabaseWriter<DM>;
-  auth: Auth;
+  auth: Auth<Claims>;
   now: number;
   /** Seeded per mutation, so a client can replay it. */
   random(): number;
@@ -288,12 +294,12 @@ export interface ShardsApi {
   ): Promise<Array<FanOutResult<FunctionReturnType<F>>>>;
 }
 
-export interface ActionCtx<DM extends GenericDataModel = AnyDataModel> extends ShardHandle, ActionSearch<DM> {
+export interface ActionCtx<DM extends GenericDataModel = AnyDataModel, Claims = AnyClaims> extends ShardHandle, ActionSearch<DM> {
   /** The shard catalog: list the shards of a kind, run a function on each (`fanOut`). */
   shards: ShardsApi;
   /** Set inside component functions. */
   component?: ComponentInfo;
-  auth: { getUserIdentity(): Promise<Identity | null>; require(): Promise<Identity> };
+  auth: ActionAuth<Claims>;
   runAction<F extends FunctionReference<"action", any>>(fn: F, ...args: OptionalRestArgs<F>): Promise<FunctionReturnType<F>>;
   onShard(shard: string): ShardHandle;
   /** The Worker's env bindings (R2, AI, Queues, secrets...). */
@@ -424,12 +430,21 @@ const claimOf = (x: unknown): string | undefined => (typeof x === "object" && x 
  * `org` of the caller's identity). Checked on every call: a function declared for one shard kind refuses to run on
  * another (`WrongShard`).
  */
-export type ShardDef<Args> = string | { readonly [kind: string]: (keyof Args & string) | FromAuth };
+export type ShardDef<Args, Claims = AnyClaims> = string | { readonly [kind: string]: (keyof Args & string) | FromAuth<ClaimName<Claims>> };
 
-type Def<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorFactory[] = readonly [], XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
+type Def<
+  Ctx,
+  A extends ArgsValidator,
+  R,
+  E extends readonly AnyErrorFactory[] = readonly [],
+  XA = {},
+  XE extends readonly AnyErrorFactory[] = readonly [],
+  C = AnyClaims,
+> = {
   args?: A;
   returns?: GenericValidator;
-  shard?: ShardDef<ArgsType<A>>;
+  /** With declared claims (`_generated/claims.d.ts`), `fromAuth` names one of them. */
+  shard?: ShardDef<ArgsType<A>, C>;
   /**
    * The application errors this function may throw (`defineErrors`). Optional: codegen infers them from the handler;
    * declared, they are its contract (codegen warns about a thrown error missing from the list) and `ctx.fail` offers them.
@@ -448,7 +463,15 @@ export type FailCtx<E extends readonly AnyErrorFactory[]> = {
  * The builder's middlewares run before each phase (twice per full call: keep them free of side effects), and one that
  * reads `ctx.auth` makes the handler's result per identity again (correct, not shared): read the identity in `authorize`.
  */
-type AuthorizedDef<Ctx, A extends ArgsValidator, R, E extends readonly AnyErrorFactory[] = readonly [], XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = Omit<Def<Ctx, A, R, E, XA, XE>, "handler"> & {
+type AuthorizedDef<
+  Ctx,
+  A extends ArgsValidator,
+  R,
+  E extends readonly AnyErrorFactory[] = readonly [],
+  XA = {},
+  XE extends readonly AnyErrorFactory[] = readonly [],
+  C = AnyClaims,
+> = Omit<Def<Ctx, A, R, E, XA, XE, C>, "handler"> & {
   authorize: (ctx: Ctx & FailCtx<readonly [...XE, ...E]>, args: Expand<ArgsType<A> & XA>) => void;
   handler: (ctx: Omit<Ctx, "auth"> & FailCtx<readonly [...XE, ...E]>, args: Expand<ArgsType<A> & XA>) => R;
 };
@@ -498,40 +521,43 @@ export type MiddlewareResult<Add, Ctx> = { ctx?: Add; onSuccess?: (ctx: Ctx, res
 
 type Merged<XE extends readonly AnyErrorFactory[], E extends readonly AnyErrorFactory[]> = ErrorSpecsOf<readonly [...XE, ...E]>;
 
-/** `X`: extra ctx fields (middlewares, component builders); `XA` / `XE`: arguments and errors the middlewares add. */
-export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
+/**
+ * `X`: extra ctx fields (middlewares, component builders); `XA` / `XE`: arguments and errors the middlewares add; `C`:
+ * the identity's claims (`_generated/server` passes the app's, from `_generated/claims.d.ts`).
+ */
+export type QueryBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly [], C = AnyClaims> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: AuthorizedDef<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & QueryCacheDef<Vis> & SyncOnly<R>,
+    def: AuthorizedDef<QueryCtx<DM, C> & X, A, R, E, XA, XE, C> & QueryLimitsDef & QueryCacheDef<Vis> & SyncOnly<R>,
   ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<QueryCtx<DM> & X, A, R, E, XA, XE> & QueryLimitsDef & QueryCacheDef<Vis> & SyncOnly<R>,
+    def: Def<QueryCtx<DM, C> & X, A, R, E, XA, XE, C> & QueryLimitsDef & QueryCacheDef<Vis> & SyncOnly<R>,
   ): RegisteredQuery<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
-  <R = unknown>(handler: ((ctx: QueryCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredQuery<Vis, XA, R, Merged<XE, readonly []>>;
+  <R = unknown>(handler: ((ctx: QueryCtx<DM, C> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredQuery<Vis, XA, R, Merged<XE, readonly []>>;
   /** A builder whose functions run `mw` first (see `Middleware`). */
   use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
-    mw: Middleware<QueryCtx<DM> & X, MA, ME, Add, MiddlewareResult<Add, QueryCtx<DM> & X>>,
-  ): QueryBuilder<DM, Vis, X & Add, Expand<XA & ObjectType<MA>>, readonly [...XE, ...ME]>;
+    mw: Middleware<QueryCtx<DM, C> & X, MA, ME, Add, MiddlewareResult<Add, QueryCtx<DM, C> & X>>,
+  ): QueryBuilder<DM, Vis, X & Add, Expand<XA & ObjectType<MA>>, readonly [...XE, ...ME], C>;
 };
-export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
+export type MutationBuilder<DM extends GenericDataModel, Vis extends Visibility, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly [], C = AnyClaims> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<MutationCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & MutationLimitsDef & RetainDef & SyncOnly<R>,
+    def: Def<MutationCtx<DM, C> & X, A, R, E, XA, XE, C> & SensitiveDef & MutationLimitsDef & RetainDef & SyncOnly<R>,
   ): RegisteredMutation<Vis, Expand<ArgsInput<A> & XA>, R, Merged<XE, E>>;
-  <R = unknown>(handler: ((ctx: MutationCtx<DM> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredMutation<Vis, XA, R, Merged<XE, readonly []>>;
+  <R = unknown>(handler: ((ctx: MutationCtx<DM, C> & X & FailCtx<XE>) => R) & SyncOnly<R>): RegisteredMutation<Vis, XA, R, Merged<XE, readonly []>>;
   use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
-    mw: Middleware<MutationCtx<DM> & X, MA, ME, Add, MiddlewareResult<Add, MutationCtx<DM> & X>>,
-  ): MutationBuilder<DM, Vis, X & Add, Expand<XA & ObjectType<MA>>, readonly [...XE, ...ME]>;
+    mw: Middleware<MutationCtx<DM, C> & X, MA, ME, Add, MiddlewareResult<Add, MutationCtx<DM, C> & X>>,
+  ): MutationBuilder<DM, Vis, X & Add, Expand<XA & ObjectType<MA>>, readonly [...XE, ...ME], C>;
 };
-export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly []> = {
+export type ActionBuilder<Vis extends Visibility, DM extends GenericDataModel = AnyDataModel, X = {}, XA = {}, XE extends readonly AnyErrorFactory[] = readonly [], C = AnyClaims> = {
   <A extends ArgsValidator = {}, R = unknown, const E extends readonly AnyErrorFactory[] = readonly []>(
-    def: Def<ActionCtx<DM> & X, A, R, E, XA, XE> & SensitiveDef & DispatchDef & RetainDef,
+    def: Def<ActionCtx<DM, C> & X, A, R, E, XA, XE, C> & SensitiveDef & DispatchDef & RetainDef,
   ): RegisteredAction<Vis, Expand<ArgsInput<A> & XA>, Awaited<R>, Merged<XE, E>>;
-  <R = unknown>(handler: (ctx: ActionCtx<DM> & X & FailCtx<XE>) => R): RegisteredAction<Vis, XA, Awaited<R>, Merged<XE, readonly []>>;
+  <R = unknown>(handler: (ctx: ActionCtx<DM, C> & X & FailCtx<XE>) => R): RegisteredAction<Vis, XA, Awaited<R>, Merged<XE, readonly []>>;
   /** Action middlewares may be async. */
   use<Add extends object = {}, const MA extends PropertyValidators = {}, const ME extends readonly AnyErrorFactory[] = readonly []>(
-    mw: Middleware<ActionCtx<DM> & X, MA, ME, Add, MiddlewareResult<Add, ActionCtx<DM> & X> | Promise<MiddlewareResult<Add, ActionCtx<DM> & X>>>,
-  ): ActionBuilder<Vis, DM, X & Add, Expand<XA & ObjectType<MA>>, readonly [...XE, ...ME]>;
+    mw: Middleware<ActionCtx<DM, C> & X, MA, ME, Add, MiddlewareResult<Add, ActionCtx<DM, C> & X> | Promise<MiddlewareResult<Add, ActionCtx<DM, C> & X>>>,
+  ): ActionBuilder<Vis, DM, X & Add, Expand<XA & ObjectType<MA>>, readonly [...XE, ...ME], C>;
 };
-export type HttpActionBuilder<DM extends GenericDataModel = AnyDataModel, X = {}> = (handler: (ctx: ActionCtx<DM> & X, request: Request) => Promise<Response>) => RegisteredHttpAction;
+export type HttpActionBuilder<DM extends GenericDataModel = AnyDataModel, X = {}, C = AnyClaims> = (handler: (ctx: ActionCtx<DM, C> & X, request: Request) => Promise<Response>) => RegisteredHttpAction;
 
 /**
  * Typed builders for a component's own functions: `ctx.db` over the component's schema (logical table names) and

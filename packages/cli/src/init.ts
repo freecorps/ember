@@ -152,6 +152,10 @@ import { organization } from "@freecorps/ember-auth/plugins";
 export default defineAuth({
   emailAndPassword: { enabled: true },
   plugins: [organization()],
+  // Extra JWT claims (keep them small: they ride along with every request). \`ember codegen\` types them, with Better
+  // Auth's (sid, email, name, emailVerified, and org for the organization plugin), in ember/_generated/claims.d.ts:
+  // \`ctx.auth.require().claims?.role\` is "admin" | "member" | undefined, and \`fromAuth("role")\` checks the name.
+  // ember: { claims: ({ user }) => ({ role: user.role === "admin" ? ("admin" as const) : ("member" as const) }) },
 });
 `;
 
@@ -159,7 +163,10 @@ export const SAMPLE_USERS = `import { v } from "@freecorps/ember-server";
 import { internalMutation, mutation, query } from "./_generated/server";
 import { errors } from "./errors";
 
-/** The caller as the runtime verified it (JWT claims), plus the synced profile; null when signed out. */
+/**
+ * The caller as the runtime verified it, plus the synced profile; null when signed out. Its claims are typed from
+ * ember/auth.config.ts (ember/_generated/claims.d.ts): \`identity.claims?.email\` is a string.
+ */
 export const me = query({
   handler: (ctx) => {
     const identity = ctx.auth.getUserIdentity();

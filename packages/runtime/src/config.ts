@@ -145,6 +145,8 @@ export interface EmberConfig {
   /** Set by `createEmberWorker`: component queues (consumed by the Worker) and `email()` hooks. */
   componentQueues?: import("@freecorps/ember-server").ComposedQueue[];
   emailHooks?: import("@freecorps/ember-server").ComposedEmailHook[];
+  /** Set by `createEmberWorker`: the dashboard screens of the app and its components (`GET /api/_ember/dashboards`). */
+  dashboards?: import("@freecorps/ember-server").DashboardManifest[];
   auth?: EmberAuthHook;
   /** Engine factory. Defaults to `createEngine` from `@freecorps/ember-server`. */
   createEngine?: CreateEngine;

@@ -344,6 +344,8 @@ export interface LoadedProject {
   /** Default export of `ember/import.config.ts` (`defineImport()`), undefined without one. */
   importConfig: unknown;
   modules: Record<string, Record<string, unknown>>;
+  /** The files the evaluation bundled (absolute; generated files served from memory excluded). */
+  inputs?: string[];
 }
 
 type EvalExports = { schema: unknown; crons: unknown[]; authConfig: unknown; app: unknown; http: unknown; triggers: unknown; importConfig: unknown; modules: LoadedProject["modules"] };
@@ -382,9 +384,11 @@ export async function loadProjectCode(project: Project, files = discover(project
     conditions: SOURCE_CONDITIONS,
     nodePaths: NODE_PATHS,
     logLevel: "silent" as const,
+    metafile: true as const,
     ...(virtual ? { plugins: [virtualFiles(project.generatedDir, virtual)] } : {}),
   };
   let cjs: string | null = null;
+  let inputs: string[] = [];
   try {
     const result = await esbuild.build({
       ...options,
@@ -393,6 +397,7 @@ export async function loadProjectCode(project: Project, files = discover(project
       define: { "import.meta": "__ember_import_meta" },
     });
     cjs = result.outputFiles[0]!.text;
+    inputs = bundledInputs(result.metafile);
     // `import.meta.resolve` resolves with the ES module conditions (`exports` → "import"), which CommonJS's
     // `require.resolve` cannot reproduce: code that reads it is evaluated as an ES module instead.
     if (USES_META_RESOLVE.test(cjs)) {
@@ -409,8 +414,22 @@ export async function loadProjectCode(project: Project, files = discover(project
       console.warn("ember: the project's code uses top-level await, so it is evaluated as an ES module, which Node never unloads: `ember dev` memory grows with each rebuild");
     }
   }
-  const mod = cjs !== null ? evaluateCjs(cjs, join(outDir, "ember-eval.cjs")) : await importEsm(outDir, (await esbuild.build({ ...options, format: "esm" })).outputFiles[0]!.text);
-  return { files, schema: mod.schema, crons: cronList(mod.crons), authConfig: mod.authConfig, app: mod.app, http: mod.http, triggers: mod.triggers, importConfig: mod.importConfig, modules: mod.modules };
+  let mod: EvalExports;
+  if (cjs !== null) mod = evaluateCjs(cjs, join(outDir, "ember-eval.cjs"));
+  else {
+    const esm = await esbuild.build({ ...options, format: "esm" });
+    inputs = bundledInputs(esm.metafile);
+    mod = await importEsm(outDir, esm.outputFiles[0]!.text);
+  }
+  return { files, schema: mod.schema, crons: cronList(mod.crons), authConfig: mod.authConfig, app: mod.app, http: mod.http, triggers: mod.triggers, importConfig: mod.importConfig, modules: mod.modules, inputs };
+}
+
+/** The files of a bundle's metafile, absolute: not stdin nor a plugin's namespace (`ember-virtual:...`). */
+function bundledInputs(meta: esbuild.Metafile | undefined): string[] {
+  if (!meta) return [];
+  return Object.keys(meta.inputs)
+    .filter((p) => !p.startsWith("<") && !/^[A-Za-z][\w-]+:/.test(p))
+    .map((p) => resolve(process.cwd(), p));
 }
 
 /** What `import.meta` reads as in the CommonJS evaluation: the bundle file's, as an ES module there would have. */
