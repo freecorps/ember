@@ -92,18 +92,19 @@ export class DoSqlDriver implements SqlDriver {
   }
 
   /**
-   * `exec` with the cursor's own arrays (`raw()`) as the rows: no object per row. BLOBs are turned into Uint8Array in
-   * place (as `exec` does); the counters move exactly as for `exec`.
+   * `exec` with arrays as the rows (`raw()`): no object per row, no property per column. Each row is a new array the
+   * values are copied into (the cursor's own may be reused from one step to the next), BLOBs as Uint8Array (as `exec`
+   * does); the counters move exactly as for `exec`.
    */
   execRaw(sql: string, ...params: SqlValue[]): SqlRawResult {
     const cursor = this.cursor(sql, params);
     const rows: SqlValue[][] = [];
     const n = cursor.columnNames.length;
     if (n > 0) for (const raw of cursor.raw()) {
-      const row = raw as unknown as SqlValue[];
+      const row = new Array<SqlValue>(n);
       for (let i = 0; i < n; i++) {
         const v = raw[i];
-        if (v instanceof ArrayBuffer) row[i] = new Uint8Array(v);
+        row[i] = v instanceof ArrayBuffer ? new Uint8Array(v) : (v as SqlValue);
       }
       rows.push(row);
     }

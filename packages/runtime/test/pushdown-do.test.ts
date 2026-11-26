@@ -127,6 +127,11 @@ describe("filter pushdown on DO SQLite", () => {
         objects: objects.rows.map((r) => [r.v, r.w, r.b instanceof Uint8Array ? [...r.b] : r.b]),
         arrays: arrays.rows.map((r) => [r[0], r[1], r[2] instanceof Uint8Array ? [...r[2]] : r[2]]),
         distinct: new Set(arrays.rows).size,
+        // Independent rows: writing into one changes no other, nor what a later read gives (row 2 is the UPDATE's 'z').
+        independent: (() => {
+          arrays.rows[0]![1] = "changed";
+          return [arrays.rows.map((r) => r[1]), d.execRaw("SELECT w FROM t ORDER BY v").rows.map((r) => r[0])];
+        })(),
         blobType: arrays.rows[0]![2] instanceof Uint8Array,
         read: [objects.rowsRead, arrays.rowsRead],
         select: [JSON.parse(c1).select[0] - JSON.parse(c0).select[0], c2.select[0] - JSON.parse(c1).select[0]],
@@ -135,11 +140,49 @@ describe("filter pushdown on DO SQLite", () => {
       };
     });
     expect(out.arrays).toEqual(out.objects);
+    expect(out.arrays).toEqual([
+      [1, "a", [1, 2]],
+      [2, "b", null],
+      [3, "c", []],
+    ]);
     expect(out.distinct).toBe(3);
+    expect(out.independent).toEqual([
+      ["changed", "b", "c"],
+      ["a", "z", "c"],
+    ]);
     expect(out.blobType).toBe(true);
     expect(out.read[1]).toBe(out.read[0]);
     expect(out.select).toEqual([1, 1]);
     expect(out.rowsSelected[1]).toBe(out.rowsSelected[0]);
     expect(out.none).toEqual({ rows: [], written: 1 });
+  });
+
+  it("execRaw copies each row: a cursor that reuses one array per step still gives every row", () => {
+    // What the DO cursor does not promise: a fresh array per step. A cursor that rewrites one array in place.
+    const data: unknown[][] = [
+      [1, "a", new Uint8Array([1, 2]).buffer],
+      [2, "b", null],
+      [3, "c", new ArrayBuffer(0)],
+    ];
+    const cursor = {
+      columnNames: ["v", "w", "b"],
+      rowsRead: 3,
+      rowsWritten: 0,
+      *raw() {
+        const shared: unknown[] = [];
+        for (const r of data) {
+          shared.length = 0;
+          shared.push(...r);
+          yield shared;
+        }
+      },
+    };
+    const storage = { sql: { exec: () => cursor } } as unknown as DurableObjectStorage;
+    const rows = new DoSqlDriver(storage).execRaw("SELECT v, w, b FROM t").rows;
+    expect(rows.map((r) => [r[0], r[1], r[2] instanceof Uint8Array ? [...r[2]] : r[2]])).toEqual([
+      [1, "a", [1, 2]],
+      [2, "b", null],
+      [3, "c", []],
+    ]);
   });
 });
