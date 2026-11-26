@@ -23,6 +23,14 @@ export interface TypedRouteSpec {
   description?: string;
 }
 
+/**
+ * Where a component's route path (`/x`, `/`, or a `pathPrefix` ending in `/`) is served once the component is mounted
+ * at `prefix` (`/` = the root). The one join `composeApp` uses for both the routes and the embed blocks' `path`.
+ */
+export function mountPath(prefix: string, path: string): string {
+  return prefix === "/" ? path : path === "/" ? prefix : prefix + path;
+}
+
 export interface HttpRoute {
   /** Exact path (`/webhooks/email`); with `:name` segments on a typed route (`/mailboxes/:id`). */
   path?: string;

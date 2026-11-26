@@ -30,11 +30,11 @@ import {
 } from "./functions.ts";
 import type { IndexKind } from "./indexKinds.ts";
 import { canonicalJson, manifestHash, SchemaDefinition, type SchemaManifest, type TableManifest } from "./schema.ts";
-import { assertNotReserved, type HttpRouter, type HttpRoute } from "./http.ts";
+import { assertNotReserved, mountPath, type HttpRouter, type HttpRoute } from "./http.ts";
 import { cronFunctionName, cronList, type CronDef, type CronsExport } from "./crons.ts";
 import type { ActionCtx } from "./functions.ts";
 import { checkChannels, type ChannelsConfig } from "./channels.ts";
-import { checkDashboardShape, prefixDashboard, resolveDashboard, type DashboardManifest, type DashboardSpec, type DashboardSpecInput } from "./dashboard.ts";
+import { checkDashboardShape, mountDashboard, prefixDashboard, resolveDashboard, type DashboardManifest, type DashboardSpec, type DashboardSpecInput } from "./dashboard.ts";
 
 /** Separator of physical table names: `<component>$<table>`. Never valid in an app table name. */
 export const TABLE_SEP = "$";
@@ -238,7 +238,7 @@ export function defineComponent<const Name extends string, Modules extends Recor
     if (d.binding !== undefined && !BINDING_NAME.test(d.binding)) throw new Error(`Component ${def.name}: queue ${q}: invalid binding name ${d.binding}`);
   }
   if (def.email && typeof def.email.handler !== "function") throw new Error(`Component ${def.name}: email needs a handler`);
-  const dashboard = def.dashboard === undefined ? undefined : resolveDashboard(def.dashboard, flattenFunctions(def.functions ?? {}), `Component ${def.name}`);
+  const dashboard = def.dashboard === undefined ? undefined : resolveDashboard(def.dashboard, flattenFunctions(def.functions ?? {}), `Component ${def.name}`, "component", def.http?.routes ?? []);
   return makeComponent({
     name: def.name,
     schema: def.schema,
@@ -658,7 +658,7 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
   const queues: ComposedQueue[] = [];
   const email: ComposedEmailHook[] = [];
   const dashboards: DashboardManifest[] = [];
-  if (input.app?.dashboard !== undefined) dashboards.push({ key: "", component: null, ...resolveDashboard(input.app.dashboard, appFns, "defineApp", "app") });
+  if (input.app?.dashboard !== undefined) dashboards.push({ key: "", component: null, ...mountDashboard(resolveDashboard(input.app.dashboard, appFns, "defineApp", "app", input.http?.routes ?? []), "/") });
   const installed = input.app?.components ?? [];
   if (!installed.length) return { schema: input.schema, functions, routes, configs, crons, queues, email, dashboards };
 
@@ -717,7 +717,7 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
         ...(c.email ? { email: true as const } : {}),
       };
       configs.set(key, inst.config);
-      if (c.dashboard) dashboards.push({ key, component: c.name, ...prefixDashboard(c.dashboard, scopePrefix(p)) });
+      if (c.dashboard) dashboards.push({ key, component: c.name, ...mountDashboard(prefixDashboard(c.dashboard, scopePrefix(p)), prefix) });
       const ownFns = flattenFunctions(c.functions);
       for (const [name, f] of ownFns) {
         if (name.startsWith("@") || name.startsWith("&")) throw new Error(`Component ${key}: function name ${name} is reserved`);
@@ -761,8 +761,7 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
 }
 
 function mountRoute(r: HttpRoute, prefix: string): Pick<HttpRoute, "path" | "pathPrefix"> {
-  const join = (p: string) => (prefix === "/" ? p : p === "/" ? prefix : prefix + p);
-  const out = r.path !== undefined ? { path: join(r.path) } : { pathPrefix: join(r.pathPrefix!) };
+  const out = r.path !== undefined ? { path: mountPath(prefix, r.path) } : { pathPrefix: mountPath(prefix, r.pathPrefix!) };
   assertNotReserved((out.path ?? out.pathPrefix)!);
   return out;
 }
