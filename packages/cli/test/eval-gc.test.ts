@@ -2,10 +2,10 @@
 // never leaves Node's module map, so importing a new bundle per rebuild grew the heap with each save. `loadProjectCode`
 // runs a CommonJS bundle as a function instead (build.ts); only code with top-level await falls back to `import()`.
 import { spawnSync } from "node:child_process";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setFlagsFromString } from "node:v8";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { runInNewContext } from "node:vm";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { loadProjectCode } from "../src/build.ts";
@@ -99,6 +99,24 @@ describe("evaluating the project's code (ember dev rebuilds)", () => {
     } finally {
       warn.mockRestore();
       writeFileSync(file, readFileSync(file, "utf8").replace("\nexport const ready = await Promise.resolve(true);\n", ""));
+    }
+  });
+
+  it("import.meta.resolve keeps ES module resolution (an exports entry with only \"import\"; builtins as node:)", async () => {
+    // Runs after the top-level await test: the one-time warning is already spent.
+    const pkg = join(project.root, "node_modules", "esm-only-pkg");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "esm-only-pkg", type: "module", exports: { "./config.json": { import: "./config.json" } } }));
+    writeFileSync(join(pkg, "config.json"), "{}");
+    const file = join(project.dir, "messages.ts");
+    const extra = '\nexport const resolved = { cfg: import.meta.resolve("esm-only-pkg/config.json"), fs: import.meta.resolve("fs") };\n';
+    appendFileSync(file, extra);
+    try {
+      const m = (await loadProjectCode(project)).modules.messages as { resolved: { cfg: string; fs: string } };
+      expect(m.resolved.cfg).toBe(pathToFileURL(join(pkg, "config.json")).href);
+      expect(m.resolved.fs).toBe("node:fs");
+    } finally {
+      writeFileSync(file, readFileSync(file, "utf8").replace(extra, ""));
     }
   });
 });

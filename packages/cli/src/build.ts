@@ -3,7 +3,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { createRequire, isBuiltin } from "node:module";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { constants as vmConstants, runInThisContext } from "node:vm";
@@ -250,6 +250,10 @@ type EvalExports = { schema: unknown; crons: unknown[]; authConfig: unknown; app
 
 /** esbuild's refusal of top-level await in a CommonJS bundle. */
 const TOP_LEVEL_AWAIT = /Top-level await is currently not supported with the "cjs" output format/;
+/** `import.meta.resolve` read in the CommonJS output (`import.meta` is defined as `__ember_import_meta`): a call, or
+ * `resolve` taken off the object (`const { resolve } = import.meta`). An alias (`m = import.meta; m.resolve(x)`) is
+ * not seen: it resolves as CommonJS does, which agrees except for `exports` entries with only an "import" condition. */
+const USES_META_RESOLVE = /__ember_import_meta\s*(?:\.|\[\s*["'`])\s*resolve\b|\bresolve\b[^;]*?=\s*__ember_import_meta\b/;
 let warnedEsmEval = false;
 
 /**
@@ -289,6 +293,15 @@ export async function loadProjectCode(project: Project, files = discover(project
       define: { "import.meta": "__ember_import_meta" },
     });
     cjs = result.outputFiles[0]!.text;
+    // `import.meta.resolve` resolves with the ES module conditions (`exports` → "import"), which CommonJS's
+    // `require.resolve` cannot reproduce: code that reads it is evaluated as an ES module instead.
+    if (USES_META_RESOLVE.test(cjs)) {
+      cjs = null;
+      if (!warnedEsmEval) {
+        warnedEsmEval = true;
+        console.warn("ember: the project's code uses import.meta.resolve, so it is evaluated as an ES module, which Node never unloads: `ember dev` memory grows with each rebuild");
+      }
+    }
   } catch (e) {
     if (!TOP_LEVEL_AWAIT.test(String((e as Error)?.message))) throw e;
     if (!warnedEsmEval) {
@@ -317,6 +330,7 @@ function evaluateCjs(code: string, file: string): EvalExports {
   const url = pathToFileURL(file).href;
   const resolveFrom = (specifier: string): string => {
     if (/^[a-z][a-z0-9+.-]*:/i.test(specifier)) return specifier; // node:, file:, data: …
+    if (isBuiltin(specifier)) return `node:${specifier}`; // `fs` resolves to `node:fs`, as in an ES module
     if (specifier.startsWith(".") || specifier.startsWith("/")) return new URL(specifier, url).href;
     try {
       return pathToFileURL(req.resolve(specifier)).href;
