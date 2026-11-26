@@ -200,6 +200,21 @@
         "wrangler": "^4.157.0",
       },
     },
+    "packages/audit": {
+      "name": "@freecorps/ember-audit",
+      "version": "0.9.0",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@freecorps/ember-testing": "workspace:*",
+        "wrangler": "^4.157.0",
+      },
+    },
     "packages/auth": {
       "name": "@freecorps/ember-auth",
       "version": "0.9.0",
@@ -891,6 +906,8 @@
     "@freecorps/ember-agent": ["@freecorps/ember-agent@workspace:packages/agent"],
 
     "@freecorps/ember-analytics": ["@freecorps/ember-analytics@workspace:packages/analytics"],
+
+    "@freecorps/ember-audit": ["@freecorps/ember-audit@workspace:packages/audit"],
 
     "@freecorps/ember-auth": ["@freecorps/ember-auth@workspace:packages/auth"],
 
