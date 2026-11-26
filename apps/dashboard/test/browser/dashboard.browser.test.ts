@@ -171,13 +171,44 @@ describe.skipIf(!hasBrowser)("dashboard in Chromium", () => {
     await page.getByText("Needs attention").waitFor();
     // Analytics is not configured: one notice says how to connect it.
     await page.getByText("Connect Analytics Engine").waitFor();
-    // org:beta is still backfilling an index.
+    // The catalog says org:beta reported an older schema; its live status (backfilling an index) is asked on demand.
     await page.locator(".attention li", { hasText: "org:beta" }).waitFor();
+    await page.getByText("behind (catalog)").first().waitFor();
+    await page.getByRole("button", { name: "Check live status" }).click();
     await page.locator("text=backfilling 1").first().waitFor();
     const storage = await page.evaluate(() => JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } }));
     expect(storage).not.toContain("admin-token-for-tests");
     expect(page.url()).not.toContain("token");
     await shot(page, "health");
+    expect(problems).toEqual([]);
+    await close();
+  });
+
+  it("costs the project little: health and the shard search read the catalog; live status only on demand", async () => {
+    const before = prod.calls.length;
+    const { page, problems, close } = await open("#/p/chat/prod/health");
+    await page.getByText("Needs attention").waitFor();
+    await page.getByText("behind (catalog)").first().waitFor();
+    // Opening Health asks the project for its capabilities only: no shard woken.
+    const status = () => prod.calls.slice(before).filter((c) => c.startsWith("GET status"));
+    expect(status()).toEqual([]);
+    await page.keyboard.press("s");
+    await page.getByRole("table", { name: "Shards" }).waitFor();
+    // Typing in the filter: catalog queries (D1, debounced), never the live status of 50 shards per keystroke.
+    await page.getByLabel("Filter shards").pressSequentially("org:b", { delay: 30 });
+    await page.getByRole("table", { name: "Shards" }).getByText("org:beta").waitFor();
+    await page.waitForTimeout(400);
+    expect(status()).toEqual([]);
+    // The button asks once for the listed shards.
+    await page.getByRole("button", { name: "Check live status" }).click();
+    await page.getByRole("table", { name: "Shards" }).getByText("backfilling 1").waitFor();
+    expect(status()).toEqual(["GET status?org:beta"]);
+    // Selecting a shard asks for that one only.
+    await page.getByRole("table", { name: "Shards" }).getByText("org:beta").click();
+    await page.getByRole("complementary", { name: "Shard org:beta" }).waitFor();
+    await page.getByText("Re-runs since boot").waitFor();
+    expect(status()).toEqual(["GET status?org:beta", "GET status?org:beta"]);
+    expect(prod.calls.slice(before).filter((c) => c.startsWith("GET status") || c.startsWith("GET inspect")).every((c) => !c.includes(","))).toBe(true);
     expect(problems).toEqual([]);
     await close();
   });

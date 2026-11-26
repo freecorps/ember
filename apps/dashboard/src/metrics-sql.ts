@@ -187,9 +187,14 @@ export interface FunctionPoint {
   p95: number;
   rowsRead: number;
   rowsWritten: number;
+  /** Highest fraction of each per-transaction limit one call used in the bucket (the function page's warning). */
+  limitPeaks: LimitPeaks;
 }
 
-/** One function over time: calls, errors, p50/p95, rows read and written per bucket. */
+/**
+ * One function over time: calls, errors, p50/p95, rows read and written per bucket, and the limit peaks (so the
+ * function page needs no second query over every function for its "near a limit" warning).
+ */
 export function functionSeriesSql(o: { dataset: string; project: string; env: string; fn: string; sinceHours: number }): string {
   if (!IDENT.test(o.dataset)) throw new Error(`invalid dataset name ${JSON.stringify(o.dataset)}`);
   if (!FN.test(o.fn)) throw new Error("invalid function name");
@@ -202,7 +207,10 @@ export function functionSeriesSql(o: { dataset: string; project: string; env: st
     "  quantileExactWeighted(0.5)(double1, _sample_interval) AS p50,",
     "  quantileExactWeighted(0.95)(double1, _sample_interval) AS p95,",
     `  SUM(double2 * ${w}) AS rows_read,`,
-    `  SUM(double3 * ${w}) AS rows_written`,
+    `  SUM(double3 * ${w}) AS rows_written,`,
+    "  MAX(double7) AS peak_rows_read,",
+    "  MAX(double8) AS peak_docs_read,",
+    "  MAX(double9) AS peak_rows_written",
     `FROM ${o.dataset}`,
     `WHERE ${where.join(" AND ")}`,
     "GROUP BY t",
@@ -227,7 +235,15 @@ export function parseFunctionSeries(body: { data?: Array<Record<string, unknown>
     p95: Number(r.p95) || 0,
     rowsRead: Number(r.rows_read) || 0,
     rowsWritten: Number(r.rows_written) || 0,
+    limitPeaks: { rowsRead: Number(r.peak_rows_read) || 0, documentsRead: Number(r.peak_docs_read) || 0, rowsWritten: Number(r.peak_rows_written) || 0 },
   }));
+}
+
+/** The highest of each limit peak over a series (0 when empty). */
+export function seriesPeaks(points: Array<{ limitPeaks?: Partial<LimitPeaks> }>): LimitPeaks {
+  const out: LimitPeaks = { rowsRead: 0, documentsRead: 0, rowsWritten: 0 };
+  for (const p of points) for (const k of ["rowsRead", "documentsRead", "rowsWritten"] as const) out[k] = Math.max(out[k], p.limitPeaks?.[k] ?? 0);
+  return out;
 }
 
 /** The last errors of one function (Analytics Engine keeps the error code and shard; messages are in the logs). */

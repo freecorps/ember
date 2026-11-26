@@ -1,4 +1,4 @@
-// Shards of an environment (catalog + live status) and one shard's detail: status, live counters, bookmarks with
+// Shards of an environment (the catalog; live status on demand) and one shard's detail: status, live counters, bookmarks with
 // "record now" and "restore to this" (admin; typed confirmation on protected environments).
 
 import { useEffect, useState } from "react";
@@ -6,20 +6,26 @@ import { api, ApiError, path } from "../api.ts";
 import { ago, fmtBytes, fmtNum, fmtTime, short } from "../format.ts";
 import { href, useApi, useSession } from "../hooks.ts";
 import { Badge, ConfirmDialog, Empty, Loading, Mono, Problem, Section, Stat, Table } from "../ui.tsx";
-import { migrationState } from "./health.tsx";
+import { catalogState, migrationState, statusPath } from "./health.tsx";
 import type { Bookmark, ShardRow, StatusBody } from "./types.ts";
+
+/** How long the filter waits after the last keystroke (each search is one D1 query; no shard is woken). */
+export const SHARD_SEARCH_DEBOUNCE_MS = 250;
 
 export function Shards({ project, env, shard }: { project: string; env: string; shard?: string }) {
   const [q, setQ] = useState("");
-  // Debounced: every request with status=1 asks the project for the live status of up to 50 shards.
   const [term, setTerm] = useState("");
   useEffect(() => {
-    const t = setTimeout(() => setTerm(q.trim()), 200);
+    const t = setTimeout(() => setTerm(q.trim()), SHARD_SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(t);
   }, [q]);
-  const list = useApi<{ shards: ShardRow[]; status: StatusBody | { ok: false; status: number; error: string } | null }>(path("/api/shards", { project, env, status: 1, q: term }));
-  const live = new Map((list.data?.status && "shards" in list.data.status ? list.data.status.shards : []).map((s) => [s.shard, s]));
+  // The catalog (D1) only: typing, paging and opening the screen never wake a shard. The live status of the listed
+  // shards (up to 50 Durable Objects) is asked for by the button; the detail of a selected shard asks for its own.
+  const list = useApi<{ shards: ShardRow[]; expected?: string | null }>(path("/api/shards", { project, env, q: term }));
   const rows = list.data?.shards ?? [];
+  const [check, setCheck] = useState<string[] | null>(null);
+  const status = useApi<StatusBody>(check?.length ? statusPath(project, env, check) : null);
+  const live = new Map((status.data?.shards ?? []).map((s) => [s.shard, s]));
   const selected = shard ? rows.findIndex((r) => r.shard === shard) : -1;
   return (
     <div className={shard ? "split" : undefined}>
@@ -30,7 +36,20 @@ export function Shards({ project, env, shard }: { project: string; env: string; 
           <button type="button" onClick={list.reload}>
             Refresh
           </button>
+          <button
+            type="button"
+            disabled={!rows.length || status.loading}
+            title="Asks the project for the live status of the listed shards (wakes up to 50 Durable Objects)"
+            onClick={() => {
+              const names = rows.slice(0, 50).map((r) => r.shard);
+              if (check && check.join("\n") === names.join("\n")) status.reload();
+              else setCheck(names);
+            }}
+          >
+            {status.loading ? "Checking…" : "Check live status"}
+          </button>
         </div>
+        {status.error && <Problem error={status.error} onRetry={status.reload} />}
         {list.error ? (
           <Problem error={list.error} onRetry={list.reload} />
         ) : !list.data ? (
@@ -44,7 +63,7 @@ export function Shards({ project, env, shard }: { project: string; env: string; 
             cols={[{ h: "Shard" }, { h: "Size", num: true }, { h: "Schema" }, { h: "Migration" }, { h: "Last write" }, { h: "Reported" }]}
             rows={rows.map((s) => {
               const st = live.get(s.shard);
-              const m = migrationState(st);
+              const m = st ? migrationState(st) : catalogState(s, list.data?.expected);
               return [
                 <Mono>{s.shard}</Mono>,
                 fmtBytes(st?.databaseSize ?? s.db_size),
