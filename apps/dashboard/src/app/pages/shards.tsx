@@ -62,7 +62,9 @@ export function Shards({ project, env, shard }: { project: string; env: string; 
             onRow={(i) => (location.hash = href({ project, env, section: "shards", shard: rows[i]!.shard }))}
             cols={[{ h: "Shard" }, { h: "Size", num: true }, { h: "Schema" }, { h: "Migration" }, { h: "Last write" }, { h: "Reported" }]}
             rows={rows.map((s) => {
-              const st = live.get(s.shard);
+              // A live answer from before a deploy (another expected schema) no longer says anything: the catalog does.
+              const fresh = live.get(s.shard);
+              const st = fresh && (!list.data?.expected || fresh.expectedVersion === list.data.expected) ? fresh : undefined;
               const m = st ? migrationState(st) : catalogState(s, list.data?.expected);
               return [
                 <Mono>{s.shard}</Mono>,

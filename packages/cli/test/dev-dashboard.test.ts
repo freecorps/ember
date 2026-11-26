@@ -19,7 +19,7 @@ const get = async (path: string) => {
   return { status: res.status, body: (await res.json()) as any };
 };
 
-/** A request with the Host header a DNS-rebound page would send (fetch does not let one set Host). */
+/** A request with the Host header (and target) a DNS-rebound page would send (fetch does not let one set Host). */
 const withHost = (path: string, host: string) =>
   new Promise<number>((resolve, reject) => {
     const r = request({ host: "127.0.0.1", port: Number(dash.port), path, headers: { host } }, (res) => {
@@ -82,6 +82,7 @@ describe("ember dev --dashboard", () => {
       if (!rows.length) await new Promise((r) => setTimeout(r, 50));
     }
     const s = await get("/api/shards?project=devdash&env=local");
+    expect(rows.length, "the runtime never reported global:main to the local registry").toBeGreaterThan(0);
     expect(rows.map((r) => r.shard)).toEqual(["global:main"]);
     expect(rows[0]!.schema_version).toBe(s.body.expected);
   });
@@ -103,5 +104,18 @@ describe("ember dev --dashboard", () => {
     expect(await withHost("/api/me", `localhost:${dash.port}`)).toBe(200);
     expect(await withHost("/api/me", "evil.example")).toBe(403);
     expect(await withHost("/api/projects", `rebind.evil.example:${dash.port}`)).toBe(403);
+    // A scheme-relative or absolute target cannot swap the Host's authority for a loopback one.
+    expect(await withHost(`//127.0.0.1:${dash.port}/api/me`, `evil.example:${dash.port}`)).toBe(403);
+    expect(await withHost(`//127.0.0.1:${dash.port}/api/me`, `localhost:${dash.port}`)).toBe(400);
+    expect(await withHost(`http://127.0.0.1:${dash.port}/api/me`, `localhost:${dash.port}`)).toBe(400);
+  });
+
+  it("keeps working after a reload (Miniflare hands out a new registry handle)", async () => {
+    await session.reload("vars");
+    await session.reload("code");
+    const p = await get("/api/projects");
+    expect(p.status).toBe(200);
+    expect(p.body.projects[0].envs[0].env).toBe("local");
+    expect((await get("/api/audit?project=devdash&env=local")).body.entries.length).toBeGreaterThan(0);
   });
 });

@@ -148,7 +148,7 @@ function PaletteBody({
     inEnv ? path("/api/shards", { ...inEnv, q: term }) : null,
   );
   const users = useApi<{
-    users: Array<{ id: string; email: string; name: string | null }>;
+    users: Array<{ id: string; email: string | null; name: string | null }>;
   }>(
     inEnv && term.length >= USER_SEARCH_MIN
       ? path("/api/users", { ...inEnv, q: term, limit: 8 })
@@ -244,9 +244,9 @@ function PaletteBody({
         out.push({
           id: `user:${u.id}`,
           group: "Users",
-          label: u.email,
+          label: u.email ?? u.name ?? u.id,
           hint: u.name ?? u.id,
-          href: href({ ...s, section: "users", shard: u.email }),
+          href: href({ ...s, section: "users", shard: u.email ?? u.name ?? u.id }),
         });
     }
     return out;
@@ -265,6 +265,10 @@ function PaletteBody({
 
   const results = useMemo(() => rankItems(items, q), [items, q]);
   const pick = Math.min(active, Math.max(0, results.length - 1));
+  // The active option stays visible while the arrows move past the list's edge (focus stays in the input).
+  useEffect(() => {
+    document.getElementById(`palette-${pick}`)?.scrollIntoView({ block: "nearest" });
+  }, [pick, results]);
   const go = (item: PaletteItem | undefined) => {
     if (!item) return;
     onClose();

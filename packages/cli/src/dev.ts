@@ -120,7 +120,8 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
   // `--dashboard`: a session token opens the runtime's admin endpoints to the local dashboard, and a local D1 is the
   // registry (the runtime fills its shard catalog; the dashboard keeps its audit log there).
   const dashToken = opts.dashboard ? devDashboardToken() : null;
-  const sessionVars = (vars: Record<string, string>) => ({ EMBER_DEV_PERF: "1", ...vars, ...(dashToken ? { EMBER_ADMIN_TOKEN_DASHBOARD: dashToken } : {}) });
+  // The session's own values win over `.dev.vars`.
+  const sessionVars = (vars: Record<string, string>) => ({ ...vars, EMBER_DEV_PERF: "1", ...(dashToken ? { EMBER_ADMIN_TOKEN_DASHBOARD: dashToken } : {}) });
   let local: Awaited<ReturnType<typeof startLocal>>;
   try {
     local = await startLocal(project, first, { ...(opts.port !== undefined ? { port: opts.port } : { port: 8787 }), persist: opts.persist ?? true, vars: sessionVars(dv.vars), ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}), ...(dashToken ? { registry: true } : {}) });
@@ -155,6 +156,8 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
   const apply = async (p: Project, build: WorkerBuild, vars: Record<string, string>, comps: LocalOptions["components"]) => {
     await local.mf.setOptions(miniflareOptions(p, build, { port: Number(url.port), persist: opts.persist ?? true, vars: sessionVars(vars), ...(remote ? { remote: remote.bindings } : {}), ...(comps ? { components: comps } : {}), ...(dashToken ? { registry: true } : {}) }));
     current = build;
+    // setOptions() invalidates what getD1Database() returned: the local dashboard gets the new handle.
+    if (dashboard) dashboard.setRegistry((await local.mf.getD1Database("EMBER_REGISTRY")) as unknown as DevRegistry);
   };
   /** An ember.json read but not built yet (its rebuild failed): code changes build it until one succeeds. */
   let pending: Project | null = null;
@@ -186,7 +189,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
       project = target;
       pending = null;
       // The local dashboard compares each shard's reported schema with the running build's.
-      await dashboard?.sync({ schemaVersion });
+      if (dashboard) await dashboard.sync({ schemaVersion }).catch((e: unknown) => log(`warning: the local dashboard's registry still has the previous schema (${(e as Error).message}): its "behind" states may be wrong until the next reload`));
       if (remote && remoteKeys() !== boundKeys) log("warning: the schema's external indexes changed (added, removed or now a different index): restart `ember dev --remote` to bind (and create) them remotely");
       log(kind === "config" ? `${CONFIG_FILE}: reloaded` : "reloaded");
     } catch (e) {
