@@ -1,7 +1,9 @@
 // ember.json `limits.cpuMs` / `placement` (Script PUT only, no redundant write) and `ember deploy --preview <branch>`
 // (derived environments), against the fake Cloudflare account, counting requests.
+import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
 import { authSettings, envConfig, isDerivedPreview, previewEnvName, projectFrom, resolveEnv, validateConfig, workerName, workerSettings, type EmberConfigFile, type Project } from "../src/config.ts";
 import { deploy, planDeploy, settingsChanges, versionMetadata, type DeployOptions } from "../src/deploy/index.ts";
@@ -254,3 +256,34 @@ describe("ember deploy --preview <branch>", () => {
     expect(again.deleted).not.toContain(`worker ${worker}`);
   });
 });
+
+describe("ember destroy --preview / deploy --preview --destroy (the CLI)", () => {
+  const cli = (cwd: string, args: string[]) => {
+    const env = { ...process.env };
+    delete env.CLOUDFLARE_ACCOUNT_ID;
+    delete env.CLOUDFLARE_API_TOKEN;
+    const r = spawnSync(process.execPath, [fileURLToPath(new URL("../bin/ember.js", import.meta.url)), ...args], { cwd, env, encoding: "utf8" });
+    return { code: r.status, stderr: r.stderr };
+  };
+
+  it("the destroy alias needs no --yes for a preview (naming the branch is the ask); a declared environment still does", () => {
+    const p = repo();
+    // Past the confirmation: it stops at the missing account, before any request.
+    const alias = cli(p.root, ["destroy", "--preview", "feat/x"]);
+    expect([alias.code, alias.stderr]).toEqual([1, expect.stringMatching(/No Cloudflare account/)]);
+    expect(alias.stderr).not.toMatch(/--yes/);
+    const viaDeploy = cli(p.root, ["deploy", "--preview", "feat/x", "--destroy"]);
+    expect(viaDeploy.stderr).toMatch(/No Cloudflare account/);
+    const declared = cli(p.root, ["destroy", "--env", "prod"]);
+    expect([declared.code, declared.stderr]).toEqual([1, expect.stringMatching(/Re-run with --yes/)]);
+  }, 60_000);
+
+  it("--destroy refuses the deploy-only flags it would ignore", () => {
+    const p = repo();
+    for (const flag of [["--url", "https://x.example"], ["--admin-token", "t"], ["--shard", "global:main"], ["--no-dashboard"]]) {
+      const r = cli(p.root, ["deploy", "--preview", "feat/x", "--destroy", ...flag]);
+      expect([flag[0], r.code, r.stderr]).toEqual([flag[0], 1, expect.stringContaining(`it does not take ${flag[0]}`)]);
+    }
+  }, 60_000);
+});
+

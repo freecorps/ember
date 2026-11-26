@@ -342,7 +342,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         const project = loadProject();
         const name = previewOf(project, values.preview);
         if (values.destroy) {
-          const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "allow-schema-rollback", "allow-missing-env"] as const).filter((k) => values[k] !== undefined);
+          const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "no-dashboard", "allow-schema-rollback", "allow-missing-env", "url", "admin-token", "shard"] as const).filter((k) => values[k] !== undefined);
           if (clash.length) throw new Error(`--destroy deletes the preview: it does not take ${clash.map((k) => `--${k}`).join(", ")}`);
           // --destroy is the explicit ask: a preview's data is disposable by definition (no --yes, CI runs it on branch delete).
           const r = await destroy(project, { env: name, yes: true, ...(values.registry ? { registryName: values.registry } : {}) });
@@ -350,9 +350,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         }
         console.log(`preview: ${values.preview} → environment ${name} (${workerName(project.config.project, name)}, from environments.preview)`);
         values.env = name;
-        // A preview is not linked to the Ember Dashboard unless asked for (one service binding per branch otherwise).
-        if (!values.dashboard) values["no-dashboard"] = true;
       }
+      // A preview is not linked to the Ember Dashboard unless asked for (one service binding per branch otherwise), and
+      // that default is not saved: ember.json's "dashboard" is the project's choice for its declared environments.
+      const skipDashboard = values.preview !== undefined && !values.dashboard && !values["no-dashboard"];
       if (values.preflight && values["allow-missing-env"]) throw new Error("--preflight uploads nothing: it does not take --allow-missing-env");
       if (values.preflight) {
         const clash = (["dry-run", "wait", "gradual", "message", "wait-timeout", "dashboard", "no-dashboard"] as const).filter((k) => values[k] !== undefined);
@@ -404,6 +405,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       const io = cliIo();
       const result = await deployWithDashboard(project, {
         flag: values.dashboard ? true : values["no-dashboard"] ? false : undefined,
+        ...(skipDashboard ? { skip: true } : {}),
         env: resolveEnv(project, values.env).name,
         dryRun,
         io,
@@ -466,7 +468,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       if (values.preview !== undefined && values.env) throw new Error("--preview <branch> names the environment itself: drop --env");
       const project = loadProject();
       const env = values.preview !== undefined ? previewOf(project, values.preview) : values.env;
-      const r = await destroy(project, { ...(env ? { env } : {}), ...(values.yes ? { yes: true } : {}), ...(values.registry ? { registryName: values.registry } : {}) });
+      // As `ember deploy --preview <branch> --destroy`: naming the branch is the confirmation (a preview's data is
+      // disposable). A declared environment still needs --yes.
+      const yes = !!values.yes || values.preview !== undefined;
+      const r = await destroy(project, { ...(env ? { env } : {}), ...(yes ? { yes: true } : {}), ...(values.registry ? { registryName: values.registry } : {}) });
       return r.warnings.length ? 1 : 0;
     }
     case "logs": {

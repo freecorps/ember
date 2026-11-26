@@ -256,6 +256,8 @@ export async function deployWithDashboard<T>(
   project: Project,
   o: {
     flag: boolean | undefined;
+    /** Not linked this time, and nothing saved (a preview's default): `flag` and the saved choice are not consulted. */
+    skip?: boolean;
     env: string;
     dryRun: boolean;
     io: DashboardIo;
@@ -267,7 +269,7 @@ export async function deployWithDashboard<T>(
 ): Promise<T> {
   let link: DashboardLink | null = null;
   let client: CfClient | null = null;
-  if (!o.dryRun) {
+  if (!o.dryRun && !o.skip) {
     const choice = await dashboardChoice(project, o.flag, o.io);
     if (choice.enabled) {
       client = o.client();
