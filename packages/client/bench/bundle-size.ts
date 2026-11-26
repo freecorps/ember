@@ -62,8 +62,10 @@ try {
     const join_ = (ps: string[]) => Buffer.concat(ps.map((p) => Buffer.from(file(p))));
     const now = join_([...eager]);
     const lazy = join_(Object.keys(outs).filter((p) => p.endsWith(".js") && !eager.has(p)));
+    // Each eager file is its own download: gzip them one by one (no compression across chunks, one wrapper each).
+    const nowGz = [...eager].reduce((n, p) => n + gzipSync(file(p), { level: 9 }).length, 0);
     console.log(
-      `${name.padEnd(26)} one file ${kib(whole.length)} (gzip ${kib(gzipSync(whole, { level: 9 }).length)}) | split: on load ${kib(now.length)} (gzip ${kib(gzipSync(now, { level: 9 }).length)}), import() ${kib(lazy.length)}`,
+      `${name.padEnd(26)} one file ${kib(whole.length)} (gzip ${kib(gzipSync(whole, { level: 9 }).length)}) | split: on load ${kib(now.length)} (gzip ${kib(nowGz)}), import() ${kib(lazy.length)}`,
     );
   }
 } finally {
