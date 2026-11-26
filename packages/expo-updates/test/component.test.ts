@@ -289,9 +289,8 @@ describe("expo updates component", () => {
     expect((await ask(t)).kind).toBe("rollBackToEmbedded");
     // The bounded rollback left copies of B live below the directive (the case the exclusion is for).
     expect(await liveB()).toBeGreaterThan(0);
-    // Copies of B the bounded rollback left behind are never served again: another to-embedded changes nothing, and
-    // rolling the directive back reaches A, not a leftover B.
-    expect(await t.mutation(m("rollback"), { branch: "production", toEmbedded: true })).toEqual([]);
+    // Copies of B the bounded rollback left behind are never served again: rolling the directive back, with them still
+    // live below it, reaches A, not a leftover B (repeated to-embedded cleanups have their own test below).
     await t.mutation(m("rollback"), { branch: "production" });
     expect((await ask(t)).manifest.launchAsset.hash).toBe(createHash("sha256").update("A").digest("base64url"));
   }, 180_000);
