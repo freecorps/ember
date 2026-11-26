@@ -2,7 +2,7 @@
 // and the logs search and NDJSON export (logsearch.ts).
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { curlFor, HISTORY_KEY, HISTORY_MAX, loadHistory, refFor, RESULT_MAX, saveRun, shellQuote, tsFor, tsLiteral } from "../src/app/runner.ts";
+import { clearHistory, curlFor, forgetHistory, HISTORY_KEY, HISTORY_MAX, loadHistory, refFor, RESULT_MAX, saveRun, shellQuote, tsFor, tsLiteral } from "../src/app/runner.ts";
 import { EXPORT_MAX, searchLogs, toNdjson, type LogRecord } from "../src/app/logsearch.ts";
 import { fileName } from "../src/app/export.ts";
 import { sameRoute } from "../src/app/hooks.ts";
@@ -31,6 +31,21 @@ describe("run history (localStorage)", () => {
     const big = saveRun(list, { ...run(99), ok: false, result: { message: "x".repeat(RESULT_MAX * 2) } });
     expect(big[0]!.result.length).toBe(RESULT_MAX + 1);
     expect(m.get(HISTORY_KEY)).not.toContain("token");
+  });
+
+  it("each write starts from the stored history (two tabs), and signing out forgets it", () => {
+    const m = memoryStorage();
+    // Both tabs loaded an empty history; each saves a run from its own (stale) copy.
+    const tabA = saveRun([], run(1));
+    const tabB = saveRun([], run(2));
+    expect(tabB.map((e) => e.args)).toEqual([{ i: 2 }, { i: 1 }]);
+    expect(loadHistory()).toHaveLength(2);
+    // Tab A clears the function with a copy that misses B's run: B's run (same function) goes too, nothing comes back.
+    expect(clearHistory(tabA, { project: "chat", env: "prod", fn: "messages:send" })).toEqual([]);
+    saveRun([], { ...run(3), fn: "rooms:list" });
+    expect(clearHistory(tabA, { project: "chat", env: "prod", fn: "messages:send" }).map((e) => e.fn)).toEqual(["rooms:list"]);
+    forgetHistory();
+    expect(m.has(HISTORY_KEY)).toBe(false);
   });
 
   it("works without storage (throws, or garbage in it)", () => {
@@ -80,6 +95,10 @@ describe("copy as TypeScript", () => {
     expect(tsLiteral({ a: 1, "b-c": "it's \"x\"\n", nested: { list: [true, null] }, empty: {} })).toBe(
       `{\n  a: 1,\n  "b-c": "it's \\"x\\"\\n",\n  nested: {\n    list: [\n      true,\n      null,\n    ],\n  },\n  empty: {},\n}`,
     );
+    // `__proto__` stays an own key (a plain `__proto__:` would set the prototype).
+    const proto = tsLiteral(JSON.parse(`{"payload":{"__proto__":{"x":1}}}`));
+    expect(proto).toContain(`["__proto__"]: {`);
+    expect(new Function(`return ${proto}`)()).toEqual(JSON.parse(`{"payload":{"__proto__":{"x":1}}}`));
     const pub = tsFor({ fn: "messages:send", type: "mutation", visibility: "public", args: { channel: "general" } });
     expect(pub).toContain(`await client.mutation(api.messages.send, {\n  channel: "general",\n});`);
     expect(pub).toContain(`await ctx.runMutation(api.messages.send, {`);
@@ -107,9 +126,10 @@ describe("logs search and NDJSON export", () => {
     expect(q({ level: "warn" })).toEqual([10, 2, 1]);
     expect(q({ level: "error" })).toEqual([2, 1]);
     expect(q({ fn: "messages:" })).toEqual([2]);
-    // The function filter ignores case too (in the exec line and in the head).
+    // The function filter ignores case too, and matches only the executions' functions (never the request line).
     expect(q({ fn: "Messages:SEND" })).toEqual([2]);
-    expect(q({ fn: "post /API" })).toEqual([30, 10, 2, 1]);
+    expect(q({ fn: "mutation" })).toEqual([]);
+    expect(q({ text: "mutation" })).toEqual([30, 10, 2, 1]);
     expect(q({ since: now - 5 * 60_000 })).toEqual([2, 1]);
     expect(q({ since: now - 5 * 60_000, level: "error", text: "typeerror" })).toEqual([1]);
   });

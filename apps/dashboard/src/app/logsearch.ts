@@ -62,8 +62,9 @@ export function searchLogs<T extends LogRecord>(records: readonly T[], q: LogSea
       const l = levelOf(r);
       if (q.level === "error" ? l !== "error" : l === "log") return false;
     }
-    // Case-insensitive, like the text search.
-    if (fn && !r.lines.some((l) => l.kind === "exec" && l.fn.toLowerCase().includes(fn)) && !r.head.toLowerCase().includes(fn)) return false;
+    // Only the executions' functions (the request line is text-search matter: `mutation` must not match `POST
+    // /api/mutation`), case-insensitive like the text search.
+    if (fn && !r.lines.some((l) => l.kind === "exec" && l.fn.toLowerCase().includes(fn))) return false;
     return !text || haystack(r).includes(text);
   });
 }
