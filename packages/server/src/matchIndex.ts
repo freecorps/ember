@@ -10,7 +10,7 @@
 //   `debounceTableWrites` (search: bm25 order drifts with any write); the runtime re-runs those debounced (PLAN §4).
 
 import { compareBytes } from "@freecorps/ember-values";
-import { docKey, readSetFields } from "./ddl.ts";
+import { indexKey, readSetFields, readSetSparse } from "./ddl.ts";
 import { passes } from "./filter.ts";
 import type { IndexKind, MatchHelpers } from "./indexKinds.ts";
 import { fieldOf } from "./layout.ts";
@@ -202,7 +202,7 @@ export function createMatchIndex<K>(schema: { manifest: SchemaManifest; indexKin
 class MatchIndexImpl<K> implements MatchIndex<K> {
   private readonly keys = new Map<K, KeyState<K>>();
   /** table -> index -> intervals */
-  private readonly intervals = new Map<string, Map<string, { fields: string[]; set: IntervalSet<K> }>>();
+  private readonly intervals = new Map<string, Map<string, { fields: string[]; sparse: boolean; set: IntervalSet<K> }>>();
   /** table -> key -> plugin entries */
   private readonly plugins = new Map<string, Map<K, ReadSetEntry[]>>();
   /** table -> keys matching any change to it */
@@ -251,7 +251,7 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
         let byIndex = this.intervals.get(entry.table);
         if (!byIndex) this.intervals.set(entry.table, (byIndex = new Map()));
         let slot = byIndex.get(entry.index);
-        if (!slot) byIndex.set(entry.index, (slot = { fields, set: new IntervalSet<K>() }));
+        if (!slot) byIndex.set(entry.index, (slot = { fields, sparse: readSetSparse(this.manifest, entry.table, entry.index), set: new IntervalSet<K>() }));
         st.recs.push({ set: slot.set, rec: slot.set.add({ key, lo: entry.lo, hi: entry.hi, entry }) });
       } else if (!this.manifest.tables[entry.table]) {
         wide(entry.table);
@@ -299,13 +299,14 @@ class MatchIndexImpl<K> implements MatchIndex<K> {
       for (const k of this.tableWide.get(change.table) ?? []) exact.add(k);
       const byIndex = this.intervals.get(change.table);
       if (byIndex) {
-        for (const { fields, set } of byIndex.values()) {
+        for (const { fields, sparse, set } of byIndex.values()) {
           // Before in range: the row may leave (or change inside) the result; after in range: it may enter.
           const { before, after } = change;
           // An update that leaves the index fields as they were: one key for both versions.
           const same = before && after && sameKeyFields(before, after, fields);
-          const kb = before ? docKey(before, fields) : null;
-          const ka = same ? kb : after ? docKey(after, fields) : null;
+          // A sparse index: a version missing one of its fields is not in it (null: in no range).
+          const kb = before ? indexKey(before, fields, sparse) : null;
+          const ka = same ? kb : after ? indexKey(after, fields, sparse) : null;
           if (kb && ka && (same || compareBytes(kb, ka) === 0)) {
             // The index key did not move (an update of other fields): one stab for both versions.
             set.stab(kb, (r) => {

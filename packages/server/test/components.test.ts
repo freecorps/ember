@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import { createNodeSqliteDriver } from "../src/testing.ts";
 import {
   anyComponents,
+  compileSchema,
   componentBuilders,
   composeApp,
   createEngine,
@@ -519,5 +520,36 @@ describe("private SQL with components", () => {
         }),
       }),
     ).toThrow(/cannot declare privateSql/);
+  });
+});
+
+describe("defineComponent({ omitIndexes })", () => {
+  const notes = defineComponent({
+    name: "notes",
+    schema: defineSchema({
+      tables: { notes: defineTable({ text: v.string(), tag: v.optional(v.string()) }).index("by_tag", ["tag"]).searchIndex("search", { searchField: "text" }) },
+    }),
+    functions: {},
+    config: v.optional(v.object({ search: v.optional(v.boolean()) })),
+    omitIndexes: (config) => (config?.search ? [] : ["notes.search"]),
+  });
+  const base = defineSchema({ tables: {} });
+  const indexes = (app: ReturnType<typeof defineApp>) =>
+    composeApp({ schema: base, app }).schema.manifest.tables["notes$notes"]!.indexes.map((i) => i.name);
+
+  test("an install leaves out the indexes its config does not use; another install keeps them", () => {
+    expect(indexes(defineApp().use(notes))).toEqual(["by_tag"]);
+    expect(indexes(defineApp().use(notes, { config: { search: true } }))).toEqual(["by_tag", "search"]);
+    const both = composeApp({ schema: base, app: defineApp().use(notes).use(notes, { name: "searchable", config: { search: true } }) }).schema.manifest.tables;
+    expect(both["notes$notes"]!.indexes.map((i) => i.name)).toEqual(["by_tag"]);
+    expect(both["searchable$notes"]!.indexes.map((i) => i.name)).toEqual(["by_tag", "search"]);
+    // the DDL follows: no FTS5 table without it
+    const ddl = compileSchema(composeApp({ schema: base, app: defineApp().use(notes) }).schema.manifest, base.indexKinds).join("\n");
+    expect(ddl).not.toContain("fts5");
+  });
+
+  test("an unknown index name is refused", () => {
+    const bad = defineComponent({ name: "bad", schema: notes.schema!, functions: {}, omitIndexes: () => ["notes.nope"] });
+    expect(() => composeApp({ schema: base, app: defineApp().use(bad) })).toThrow(/omitIndexes names unknown index "notes.nope"/);
   });
 });

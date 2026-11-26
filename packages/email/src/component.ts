@@ -214,17 +214,51 @@ function attachmentRows(ctx: Ctx, list: InboxAttachment[] | undefined) {
   });
 }
 
+/**
+ * `primary`, or `fallback` while the index it reads is still being backfilled (`IndexNotReady`): right after the
+ * deploy that changed it (made it sparse), until the shard's backfill ends. `fallback` gives the same answer, slower.
+ */
+function whileBackfilling<T>(primary: () => T, fallback: () => T): T {
+  try {
+    return primary();
+  } catch (e) {
+    if ((e as EmberError).code !== "IndexNotReady") throw e;
+    return fallback();
+  }
+}
+
+/**
+ * A thread's emails in `status`, soonest `sendAt` first, by the sparse `by_thread_status` (only emails of a thread are
+ * in it); while it backfills after the upgrade, the emails in that status (`by_status`, the same order) filtered.
+ */
+function threadEmails(ctx: Pick<ReadCtx, "db">, threadId: string, status: EmailStatus): EmailDoc[] {
+  return whileBackfilling(
+    () => ctx.db.query("emails").withIndex("by_thread_status", (q) => q.eq("threadId", threadId).eq("status", status)).collect(),
+    () => ctx.db.query("emails").withIndex("by_status", (q) => q.eq("status", status)).filter((q) => q.eq(q.field("threadId"), threadId)).collect(),
+  ) as EmailDoc[];
+}
+
 const RESERVED_HEADERS = new Set(["from", "to", "cc", "bcc", "subject", "reply-to", "content-type", "mime-version", "content-transfer-encoding"]);
+
+/** What a thread's message needs of the email it is for (`appendOutbound`), before that email's row is written. */
+type SentEmail = { _id: GenericId<"emails">; status: EmailStatus; sendAt: number; threadId?: string };
 
 /**
  * `link`: a send from a thread (`reply` / `compose`) inserts the thread's message for the new email and returns its
- * id; it is stored on the email (`threadMessageId`) in the same write as the job id.
+ * id; it is stored on the email (`threadMessageId`). The email is written once, with its job and that message
+ * (`insert(table, (id) => doc)`): no insert and then a patch.
  */
-function doSend(ctx: Ctx, a: SendInput, link?: (id: GenericId<"emails">) => GenericId<"messages">): SendResult {
+function doSend(ctx: Ctx, a: SendInput, link?: (email: SentEmail) => GenericId<"messages">): SendResult {
   const project = a.project ?? "default";
   if (a.idempotencyKey !== undefined) {
     if (!a.idempotencyKey || a.idempotencyKey.length > 256) fail("ValidationError", "idempotencyKey must be 1..256 characters");
-    const prev = ctx.db.query("emails").withIndex("by_project_key", (q) => q.eq("project", project).eq("idempotencyKey", a.idempotencyKey)).first();
+    const key = a.idempotencyKey;
+    // `by_project_key` is sparse (only emails with a key): while it backfills after the upgrade that made it so, the
+    // project's emails filtered by the key stand in.
+    const prev = whileBackfilling(
+      () => ctx.db.query("emails").withIndex("by_project_key", (q) => q.eq("project", project).eq("idempotencyKey", key)).first(),
+      () => ctx.db.query("emails").withIndex("by_project", (q) => q.eq("project", project)).filter((q) => q.eq(q.field("idempotencyKey"), key)).first(),
+    );
     if (prev) return { id: prev._id, status: prev.status as EmailStatus, duplicate: true };
   }
   let from: EmailAddress, to: EmailAddress[], cc: EmailAddress[], bcc: EmailAddress[], replyTo: EmailAddress | undefined;
@@ -266,7 +300,10 @@ function doSend(ctx: Ctx, a: SendInput, link?: (id: GenericId<"emails">) => Gene
   }
   const sendAt = Math.max(ctx.now, a.sendAt ?? ctx.now);
   const status: EmailStatus = allSuppressed ? "suppressed" : sendAt > ctx.now ? "scheduled" : "queued";
-  const id = ctx.db.insert("emails", {
+  const id = ctx.db.insert("emails", (id) => {
+    const jobId = allSuppressed ? undefined : ctx.scheduler.runAt(sendAt, "lib:deliver", { emailId: id });
+    const threadMessageId = link?.({ _id: id, status, sendAt, ...(a.threadId ? { threadId: a.threadId } : {}) });
+    return {
     project,
     from,
     to: toK,
@@ -286,10 +323,10 @@ function doSend(ctx: Ctx, a: SendInput, link?: (id: GenericId<"emails">) => Gene
     status,
     sendAt,
     attempts: 0,
+    ...(jobId !== undefined ? { jobId } : {}),
+    ...(threadMessageId !== undefined ? { threadMessageId } : {}),
+    };
   });
-  const jobId = allSuppressed ? undefined : ctx.scheduler.runAt(sendAt, "lib:deliver", { emailId: id });
-  const threadMessageId = link?.(id);
-  if (jobId !== undefined || threadMessageId !== undefined) ctx.db.patch(id, { ...(jobId !== undefined ? { jobId } : {}), ...(threadMessageId !== undefined ? { threadMessageId } : {}) });
   return { id, status, ...(dropped.length ? { suppressed: dropped } : {}) };
 }
 
@@ -425,13 +462,42 @@ async function deliver(ctx: ActCtx, emailId: string) {
 
 // ------------------------------------------------------------------------------------------------ events
 
+/** Rows a delivery event's email lookup reads while `by_message_id` backfills (`recentByMessageId`). */
+export const EVENT_FALLBACK_ROWS = 1000;
+
+/**
+ * The email with `messageId` among the newest EVENT_FALLBACK_ROWS, in pages (stops at the match). Not there and the
+ * table has older emails: `IndexNotReady`, so the event batch is retried (once the index is ready it finds any email)
+ * instead of scanning the whole table per event or recording the event without its email.
+ */
+function recentByMessageId(ctx: Ctx, messageId: string): EmailDoc | null {
+  let cursor: string | null = null;
+  for (let read = 0; read < EVENT_FALLBACK_ROWS; ) {
+    const r: { page: EmailDoc[]; isDone: boolean; continueCursor: string } = ctx.db
+      .query("emails")
+      .order("desc")
+      .paginate({ numItems: Math.min(100, EVENT_FALLBACK_ROWS - read), cursor });
+    const hit = r.page.find((x) => x.messageId === messageId);
+    if (hit) return hit;
+    if (r.isDone) return null;
+    read += r.page.length;
+    cursor = r.continueCursor;
+  }
+  throw new EmberError("IndexNotReady", `email: by_message_id is still backfilling and ${messageId} is not among the newest ${EVENT_FALLBACK_ROWS} emails (the event is retried)`);
+}
+
 function applyEvent(ctx: Ctx, ev: DeliveryEvent) {
   const seen = ctx.db.query("events").withIndex("by_event", (q) => q.eq("eventId", ev.eventId)).first();
   if (seen) {
     ctx.db.patch(seen._id, { duplicates: (seen.duplicates ?? 0) + 1 });
     return { duplicate: true };
   }
-  const e = ctx.db.query("emails").withIndex("by_message_id", (q) => q.eq("messageId", ev.messageId)).first() as EmailDoc | null;
+  // While the sparse `by_message_id` backfills (after the upgrade): the newest emails first (an event is about a
+  // recent email), at most EVENT_FALLBACK_ROWS of them; older than that, the batch fails and the queue retries it.
+  const e = whileBackfilling(
+    () => ctx.db.query("emails").withIndex("by_message_id", (q) => q.eq("messageId", ev.messageId)).first(),
+    () => recentByMessageId(ctx, ev.messageId),
+  ) as EmailDoc | null;
   ctx.db.insert("events", {
     eventId: ev.eventId,
     ...(e ? { emailId: e._id } : {}),
@@ -959,9 +1025,10 @@ function blindAfter(thread: { contact: string; blind?: string[] }, a: { to: Emai
 }
 
 /** `counted`: the thread was just inserted with this message's counts and list fields (compose): no thread write. */
-function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema>["threads"]["document"], mb: { address: string; displayName?: string | undefined }, a: { text: string; html?: string; emailId?: GenericId<"emails">; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows>; counted?: boolean }) {
-  const email = a.emailId ? (ctx.db.get(a.emailId) as EmailDoc | null) : null;
-  const scheduledFor = email?.status === "scheduled" ? (email.sendAt as number) : undefined;
+function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema>["threads"]["document"], mb: { address: string; displayName?: string | undefined }, a: { text: string; html?: string; email?: SentEmail; author?: string; note?: boolean; to: EmailAddress[]; cc?: EmailAddress[]; bcc?: EmailAddress[]; attachments?: ReturnType<typeof attachmentRows>; counted?: boolean }) {
+  // The email being sent (`doSend`): its row is written after this message, with the message's id.
+  const email = a.email;
+  const scheduledFor = email?.status === "scheduled" ? email.sendAt : undefined;
   const from: EmailAddress = { email: mb.address, ...(mb.displayName ? { name: mb.displayName } : {}) };
   const snippet = snippetOf(a.text);
   const id = ctx.db.insert("messages", {
@@ -982,12 +1049,12 @@ function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema
     searchText: `${thread.subject}\n${a.author ?? ""}\n${a.text}${(a.attachments ?? []).map((x) => `\n${x.filename}`).join("")}`.slice(0, 100_000),
     attachments: a.attachments ?? [],
     autoSubmitted: false,
-    ...(a.emailId ? { emailId: a.emailId } : {}),
+    ...(email ? { emailId: email._id } : {}),
     ...(a.author ? { author: a.author } : {}),
     ...(scheduledFor !== undefined ? { scheduledFor } : {}),
     at: ctx.now,
   });
-  if (scheduledFor !== undefined) recordEvent(ctx, thread, "scheduled", { emailId: a.emailId, messageId: id, sendAt: scheduledFor }, a.author);
+  if (email && scheduledFor !== undefined) recordEvent(ctx, thread, "scheduled", { emailId: email._id, messageId: id, sendAt: scheduledFor }, a.author);
   const blind = a.note ? undefined : blindAfter(thread, a);
   if (!a.counted) writeThread(
     ctx,
@@ -1005,7 +1072,7 @@ function appendOutbound(ctx: Ctx, thread: DataModelFromSchema<typeof emailSchema
   // Suppressed at send time (every recipient on the suppression list): the timeline says so, as it does when the
   // suppression is found later.
   // (The email read above: writing the message and the thread does not touch it.)
-  if (email?.status === "suppressed") deliveryEvent(ctx, email, "queued", "suppressed");
+  if (email?.status === "suppressed") deliveryEvent(ctx, email, "queued", "suppressed", {}, { _id: id });
   return id;
 }
 
@@ -1437,7 +1504,7 @@ const TIMELINE_STATUSES = new Set<string>(["sent", "delivery_delayed", "delivere
  * Records an outbound email's status change on its thread's timeline (`delivery`), when it has one. `known`: the
  * email's thread message when the caller already looked it up (null: it has none), so the thread is not scanned twice.
  */
-function deliveryEvent(ctx: Ctx, e: EmailDoc, from: string, to: string, extra: Record<string, unknown> = {}, known?: { _id: string } | null) {
+function deliveryEvent(ctx: Ctx, e: { _id: GenericId<"emails">; threadId?: string | undefined; threadMessageId?: GenericId<"messages"> | undefined }, from: string, to: string, extra: Record<string, unknown> = {}, known?: { _id: string } | null) {
   if (from === to || !e.threadId || !TIMELINE_STATUSES.has(to)) return;
   const tid = ctx.db.normalizeId("threads", e.threadId);
   const t = tid ? (ctx.db.get(tid) as ThreadDoc | null) : null;
@@ -2148,7 +2215,7 @@ export const emailFunctions = {
         let canceled = 0;
         for (const status of ["queued", "scheduled"] as const) {
           // `by_thread_status`: the thread's own emails in that status (not every queued email of the mailbox, filtered).
-          for (const e of ctx.db.query("emails").withIndex("by_thread_status", (q) => q.eq("threadId", t._id).eq("status", status)).collect()) {
+          for (const e of threadEmails(ctx, t._id, status)) {
             if (e.jobId) ctx.scheduler.cancel(e.jobId);
             ctx.db.patch(e._id, { status: "canceled" });
             canceled++;
@@ -2227,7 +2294,7 @@ export const emailFunctions = {
           threadId: thread._id,
           ...(a.sendAt ? { sendAt: a.sendAt } : {}),
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
-        }, (emailId) => (messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), ...(a.bcc?.length ? { bcc: parseAddressList(a.bcc) } : {}), attachments: files })));
+        }, (email) => (messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), email, ...(a.author ? { author: a.author } : {}), to, ...(a.cc?.length ? { cc: parseAddressList(a.cc) } : {}), ...(a.bcc?.length ? { bcc: parseAddressList(a.bcc) } : {}), attachments: files })));
         return { emailId: sent.id, messageId: messageId!, status: sent.status };
       },
     }),
@@ -2324,7 +2391,7 @@ export const emailFunctions = {
           threadId,
           ...(a.sendAt ? { sendAt: a.sendAt } : {}),
           ...(mimeParts(a.attachments).length ? { attachments: mimeParts(a.attachments) } : {}),
-        }, (emailId) => (messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), emailId, ...(a.author ? { author: a.author } : {}), to, ...(cc ? { cc } : {}), ...(bcc ? { bcc } : {}), attachments: files, counted: true })));
+        }, (email) => (messageId = appendOutbound(ctx as unknown as Ctx, thread, mb, { text: a.text, ...(body.stored ? { html: body.stored } : {}), email, ...(a.author ? { author: a.author } : {}), to, ...(cc ? { cc } : {}), ...(bcc ? { bcc } : {}), attachments: files, counted: true })));
         return { threadId, emailId: sent.id, messageId: messageId!, status: sent.status, number };
       },
     }),
@@ -2485,10 +2552,7 @@ export const emailFunctions = {
       handler: (ctx, a) => {
         const id = ctx.db.normalizeId("threads", a.threadId);
         if (!id) return [];
-        return ctx.db
-          .query("emails")
-          .withIndex("by_thread_status", (q) => q.eq("threadId", id).eq("status", "scheduled"))
-          .collect()
+        return threadEmails(ctx, id, "scheduled")
           .map((e) => {
             const m = threadMessageOf(ctx as unknown as Ctx, id, e);
             return { emailId: e._id, sendAt: e.sendAt, subject: e.subject, to: e.to, ...(e.cc ? { cc: e.cc } : {}), ...(m ? { messageId: m._id, ...(m.author ? { author: m.author } : {}), snippet: m.snippet } : {}) };

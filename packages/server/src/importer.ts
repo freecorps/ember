@@ -8,7 +8,7 @@
 import { encodeJsonStable, validate, valueSize, type ObjectShape } from "@freecorps/ember-values";
 import { aggregatesOf, AGGREGATE_KIND } from "./aggregate.ts";
 import { q, type SqlDriver, type SqlRow, type SqlValue } from "./driver.ts";
-import { docKey, indexFields, ownedObjects, dbIndexesOf } from "./ddl.ts";
+import { indexFields, indexKey, ownedObjects, dbIndexesOf } from "./ddl.ts";
 import { EmberError } from "./errors.ts";
 import { isExternalKind, outboxEnqueue } from "./external.ts";
 import { collectFiles, FILES_DDL, FILES_TABLE, fileKey, shapeHasFiles } from "./files.ts";
@@ -180,7 +180,7 @@ export class Importer {
     const t = this.appTable(table);
     if (!classicTables(this.d.driver).has(table)) throw new EmberError("ImportNotBegun", `Table ${table} was not prepared for import (call import begin first)`);
     const layout = layoutOf(table, t.document);
-    const keys = dbIndexesOf(t).map((i) => ({ column: keyColumn(i.name), fields: indexFields(t, i.name)! }));
+    const keys = dbIndexesOf(t).map((i) => ({ column: keyColumn(i.name), fields: indexFields(t, i.name)!, sparse: i.sparse === true }));
     const invalid: ImportInvalid[] = [];
     const good: Doc[] = [];
     docs.forEach((raw, index) => {
@@ -366,14 +366,15 @@ export class Importer {
   }
 
   /** Bulk upsert through `json_each(?)` (one bound JSON array per statement), exact for floats (checked back). */
-  private upsert(table: string, layout: Layout, keys: Array<{ column: string; fields: string[] }>, docs: Doc[]): void {
+  private upsert(table: string, layout: Layout, keys: Array<{ column: string; fields: string[]; sparse: boolean }>, docs: Doc[]): void {
     const cols = ["_id", "_creationTime", ...layout.columns.map((c) => c.field), "_json", ...keys.map((k) => k.column)];
     const blob = new Set([...layout.columns.filter((c) => c.spec.sqlType === "BLOB").map((c) => c.field), ...keys.map((k) => k.column)]);
     const real = ["_creationTime", ...layout.columns.filter((c) => c.spec.sqlType === "REAL").map((c) => c.field)];
     const encoded = docs.map((doc) => {
       const f = encodeFields(layout, doc);
       const values: SqlValue[] = cols.map((c) => (c === "_id" ? doc._id : c === "_creationTime" ? doc._creationTime + 0 : c in f ? f[c]! : null));
-      keys.forEach((k, i) => (values[cols.length - keys.length + i] = docKey(doc, k.fields)));
+      // `k.fields` carries the tiebreakers (always present): sparse means "a declared field is absent", as in the engine.
+      keys.forEach((k, i) => (values[cols.length - keys.length + i] = indexKey(doc, k.fields, k.sparse)));
       // Non-finite numbers and -0 never reach a column (they escape to `_json`), so every value has a JSON form.
       return { values, json: JSON.stringify(values.map((x) => (x instanceof Uint8Array ? hex(x) : x))) };
     });

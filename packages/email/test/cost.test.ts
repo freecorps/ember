@@ -2,6 +2,7 @@
 // are the node:sqlite usage (rows returned / changed) measured after the change; the comments give the numbers before.
 import type { InboundEmailMessage } from "@freecorps/ember-server";
 import { describe, expect, test } from "vitest";
+import { EVENT_FALLBACK_ROWS } from "../src/component.ts";
 import { email } from "../src/index.ts";
 import { event, inboxHarness } from "./harness.ts";
 
@@ -91,9 +92,10 @@ describe("email: fewer rows per write", () => {
     const h = inboxHarness();
     h.resetCounters();
     const c = h.mutate("@email/lib:compose", { mailbox: "support", to: ["caio@user.test"], subject: "Hi", text: "Hello", bcc: ["audit@acme.test"] });
-    // before PR 2D: 11 rows written (thread insert, then a patch with the first message's counts); now 9, plus the
-    // rateLimit GC's `gc` row of the shard's first bucket (see above).
-    expect(h.counters.rowsWritten).toBeLessThanOrEqual(10);
+    // before PR 2D: 11 rows written (thread insert, then a patch with the first message's counts); 9; since PR 3a 8
+    // (the email written once, with its job and thread message), plus the rateLimit GC's `gc` row of the shard's
+    // first bucket (see above).
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(9);
     const t = h.query("@email/lib:thread", { threadId: c.threadId }).thread;
     expect(t).toMatchObject({ messageCount: 1, unreadCount: 0, hasUnread: false, status: "waiting", blind: ["audit@acme.test"] });
     expect(h.query("@email/lib:counts", { mailbox: "support" }).byStatus.waiting).toEqual({ threads: 1, unread: 0, unreadThreads: 0 });
@@ -393,5 +395,98 @@ describe("email: writes per send and per inbound (PR 4A-5a)", () => {
     h.advance(2 * 86_400_000);
     expect(h.mutate("@email/lib:maintain", {})).toMatchObject({ purged: 1 });
     expect(h.query("@email/lib:thread", { threadId: t.threadId })).toBeNull();
+  });
+});
+
+// PR 3a (v0.10): sparse indexes and one write per sent email. node:sqlite counts table rows (`changes`), not index
+// entries; the DO bills both (one row per index entry an INSERT/UPDATE touches), so the index entries an email row
+// holds are counted from its key columns. Numbers before → after in the comments (main at c95ae510).
+describe("email: sparse indexes and one write per email (PR 3a)", () => {
+  /** Index entries of an email row: its non-NULL `_k_*` key columns (a sparse index's NULL is no entry). */
+  const entries = (h: H, id: string) => {
+    const row = h.driver.exec(`SELECT * FROM "email$emails" WHERE "_id" = ?`, id).rows[0]!;
+    return Object.keys(row).filter((c) => c.startsWith("_k_") && c !== "_k_by_creation_time" && row[c] !== null).length;
+  };
+  const sendArgs = { from: "x@acme.test", to: "a@b.io", subject: "s", text: "t" };
+
+  test("send: the email is written once (with its job) and in 3 of its 6 indexes", () => {
+    const h = inboxHarness(noLimit);
+    h.mutate("@email/lib:send", sendArgs); // warm: the rate-limit bucket, the sweep row
+    h.resetCounters();
+    const r = h.mutate("@email/lib:send", sendArgs);
+    // before: 4 rows written (the email insert, its patch with the job id, the rate bucket, the status aggregate); now 3.
+    // On the DO (index entries billed too): 10 → 6.
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(3);
+    // before: 6 index entries (every index, `undefined` keys included); now 3 (no key, no provider id, no thread).
+    expect(entries(h, r.id)).toBe(3);
+    expect(h.get(r.id)).toMatchObject({ jobId: expect.any(String), status: "queued" });
+    // with an idempotency key: that index too, and the key still dedupes
+    const k = h.mutate("@email/lib:send", { ...sendArgs, idempotencyKey: "k1" });
+    expect(entries(h, k.id)).toBe(4);
+    expect(h.mutate("@email/lib:send", { ...sendArgs, idempotencyKey: "k1" })).toMatchObject({ id: k.id, duplicate: true });
+  });
+
+  test("reply: the email is written once, with its job and its thread message", () => {
+    const h = inboxHarness(noLimit);
+    const t = h.ingest({ messageId: "r1@user.test" });
+    h.mutate("@email/lib:reply", { threadId: t.threadId, text: "warm" });
+    h.resetCounters();
+    const r = h.mutate("@email/lib:reply", { threadId: t.threadId, text: "On it." });
+    // before: 6 rows written (the email insert, its patch with the job and the message ids, ...); now 5. Read: 5 (the
+    // email read back for its status was already a cached read of the mutation's own write), plus the rateLimit GC's
+    // `gc` row that every bucket write now checks (PR 2 v0.10).
+    expect(h.counters.rowsWritten).toBeLessThanOrEqual(5);
+    expect(h.counters.rowsRead).toBeLessThanOrEqual(6);
+    expect(h.get(r.emailId)).toMatchObject({ threadMessageId: r.messageId, jobId: expect.any(String), threadId: t.threadId });
+    expect(entries(h, r.emailId)).toBe(4); // before: 6; + by_thread_status (a thread's email)
+    // a scheduled reply: listed by the sparse by_thread_status, with its message
+    const later = h.mutate("@email/lib:reply", { threadId: t.threadId, text: "later", sendAt: Date.UTC(2100, 0, 1) });
+    expect(h.query("@email/lib:scheduled", { threadId: t.threadId })).toEqual([expect.objectContaining({ emailId: later.emailId, messageId: later.messageId })]);
+  });
+
+  test("the sparse indexes are read while they backfill after the upgrade (IndexNotReady stand-ins)", () => {
+    const h = inboxHarness(noLimit);
+    const k = h.mutate("@email/lib:send", { ...sendArgs, idempotencyKey: "k1" });
+    const t = h.ingest({ messageId: "b1@user.test" });
+    const later = h.mutate("@email/lib:reply", { threadId: t.threadId, text: "later", sendAt: Date.UTC(2100, 0, 1) });
+    h.driver.exec(`UPDATE "email$emails" SET "messageId" = 'mid-b' WHERE "_id" = ?`, k.id);
+    // What the deploy that made them sparse leaves until the backfill ends: the indexes staged (not queryable).
+    for (const index of ["by_project_key", "by_message_id", "by_thread_status"]) {
+      h.driver.exec(`INSERT INTO "_ember_indexes" ("tbl", "name", "kind", "cursor", "until") VALUES ('email$emails', ?, 'db', 0, 0)`, index);
+    }
+    h.engine.migrate();
+    expect(h.mutate("@email/lib:send", { ...sendArgs, idempotencyKey: "k1" })).toMatchObject({ id: k.id, duplicate: true });
+    expect(h.query("@email/lib:scheduled", { threadId: t.threadId })).toEqual([expect.objectContaining({ emailId: later.emailId })]);
+    h.mutate("@email/lib:applyEvents", { events: [event("delivered", "mid-b", {}, "ev-b")] });
+    expect(h.get(k.id)).toMatchObject({ status: "delivered" });
+    // the queued auto-reply and the scheduled reply
+    expect(h.mutate("@email/lib:deleteThread", { threadId: t.threadId })).toMatchObject({ deleted: true, canceled: 2 });
+    h.driver.exec(`DELETE FROM "_ember_indexes"`);
+    h.engine.migrate();
+  });
+
+  test("while by_message_id backfills, an event's email is looked up among the newest emails only (bounded); older: retried", () => {
+    const h = inboxHarness(noLimit);
+    const old = h.mutate("@email/lib:send", sendArgs);
+    h.driver.exec(`UPDATE "email$emails" SET "messageId" = 'mid-old' WHERE "_id" = ?`, old.id);
+    for (let i = 0; i < EVENT_FALLBACK_ROWS; i++) h.mutate("@email/lib:send", sendArgs);
+    const recent = h.mutate("@email/lib:send", sendArgs);
+    h.driver.exec(`UPDATE "email$emails" SET "messageId" = 'mid-new' WHERE "_id" = ?`, recent.id);
+    h.driver.exec(`INSERT INTO "_ember_indexes" ("tbl", "name", "kind", "cursor", "until") VALUES ('email$emails', 'by_message_id', 'db', 0, 0)`);
+    h.engine.migrate();
+    // the newest: found in the first page
+    h.resetCounters();
+    h.mutate("@email/lib:applyEvents", { events: [event("delivered", "mid-new", {}, "ev-new")] });
+    expect(h.get(recent.id)).toMatchObject({ status: "delivered" });
+    expect(h.counters.rowsRead).toBeLessThan(150);
+    // older than the newest EVENT_FALLBACK_ROWS: the batch fails (the queue retries it), nothing is scanned past that
+    expect(() => h.mutate("@email/lib:applyEvents", { events: [event("delivered", "mid-old", {}, "ev-old")] })).toThrow(/not among the newest 1000 emails/);
+    expect(h.get(old.id)).not.toMatchObject({ status: "delivered" });
+    // once the backfill ends (it also writes the keys of the ids set by hand above) the retry finds it
+    h.driver.exec(`UPDATE "_ember_indexes" SET "until" = 9007199254740991`);
+    for (let i = 0; i < 100 && !h.engine.backfillStep(5000).done; i++);
+    expect(h.driver.exec(`SELECT count(*) AS n FROM "_ember_indexes"`).rows[0]!.n).toBe(0);
+    h.mutate("@email/lib:applyEvents", { events: [event("delivered", "mid-old", {}, "ev-old")] });
+    expect(h.get(old.id)).toMatchObject({ status: "delivered" });
   });
 });

@@ -78,6 +78,19 @@ Linhas lidas e escritas do DO, jobs e requisições, medidas nos testes de conta
 - **Offline (#155):** um frame que liquida mutations entre updates: 3 commits → 1; registro frio comparado por
   fingerprint sem ler as linhas.
 
+## Depois da 0.9.0: índices esparsos e uma escrita por documento (PR 3a da 0.10)
+
+Contadores dos testes de cada pacote (`node:sqlite`: linhas devolvidas / alteradas, sem contar entradas de índice) e,
+para o índice esparso, as linhas cobradas pelo DO no workerd (`spikes/rows-written.md`, "Índice esparso"):
+
+- **Índice esparso** (`.index(name, fields, { sparse: true })`): insert sem o campo opcional 4 → 3 linhas cobradas no
+  DO (a entrada do índice some); com o campo, igual.
+- **Email:** `send` sem chave nem thread 4 → 3 linhas escritas e 6 → 3 entradas de índice no email (no DO, ~10 → 6);
+  `reply` 6 → 5, `compose` 9 → 8 (o email gravado uma vez, já com o job e a mensagem da thread).
+- **Agent:** `send` com prompt e resposta 4 → 3 escritas e 3 → 2 lidas; `toolResults` 2 → 1 lida; instalação padrão
+  sem índice FTS5 (busca opt-in, `{ search: true }`): nenhuma linha de FTS por mensagem.
+- **Migrations:** `start` 2 → 1 linha escrita. **Workpool:** item sem `key` sem entrada no `by_key`.
+
 ## Reproduzir
 
 ```sh
