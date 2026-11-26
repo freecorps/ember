@@ -795,6 +795,9 @@ export const ROUTES: Route[] = [
       if (!args || typeof args !== "object" || Array.isArray(args)) return err(400, "bad_request", "args must be an object");
       // What to type: the function's own name (`cancelAll` of `@pool/lib:cancelAll`).
       const confirm = fn.slice(fn.lastIndexOf(":") + 1);
+      // What `resolve` read: the project runs a destructive function only when told the confirmation was for one, so
+      // a deploy that makes it destructive between the two requests is refused (409 dashboard_changed), not run.
+      let destructive = false;
       return {
         ...s,
         target: fn,
@@ -805,9 +808,10 @@ export const ROUTES: Route[] = [
           const f = await dashboardFunction(c, t, dashboard, fn);
           if (f instanceof Response) return f;
           if (f.type === "query") return err(403, "not_in_dashboard", `${fn} is a query: it runs through /api/dash/query`);
-          return { destructive: f.destructive, confirm };
+          destructive = f.destructive;
+          return { destructive, confirm };
         },
-        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/dashboards/run", c.fetch, { method: "POST", body: { shard: s.shard, dashboard, fn, args } }), t, "dashboards/run"),
+        run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/dashboards/run", c.fetch, { method: "POST", body: { shard: s.shard, dashboard, fn, args, destructive } }), t, "dashboards/run"),
       };
     },
   },
@@ -972,7 +976,13 @@ async function write(route: WriteRoute, c: Ctx): Promise<Response> {
   let destructive = route.destructive;
   let confirm = plan.confirm;
   if (plan.resolve) {
-    const r = await plan.resolve(c, target);
+    let r: Awaited<ReturnType<NonNullable<WritePlan["resolve"]>>>;
+    try {
+      r = await plan.resolve(c, target);
+    } catch (e) {
+      // The project did not answer (before any audit row: nothing ran).
+      return err(502, "project_unreachable", (e as Error).message);
+    }
     if (r instanceof Response) return r;
     ({ destructive, confirm } = r);
   }

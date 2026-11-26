@@ -7,7 +7,7 @@
  * read. For tests of client SDKs; not a database.
  */
 import { encodeParts, rowDiff, valueDiffJson } from "@freecorps/ember-values";
-import type { ClientMessage, Id, PatchChange, ServerMessage } from "./protocol.ts";
+import { MAX_BATCH_MESSAGES, type ClientMessage, type Id, type PatchChange, type ServerMessage } from "./protocol.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 import type { WebSocketLike } from "./client.ts";
 
@@ -133,6 +133,8 @@ export class FakeSocket implements WebSocketLike {
   batch = false;
   batchesIn = 0;
   batchesOut = 0;
+  /** Messages in each array frame the server took (one larger than `MAX_BATCH_MESSAGES` is refused, as the runtime does). */
+  readonly batchSizes: number[] = [];
   /** Frames the client sent ("ping" excluded), an array frame counting once. */
   framesIn = 0;
   outbox: string[] | null = null;
@@ -421,7 +423,11 @@ export class FakeEmberServer {
     }
     if (ws.batch && raw.startsWith("[")) {
       ws.batchesIn++;
-      for (const m of parse(raw) as unknown[]) this.receive(ws, stringify(m), true, sentOpen);
+      const all = parse(raw) as unknown[];
+      // As the runtime (`MAX_BATCH_MESSAGES`): a larger batch is refused whole, nothing of it runs.
+      if (all.length === 0 || all.length > MAX_BATCH_MESSAGES) return this.send(ws, { t: "err", code: "bad_frame", message: `a batch frame carries 1 to ${MAX_BATCH_MESSAGES} messages` });
+      ws.batchSizes.push(all.length);
+      for (const m of all) this.receive(ws, stringify(m), true, sentOpen);
       return;
     }
     let msg: ClientMessage;

@@ -45,7 +45,7 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
 
 - `EmberClient` options: `url`, `auth`, `defaultShard`, `storage` (a `PendingStorage` or an offline
   `StorageAdapter`), `optimisticUpdates`, `connectivity`, `snapshotCache`, `onError`, `WebSocket` / `fetch` (to
-  inject), `backoff`, `heartbeat`, `idleTimeoutMs`, `multiTab`.
+  inject), `backoff`, `heartbeat`, `idleTimeoutMs`, `multiTab`, `files`, `zframe`.
 - Methods: `query` (one shot), `subscribe` / `watchQuery` (live), `mutation`, `action`, `setAuth` / `clearAuth`,
   `connectionState` / `onConnectionStateChange`, `discardPending`, `fetchForHydration` / `hydrate` / `dehydrate` (SSR; `WebSocket: null` on the server),
   `files.upload` / `files.url`, `close`.
@@ -61,16 +61,31 @@ The optimistic update itself (`store.getAllQueries` / `store.setQuery`) is in
   `browserConnectivity()`.
 - Every call takes `{ shard }` to pick a shard explicitly; otherwise the function's declared routing (an argument or a
   token claim) or `defaultShard` decides.
+- HTTP one-shots of the same turn for one shard (`query()` without a socket, `fetchForHydration`) go out as one
+  `POST /api/query/batch`, each answered with its own result (an older runtime: one request per query).
+- **`zframe: true`** (opt-in): the shard sends frames above 2 KiB compressed (raw DEFLATE, binary WebSocket messages),
+  decoded with the platform's `DecompressionStream`; a large `snap` is typically 5–10× smaller on the wire. It costs
+  the shard CPU (billed) to save bytes that are not billed: worth it on slow or metered links. Announced only where
+  the platform can decode it (not React Native); a runtime without the feature keeps sending text.
+- **`@freecorps/ember-client/files`**: `files()` (option `files`), `ClientFiles`, `uploadFile`. Multipart parts that
+  fail with 5xx, 429 or a network error are sent again (`partAttempts`, default 3, honouring `Retry-After`, else
+  exponential backoff from `retryDelayMs`) before the upload is aborted; `signal` cancels the waits too.
 - **`@freecorps/ember-client/testing`**: `FakeEmberServer` and `FakeSocket`, an in-process fake speaking the WebSocket
   protocol, for testing client SDKs (it is not a database; app tests belong in `@freecorps/ember-testing`); and
   `FakeBrowser`, fake tabs (BroadcastChannel + Web Locks, with crash and freeze) for testing `multiTab`.
 
 ## Several tabs: `multiTab`
 
-`new EmberClient({ url, multiTab: true })` (opt-in) keeps one WebSocket per shard for every tab of the origin instead
-of one per tab: the tab holding a Web Lock keeps the real sockets, and the other tabs' clients send the very same
-frames to it over a `BroadcastChannel`. Each tab still has its own subscriptions, optimistic updates, mutation queue and
-identity; only the transport is shared.
+```ts
+import { multiTab } from "@freecorps/ember-client/multitab";
+const client = new EmberClient({ url, multiTab: multiTab() }); // or multiTab({ name, openTimeoutMs, ... })
+```
+
+`multiTab()` (opt-in) keeps one WebSocket per shard for every tab of the origin instead of one per tab: the tab holding
+a Web Lock keeps the real sockets, and the other tabs' clients send the very same frames to it over a
+`BroadcastChannel`. Each tab still has its own subscriptions, optimistic updates, mutation queue and identity; only the
+transport is shared, and tabs subscribed to the same query share one subscription on the shard (the leader keeps its
+last value: a tab that subscribes later gets it at once). The leader's own tab talks to it in-process.
 
 - **Per identity.** Tabs share a socket only when their tokens name the same identity with the same claims (apart from
   `exp`/`iat`/`nbf`/`jti`), or the same opaque token, or are both signed out. A tab signed in as someone else gets a
@@ -90,6 +105,19 @@ identity; only the transport is shared.
   the leader does not take within `openTimeoutMs` (default 1 s) opens on its own.
 - Options: `{ name, openTimeoutMs, clientIdTimeoutMs, lifecycle, locks, BroadcastChannel, onRoleChange }`;
   `client.tabRole` says `"leader"`, `"follower"`, `"starting"`, `"closed"`, or null when not sharing.
+
+### Migrating from `multiTab: true` and `client.files` (0.10)
+
+The multi-tab hub and the upload helper are no longer in the static graph of `EmberClient`: an app that does not use
+them does not ship them (with code splitting: −20% of the client on load, `packages/client/bench/bundle-size.ts`).
+
+- `multiTab: true` / `multiTab: { ... }` still work: the hub is loaded with `import()` when the client is built (a chunk
+  of its own; the first socket waits for it). To have it in the main bundle, as before, write
+  `multiTab: multiTab({ ... })` with `multiTab` from `@freecorps/ember-client/multitab`.
+- `client.files.upload(...)` still works: the helper is loaded on the first upload. `client.files` is now typed
+  `FilesApi` (`url`, `upload`) and is a stand-in, not a `ClientFiles` instance, unless you pass
+  `files: files()` (`@freecorps/ember-client/files`). `uploadFile` and `ClientFiles` are still exported from the main
+  entry too.
 
 ## Offline and identity
 

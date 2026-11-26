@@ -43,7 +43,11 @@ describe("dashboards (admin API)", () => {
     expect(list.body.value.map((t: { key: string; n: number }) => [t.key, t.n])).toEqual([["dash", 4]]);
     // Another shard has its own tables.
     expect((await query("tally", "@tally/lib:list", {}, "dash:other")).body.value).toEqual([]);
-    const reset = await post("dashboards/run", { dashboard: "tally", fn: "@tally/lib:reset", args: { key: "dash" }, shard });
+    // A destructive function runs only for a caller that confirmed it as one (the dashboard read the same spec).
+    const unconfirmed = await post("dashboards/run", { dashboard: "tally", fn: "@tally/lib:reset", args: { key: "dash" }, shard });
+    expect([unconfirmed.status, unconfirmed.body.error.code]).toEqual([409, "dashboard_changed"]);
+    expect((await query("tally", "@tally/lib:get", { key: "dash" }, shard)).body.value).toBe(4);
+    const reset = await post("dashboards/run", { dashboard: "tally", fn: "@tally/lib:reset", args: { key: "dash" }, shard, destructive: true });
     expect(reset.body).toMatchObject({ ok: true, value: true });
     expect((await query("tally", "@tally/lib:get", { key: "dash" }, shard)).body.value).toBe(0);
   });
@@ -73,6 +77,12 @@ describe("dashboards (admin API)", () => {
     expect(bad.body.error.message).toMatch(/@tally\/lib:bump/);
     expect((await query("tally", "@tally/lib:get", { key: "x" }, "dash:args")).body.value).toBe(0);
     expect((await get(`dashboards/query?${new URLSearchParams({ dashboard: "tally", fn: "@tally/lib:get", args: "{nope" })}`)).status).toBe(400);
+    // Args that are JSON but not an object: refused before anything else (even an unknown dashboard).
+    for (const args of ["5", "[1]", "null", '"x"']) {
+      const r = await get(`dashboards/query?${new URLSearchParams({ dashboard: "nope", fn: "x", args })}`);
+      expect([r.status, r.body.error.code, r.body.error.message]).toEqual([400, "bad_request", "args must be a JSON object"]);
+    }
+    expect((await post("dashboards/run", { dashboard: "tally", fn: "@tally/lib:bump", args: [1], shard: "dash:args" })).status).toBe(400);
     // The app's screen is global.
     const app = await query("", "components:count", { key: "g" });
     expect(app.body).toMatchObject({ ok: true, value: 0, shard: "global:main" });

@@ -394,7 +394,7 @@ class Resolver {
           ...(o.rows !== undefined ? { rows: this.path(o.rows, `${at}.rows`) } : {}),
           columns,
           filters,
-          ...(paged || (!q.args && o.pageSize !== undefined) ? { pageSize: (o.pageSize as number | undefined) ?? 25 } : {}),
+          ...(paged ? { pageSize: (o.pageSize as number | undefined) ?? 25 } : {}),
           rowKey: o.rowKey === undefined ? "_id" : this.path(o.rowKey, `${at}.rowKey`),
           ...(o.detail !== undefined ? { detail: this.detail(this.object(o.detail, `${at}.detail`, ["query", "args", "fromRow", "sections"]), `${at}.detail`, true) } : {}),
           ...(rowActions ? { rowActions } : {}),
@@ -509,7 +509,9 @@ class Resolver {
       if (o.destructive !== undefined && typeof o.destructive !== "boolean") throw new SpecError(`${where}.destructive must be a boolean`);
       if (!inTable && o.fromRow !== undefined) throw new SpecError(`${where}.fromRow: only a table's rowActions have rows`);
       const f = this.fn(o.fn, `${where}.fn`, ["mutation", "action"]);
-      if (o.destructive === true) this.used.set(f.name, { ...this.used.get(f.name)!, destructive: true });
+      // `fn` recorded it (absent only in the shape-only check, which names no function).
+      const entry = this.used.get(f.name);
+      if (o.destructive === true && entry) entry.destructive = true;
       const fromRow = this.fromRow(o.fromRow, f, `${where}.fromRow`);
       return {
         id,
@@ -654,11 +656,17 @@ function acceptsBoolean(s: Shape): boolean {
   return s.kind === "boolean" || (s.kind === "union" && s.members.some(acceptsBoolean));
 }
 
-/** A paginated query: `paginationOpts` is `{ numItems, cursor }` (`paginationOptsValidator`). */
+/**
+ * A paginated query: `paginationOpts` is `{ numItems, cursor }` (`paginationOptsValidator`). The pager sends
+ * `{ numItems: <pageSize>, cursor: null }` and then the string `continueCursor`: both must fit the query's validator.
+ */
 function pagination(args: ObjectShape, at: string): boolean {
   const p = args.fields.paginationOpts;
   if (!p) return false;
   const s = p.shape;
-  if (s.kind !== "object" || s.fields.numItems?.shape.kind !== "number" || !s.fields.cursor) throw new SpecError(`${at}: its paginationOpts argument must be paginationOptsValidator`);
+  const fits = (cursor: string | null) => validate(s, { numItems: 1, cursor }).ok;
+  if (s.kind !== "object" || s.fields.numItems?.shape.kind !== "number" || !s.fields.cursor || !fits(null) || !fits("c")) {
+    throw new SpecError(`${at}: its paginationOpts argument must be paginationOptsValidator ({ numItems: v.number(), cursor: v.nullable(v.string()) })`);
+  }
   return true;
 }

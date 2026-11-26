@@ -122,6 +122,17 @@ describe("defineComponent({ dashboard })", () => {
     refuses(oneBlock({ kind: "actions", actions: [{ label: "x", fn: lib.purge, args: { status: () => "done" } }] }), /must be plain JSON/);
   });
 
+  test("a paginated table's paginationOpts must take the pager's cursor (null, then a string)", () => {
+    const withCursor = (cursor: Parameters<typeof v.object>[0][string]) => {
+      const pager = { list: b.query({ args: { paginationOpts: v.object({ numItems: v.number(), cursor }) }, handler: () => null }) };
+      return () => defineComponent({ name: "items", schema, functions: { lib: pager }, dashboard: spec(oneBlock({ kind: "table", query: pager.list, columns: [{ label: "N", path: "name" }] })) });
+    };
+    expect(withCursor(v.number())).toThrow(/paginationOpts argument must be paginationOptsValidator/);
+    expect(withCursor(v.string())).toThrow(/paginationOpts argument must be paginationOptsValidator/);
+    expect(withCursor(v.null())).toThrow(/paginationOpts argument must be paginationOptsValidator/);
+    expect(withCursor(v.nullable(v.string()))).not.toThrow();
+  });
+
   test("refuses malformed specs: unknown keys and kinds, bad paths, ids, icons, duplicates", () => {
     refuses({ icon: "rocket" as never }, /icon "rocket": one of box/);
     refuses({ scope: "everywhere" as never }, /scope must be/);
@@ -196,6 +207,9 @@ describe("composeApp: dashboards in the manifest", () => {
     const wrongKind = defineApp({ dashboard: { label: "J", tabs: [{ id: "t", label: "T", blocks: [{ kind: "stats", query: makeFunctionReference<"query">("jobs:retry"), items: [{ label: "n", path: "x" }] }] }] } });
     expect(() => composeApp({ schema: appSchema, functions: appFns, app: wrongKind })).toThrow(/jobs:retry is a mutation, expected a query/);
     expect(() => defineApp({ dashboard: { label: "", tabs: [] } })).toThrow(/defineApp: dashboard label must be a non-empty string/);
+    // The shape-only check (defineApp) accepts a destructive action and a pageSize; composeApp decides with the args.
+    const shaped = defineApp({ dashboard: { label: "J", tabs: [{ id: "t", label: "T", blocks: [{ kind: "actions", actions: [{ label: "Retry", fn: makeFunctionReference<"mutation">("jobs:retry"), destructive: true }] }] }] } });
+    expect(composeApp({ schema: appSchema, functions: appFns, app: shaped }).dashboards[0]!.functions["jobs:retry"]).toMatchObject({ type: "mutation", destructive: true });
     // A global screen cannot name a function pinned to another kind of shard (it would refuse to run on global:main).
     const pinned = { orgs: { get: queryGeneric({ shard: "org", args: {}, handler: () => null }) } };
     const spec = (scope: "global" | "shard") => defineApp({ dashboard: { label: "J", scope, tabs: [{ id: "t", label: "T", blocks: [{ kind: "stats", query: makeFunctionReference<"query">("orgs:get"), items: [{ label: "n", path: "" }] }] }] } });
