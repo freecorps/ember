@@ -60,8 +60,9 @@ export const report = action({
   server's time). A batch that breaks a rule is refused whole (400 `bad_batch`).
 - **The user is never trusted from the body.** With a valid bearer token, `userId` is the identity's subject. Without
   one, a `userId` in the batch is dropped unless `trustClientUserId: true`. The anonymous id is the client's.
-- Rate limit: with `rateLimit`, each batch is checked against a Workers Rate Limiting binding (per IP, or per
-  anonymous id with `key: "anonymousId"`); over it, 429. With `limit` and `period` the component asks `ember deploy`
+- Rate limit: with `rateLimit`, each batch is checked against a Workers Rate Limiting binding, per IP
+  (`cf-connecting-ip`), or per signed-in user with `key: "user"` (anonymous callers still by IP). The key is never
+  something the client picks (an anonymous id, an `x-forwarded-for`); over it, 429. With `limit` and `period` the component asks `ember deploy`
   for the binding; without them it uses one declared elsewhere (for example the rateLimit component's `bindings`).
   Without `rateLimit`, only the size caps apply.
 - Server side: `analytics.track(ctx, name, props)` / `trackMany` from actions. Mutations cannot do I/O: schedule an

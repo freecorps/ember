@@ -70,6 +70,12 @@ describe("server-side tracking", () => {
     expect(ds.points).toHaveLength(2);
   });
 
+  test("signed in: the identity wins over a userId the call or the event names", async () => {
+    const { t, ds } = setup();
+    await t.withIdentity({ subject: "user_1" }).action(unsafeRef<"action">("events:webhook"), {});
+    expect(ds.points.map((p) => [p.blobs[0], p.blobs[1]])).toEqual([["paid", "user_1"], ["renewed", "user_1"]]);
+  });
+
   test("archive: the batch is one gzip NDJSON object under analytics/YYYY/MM/DD/HH/", async () => {
     const { t, bucket } = setup();
     await t.action(unsafeRef<"action">("events:webhook"), {});
@@ -130,7 +136,7 @@ describe("HTTP ingest (handleTrack)", () => {
     expect(pre.headers.get("access-control-allow-headers")).toContain("authorization");
   });
 
-  test("rate limit: per IP (or anonymous id) through the edge binding; 429 writes nothing", async () => {
+  test("rate limit: per IP (or signed-in user) through the edge binding; 429 writes nothing", async () => {
     const ds = fakeDataset();
     const rl = fakeRateLimit(1);
     const ctx = ctxOf({ rateLimit: { binding: "RL_ANALYTICS" } }, { EMBER_ANALYTICS: ds, RL_ANALYTICS: rl });
@@ -142,9 +148,19 @@ describe("HTTP ingest (handleTrack)", () => {
     expect((await handleTrack(ctx, post(body, { "cf-connecting-ip": "5.6.7.8" }))).status).toBe(204);
     expect(rl.keys).toEqual(["analytics:ip:1.2.3.4", "analytics:ip:1.2.3.4", "analytics:ip:5.6.7.8"]);
     expect(ds.points).toHaveLength(2);
-    const byAnon = ctxOf({ rateLimit: { binding: "RL_ANALYTICS", key: "anonymousId" } }, { EMBER_ANALYTICS: ds, RL_ANALYTICS: rl });
-    await handleTrack(byAnon, post(JSON.stringify({ events: [{ name: "view", anonymousId: "dev-1" }] })));
-    expect(rl.keys.at(-1)).toBe("analytics:dev-1");
+    // The key is never the client's to pick: a fresh anonymousId per batch, or an x-real-ip / x-forwarded-for of its
+    // own, lands in the same IP bucket.
+    for (const [i, h] of [{}, { "x-real-ip": "9.9.9.9" }, { "x-forwarded-for": "8.8.8.8" }].entries()) {
+      await handleTrack(ctx, post(JSON.stringify({ events: [{ name: "view", anonymousId: `fresh-${i}` }] }), { "cf-connecting-ip": "5.6.7.8", ...h }));
+    }
+    expect(rl.keys.slice(-3)).toEqual(["analytics:ip:5.6.7.8", "analytics:ip:5.6.7.8", "analytics:ip:5.6.7.8"]);
+    // key: "user": the signed-in user (the identity, never a body field); anonymous callers by IP.
+    const byUser = ctxOf({ rateLimit: { binding: "RL_ANALYTICS", key: "user" } }, { EMBER_ANALYTICS: ds, RL_ANALYTICS: rl }, "user_42");
+    await handleTrack(byUser, post(JSON.stringify({ events: [{ name: "view", anonymousId: "dev-1", userId: "mallory" }] }), { "cf-connecting-ip": "1.2.3.4" }));
+    expect(rl.keys.at(-1)).toBe("analytics:user:user_42");
+    const anonUser = ctxOf({ rateLimit: { binding: "RL_ANALYTICS", key: "user" } }, { EMBER_ANALYTICS: ds, RL_ANALYTICS: rl });
+    await handleTrack(anonUser, post(JSON.stringify({ events: [{ name: "view", anonymousId: "dev-1" }] }), { "cf-connecting-ip": "1.2.3.4" }));
+    expect(rl.keys.at(-1)).toBe("analytics:ip:1.2.3.4");
     // A binding that is not there (not deployed yet): size caps only, the event is kept.
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect((await handleTrack(ctxOf({ rateLimit: { binding: "RL_MISSING" } }, { EMBER_ANALYTICS: ds }), post(body))).status).toBe(204);

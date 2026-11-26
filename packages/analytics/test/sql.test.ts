@@ -84,6 +84,16 @@ describe("SQL inputs are checked, never interpolated raw", () => {
     expect(() => countsSql(scope, { bucket: "hour) --" as never })).toThrow(SqlInputError);
   });
 
+  test("bucket and period are own keys: Object.prototype names are refused", () => {
+    for (const bad of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
+      expect(() => countsSql(scope, { bucket: bad as never })).toThrow(/minute, hour or day/);
+      expect(() => retentionSql(scope, { period: bad as never })).toThrow(/day or week/);
+      expect(() => retentionStart({ period: bad as never })).toThrow(/day or week/);
+      expect(() => parseRetention({ data: [{ cohort: 0, users: 1 }] }, { period: bad as never })).toThrow(/day or week/);
+    }
+    expect(() => parseRetention({ data: [] }, { period: "month" as never })).toThrow(SqlInputError);
+  });
+
   test("valid names end up only inside literals, and the literal escaping holds on its own", () => {
     const sql = funnelSql(scope, { steps: ["viewed pricing", "checkout:start", "paid/ok"] });
     const { strings, outside } = literals(sql);
@@ -243,5 +253,20 @@ describe("the SQL API and results", () => {
     await cachedSql(api, "SELECT 1", { ttlSeconds: 0, cache });
     await cachedSql(api, "SELECT 1", { ttlSeconds: 0, cache });
     expect(calls).toHaveLength(4);
+  });
+
+  test("cachedSql: a rotated token or another base URL never reads the cached answer", async () => {
+    const { calls, api } = recorded({ data: [{ n: 1 }] });
+    const store = new Map<string, Response>();
+    const cache: CacheLike = { match: async (k) => store.get(k)?.clone(), put: async (k, r) => void store.set(k, r) };
+    const t0 = 1_000_000;
+    await cachedSql(api, "SELECT 1", { ttlSeconds: 60, now: t0, cache });
+    expect(await cachedSql({ ...api, token: "rotated" }, "SELECT 1", { ttlSeconds: 60, now: t0 + 1000, cache })).not.toHaveProperty("cached");
+    expect(calls.map((c) => c.auth)).toEqual(["Bearer tok", "Bearer rotated"]);
+    expect(await cachedSql({ ...api, base: "https://other.example/v4" }, "SELECT 1", { ttlSeconds: 60, now: t0 + 2000, cache })).not.toHaveProperty("cached");
+    expect(calls).toHaveLength(3);
+    // The same credential still hits.
+    expect(await cachedSql(api, "SELECT 1", { ttlSeconds: 60, now: t0 + 3000, cache })).toMatchObject({ cached: true });
+    expect([...store.keys()].join()).not.toMatch(/tok|rotated/);
   });
 });

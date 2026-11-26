@@ -84,12 +84,13 @@ export const installConfigValidator = v.object({
   /** Events per batch (1..50, default 50). */
   maxEvents: v.optional(v.number()),
   /**
-   * A Workers Rate Limiting binding checked per batch (by IP, or by the batch's anonymous id). With `limit` and
+   * A Workers Rate Limiting binding checked per batch, by a key the client cannot pick: the IP (`cf-connecting-ip`,
+   * set by Cloudflare), or with `key: "user"` the signed-in user (the IP when anonymous). With `limit` and
    * `period` the component asks `ember deploy` for the binding itself; without, it uses one declared elsewhere (the
    * rateLimit component's `bindings`). Without `rateLimit`, only the size caps apply.
    */
   rateLimit: v.optional(
-    v.object({ binding: v.string(), key: v.optional(v.union(v.literal("ip"), v.literal("anonymousId"))), limit: v.optional(v.number()), period: v.optional(v.union(v.literal(10), v.literal(60))) }),
+    v.object({ binding: v.string(), key: v.optional(v.union(v.literal("ip"), v.literal("user"))), limit: v.optional(v.number()), period: v.optional(v.union(v.literal(10), v.literal(60))) }),
   ),
   /** Also write each batch to R2 as gzip NDJSON (`true`: the files bucket `EMBER_FILES`, prefix `analytics`). */
   archive: v.optional(v.union(v.boolean(), v.object({ bucket: v.optional(v.string()), prefix: v.optional(v.string()) }))),
@@ -106,7 +107,7 @@ export type AnalyticsInstallConfig = {
   measures?: string[];
   trustClientUserId?: boolean;
   maxEvents?: number;
-  rateLimit?: { binding: string; key?: "ip" | "anonymousId"; limit?: number; period?: 10 | 60 };
+  rateLimit?: { binding: string; key?: "ip" | "user"; limit?: number; period?: 10 | 60 };
   archive?: boolean | { bucket?: string; prefix?: string };
   sql?: { accountIdEnv?: string; tokenEnv?: string; base?: string; cacheSeconds?: number };
   summary?: false | { everyMinutes?: number };
@@ -209,9 +210,11 @@ export async function handleTrack(ctx: ActCtx, request: Request): Promise<Respon
     if (e instanceof BatchError) return reply(400, "bad_batch", e.message);
     throw e;
   }
-  const ip = request.headers.get("cf-connecting-ip") ?? request.headers.get("x-real-ip") ?? "unknown";
   if (cfg.rateLimit) {
-    const key = cfg.rateLimit.key === "anonymousId" ? events.find((e) => e.anonymousId)?.anonymousId ?? `ip:${ip}` : `ip:${ip}`;
+    // Never a value from the body (an anonymousId is the client's to pick: a fresh one per batch would be a fresh
+    // bucket) nor a header the client sets: Cloudflare writes cf-connecting-ip on every request it proxies.
+    const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+    const key = cfg.rateLimit.key === "user" && identity ? `user:${identity.subject}` : `ip:${ip}`;
     try {
       const { ok } = await edgeLimit(ctx, cfg.rateLimit.binding, `analytics:${key}`);
       if (!ok) return new Response(JSON.stringify({ ok: false, error: { code: "rate_limited", message: "too many events; retry later" } }), { status: 429, headers: { ...CORS, "content-type": "application/json", "retry-after": "10" } });

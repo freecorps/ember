@@ -85,7 +85,7 @@ export function countsSql(s: Scope, o: CountsOptions = {}): string {
   const { table, where } = from(s);
   const since = int(o.sinceHours ?? 24, 1, 2160, "sinceHours");
   const bucket = o.bucket ?? "hour";
-  if (!(bucket in BUCKET_UNIT)) throw new SqlInputError(`bucket must be minute, hour or day`);
+  if (typeof bucket !== "string" || !Object.hasOwn(BUCKET_UNIT, bucket)) throw new SqlInputError(`bucket must be minute, hour or day`);
   where.push(`timestamp > NOW() - INTERVAL '${since}' HOUR`);
   if (o.names !== undefined) {
     const ns = uniqueNames(o.names, "names", 1, 20);
@@ -224,12 +224,18 @@ export interface RetentionOptions {
 /** Start (unix seconds) of the first period: UTC midnight, or the UTC Monday for weeks, `periods - 1` periods ago. */
 export function retentionStart(o: RetentionOptions): number {
   const period = o.period ?? "week";
+  checkPeriod(period);
   const n = int(o.periods ?? 8, 2, 13, "periods");
   const nowS = Math.floor((o.now ?? Date.now()) / 1000);
   const day = Math.floor(nowS / 86400) * 86400;
   // 1970-01-01 (day 0) was a Thursday: day d is (d + 3) % 7 days after a Monday.
   const current = period === "day" ? day : day - ((Math.floor(day / 86400) + 3) % 7) * 86400;
   return current - (n - 1) * PERIOD_SECONDS[period];
+}
+
+/** `day` or `week` (an own key: `toString` and other `Object.prototype` names are refused). */
+function checkPeriod(period: unknown): asserts period is Period {
+  if (typeof period !== "string" || !Object.hasOwn(PERIOD_SECONDS, period)) throw new SqlInputError("period must be day or week");
 }
 
 /**
@@ -241,7 +247,7 @@ export function retentionStart(o: RetentionOptions): number {
 export function retentionSql(s: Scope, o: RetentionOptions = {}): string {
   const { table, where } = from(s);
   const period = o.period ?? "week";
-  if (!(period in PERIOD_SECONDS)) throw new SqlInputError("period must be day or week");
+  checkPeriod(period);
   const n = int(o.periods ?? 8, 2, 13, "periods");
   const p = PERIOD_SECONDS[period];
   const start = retentionStart(o);
@@ -288,6 +294,7 @@ export interface RetentionResult {
 
 export function parseRetention(body: SqlResponse, o: RetentionOptions = {}): RetentionResult {
   const period = o.period ?? "week";
+  checkPeriod(period);
   const n = int(o.periods ?? 8, 2, 13, "periods");
   const start = retentionStart(o);
   const p = PERIOD_SECONDS[period];
@@ -368,13 +375,14 @@ function defaultCache(): CacheLike | null {
 
 /**
  * `runSql` behind a short cache: the isolate's memory, then the data center's Cache API (`caches.default`, when there
- * is one), keyed by the SQL text and the account (never the token). `ttlSeconds` 0 turns it off.
+ * is one), keyed by the account and a hash of the credential, the base URL and the SQL text (the token never appears
+ * in the key itself): a rotated token or another base never reads a cached answer. `ttlSeconds` 0 turns it off.
  */
 export async function cachedSql(api: SqlApi, sql: string, o: { ttlSeconds: number; now?: number; cache?: CacheLike | null }): Promise<SqlResponse & { cached?: boolean }> {
   const ttl = Math.max(0, Math.floor(o.ttlSeconds));
   if (!ttl) return runSql(api, sql);
   const now = o.now ?? Date.now();
-  const key = `https://ember-analytics.cache/${encodeURIComponent(api.accountId)}/${await sha256Hex(sql)}`;
+  const key = `https://ember-analytics.cache/${encodeURIComponent(api.accountId)}/${await sha256Hex(`${api.token}\n${api.base ?? SQL_API_BASE}\n${sql}`)}`;
   const hit = memo.get(key);
   if (hit && now - hit.at < ttl * 1000) return { ...hit.body, cached: true };
   const cache = o.cache === undefined ? defaultCache() : o.cache;
