@@ -60,7 +60,8 @@ export interface AuditEntry {
   args?: unknown;
   /**
    * Args already serialized by the route, instead of `summarizeArgs(args)` (whose strings stop at 120 characters): the
-   * SQL Explorer keeps the query's text, up to 2 KiB. At most `MAX_ARGS_TEXT` characters are stored.
+   * SQL Explorer keeps the query's first 2048 characters (worker.ts `sqlForAudit`, which keeps the JSON under
+   * `MAX_ARGS_TEXT`). At most `MAX_ARGS_TEXT` characters are stored.
    */
   argsText?: string;
 }

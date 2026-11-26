@@ -9,7 +9,7 @@
 //     before it runs (audit.ts), and a typed confirmation for destructive ones on protected environments;
 //   - an admin endpoint the project's runtime does not have answers 501 `runtime_outdated` (projects.ts).
 
-import { allOf, auditBegin, auditDenied, auditFinish, ensureTables, listAudit, type AuditEntry, type D1Like } from "./audit.ts";
+import { allOf, auditBegin, auditDenied, auditFinish, ensureTables, listAudit, MAX_ARGS_TEXT, type AuditEntry, type D1Like } from "./audit.ts";
 import { accessConfigured, authenticate, type AuthEnv, type Principal, type Role } from "./auth.ts";
 import { b64url, err, json, MAX_BODY_BYTES, readJsonObject, readLimited } from "./http.ts";
 import {
@@ -86,6 +86,8 @@ const FN = /^[A-Za-z0-9_$@./:-]{1,200}$/;
 const DASH_ARGS_MAX = 8192;
 /** The SQL Explorer: the text kept in the audit log, the row cap, the bound parameters (the runtime's limits). */
 const SQL_AUDIT_CHARS = 2048;
+/** Largest SQL text (the runtime's SQL_TEXT_MAX): a longer one is refused here, before the project is called. */
+const SQL_TEXT_MAX = 100_000;
 const SQL_ROWS_MAX = 5000;
 const SQL_PARAMS_MAX = 100;
 /** `data/list` arguments of admin API level 16 (`id`, range bounds, `search`): older runtimes would ignore them. */
@@ -175,6 +177,22 @@ function bodyScope(b: Record<string, unknown>, needShard: boolean): { project: s
 }
 
 /** Resolves ?project&env to its registry entry (404 when unknown) and checks the runtime has `feature`. */
+/**
+ * The SQL text kept in the audit log: its first SQL_AUDIT_CHARS characters (`…` when cut), fewer when JSON escapes
+ * (quotes, backslashes, control characters: up to 6 characters each) would push the entry past MAX_ARGS_TEXT, so
+ * the stored `args` is always whole JSON, never cut by the log.
+ */
+export function sqlForAudit(sql: string): string {
+  // Room for the other fields: {"sql":"…","chars":100000,"params":100,"explain":false,"limit":5000}.
+  const budget = MAX_ARGS_TEXT - 96;
+  let end = Math.min(sql.length, SQL_AUDIT_CHARS);
+  while (end > 0 && JSON.stringify(sql.slice(0, end)).length > budget) end = Math.floor(end * 0.9);
+  if (end === sql.length) return sql;
+  // A surrogate pair is not split.
+  if (/[\uD800-\uDBFF]/.test(sql[end - 1] ?? "")) end--;
+  return `${sql.slice(0, end)}…`;
+}
+
 async function targetOf(c: Ctx, feature: string): Promise<{ target: Target } | Response> {
   const s = scope(c.q);
   if (s instanceof Response) return s;
@@ -867,12 +885,13 @@ export const ROUTES: Route[] = [
     // Read-only (the project refuses anything else, and runs it in a transaction it always aborts): no confirmation.
     destructive: false,
     feature: "sql",
-    summary: "one read-only query on a shard's SQLite (SELECT, WITH ... SELECT, EXPLAIN QUERY PLAN), up to 5000 rows; audited with its text (first 2 KiB)",
+    summary: "one read-only query on a shard's SQLite (SELECT, WITH ... SELECT, EXPLAIN QUERY PLAN), up to 5000 rows; audited with its text (first 2048 characters)",
     plan(b) {
       const s = bodyScope(b, true);
       if (s instanceof Response) return s;
       const sql = typeof b.sql === "string" ? b.sql : "";
       if (!sql.trim()) return err(400, "bad_request", "sql: the query's text");
+      if (sql.length > SQL_TEXT_MAX) return err(413, "too_large", `sql: up to ${SQL_TEXT_MAX} characters`);
       if (b.explain !== undefined && typeof b.explain !== "boolean") return err(400, "bad_request", "explain must be a boolean");
       if (b.limit !== undefined && (!Number.isInteger(b.limit) || (b.limit as number) < 1 || (b.limit as number) > SQL_ROWS_MAX)) return err(400, "bad_request", `limit: an integer in 1..${SQL_ROWS_MAX}`);
       const params = b.params === undefined || b.params === null ? [] : b.params;
@@ -882,12 +901,12 @@ export const ROUTES: Route[] = [
       const explain = b.explain === true;
       const limit = b.limit as number | undefined;
       // The text is what was run (the point of the log); parameter values are user data: only their count.
-      const text = sql.length > SQL_AUDIT_CHARS ? `${sql.slice(0, SQL_AUDIT_CHARS)}…` : sql;
+      const text = sqlForAudit(sql);
       return {
         ...s,
         target: s.shard,
         args: { sql: text, params: params.length, explain, limit: limit ?? null },
-        argsText: JSON.stringify({ sql: text, ...(sql.length > SQL_AUDIT_CHARS ? { chars: sql.length } : {}), params: params.length, explain, limit: limit ?? null }),
+        argsText: JSON.stringify({ sql: text, ...(text !== sql ? { chars: sql.length } : {}), params: params.length, explain, limit: limit ?? null }),
         confirm: s.shard,
         run: async (c, t) => pass(await projectAdmin(c.env, t, "/api/_ember/sql", c.fetch, { method: "POST", body: { shard: s.shard, sql, params, ...(explain ? { explain } : {}), ...(limit !== undefined ? { limit } : {}) } }), t, "sql"),
       };

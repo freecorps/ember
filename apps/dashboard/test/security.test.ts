@@ -2,7 +2,8 @@
 // the audit log, typed confirmations on protected environments, and runtime capability detection.
 import { beforeEach, describe, expect, it } from "vitest";
 import { isAdminEmail } from "../src/auth.ts";
-import { clearCapabilities, CSRF_HEADER, handleApi, ROUTES, summarizeArgs, type DashboardEnv } from "../src/worker.ts";
+import { clearCapabilities, CSRF_HEADER, handleApi, ROUTES, sqlForAudit, summarizeArgs, type DashboardEnv } from "../src/worker.ts";
+import { MAX_ARGS_TEXT } from "../src/audit.ts";
 import { pass, type Target } from "../src/projects.ts";
 import { seeded } from "./helpers.ts";
 
@@ -437,7 +438,27 @@ describe("SQL Explorer", () => {
     for (const bad of [{ sql: "" }, { sql: 5 }, { sql: "SELECT 1", limit: 0 }, { sql: "SELECT 1", limit: 5001 }, { sql: "SELECT 1", explain: "y" }, { sql: "SELECT ?", params: [{ a: 1 }] }, { sql: "SELECT ?", params: "x" }, { sql: "SELECT 1", shard: "no colon" }]) {
       expect((await t.post("/api/sql", { ...base, ...bad })).status, JSON.stringify(bad)).toBe(400);
     }
+    // Longer than the runtime takes: refused here (413), not forwarded.
+    expect((await t.post("/api/sql", { ...base, sql: `SELECT '${"x".repeat(100_000)}'` })).status).toBe(413);
     expect(t.project.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+    // Nor audited: the log has the one query that ran.
+    expect(t.audit().map((r) => [r.action, r.outcome])).toEqual([["sql.run", "ok"]]);
+  });
+
+  it("a text that JSON escapes (quotes, control characters) is cut so the logged args stay whole JSON", async () => {
+    const t = setup();
+    const sql = `SELECT '${'"\\\u0001'.repeat(1500)}'`;
+    expect((await t.post("/api/sql", { ...base, sql })).status).toBe(200);
+    const stored = String(t.audit()[0]!.args);
+    expect(stored.length).toBeLessThanOrEqual(MAX_ARGS_TEXT);
+    const args = JSON.parse(stored) as { sql: string; chars: number };
+    expect(args.chars).toBe(sql.length);
+    expect(args.sql.endsWith("…")).toBe(true);
+    expect(sql.startsWith(args.sql.slice(0, -1))).toBe(true);
+    // A short one is kept whole, without `chars`.
+    expect(sqlForAudit("SELECT 1")).toBe("SELECT 1");
+    // A surrogate pair at the cut is not split.
+    expect(sqlForAudit(`SELECT 'x${"😀".repeat(1500)}'`)).toMatch(/^SELECT 'x(😀)+…$/u);
   });
 
   it("a runtime before level 16 (no `sql` feature): runtime_outdated for the SQL page and for rows with bounds, id or search", async () => {
