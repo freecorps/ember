@@ -61,7 +61,7 @@ export function readStorage(exec: (sql: string, ...params: SqlValue[]) => SqlRow
  * `columns`: the select list (default every column; a read that only decodes the document passes its data columns,
  * so the `_k_*` index BLOBs are not copied out).
  */
-export function selectById(exec: (sql: string, ...params: SqlValue[]) => SqlRow[], table: string, storage: TableStorage, id: string, columns = "*"): SqlRow | undefined {
+export function selectById<R = SqlRow>(exec: (sql: string, ...params: SqlValue[]) => R[], table: string, storage: TableStorage, id: string, columns = "*"): R | undefined {
   if (!storage.compact) return exec(`SELECT ${columns} FROM ${q(table)} WHERE "_id" = ?`, id)[0];
   const micros = idMicros(id);
   if (micros !== undefined) {

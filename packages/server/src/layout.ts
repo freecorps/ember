@@ -175,6 +175,55 @@ const put = (doc: Record<string, unknown>, k: string, x: unknown): void => {
   else doc[k] = x;
 };
 
+/** Per layout: `decodePlan` with each column's position in `dataColumns` (`decodeValues`). */
+type ValuesPlan = ReadonlyArray<{ field: string; column: Column | undefined; at: number }>;
+const valuesPlans = new WeakMap<Layout, ValuesPlan>();
+const valuesPlan = (layout: Layout): ValuesPlan => {
+  let plan = valuesPlans.get(layout);
+  if (plan === undefined) {
+    const at = new Map(layout.columns.map((c, i) => [c.field, 3 + i]));
+    plan = layout.fieldOrder.map((field) => ({ field, column: layout.column(field), at: at.get(field) ?? -1 }));
+    valuesPlans.set(layout, plan);
+  }
+  return plan;
+};
+
+/**
+ * `decodeRow` over a row read as an array (`SqlDriver.execRaw`): `layout.dataColumns` start at `base` (`_id`,
+ * `_creationTime`, `_json`, then the typed columns in order). The same document `decodeRow` gives the same row as an
+ * object, without building that object.
+ */
+export function decodeValues(layout: Layout, vals: ArrayLike<SqlValue>, base: number): Doc {
+  const plan = valuesPlan(layout);
+  const raw = vals[base + 2];
+  const doc: Record<string, unknown> = { _id: String(vals[base]), _creationTime: Number(vals[base + 1]) };
+  if (raw === "{}" || typeof raw !== "string") {
+    for (const { field, column: c, at } of plan) {
+      if (!c) continue;
+      const x = fromSqlValue(c.spec.cls, vals[base + at]);
+      if (x !== undefined) put(doc, field, x);
+      else if (c.spec.nullable) put(doc, field, null);
+    }
+    return doc as Doc;
+  }
+  const json = parseValue(raw) as Record<string, unknown>;
+  for (const { field, column: c, at } of plan) {
+    if (c) {
+      if (hasOwn(json, field)) put(doc, field, json[field]);
+      else {
+        const x = fromSqlValue(c.spec.cls, vals[base + at]);
+        if (x !== undefined) put(doc, field, x);
+        else if (c.spec.nullable) put(doc, field, null);
+      }
+    } else if (hasOwn(json, field) && json[field] !== undefined) put(doc, field, json[field]);
+  }
+  for (const k in json) {
+    if (hasOwn(doc, k) || layout.column(k)) continue;
+    put(doc, k, json[k]);
+  }
+  return doc as Doc;
+}
+
 /** SQL row -> document, fields in schema order. */
 export function decodeRow(layout: Layout, row: SqlRow): Doc {
   const plan = decodePlan(layout);

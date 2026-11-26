@@ -478,23 +478,27 @@ function coerceValue(s: Shape, x: unknown): unknown {
 }
 
 /** The `ctx.db.sql` object of one transaction. */
+/** A `ctx.db.sql` template run: the statement compiled once per template (`SqlCache`), then `run`. */
+function runTemplate(run: (c: CompiledSql) => Record<string, unknown>[], cache: SqlCache, strings: TemplateStringsArray, values: unknown[]): Record<string, unknown>[] {
+  if (!strings || !Array.isArray(strings.raw)) bad("use it as a tagged template: ctx.db.sql`SELECT ...`");
+  return run(cache.compile(strings, values));
+}
+
 export function makeSqlReader(run: (c: CompiledSql) => Record<string, unknown>[], schemaTables: Iterable<string> | SqlCache, tableOfId?: (id: string) => string | undefined): SqlReader {
   const cache = schemaTables instanceof SqlCache ? schemaTables : new SqlCache(schemaTables);
-  const exec = (strings: TemplateStringsArray, values: unknown[]) => {
-    if (!strings || !Array.isArray(strings.raw)) bad("use it as a tagged template: ctx.db.sql`SELECT ...`");
-    return run(cache.compile(strings, values));
-  };
+  // Built per transaction (every query and mutation has a `ctx.db.sql`): one closure, its `id` set on it directly.
   const tag = (first: unknown, ...rest: unknown[]): any => {
-    if (Array.isArray(first) && Array.isArray((first as any).raw)) return exec(first as unknown as TemplateStringsArray, rest);
+    if (Array.isArray(first) && Array.isArray((first as any).raw)) return runTemplate(run, cache, first as unknown as TemplateStringsArray, rest);
     const validator = first as GenericValidator;
     if (!validator || typeof validator !== "object" || !("shape" in validator)) bad("call it as a tag, or with a row validator: ctx.db.sql(v.object({...}))`...`");
     return (strings: TemplateStringsArray, ...values: unknown[]) =>
-      exec(strings, values).map((row, i) => {
+      runTemplate(run, cache, strings, values).map((row, i) => {
         const value = coerceRow(validator.shape, row);
         const r = validate(validator.shape, value, tableOfId ? { tableOfId } : {});
         if (!r.ok) throw new EmberError("ValidationError", `ctx.db.sql: row ${i} does not match the validator: ${r.path}: ${r.message}`, { path: r.path });
         return value;
       });
   };
-  return Object.assign(tag, { id: sqlId }) as SqlReader;
+  (tag as unknown as { id: typeof sqlId }).id = sqlId;
+  return tag as SqlReader;
 }
