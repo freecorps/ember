@@ -14,6 +14,9 @@
 //   - names of SQLite's and Cloudflare's internal tables (`sqlite_*`, `_cf_*`), quoted or not, except `sqlite_master`
 //     and `sqlite_schema` (the schema, read-only by nature). Any name: a column alias or a CTE called `sqlite_x` too
 //     (deciding which names are tables would need a parser, and `FROM sqlite_stat1 AS s` must not pass);
+//   - the same names as 'single-quoted strings' shaped like a name (SQLite reads a string as a name where only a name
+//     fits: `FROM '_cf_KV'`); a string value equal to one (`WHERE name = 'sqlite_sequence'`) is refused with them,
+//     a pattern (`'sqlite_%'`) is not;
 //   - what SQLite tokenizes differently from the plain reading: a NUL anywhere, a Tcl-style parameter `$a(...)`
 //     (and a BOM where a token starts is whitespace, as in SQLite, so `\uFEFF_cf_KV` is `_cf_KV`);
 //   - `pragma_*` table-valued functions, except the schema introspection ones (`pragma_table_info`,
@@ -214,6 +217,9 @@ const FORBIDDEN_FUNCTIONS = new Set(["load_extension", "readfile", "writefile", 
 /** Table-valued pragma functions that only read the schema: allowed. */
 export const ALLOWED_PRAGMA_FUNCTIONS: readonly string[] = ["pragma_table_info", "pragma_table_xinfo", "pragma_index_list", "pragma_index_info", "pragma_index_xinfo", "pragma_foreign_key_list"];
 
+/** A string SQLite could read as a name: identifier characters only (as the tokenizer has them). */
+const NAME_SHAPED = /^[\w$\u0080-\uffff]+$/;
+
 const ALLOWED_INTERNAL = new Set(["sqlite_master", "sqlite_schema", "sqlite_temp_master", "sqlite_temp_schema"]);
 
 export type ReadOnlySqlCheck =
@@ -271,8 +277,16 @@ export function checkReadOnlySql(sql: string): ReadOnlySqlCheck {
       params++;
       continue;
     }
-    if (t.kind !== "word" && t.kind !== "quoted") continue;
-    const name = t.value;
+    let name: string;
+    if (t.kind === "string") {
+      // SQLite takes a 'string' as a name where only a name fits (`FROM 'sqlite_sequence'`, `JOIN '_cf_KV'`,
+      // `main.'x'`, `'pragma_database_list'()`): one shaped like a name is checked as one. Not a LIKE pattern
+      // (`'sqlite_%'`), which names nothing.
+      const inner = t.text.slice(1, -1).replace(/''/g, "'");
+      if (!NAME_SHAPED.test(inner)) continue;
+      name = inner.toLowerCase();
+    } else if (t.kind === "word" || t.kind === "quoted") name = t.value;
+    else continue;
     if (t.kind === "word") {
       if (WRITE_KEYWORDS.has(name)) return refuse(`${t.text} is not allowed in a read-only query (a name spelled like it is written quoted: "${t.text}")`, t.at);
       // REPLACE is a statement (and INSERT OR REPLACE) but also the string function replace(x, y, z).

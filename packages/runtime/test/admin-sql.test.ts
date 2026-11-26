@@ -94,6 +94,9 @@ describe("POST /api/_ember/sql", () => {
       "WITH x AS (SELECT 1) \uFEFFDELETE FROM messages",
       "SELECT $a('x) , * FROM sqlite_sequence --')",
       "SELECT 1 -- \u0000\nDELETE FROM messages",
+      // A 'string' where only a name fits is a name to SQLite.
+      "SELECT * FROM '_cf_KV'",
+      "SELECT * FROM messages, 'sqlite_sequence'",
     ]) {
       const r = await sql(shard, text);
       expect([text, r.status, r.body.error.code]).toEqual([text, 400, "SqlRefused"]);

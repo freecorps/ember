@@ -39,6 +39,8 @@ describe("checkReadOnlySql: accepted", () => {
     "\uFEFFSELECT 1",
     " \uFEFF SELECT 1 \uFEFF",
     "SELECT :a::b, $c::d",
+    "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name <> 'sqlite x'",
+    "SELECT * FROM 'messages'",
     "SELECT * FROM pragma_table_info('messages')",
     "SELECT * FROM pragma_index_list('messages')",
     "SELECT json_extract(_json, '$.a') FROM t WHERE _id = :id OR _id = @id OR _id = $id OR _id = ?1",
@@ -141,6 +143,16 @@ describe("checkReadOnlySql: refused (adversarial)", () => {
     ["SELECT 1 /* \u0000 */", /NUL/],
     ["SELECT 1\u0000; DELETE FROM t", /NUL/],
     ["SELECT $ FROM t", /needs a name/],
+    // A 'string' is a name where only a name fits: shaped like a restricted one, it is refused.
+    ["SELECT * FROM 'sqlite_sequence'", /internal table/],
+    ["SELECT * FROM main.'sqlite_sequence'", /internal table/],
+    ["SELECT * FROM t, '_cf_KV'", /internal table/],
+    ["SELECT * FROM t CROSS JOIN '_CF_KV'", /internal table/],
+    ["SELECT * FROM (SELECT 1) LEFT JOIN '_cf_METADATA' ON 1", /internal table/],
+    ["SELECT * FROM 'pragma_database_list'", /only the schema pragmas/],
+    ["SELECT * FROM 'pragma_database_list'()", /only the schema pragmas/],
+    ["SELECT * FROM pragma_table_info('_cf_KV')", /internal table/],
+    ["SELECT * FROM t WHERE name = 'sqlite_sequence'", /internal table/],
     // A name is refused wherever it is: an alias or a CTE called like an internal table too (no parser here).
     ["SELECT 1 AS sqlite_version", /internal table/],
     ["WITH sqlite_x AS (SELECT 1) SELECT * FROM sqlite_x", /internal table/],
@@ -157,7 +169,7 @@ describe("checkReadOnlySql: refused (adversarial)", () => {
   it("agrees with SQLite where its tokenizer differs from a plain reading: these really read internal tables", () => {
     const db = new DatabaseSync(":memory:");
     db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v); INSERT INTO t (v) VALUES (1)");
-    for (const sql of ["SELECT * FROM \uFEFFsqlite_sequence", "SELECT $a('x) , * FROM sqlite_sequence --')", "SELECT :a('x) , * FROM sqlite_sequence --')"]) {
+    for (const sql of ["SELECT * FROM \uFEFFsqlite_sequence", "SELECT $a('x) , * FROM sqlite_sequence --')", "SELECT :a('x) , * FROM sqlite_sequence --')", "SELECT * FROM 'sqlite_sequence'", "SELECT * FROM main.'sqlite_sequence'"]) {
       expect(db.prepare(sql).all(), sql).toEqual([expect.objectContaining({ name: "t", seq: 1 })]);
       expect(ok(sql), sql).toBe(false);
     }
