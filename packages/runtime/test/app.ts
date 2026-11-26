@@ -177,6 +177,12 @@ const jobs = {
     args: { label: v.string() },
     handler: (ctx: M, { label }: { label: string }) => ctx.db.insert("runs", { label, at: ctx.now }),
   }),
+  /** `jobs:record` whose finished scheduled runs keep no `_jobs` row (`retainMs: 0`). */
+  recordEphemeral: internalMutation({
+    args: { label: v.string() },
+    retainMs: 0,
+    handler: (ctx: M, { label }: { label: string }) => ctx.db.insert("runs", { label, at: ctx.now }),
+  }),
   /** Records what the scheduler says of jobs job_gk0/job_gk1 and how many are pending (a batched job's view). */
   seeJobs: internalMutation({
     args: {},
@@ -333,6 +339,12 @@ const actions = {
   recordBig: internalAction({
     args: { label: v.string(), n: v.int64() },
     handler: async (ctx: ActionCtx, { label, n }: { label: string; n: bigint }) => ctx.runMutation("jobs:record" as any, { label: `${label}:${n}` } as any),
+  }),
+  /** `actions:record` whose finished scheduled runs keep no `_jobs` row (`retainMs: 0`). */
+  recordEphemeral: internalAction({
+    args: { label: v.string() },
+    retainMs: 0,
+    handler: async (ctx: ActionCtx, { label }: { label: string }) => ctx.runMutation("jobs:record" as any, { label } as any),
   }),
   /** A scheduled action job leased for 1 s when handed to the queue. */
   leased: internalAction({

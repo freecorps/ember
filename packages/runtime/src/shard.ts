@@ -66,7 +66,7 @@ import {
   type LocalOp,
   type LocalSearch,
 } from "./ai-indexes.ts";
-import { ActionRunner, actionDispatch, type ShardApi } from "./actions.ts";
+import { ActionRunner, ephemeralJobs, actionDispatch, type ShardApi } from "./actions.ts";
 import {
   ANON,
   DEFAULT_CREATE_ENGINE,
@@ -2723,11 +2723,22 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return r !== undefined && Number.isFinite(r) && r >= 0 ? r : JOB_RETENTION_MS;
   }
 
+  /** Whether a finished run of `fn` keeps its `_jobs` row: `scheduler.retainMs` above 0 and not `retainMs: 0` on `fn`. */
+  private retains(fn: string | undefined): boolean {
+    if (this.retainMs() <= 0) return false;
+    const ephemeral = ephemeralJobs(this.cfg);
+    return !ephemeral.size || fn === undefined || !ephemeral.has(fn);
+  }
+
   /** A pending job (or one handed to the Queue and not claimed) is cancelled: kept as `canceled`, or deleted. */
   private cancelRow(jobId: string): boolean {
     this.warmAll();
     const now = Date.now();
-    const r = this.retainMs() > 0
+    // With functions declared `retainMs: 0`, the row's function decides (one read; none otherwise).
+    const fn = this.retainMs() > 0 && ephemeralJobs(this.cfg).size
+      ? (this.driver.exec("SELECT fn FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched')", jobId).rows[0]?.fn as string | undefined)
+      : undefined;
+    const r = this.retains(fn)
       ? this.driver.exec("UPDATE _jobs SET state = 'canceled', dedup_key = NULL, run_at = ?, updated_at = ? WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", now, now, jobId)
       : this.driver.exec("DELETE FROM _jobs WHERE job_id = ? AND state IN ('pending', 'dispatched') RETURNING id", jobId);
     if (r.rows.length) this.jobChanged(jobId);
@@ -2738,7 +2749,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   private succeedJob(job: Record<string, unknown>): void {
     this.warmAll();
     const now = Date.now();
-    if (this.retainMs() > 0) this.driver.exec("UPDATE _jobs SET state = 'success', dedup_key = NULL, run_at = ?, updated_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?", now, now, job.id as number);
+    if (this.retains(job.fn as string)) this.driver.exec("UPDATE _jobs SET state = 'success', dedup_key = NULL, run_at = ?, updated_at = ?, attempts = attempts + 1, last_error = NULL WHERE id = ?", now, now, job.id as number);
     else this.driver.exec("DELETE FROM _jobs WHERE id = ?", job.id as number);
     this.jobChanged(job.job_id as string | null);
   }

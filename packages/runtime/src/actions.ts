@@ -77,7 +77,7 @@ export class ActionCallError extends Error {
 const callError = (e: WireError) => new ActionCallError(e.code, e.message, e.data, e.kind, e.status);
 
 type Fn = AnyRegisteredFunction | RegisteredHttpAction;
-const registry = new WeakMap<EmberConfig, { fns: Map<string, Fn>; scopes: ComponentScopes }>();
+const registry = new WeakMap<EmberConfig, { fns: Map<string, Fn>; scopes: ComponentScopes; ephemeral?: ReadonlySet<string> }>();
 
 function lookup(config: EmberConfig) {
   let r = registry.get(config);
@@ -86,6 +86,17 @@ function lookup(config: EmberConfig) {
     registry.set(config, r);
   }
   return r;
+}
+
+/** The mutations and actions declared `retainMs: 0`: a finished scheduled run of them keeps no `_jobs` row. */
+export function ephemeralJobs(config: EmberConfig): ReadonlySet<string> {
+  const r = lookup(config);
+  if (!r.ephemeral) {
+    const out = new Set<string>();
+    for (const [name, f] of r.fns) if (f.type !== "httpAction" && (f as AnyRegisteredFunction).retainMs === 0) out.add(name);
+    r.ephemeral = out;
+  }
+  return r.ephemeral;
 }
 
 const fail = (code: string, message: string): MutationOutcome => ({ ok: false, error: { code, message } });
