@@ -5080,10 +5080,12 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
   async sqlQuery(shard: string, input: SqlQueryInput): Promise<SqlQueryOutcome> {
     this.setShardName(shard);
     const r = runReadOnlySql(this.ctx.storage, input);
-    if (r.ok) {
-      this.driver.rowsRead += r.value.rowsRead;
+    // A statement that ran counts, failed or not (its reads are billed); a refused text never ran.
+    if (r.ok || r.code !== "SqlRefused") {
+      const read = r.ok ? r.value.rowsRead : (r.rowsRead ?? 0);
+      this.driver.rowsRead += read;
       this.driver.counters.select[0]++;
-      this.driver.counters.select[1] += r.value.rowsRead;
+      this.driver.counters.select[1] += read;
     }
     return r;
   }

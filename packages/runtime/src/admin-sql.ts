@@ -38,7 +38,8 @@ export interface SqlQueryResult {
   plan?: SqlPlanNode[];
 }
 
-export type SqlQueryOutcome = { ok: true; value: SqlQueryResult } | { ok: false; code: "SqlRefused" | "SqlError" | "SqlWrote"; message: string; data?: { at: number } };
+/** `rowsRead` on a failure: what the statement read before it failed (billed all the same); 0 when it never ran. */
+export type SqlQueryOutcome = { ok: true; value: SqlQueryResult } | { ok: false; code: "SqlRefused" | "SqlError" | "SqlWrote"; message: string; data?: { at: number }; rowsRead?: number };
 
 /** Answer size budget (approximate bytes of the cells): past it the rows stop and `truncated` is set. */
 export const SQL_BYTES_MAX = 4 * 1024 * 1024;
@@ -57,10 +58,12 @@ export function runReadOnlySql(storage: Pick<DurableObjectStorage, "sql" | "tran
   const params = input.params ?? [];
   const abort = new Abort("read-only");
   let result: SqlQueryResult | null = null;
+  let cursor: { rowsRead: number } | null = null;
   const t0 = performance.now();
   try {
     storage.transactionSync(() => {
       const cur = storage.sql.exec(text, ...params);
+      cursor = cur;
       const columns = [...cur.columnNames];
       const rows: SqlCell[][] = [];
       let truncated = false;
@@ -80,7 +83,7 @@ export function runReadOnlySql(storage: Pick<DurableObjectStorage, "sql" | "tran
       throw abort;
     });
   } catch (e) {
-    if (e !== abort) return { ok: false, code: "SqlError", message: (e as Error).message ?? String(e) };
+    if (e !== abort) return { ok: false, code: "SqlError", message: (e as Error).message ?? String(e), rowsRead: (cursor as { rowsRead: number } | null)?.rowsRead ?? 0 };
   }
   const r = result as SqlQueryResult | null;
   if (!r) return { ok: false, code: "SqlError", message: "the statement gave no answer" };
@@ -88,7 +91,7 @@ export function runReadOnlySql(storage: Pick<DurableObjectStorage, "sql" | "tran
   // at the cap without draining the cursor: draining a huge SELECT to look for writes would cost what the cap saves).
   // The abort is the guard that always holds; this one catches a write that happened before the rows were read (a DML
   // statement with RETURNING does all of its writes on the first step), which the text check refuses anyway.
-  if (r.rowsWritten > 0) return { ok: false, code: "SqlWrote", message: `the statement wrote ${r.rowsWritten} row(s): rolled back, refused` };
+  if (r.rowsWritten > 0) return { ok: false, code: "SqlWrote", message: `the statement wrote ${r.rowsWritten} row(s): rolled back, refused`, rowsRead: r.rowsRead };
   r.ms = performance.now() - t0;
   if (explain) r.plan = planTree(r.rows);
   return { ok: true, value: r };

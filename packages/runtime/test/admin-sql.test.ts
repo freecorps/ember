@@ -184,4 +184,20 @@ describe("runReadOnlySql (defense in depth)", () => {
     };
     expect(runReadOnlySql(storage, { sql: "DELETE FROM t" })).toMatchObject({ ok: false, code: "SqlRefused" });
   });
+
+  it("a statement that fails midway reports what it read (billed, counted in the shard's metrics)", () => {
+    const cursor = {
+      columnNames: ["n"],
+      rowsRead: 0,
+      rowsWritten: 0,
+      *raw() {
+        cursor.rowsRead = 3;
+        yield [1];
+        throw new Error("integer overflow");
+      },
+    };
+    const storage = { transactionSync: <T>(fn: () => T): T => fn(), sql: { exec: () => cursor } } as unknown as Parameters<typeof runReadOnlySql>[0];
+    expect(runReadOnlySql(storage, { sql: "SELECT n FROM t" })).toMatchObject({ ok: false, code: "SqlError", message: "integer overflow", rowsRead: 3 });
+    expect(runReadOnlySql(storage, { sql: "DELETE FROM t" })).not.toHaveProperty("rowsRead");
+  });
 });
