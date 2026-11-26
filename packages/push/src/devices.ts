@@ -188,7 +188,7 @@ export const PUSH_PRUNE_BATCH = 500;
 
 /**
  * Deletes devices not registered (`updatedAt`) for `olderThanMs` or more, oldest first, at most `limit` (default
- * `PUSH_PRUNE_BATCH`) per call: `{ deleted, more }`, `more` when the batch was full (call again, or schedule it).
+ * `PUSH_PRUNE_BATCH`) per call: `{ deleted, more }`, `more` when rows past the batch are left (call again, or schedule it).
  * `olderThanMs` must be at least `PUSH_DEVICE_REFRESH_MS` (24 h): an app that registers on every launch only
  * refreshes `updatedAt` once a day, so a shorter window would delete devices in use. Needs the `by_updated` index.
  */
@@ -202,9 +202,11 @@ export function pruneStalePushDevices(
   }
   const limit = Math.max(1, Math.floor(opts.limit ?? PUSH_PRUNE_BATCH));
   const cutoff = ctx.now - olderThanMs;
-  const stale = ctx.db.query(opts.table ?? PUSH_DEVICES_TABLE).withIndex("by_updated", (q) => q.lte("updatedAt", cutoff)).take(limit) as PushDevice[];
+  // One row past the batch says whether more are left, so a batch that empties the range ends the chain itself.
+  const found = ctx.db.query(opts.table ?? PUSH_DEVICES_TABLE).withIndex("by_updated", (q) => q.lte("updatedAt", cutoff)).take(limit + 1) as PushDevice[];
+  const stale = found.slice(0, limit);
   for (const d of stale) ctx.db.delete(d._id);
-  return { deleted: stale.length, more: stale.length >= limit };
+  return { deleted: stale.length, more: found.length > limit };
 }
 
 export function pushDevicesForUser(db: Db, userId: string, table = PUSH_DEVICES_TABLE): PushDevice[] {

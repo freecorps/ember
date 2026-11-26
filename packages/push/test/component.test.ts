@@ -14,7 +14,7 @@ import {
 } from "@freecorps/ember-server";
 import { createNodeSqliteDriver } from "@freecorps/ember-server/testing";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent,
+import { clearApnsTokenCache, clearFcmTokenCache, generateRecipient, openPushEnvelope, pushComponent, pushFunctions,
   setPushSeal, PushNotifications, registerPushDevice, toBase64url } from "../src/index.ts";
 import { RECEIPTS_DRAIN_LEASE_MS, RECEIPTS_DRAIN_STALE_MS, SEND_EMBED_FRESH_MS, SEND_EMBED_MAX_DEVICES, SEND_PRECHECK_MAX_USERS } from "../src/component.ts";
 import { fakeApns, fakeFcm, hexToken } from "./fakes.ts";
@@ -198,6 +198,22 @@ describe("push component", () => {
     expect(h.engine.runQuery("@push/lib:count").value).toBe(41);
   });
 
+  test("lib:count while by_provider is still backfilling (an install with devices before it): counts the rows", () => {
+    const rows = [{ provider: "apns" }, { provider: "fcm" }, { provider: "apns" }, {}];
+    const db = {
+      aggregate: () => {
+        throw Object.assign(new Error("Aggregate devices.by_provider is still backfilling"), { code: "IndexNotReady" });
+      },
+      query: () => ({ collect: () => rows }),
+    };
+    const count = pushFunctions.lib.count.handler as (ctx: unknown, a: { provider?: string }) => number;
+    expect(count({ db }, {})).toBe(4);
+    expect(count({ db }, { provider: "apns" })).toBe(2);
+    expect(count({ db }, { provider: "expo" })).toBe(0);
+    const broken = { ...db, aggregate: () => { throw new Error("other"); } };
+    expect(() => count({ db: broken }, {})).toThrow("other");
+  });
+
   test("pruneStale deletes devices not registered for a while, in batches continued by a job; fresh ones stay", async () => {
     const h = harness();
     const DAY = 24 * 3600_000;
@@ -210,8 +226,8 @@ describe("push component", () => {
     expect(h.mutate("chat:prune", { olderThanMs: 7 * DAY, limit: 2 })).toBe(2);
     expect(h.takeScheduled()).toEqual(["@push/lib:pruneStaleNext"]);
     await h.tick();
-    // 4 stale: 2 now, 2 in the next job (a full batch: it schedules one more, which finds none).
-    expect(h.takeScheduled()).toEqual(["@push/lib:pruneStaleNext"]);
+    // 4 stale: 2 now, 2 in the next job, which sees nothing past its batch and ends the chain (no empty extra job).
+    expect(h.takeScheduled()).toEqual([]);
     expect(h.engine.runQuery("@push/lib:count").value).toBe(2);
     expect(h.mutate("chat:devices", { user: "old0" })).toEqual(["ExponentPushToken[old0]"]);
     expect(h.mutate("chat:devices", { user: "new" })).toEqual(["ExponentPushToken[new]"]);

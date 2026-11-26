@@ -547,14 +547,23 @@ export const pushFunctions = {
         return removePushTokens(ctx.db, a.tokens, TABLE);
       },
     }),
-    /** Devices in this shard (of one provider when given): the `by_provider` aggregate, never the rows. */
+    /**
+     * Devices in this shard (of one provider when given): the `by_provider` aggregate (an empty group reads as 0).
+     * While it is still being built (an install that had devices before it), the rows are counted, as before it.
+     */
     count: internalQuery({
       args: { provider: v.optional(v.string()) },
       returns: v.number(),
-      handler: (ctx, a) =>
-        a.provider !== undefined
-          ? ctx.db.aggregate("devices", "by_provider").get([a.provider]).count
-          : ctx.db.aggregate("devices", "by_provider").range().reduce((n, g) => n + g.count, 0),
+      handler: (ctx, a) => {
+        try {
+          const agg = ctx.db.aggregate("devices", "by_provider");
+          return a.provider !== undefined ? agg.get([a.provider]).count : agg.range().reduce((n, g) => n + g.count, 0);
+        } catch (e) {
+          if ((e as { code?: unknown }).code !== "IndexNotReady") throw e;
+          const rows = ctx.db.query("devices").collect();
+          return a.provider !== undefined ? rows.filter((d) => d.provider === a.provider).length : rows.length;
+        }
+      },
     }),
     /**
      * Deletes devices not registered for `olderThanMs` or more (at least 24 h; see `pruneStalePushDevices`), up to
