@@ -40,6 +40,13 @@ export interface FunctionManifest {
   errorsDeclared?: true;
   /** The shard kind it runs in (`shard:`); `fromArg`: the argument clients route by; `fromClaim`: the identity's claim. */
   shard?: { kind: string; fromArg?: string; fromClaim?: string };
+  /** Public queries: anonymous `GET /api/query/<fn>` is edge-cached (`query({ cache })`, seconds). */
+  cache?: { maxAge: number; swr?: number };
+  /**
+   * Mutations and actions (`retainMs: 0`): a scheduled run that succeeds or is cancelled keeps no `_jobs` row; one that
+   * exhausts its attempts keeps its `failed` row until maintenance removes it (`scheduler.retainMs`), as any job.
+   */
+  retainMs?: 0;
 }
 
 /** One code of `defineErrors` (the payload shape, null when it carries none). */
@@ -307,7 +314,7 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
   const functions: FunctionManifest[] = [];
   for (const [name, x] of Object.entries(composed.functions)) {
     if (!x || typeof x !== "object" || (x as unknown as Record<symbol, unknown>)[IS_FUNCTION] !== true) continue;
-    const fn = x as unknown as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true; errors?: Array<{ code: string }>; declaresErrors?: true; shard?: { kind: string; fromArg?: string; fromClaim?: string } };
+    const fn = x as unknown as { type: FunctionManifest["type"]; visibility?: FunctionManifest["visibility"]; args?: ObjectShape; returns?: Shape; sensitive?: true; errors?: Array<{ code: string }>; declaresErrors?: true; shard?: { kind: string; fromArg?: string; fromClaim?: string }; cache?: { maxAge: number; swr?: number }; retainMs?: 0 };
     const entry: FunctionManifest = { name, type: fn.type, visibility: fn.visibility ?? "public" };
     if (name.startsWith("@")) entry.component = splitFunctionName(name).path.join("/");
     if (fn.sensitive) entry.sensitive = true;
@@ -315,6 +322,9 @@ export function buildManifest(loaded: LoadedProject): EmberManifest {
     if (fn.returns) entry.returns = fn.returns;
     if (fn.errors?.length || fn.declaresErrors) entry.errors = [...new Set((fn.errors ?? []).map((e) => e.code))].sort();
     if (fn.declaresErrors) entry.errorsDeclared = true;
+    // `swr: 0` is no stale window: the builder (`queryCacheOf`) drops it, and the manifest leaves it out the same way.
+    if (fn.cache) entry.cache = { maxAge: fn.cache.maxAge, ...(fn.cache.swr ? { swr: fn.cache.swr } : {}) };
+    if (fn.retainMs === 0) entry.retainMs = 0;
     if (fn.shard) {
       const shards = (composed.schema.manifest as { shards?: Record<string, { key: Shape }> }).shards ?? {};
       const key = shards[fn.shard.kind]?.key ?? (fn.shard.kind === "global" ? { kind: "string" } : undefined);

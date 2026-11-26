@@ -52,6 +52,13 @@ export async function main() {
 }
 `;
 
+// A query cached at the edge (`GET /api/query/<fn>`) and a mutation whose scheduled runs are ephemeral.
+const FEED = `import { mutation, query, v } from "@freecorps/ember-server";
+
+export const latest = query({ args: { channel: v.string() }, cache: { maxAge: 30, swr: 300 }, handler: (_ctx, { channel }) => channel });
+export const tick = mutation({ retainMs: 0, handler: () => null });
+`;
+
 function check(project: Project, file: string) {
   const program = ts.createProgram([join(project.root, file)], {
     strict: true, noEmit: true, target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler,
@@ -70,6 +77,7 @@ describe("codegen: typed HTTP routes, OpenAPI, AI guide", () => {
   beforeAll(async () => {
     project = sampleProject("codegen-http");
     writeFileSync(join(project.dir, "http.ts"), HTTP);
+    writeFileSync(join(project.dir, "feed.ts"), FEED);
     writeFileSync(join(project.root, "client.ts"), CLIENT);
     result = await codegen(project);
   });
@@ -116,6 +124,21 @@ describe("codegen: typed HTTP routes, OpenAPI, AI guide", () => {
     ]);
     expect(doc.paths["/channels/{channel}/messages"].post.requestBody.content["application/json"].schema.properties.body).toMatchObject({ minLength: 1, maxLength: 2000, description: "Markdown text" });
     expect(doc.components.schemas.MessageTooLong.properties.data).toMatchObject({ type: "object", required: ["max"] });
+    // Only queries declared with `cache` also answer GET (the args in `?args=`).
+    expect(doc.paths["/api/query/messages:list"].get).toBeUndefined();
+    const cached = doc.paths["/api/query/feed:latest"].get;
+    expect(cached.operationId).toBe("feed_latest_get");
+    expect(cached.description).toContain("public, max-age=30, stale-while-revalidate=300");
+    expect(cached.parameters.map((p: { name: string }) => p.name)).toEqual(["shard", "args"]);
+    expect(cached.parameters[1].content["application/json"].schema).toMatchObject({ type: "object", required: ["channel"] });
+    expect(doc.paths["/api/query/feed:latest"].post).toBeDefined();
+  });
+
+  it("the manifest carries cache and retainMs", () => {
+    const byName = new Map(result.manifest.functions.map((f) => [f.name, f]));
+    expect(byName.get("feed:latest")).toMatchObject({ type: "query", cache: { maxAge: 30, swr: 300 } });
+    expect(byName.get("feed:tick")).toMatchObject({ type: "mutation", retainMs: 0 });
+    expect(byName.get("messages:list")?.cache).toBeUndefined();
   });
 
   it("writes the AI guide and the client args shapes", async () => {
@@ -127,6 +150,6 @@ describe("codegen: typed HTTP routes, OpenAPI, AI guide", () => {
     expect(guide).toMatch(/- `api\.messages\.send` — Mutation<\{ channel: string; author: string; body: string; \}, \{ id: Id<"messages">; at: number; \}, E\.MessageTooLong>/);
     expect(guide).toContain("- `GET /channels/:channel/messages`: The latest messages of a channel");
     const { argShapes } = (await import(join(project.generatedDir, "validators.js"))) as { argShapes: Record<string, unknown> };
-    expect(Object.keys(argShapes).sort()).toEqual(["messages:count", "messages:digest", "messages:edit", "messages:list", "messages:send"]);
+    expect(Object.keys(argShapes).sort()).toEqual(["feed:latest", "feed:tick", "messages:count", "messages:digest", "messages:edit", "messages:list", "messages:send"]);
   });
 });

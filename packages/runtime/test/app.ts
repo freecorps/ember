@@ -180,6 +180,12 @@ const jobs = {
     args: { label: v.string() },
     handler: (ctx: M, { label }: { label: string }) => ctx.db.insert("runs", { label, at: ctx.now }),
   }),
+  /** `jobs:record` whose finished scheduled runs keep no `_jobs` row (`retainMs: 0`). */
+  recordEphemeral: internalMutation({
+    args: { label: v.string() },
+    retainMs: 0,
+    handler: (ctx: M, { label }: { label: string }) => ctx.db.insert("runs", { label, at: ctx.now }),
+  }),
   /** Records what the scheduler says of jobs job_gk0/job_gk1 and how many are pending (a batched job's view). */
   seeJobs: internalMutation({
     args: {},
@@ -337,11 +343,25 @@ const actions = {
     args: { label: v.string(), n: v.int64() },
     handler: async (ctx: ActionCtx, { label, n }: { label: string; n: bigint }) => ctx.runMutation("jobs:record" as any, { label: `${label}:${n}` } as any),
   }),
+  /** `actions:record` whose finished scheduled runs keep no `_jobs` row (`retainMs: 0`). */
+  recordEphemeral: internalAction({
+    args: { label: v.string() },
+    retainMs: 0,
+    handler: async (ctx: ActionCtx, { label }: { label: string }) => ctx.runMutation("jobs:record" as any, { label } as any),
+  }),
   /** A scheduled action job leased for 1 s when handed to the queue. */
   leased: internalAction({
     args: { label: v.string() },
     leaseMs: 1000,
     handler: async (ctx: ActionCtx, { label }: { label: string }) => ctx.runMutation("jobs:record" as any, { label } as any),
+  }),
+  /** `actions:record` after 2 s (default lease): a slow job of a batch. */
+  slowRecord: internalAction({
+    args: { label: v.string() },
+    handler: async (ctx: ActionCtx, { label }: { label: string }) => {
+      await new Promise((r) => setTimeout(r, 2000));
+      return ctx.runMutation("jobs:record" as any, { label } as any);
+    },
   }),
   /** Always runs in the shard's alarm, never through the queue. */
   local: internalAction({
@@ -591,7 +611,23 @@ const tenant = {
   }),
 };
 
-export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared, tallies, tenant };
+/** Queries declared with `cache` (anonymous `GET /api/query/<fn>` is edge-cached). */
+const byChannel = (ctx: Q, channel: string) => ctx.db.query("messages").withIndex("by_channel", (q: any) => q.eq("channel", channel)).collect().map((m: { body: string }) => m.body);
+const cached = {
+  list: query({ args: { channel: v.string() }, cache: { maxAge: 60 }, handler: (ctx: Q, { channel }: { channel: string }) => byChannel(ctx, channel) }),
+  /** Fresh for 1 s, then served stale for 60 s while it is refreshed. */
+  swr: query({ args: { channel: v.string() }, cache: { maxAge: 1, swr: 60 }, handler: (ctx: Q, { channel }: { channel: string }) => byChannel(ctx, channel) }),
+  /** Per signed-in user: anonymous and signed-in answers differ. */
+  who: query({ cache: { maxAge: 60 }, handler: (ctx: Q) => ctx.auth.getUserIdentity()?.subject ?? "anonymous" }),
+  /** Fails for anonymous callers: an error is never stored. */
+  members: query({ cache: { maxAge: 60 }, handler: (ctx: Q) => ctx.auth.require().subject }),
+  /** Routed by its argument (`room:<room>`). */
+  room: query({ args: { room: v.string() }, shard: { room: "room" }, cache: { maxAge: 60 }, handler: (ctx: Q, { room }: { room: string }) => byChannel(ctx, room) }),
+  /** The keys of a record argument, `__proto__` included (a key of the args the cache key must keep). */
+  keys: query({ args: { data: v.record(v.string()) }, cache: { maxAge: 60 }, handler: (_ctx: Q, { data }: { data: Record<string, string> }) => Object.keys(data) }),
+};
+
+export const functionsV1 = { messages, runs, jobs, auth, misc, actions, users, files, wide, typed, shared, tallies, tenant, cached };
 
 export const functionsV2 = {
   ...functionsV1,
