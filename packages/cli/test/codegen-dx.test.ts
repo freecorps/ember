@@ -417,6 +417,8 @@ describe("codegen DX (docs/design/dx.md)", () => {
     mkdirSync(sibling, { recursive: true });
     try {
       writeFileSync(join(sibling, "types.ts"), "export type Remote = { id: string };\n");
+      // Its package.json can pick the declaration an import resolves to (`types`): a source too.
+      writeFileSync(join(sibling, "package.json"), JSON.stringify({ name: "shared", types: "types.ts" }));
       writeFileSync(join(project.dir, "remote.ts"), `import type { Remote } from "../${siblingRel}";\nimport { query } from "./_generated/server";\nexport const remote = query((): Remote => ({ id: "r" }));\n`);
       // ember/http.ts is evaluated (routes), never part of the type-checked program.
       writeFileSync(join(project.root, "route-shapes.ts"), 'import { v } from "@freecorps/ember-server";\nexport const shape = v.object({ ok: v.boolean() });\n');
@@ -426,7 +428,11 @@ describe("codegen DX (docs/design/dx.md)", () => {
       );
       await codegen(project);
       const files = currentManifest(project)?.manifest.sources?.files ?? [];
-      expect(files).toEqual(expect.arrayContaining([siblingRel, "route-shapes.ts"]));
+      expect(files).toEqual(expect.arrayContaining([siblingRel, `../${basename(sibling)}/package.json`, "route-shapes.ts"]));
+      writeFileSync(join(sibling, "package.json"), JSON.stringify({ name: "shared", types: "types2.d.ts" }));
+      expect(currentManifest(project)).toBeNull();
+      writeFileSync(join(sibling, "package.json"), JSON.stringify({ name: "shared", types: "types.ts" }));
+      expect(currentManifest(project)).not.toBeNull();
       // Installed dependencies stay out (package.json and the lockfile stand for them).
       expect(files.some((f) => f.split("/").includes("node_modules"))).toBe(false);
       writeFileSync(join(sibling, "types.ts"), "export type Remote = { id: string; n: number };\n");

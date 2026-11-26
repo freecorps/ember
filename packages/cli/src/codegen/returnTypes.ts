@@ -172,7 +172,10 @@ export class TypeOracle {
 
   /** The files of the last `infer`'s program (absolute). */
   programFiles(): string[] {
-    return this.builder?.getProgram().getSourceFiles().map((sf) => sf.fileName) ?? [];
+    const inferred = this.builder?.getProgram().getSourceFiles().map((sf) => sf.fileName) ?? [];
+    // The claims answer is a program of its own: the files auth.config.ts read (type-only imports included) count too,
+    // also when the answer came from the cache file.
+    return [...inferred, ...(this.claimsCache?.files ?? [])];
   }
 
   /** A compiler host reading `virtual` files from memory and keeping one SourceFile per (file, text). */

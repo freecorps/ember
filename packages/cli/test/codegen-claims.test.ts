@@ -6,6 +6,7 @@ import { join } from "node:path";
 import ts from "typescript";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { codegen } from "../src/codegen/index.ts";
+import { currentManifest } from "../src/codegen/current.ts";
 import { TypeOracle } from "../src/codegen/returnTypes.ts";
 import { loadProject, type Project } from "../src/config.ts";
 import { init } from "../src/init.ts";
@@ -121,6 +122,27 @@ describe("typed identity claims (ember/auth.config.ts → _generated/claims.d.ts
     writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
     await codegen(project, { oracle: new TypeOracle() });
     expect(gen(project, "claims.d.ts")).toContain('  role?: "admin" | "member";\n};');
+  });
+
+  it("a type auth.config.ts imports from outside ember/ (type only) is a source: editing it makes the manifest stale", async () => {
+    writeFileSync(join(project.root, "roles.ts"), 'export type Role = "admin" | "member";\n');
+    try {
+      writeFileSync(
+        join(project.dir, "auth.config.ts"),
+        AUTH_CONFIG(`{ role: (user.role === "admin" ? "admin" : "member") as Role }`).replace(
+          'import { organization }',
+          'import type { Role } from "../roles";\nimport { organization }',
+        ),
+      );
+      await codegen(project, { oracle });
+      expect(currentManifest(project)?.manifest.sources?.files).toContain("roles.ts");
+      writeFileSync(join(project.root, "roles.ts"), 'export type Role = "admin" | "member" | "guest";\n');
+      expect(currentManifest(project)).toBeNull();
+    } finally {
+      writeFileSync(join(project.dir, "auth.config.ts"), AUTH_CONFIG(ROLE));
+      rmSync(join(project.root, "roles.ts"), { force: true });
+      await codegen(project, { oracle });
+    }
   });
 
   it("a literal containing the word any is a fine claim; a brand prints structurally (claims.d.ts imports nothing)", async () => {

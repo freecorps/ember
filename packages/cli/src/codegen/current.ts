@@ -4,7 +4,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import ts from "typescript";
 import type { Project } from "../config.ts";
 import type { EmberManifest } from "./index.ts";
@@ -48,7 +48,9 @@ const isSourcePath = (rel: string) => rel.length > 0 && !rel.includes("\u0000") 
 /**
  * The files codegen read (`files`: the type-checked program's, the evaluated bundle's) that are outside ember/: in the
  * project (`shared/types.ts`) or around it (`../shared/src/types.ts`, a sibling workspace package), but not installed
- * dependencies (node_modules, whose changes package.json and the lockfile stand for).
+ * dependencies (node_modules, whose changes package.json and the lockfile stand for). For a file around the project,
+ * the nearest package.json above it too: its `types`/`exports` choose which declaration an import resolves to, so a
+ * change there changes the contract with no declaration file changing.
  */
 export function outsideFiles(project: Project, files: Iterable<string>): string[] {
   const out = new Set<string>();
@@ -58,8 +60,27 @@ export function outsideFiles(project: Project, files: Iterable<string>): string[
     const rel = relative(project.root, f);
     if (!isSourcePath(rel)) continue;
     out.add(toPosix(rel));
+    if (rel.startsWith("..")) {
+      const pkg = nearestPackageJson(dirname(f));
+      if (pkg) {
+        const pr = relative(project.root, pkg);
+        if (isSourcePath(pr)) out.add(toPosix(pr));
+      }
+    }
   }
   return [...out].sort();
+}
+
+/** The package.json in `dir` or the closest directory above it (null when there is none, or it is under node_modules). */
+function nearestPackageJson(dir: string): string | null {
+  for (let d = dir; ; ) {
+    if (d.split(/[\\/]/).includes("node_modules")) return null;
+    const p = join(d, "package.json");
+    if (existsSync(p)) return p;
+    const up = dirname(d);
+    if (up === d) return null;
+    d = up;
+  }
 }
 
 /** sha256 of the sources: every file under ember/ (paths and contents), `extra` (root-relative) and the root's config files. */
