@@ -30,6 +30,15 @@ function Cursors() {
   return <p data-testid="cursors">{cursors.map((c) => `${c.user}@${c.at.x},${c.at.y}`).join(",")}</p>;
 }
 
+function Keeper() {
+  usePresence("room:a");
+  return null;
+}
+function Switcher({ room, name }: { room: string; name: string }) {
+  const { status } = usePresence<{ name: string }>(room, { state: { name } });
+  return <p data-testid="switch">{`${room}:${status}`}</p>;
+}
+
 describe("presence hooks", () => {
   it("members, typing and cursors; a cursor move re-renders only the cursors", async () => {
     const server = new FakeEmberServer({ ephemeral: true });
@@ -68,6 +77,35 @@ describe("presence hooks", () => {
     cleanup();
     await waitFor(() => expect(bia.members().map((m) => m.user)).toEqual(["bia"]));
     bia.close();
+    client.close();
+    other.close();
+  });
+
+  it("a hook that moves to another room sends its new state there, never through the room it left", async () => {
+    const server = new FakeEmberServer({ ephemeral: true });
+    const make = (user: string) => new EmberClient({ url: "https://ember.test", WebSocket: server.WebSocket, fetch: server.fetch, connectivity: null, heartbeat: false, defaultShard: "global:main", backoff: { initialMs: 5, maxMs: 10 }, auth: () => `user:${user}` });
+    const client = make("ana");
+    const other = make("bia");
+    const inA = new Presence<{ name: string }>(other, "room:a");
+    const inB = new Presence<{ name: string }>(other, "room:b");
+    const anaIn = (p: Presence<{ name: string }>) => p.members().find((m) => m.user === "ana")?.state?.name;
+    const ui = (room: string, name: string) => (
+      <EmberProvider client={client}>
+        <Keeper />
+        <Switcher room={room} name={name} />
+      </EmberProvider>
+    );
+    const { rerender } = render(ui("room:a", "A"));
+    await waitFor(() => expect(anaIn(inA)).toBe("A"));
+    // Room a stays held (Keeper): the switch must not hand it B's state.
+    rerender(ui("room:b", "B"));
+    await waitFor(() => expect(screen.getByTestId("switch").textContent).toBe("room:b:joined"));
+    await waitFor(() => expect(anaIn(inB)).toBe("B"));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(anaIn(inA)).toBe("A");
+    cleanup();
+    inA.close();
+    inB.close();
     client.close();
     other.close();
   });

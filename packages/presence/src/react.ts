@@ -62,10 +62,15 @@ const none = () => EMPTY;
 
 function useRoom<S, C>(room: string, opts: PresenceOptions<S>): Presence<S, C> | null {
   const client = useEmberClient() as unknown as ChannelSource;
-  const [presence, setPresence] = useState<Presence<S, C> | null>(null);
+  const { shard, cursorThrottleMs, typingTimeoutMs, cursorTimeoutMs } = opts;
+  // The retained `Presence` with the room it is of: after a room change, the previous one is never handed out (nor
+  // told this render's state) while the effect has not retained the new one yet.
+  const [held, setHeld] = useState<{ client: ChannelSource; shard: string | undefined; room: string; presence: Presence<S, C> } | null>(null);
+  const presence = held && held.client === client && held.shard === shard && held.room === room ? held.presence : null;
   const state = useRef(opts.state);
   state.current = opts.state;
-  const { shard, cursorThrottleMs, typingTimeoutMs, cursorTimeoutMs } = opts;
+  // The state (JSON) the current `Presence` holds from this hook: what `retainPresence` gave it, then each update.
+  const sent = useRef<string | undefined>(undefined);
   useEffect(() => {
     const { presence: p, release } = retainPresence<S, C>(client, room, {
       ...(shard !== undefined ? { shard } : {}),
@@ -74,15 +79,12 @@ function useRoom<S, C>(room: string, opts: PresenceOptions<S>): Presence<S, C> |
       ...(typingTimeoutMs !== undefined ? { typingTimeoutMs } : {}),
       ...(cursorTimeoutMs !== undefined ? { cursorTimeoutMs } : {}),
     });
-    setPresence(p);
-    return () => {
-      release();
-      setPresence(null);
-    };
+    sent.current = state.current === undefined ? undefined : JSON.stringify(state.current);
+    setHeld({ client, shard, room, presence: p });
+    return release;
   }, [client, room, shard, cursorThrottleMs, typingTimeoutMs, cursorTimeoutMs]);
-  // A new state (by value) is sent as a member update.
+  // A new state (by value) is sent as a member update, to this room's `Presence` only.
   const json = opts.state === undefined ? undefined : JSON.stringify(opts.state);
-  const sent = useRef<string | undefined>(json);
   useEffect(() => {
     if (!presence || json === undefined || json === sent.current) return;
     sent.current = json;
