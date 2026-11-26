@@ -14,7 +14,7 @@
 // The budget counts documents, not time: the Workers clock does not move during synchronous code, and the shard's
 // row limits are what a transaction can run into.
 
-import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type PatchValue } from "@freecorps/ember-server";
+import { componentBuilders, defineComponent, defineSchema, defineTable, EmberError, paginationOptsValidator, unsafeRef, v, type ComponentCtx, type DataModelFromSchema, type PatchValue } from "@freecorps/ember-server";
 
 const status = v.union(v.literal("running"), v.literal("done"), v.literal("failed"), v.literal("canceled"));
 const nextItem = v.object({ name: v.string(), fn: v.string() });
@@ -49,7 +49,10 @@ const schema = defineSchema({
       startedAt: v.number(),
       updatedAt: v.number(),
       finishedAt: v.optional(v.number()),
-    }).index("by_name", ["name"]),
+    })
+      .index("by_name", ["name"])
+      // The dashboard's table of one status (`lib:runs`).
+      .index("by_status", ["status", "name"]),
   },
 });
 
@@ -288,18 +291,17 @@ export const functions = {
     }),
 
     /**
-     * Every migration in this shard with its function handle (the dashboard's table: resuming one runs `lib:start`
-     * with its name and handle).
+     * The migrations in this shard by name, a page at a time (one status through `by_status`), with their function
+     * handle: the dashboard's table (resuming one runs `lib:start` with the row's `name` and raw handle `fn`;
+     * `function` is only the name shown).
      */
     runs: internalQuery({
-      args: { status: v.optional(status) },
-      handler: (ctx, { status: s }) =>
-        ctx.db
-          .query("migrations")
-          .withIndex("by_name")
-          .collect()
-          .filter((r) => s === undefined || r.status === s)
-          .map((r) => ({ ...view(r), fn: r.fn, function: r.fn.startsWith("&") ? r.fn.slice(1) : r.fn, pendingJob: r.pendingJob ?? null })),
+      args: { status: v.optional(status), paginationOpts: paginationOptsValidator },
+      handler: (ctx, { status: s, paginationOpts }) => {
+        const q = s !== undefined ? ctx.db.query("migrations").withIndex("by_status", (r) => r.eq("status", s)) : ctx.db.query("migrations").withIndex("by_name");
+        const page = q.paginate(paginationOpts);
+        return { ...page, page: page.page.map((r) => ({ ...view(r), fn: r.fn, function: r.fn.startsWith("&") ? r.fn.slice(1) : r.fn, pendingJob: r.pendingJob ?? null })) };
+      },
     }),
 
     // ---------------------------------------------------------------------------------------- internal loop

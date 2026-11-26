@@ -477,9 +477,13 @@ describe("migrations dashboard", () => {
     probe.failOn = "org4";
     h.mutate("api:run", { name: "addPlan" });
     h.tick();
-    const runs = h.engine.runQuery("@migrations/lib:runs", {}).value as Array<{ name: string; status: string; fn: string; function: string }>;
-    expect(runs.map((r) => [r.name, r.status, r.function])).toEqual([["defs:addPlan", "failed", "defs:addPlan"]]);
-    expect((h.engine.runQuery("@migrations/lib:runs", { status: "done" }).value as unknown[]).length).toBe(0);
+    const runsOf = (args: object) => (h.engine.runQuery("@migrations/lib:runs", { paginationOpts: { numItems: 10, cursor: null }, ...args }).value as { page: Array<{ name: string; status: string; fn: string; function: string }> }).page;
+    const runs = runsOf({});
+    // `fn` is the raw handle lib:start takes (the screen's Resume passes it); `function` only shows the name.
+    expect(runs.map((r) => [r.name, r.status, r.fn, r.function])).toEqual([["defs:addPlan", "failed", "&defs:addPlan", "defs:addPlan"]]);
+    expect(runsOf({ status: "done" })).toHaveLength(0);
+    expect(runsOf({ status: "failed" }).map((r) => r.name)).toEqual(["defs:addPlan"]);
+    expect(spec!.tabs[0]!.blocks[0]).toMatchObject({ kind: "table", pageSize: 25 });
     // "Resume" is lib:start with the row's name and handle: it continues from the cursor.
     probe.failOn = "";
     h.mutate("@migrations/lib:start", { name: runs[0]!.name, fn: runs[0]!.fn });
