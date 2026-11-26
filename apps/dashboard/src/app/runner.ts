@@ -33,9 +33,19 @@ export const HISTORY_KEY = "ember-dashboard-runs";
 
 /** The history, newest first; [] when storage is unavailable or holds something else. */
 export function loadHistory(): RunEntry[] {
+  return stored() ?? [];
+}
+
+/** The stored history, or null when storage cannot be read (then the page's own list is all there is). */
+function stored(): RunEntry[] | null {
+  let raw: string | null;
   try {
-    const raw = localStorage.getItem(HISTORY_KEY);
-    if (!raw) return [];
+    raw = localStorage.getItem(HISTORY_KEY);
+  } catch {
+    return null;
+  }
+  if (!raw) return [];
+  try {
     const v: unknown = JSON.parse(raw);
     return Array.isArray(v) ? (v.filter(isEntry) as RunEntry[]).slice(0, HISTORY_MAX) : [];
   } catch {
@@ -48,7 +58,10 @@ function isEntry(x: unknown): boolean {
   return !!e && typeof e === "object" && typeof e.id === "string" && typeof e.fn === "string" && typeof e.shard === "string" && !!e.args && typeof e.args === "object" && !Array.isArray(e.args);
 }
 
-/** Adds a run (newest first, HISTORY_MAX kept) and returns the new list; storage failures keep it in memory only. */
+/**
+ * Adds a run (newest first, HISTORY_MAX kept) and returns the new list; storage failures keep it in memory only.
+ * Built on the history stored now, not on `list` (the page's copy): another tab's runs and clears are kept.
+ */
 export function saveRun(list: RunEntry[], entry: Omit<RunEntry, "id" | "result"> & { result: unknown }): RunEntry[] {
   let text: string;
   try {
@@ -57,15 +70,25 @@ export function saveRun(list: RunEntry[], entry: Omit<RunEntry, "id" | "result">
     text = String(entry.result);
   }
   const e: RunEntry = { ...entry, id: `${entry.at.toString(36)}-${Math.random().toString(36).slice(2, 8)}`, result: text.length > RESULT_MAX ? `${text.slice(0, RESULT_MAX)}…` : text };
-  const next = [e, ...list].slice(0, HISTORY_MAX);
+  const next = [e, ...(stored() ?? list)].slice(0, HISTORY_MAX);
   write(next);
   return next;
 }
 
+/** Drops a function's runs (of one project and environment), from the history stored now (as `saveRun`). */
 export function clearHistory(list: RunEntry[], scope: { project: string; env: string; fn: string }): RunEntry[] {
-  const next = list.filter((e) => e.project !== scope.project || e.env !== scope.env || e.fn !== scope.fn);
+  const next = (stored() ?? list).filter((e) => e.project !== scope.project || e.env !== scope.env || e.fn !== scope.fn);
   write(next);
   return next;
+}
+
+/** Signing out forgets the history (args, results and act-as subjects of the runs of whoever used this browser). */
+export function forgetHistory(): void {
+  try {
+    localStorage.removeItem(HISTORY_KEY);
+  } catch {
+    // storage unavailable: nothing was kept
+  }
 }
 
 function write(list: RunEntry[]): void {
@@ -93,7 +116,8 @@ export function curlFor(o: { url: string | null; shard: string; fn: string; args
 
 const IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 /** Words a property name may be without quotes in a TS object literal or after a dot (all of them, in ES5+). */
-const prop = (k: string) => (IDENT.test(k) ? k : JSON.stringify(k));
+// `__proto__: v` in a literal sets the prototype instead of a key: a computed key keeps it an own property.
+const prop = (k: string) => (k === "__proto__" ? `["__proto__"]` : IDENT.test(k) ? k : JSON.stringify(k));
 const member = (k: string) => (IDENT.test(k) ? `.${k}` : `[${JSON.stringify(k)}]`);
 
 /** A JSON value as a TypeScript literal: identifier keys unquoted, strings JSON-quoted (valid TS), indented. */

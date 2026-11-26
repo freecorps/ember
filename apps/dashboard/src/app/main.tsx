@@ -32,6 +32,7 @@ import { SqlExplorer } from "./pages/sql.tsx";
 import type { Project, ShardRow } from "./pages/types.ts";
 import { Dialog, Loading, Mono, Problem, Toasts, type ToastItem } from "./ui.tsx";
 import { Palette, usePaletteShortcut } from "./palette.tsx";
+import { forgetHistory } from "./runner.ts";
 
 const SECTIONS = [
   { id: "health", label: "Health", key: "h" },
@@ -472,6 +473,7 @@ function App() {
       me={me.data}
       onSignOut={() => {
         session.setToken(null);
+        forgetHistory();
         me.reload();
       }}
     />

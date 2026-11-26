@@ -4,7 +4,7 @@
 // The runner keeps the last runs in this browser (localStorage, runner.ts) to run one again, and copies the call as
 // cURL (the admin token as the `$EMBER_ADMIN_TOKEN` placeholder, never a real one) or as TypeScript.
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, ApiError, path } from "../api.ts";
 import { TimeChart } from "../chart.tsx";
 import { ago, fmtBytes, fmtNum, fmtPct, fmtTime, windowLabel, windows } from "../format.ts";
@@ -12,7 +12,7 @@ import { href, useApi, useSession } from "../hooks.ts";
 import { Badge, ConfirmDialog, Dialog, Empty, JsonView, Loading, Mono, Problem, Section, Table } from "../ui.tsx";
 import { limitWarnings, seriesPeaks } from "../../metrics-sql.ts";
 import type { FunctionRow, Project } from "./types.ts";
-import { clearHistory, curlFor, loadHistory, saveRun, tsFor, type RunEntry } from "../runner.ts";
+import { clearHistory, curlFor, HISTORY_KEY, loadHistory, saveRun, tsFor, type RunEntry } from "../runner.ts";
 import { argsFromForm, fieldKind, type Shape } from "../forms.ts";
 
 /** What p50/p95 measure per timing label (@freecorps/ember-runtime metrics.ts). */
@@ -253,6 +253,14 @@ function Runner({ project, env, info, url }: { project: string; env: string; inf
   const [result, setResult] = useState<{ ok: boolean; value?: unknown; error?: unknown; ms?: number; as?: string | null } | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
   const [history, setHistory] = useState<RunEntry[]>(loadHistory);
+  // Another tab ran or cleared something: show the stored history.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === HISTORY_KEY || e.key === null) setHistory(loadHistory());
+    };
+    addEventListener("storage", onStorage);
+    return () => removeEventListener("storage", onStorage);
+  }, []);
   const mine = history.filter((e) => e.project === project && e.env === env && e.fn === info.name);
   /** The run waiting for the protected environment's confirmation (the form's, or a history entry's). */
   const [pending, setPending] = useState<RunInput | null>(null);
@@ -295,7 +303,8 @@ function Runner({ project, env, info, url }: { project: string; env: string; inf
 
   const current = (): RunInput | null => (args ? { args, shard: target, as: asUser.trim() ? { subject: asUser.trim(), ...(claimsObj ? { claims: claimsObj } : {}) } : null } : null);
   const record = (input: RunInput, ok: boolean, value: unknown, ms: number | null) =>
-    setHistory((h) => saveRun(h, { at: Date.now(), project, env, fn: info.name, type: info.type, shard: input.shard, args: input.args, ...(input.as ? { as: input.as.subject, ...(input.as.claims ? { claims: input.as.claims } : {}) } : {}), ok, result: value, ms }));
+    // Written here, not in a state updater (React may call one twice): saveRun reads and writes the stored history.
+    setHistory(saveRun(history, { at: Date.now(), project, env, fn: info.name, type: info.type, shard: input.shard, args: input.args, ...(input.as ? { as: input.as.subject, ...(input.as.claims ? { claims: input.as.claims } : {}) } : {}), ok, result: value, ms }));
 
   const run = async (input: RunInput) => {
     setBusy(true);
@@ -464,7 +473,7 @@ function Runner({ project, env, info, url }: { project: string; env: string; inf
         </div>
       )}
     </form>
-      <RunHistory entries={mine} busy={busy} onLoad={(e) => load(e, false)} onRerun={(e) => load(e, true)} onClear={() => setHistory((h) => clearHistory(h, { project, env, fn: info.name }))} />
+      <RunHistory entries={mine} busy={busy} onLoad={(e) => load(e, false)} onRerun={(e) => load(e, true)} onClear={() => setHistory(clearHistory(history, { project, env, fn: info.name }))} />
       {/* Outside the form: the dialog has its own form, and forms do not nest. */}
       <ConfirmDialog open={confirming} title={`Run ${info.name} on ${env}?`} confirmLabel={`Run ${info.type}`} busy={busy} onCancel={() => (setConfirming(false), setPending(null))} onConfirm={() => pending && void run(pending)}>
         <p>
