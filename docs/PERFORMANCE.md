@@ -104,7 +104,7 @@ mesma máquina) e o teste `packages/cli/test/lazy-actions.test.ts`:
 | rajada de 40 puts + 40 removes da fila: transações de escrita (SQLite, IndexedDB, TinyBase) | 80 | **2** |
 | idem, SQLite em arquivo | 18,5 ms | **0,8 ms** |
 | mesmo valor de novo (200 linhas, N abas), objetos do cliente / clone estruturado | 57 / 98 µs | **4,3** / 111 µs |
-| ponte: rajada de 20 updates, mensagens página→Worker / Worker→página | 20 / 22 | **1 / 3** |
+| ponte: rajada de 20 updates, mensagens página→Worker / Worker→página | 20 / 21 | **1 / 2** |
 | ponte: resultado observado (500 linhas, 1 mudou), bytes Worker→página | 102 KB | **404 B** |
 | Worker com um módulo só de actions que importa ~195 KiB: módulos avaliados no startup | 896 KiB | **702 KiB** |
 
