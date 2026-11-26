@@ -1,6 +1,6 @@
 // `ember dev` end to end in Miniflare: one incremental esbuild context for the session's Worker bundles, and the
 // watchers on ember/, .dev.vars (new values, no rebuild) and ember.json (config loaded again, rebuilt).
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildWorker, createWorkerBuildContext } from "../src/build.ts";
@@ -87,6 +87,43 @@ describe("ember dev", () => {
     expect(await env("EMBER_LOCATION_HINT")).toBe("v2:weur");
     writeFileSync(join(dir, "ember.json"), JSON.stringify({ ...cfg, locationHint: "weur" }, null, 2));
     await logged(/ember\.json: reloaded/, before);
+  });
+
+  it("a functionsDir that fails to build keeps the running config; its directory is watched and builds once fixed", async () => {
+    await session.idle();
+    const cfg = JSON.parse(readFileSync(join(dir, "ember.json"), "utf8"));
+    cpSync(join(dir, "ember"), join(dir, "backend"), { recursive: true, filter: (src) => !src.includes("_generated") });
+    const hello = join(dir, "backend/hello.ts");
+    const good = readFileSync(hello, "utf8").replace("v2:", "backend:");
+    writeFileSync(hello, "export const broken = ;\n");
+    let from = lines.length;
+    writeFileSync(join(dir, "ember.json"), JSON.stringify({ ...cfg, functionsDir: "backend" }, null, 2));
+    await logged(/^error: /, from);
+    await session.idle();
+    // Still the last build and its config: a vars reload applies them.
+    from = lines.length;
+    writeFileSync(join(dir, ".dev.vars"), "GREETING=three\n");
+    await logged(/\.dev\.vars: reloaded/, from);
+    await session.idle();
+    expect(await env("GREETING")).toBe("v2:three");
+    // A save in the new directory (watched now) builds the pending config.
+    from = lines.length;
+    writeFileSync(hello, good);
+    await logged(/^reloaded$/, from);
+    await session.idle();
+    expect(await env("GREETING")).toBe("backend:three");
+    // And later saves there keep reloading.
+    from = lines.length;
+    writeFileSync(hello, good.replace("backend:", "backend2:"));
+    await logged(/^reloaded$/, from);
+    await session.idle();
+    expect(await env("GREETING")).toBe("backend2:three");
+    // Back to ember/ for the tests below.
+    from = lines.length;
+    writeFileSync(join(dir, "ember.json"), JSON.stringify(cfg, null, 2));
+    await logged(/ember\.json: reloaded/, from);
+    await session.idle();
+    rmSync(join(dir, "backend"), { recursive: true, force: true });
   });
 });
 

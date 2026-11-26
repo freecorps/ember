@@ -47,28 +47,39 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
   let declaredEnv: Array<{ name: string; optional: boolean }> = [];
   // One TypeScript program for the whole session: each save re-checks incrementally.
   const oracle = new TypeOracle();
-  const rebuild = async () => {
+  /** A build of `p` and what the session takes from it once it is running (`adopt`). */
+  type Built = { build: WorkerBuild; schema: SchemaManifestLike; env: typeof declaredEnv; components: LocalOptions["components"] };
+  const rebuild = async (p: Project): Promise<Built> => {
     const t = Date.now();
-    const gen = await codegen(project, { oracle });
+    const gen = await codegen(p, { oracle });
     for (const w of gen.warnings) log(`warning: ${w}`);
-    const build = await buildWorker(project, { outDir, loaded: gen.loaded, context: buildContext });
-    schema = gen.manifest.schema as unknown as SchemaManifestLike;
-    declaredEnv = gen.manifest.env ?? [];
+    const build = await buildWorker(p, { outDir, loaded: gen.loaded, context: buildContext });
     log(`built in ${Date.now() - t} ms (${gen.manifest.functions.length} functions, ${(build.bytes / 1024).toFixed(0)} KiB)`);
-    components = (gen.manifest.schema as { components?: LocalOptions["components"] }).components;
-    return build;
+    return {
+      build,
+      schema: gen.manifest.schema as unknown as SchemaManifestLike,
+      env: gen.manifest.env ?? [],
+      components: (gen.manifest.schema as { components?: LocalOptions["components"] }).components,
+    };
+  };
+  const adopt = (b: Built) => {
+    schema = b.schema;
+    declaredEnv = b.env;
+    components = b.components;
   };
 
   let components: LocalOptions["components"];
   // Local secrets and vars: `.dev.vars` (gitignored), re-read on every rebuild.
-  const devVars = () => {
-    const d = loadDevVars(project);
+  const devVars = (p: Project = project) => {
+    const d = loadDevVars(p);
     for (const w of d.warnings) log(`warning: ${w}`);
     return d;
   };
   let first: WorkerBuild;
   try {
-    first = await rebuild();
+    const b = await rebuild(project);
+    adopt(b);
+    first = b.build;
   } catch (e) {
     await buildContext.dispose();
     throw e;
@@ -111,32 +122,41 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
   process.once("exit", removeMarker);
   log(`ember dev: ${url.href}  (state in ${join(project.stateDir, "state")})`);
 
+  // `current` is the running build and `project` the config it was built from: `.dev.vars` reloads apply both.
   let current = first;
-  const apply = async (build: WorkerBuild, vars: Record<string, string> = devVars().vars) => {
-    await local.mf.setOptions(miniflareOptions(project, build, { port: Number(url.port), persist: opts.persist ?? true, vars: { EMBER_DEV_PERF: "1", ...vars }, ...(remote ? { remote: remote.bindings } : {}), ...(components ? { components } : {}) }));
+  const apply = async (p: Project, build: WorkerBuild, vars: Record<string, string>, comps: LocalOptions["components"]) => {
+    await local.mf.setOptions(miniflareOptions(p, build, { port: Number(url.port), persist: opts.persist ?? true, vars: { EMBER_DEV_PERF: "1", ...vars }, ...(remote ? { remote: remote.bindings } : {}), ...(comps ? { components: comps } : {}) }));
     current = build;
   };
+  /** An ember.json read but not built yet (its rebuild failed): code changes build it until one succeeds. */
+  let pending: Project | null = null;
   /**
    * `code`: an ember/ file changed: codegen + bundle + reload. `config`: ember.json changed: the project is loaded again
-   * (a broken file keeps the previous one) and rebuilt, since it shapes the bundle (auth, resources, build options).
+   * (a broken file keeps the previous one) and rebuilt, since it shapes the bundle (auth, resources, build options);
+   * the session takes the new config only once that build runs, so a failed one leaves the running pair as it was.
    * `vars`: .dev.vars changed: the Worker gets the new values, nothing is rebuilt.
    */
   const reloadNow = async (kind: "code" | "config" | "vars") => {
     try {
+      if (kind === "vars") {
+        const dv = devVars();
+        await apply(project, current, dv.vars, components);
+        log(`${DEV_VARS_FILE}: reloaded (${Object.keys(dv.vars).length} value(s))`);
+        return;
+      }
       if (kind === "config") {
         const next = loadProject(project.root);
         if (next.config.project !== project.config.project) log(`warning: ${CONFIG_FILE}: the project name changed (${project.config.project} → ${next.config.project}); restart \`ember dev\` to use the new local state`);
         if (JSON.stringify(next.config.resources ?? null) !== JSON.stringify(project.config.resources ?? null) && remote) log(`warning: ${CONFIG_FILE}: resources changed; restart \`ember dev --remote\` to bind them remotely`);
-        project = next;
+        pending = next;
+        watchSources(next.dir); // the functions directory it names (`functionsDir`), even before it builds
       }
-      if (kind === "vars") {
-        const dv = devVars();
-        await apply(current, dv.vars);
-        log(`${DEV_VARS_FILE}: reloaded (${Object.keys(dv.vars).length} value(s))`);
-        return;
-      }
-      const build = await rebuild();
-      await apply(build);
+      const target = pending ?? project;
+      const b = await rebuild(target);
+      await apply(target, b.build, devVars(target).vars, b.components);
+      adopt(b);
+      project = target;
+      pending = null;
       if (remote && remoteKeys() !== boundKeys) log("warning: the schema's external indexes changed (added, removed or now a different index): restart `ember dev --remote` to bind (and create) them remotely");
       log(kind === "config" ? `${CONFIG_FILE}: reloaded` : "reloaded");
     } catch (e) {
@@ -155,12 +175,22 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
       void reload(kind);
     }, 150));
   };
-  // ember/, recursive; changes in _generated are ours and ignored.
-  const watcher = watch(project.dir, { recursive: true }, (_event, file) => {
-    const f = String(file ?? "");
-    if (f.split(/[\\/]/).some((part) => part === "_generated" || part.startsWith("."))) return;
-    schedule("code");
-  });
+  // ember/ (the config's `functionsDir`), recursive; changes in _generated are ours and ignored. Replaced when a
+  // reloaded ember.json names another directory.
+  let watcher: ReturnType<typeof watch> | null = null;
+  let watched = "";
+  function watchSources(dir: string) {
+    if (dir === watched) return;
+    const w = watch(dir, { recursive: true }, (_event, file) => {
+      const f = String(file ?? "");
+      if (f.split(/[\\/]/).some((part) => part === "_generated" || part.startsWith("."))) return;
+      schedule("code");
+    });
+    watcher?.close();
+    watcher = w;
+    watched = dir;
+  }
+  watchSources(project.dir);
   // The project root, not recursive: only ember.json and .dev.vars (editors save through a rename: match by name).
   const rootWatcher = watch(project.root, (_event, file) => {
     const f = String(file ?? "");
@@ -184,7 +214,7 @@ export async function dev(project: Project, opts: DevOptions = {}): Promise<DevS
     },
     async close() {
       for (const t of timers.values()) clearTimeout(t);
-      watcher.close();
+      watcher?.close();
       rootWatcher.close();
       await running;
       await local.mf.dispose();
