@@ -12,6 +12,7 @@
 // importing them (directly or not); the others are replayed from the cache, so a save re-checks the edited module and
 // its callers, not the app. The output is the same as a run from scratch's (codegen-incremental.test.ts).
 
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import ts from "typescript";
 import { SOURCE_CONDITIONS } from "../source.ts";
@@ -84,6 +85,35 @@ interface ModuleCache {
 
 type VersionedSourceFile = ts.SourceFile & { version?: string };
 
+/** `TypeOracle.claims`: the printed claims, or why there are none. */
+export type ClaimsResult = { text: string } | { problem: string };
+/** What the claims were computed from: the files their program read, with their sizes and mtimes. */
+type ClaimsCache = { authConfig: string; files: string[]; stamp: string; result: ClaimsResult };
+
+const stampOf = (files: string[]) =>
+  files
+    .map((f) => {
+      try {
+        const st = statSync(f);
+        return `${f}:${st.size}:${st.mtimeMs}`;
+      } catch {
+        return `${f}:-`;
+      }
+    })
+    .join("|");
+
+function readClaimsCache(file: string): ClaimsCache | undefined {
+  try {
+    const c = JSON.parse(readFileSync(file, "utf8")) as Partial<ClaimsCache>;
+    const r = c.result as Partial<{ text: unknown; problem: unknown }> | undefined;
+    if (typeof c.authConfig !== "string" || !Array.isArray(c.files) || typeof c.stamp !== "string" || !r) return undefined;
+    if (typeof r.text !== "string" && typeof r.problem !== "string") return undefined;
+    return c as ClaimsCache;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Keeps the TypeScript program between runs (`ember dev`): a builder program (the previous program is reused, and its
  * reference graph tells what each module imports) and caches of each module's inferred types and diagnostics, keyed
@@ -97,6 +127,8 @@ export class TypeOracle {
   private nextVersion = 0;
   /** The modules of the last `infer` and the dependency key of each. */
   private last: Array<{ file: string; key: string }> = [];
+  private claimsProgram: ts.Program | undefined;
+  private claimsCache: ClaimsCache | undefined;
 
   /**
    * Syntax and type errors of the user's modules in the program of the last `infer` (codegen asks once, after the pass
@@ -122,16 +154,15 @@ export class TypeOracle {
     return this.builder?.getProgram().getSourceFiles().map((sf) => sf.fileName) ?? [];
   }
 
-  infer(o: InferOptions): InferResult {
+  /** A compiler host reading `virtual` files from memory and keeping one SourceFile per (file, text). */
+  private host(virtual: Map<string, string>): ts.CompilerHost {
     const host = ts.createCompilerHost(COMPILER_OPTIONS, true);
     const read = host.readFile.bind(host);
     const exists = host.fileExists.bind(host);
     const getSf = host.getSourceFile.bind(host);
-    const virtual = new Map([...o.virtualFiles].map(([k, v]) => [resolve(k), v]));
     host.fileExists = (f) => virtual.has(resolve(f)) || exists(f);
     host.readFile = (f) => virtual.get(resolve(f)) ?? read(f);
-    // One SourceFile per (file, text), with a version (the builder requires one): an unchanged file keeps its version,
-    // which is what the caches' keys are made of.
+    // With a version (the builder requires one): an unchanged file keeps its version, which the caches' keys are made of.
     host.getSourceFile = (f, lang, onError, create) => {
       const text = virtual.get(resolve(f)) ?? read(f);
       if (text === undefined) return getSf(f, lang, onError, create);
@@ -143,6 +174,58 @@ export class TypeOracle {
       this.files.set(key, { text, sf });
       return sf;
     };
+    return host;
+  }
+
+  /**
+   * The claims of the identities `ember/auth.config.ts` signs in (`ClaimsOf<typeof config>` of @freecorps/ember-auth),
+   * printed as a self-contained type, or why it could not be. Its own program (Better Auth's types stay out of the
+   * modules'), checked again only when a file it read changed (size or mtime). `cacheFile` (in `.ember/`) keeps the
+   * answer between processes: checking Better Auth's types takes a while.
+   */
+  claims(o: { authConfig: string; generatedDir: string; projectDir: string; cacheFile?: string }): ClaimsResult {
+    const prev = this.claimsCache ?? (o.cacheFile ? readClaimsCache(o.cacheFile) : undefined);
+    if (prev && prev.authConfig === o.authConfig && stampOf(prev.files) === prev.stamp) {
+      this.claimsCache = prev;
+      return prev.result;
+    }
+    const probe = resolve(o.generatedDir, "__ember_claims.ts");
+    const spec = JSON.stringify(relative(o.generatedDir, o.authConfig).split("\\").join("/").replace(/^(?!\.)/, "./"));
+    const virtual = new Map([[probe, `import type config from ${spec};\nimport type { ClaimsOf } from "@freecorps/ember-auth";\nexport type __EmberClaims = ClaimsOf<typeof config>;\n`]]);
+    const program = ts.createProgram({ rootNames: [probe], options: COMPILER_OPTIONS, host: this.host(virtual), ...(this.claimsProgram ? { oldProgram: this.claimsProgram } : {}) });
+    this.claimsProgram = program;
+    const c = program.getTypeChecker();
+    const sf = program.getSourceFile(probe);
+    const errors = sf ? program.getSemanticDiagnostics(sf) : [];
+    const mod = sf && c.getSymbolAtLocation(sf);
+    const alias = mod && c.getExportsOfModule(mod).find((x) => x.getName() === "__EmberClaims");
+    let result: ClaimsResult;
+    if (!alias) result = { problem: "no ClaimsOf in @freecorps/ember-auth" };
+    else if (errors.length) result = { problem: formatDiagnostic(errors[0]!) };
+    else {
+      const t = c.getDeclaredTypeOfSymbol(alias);
+      const text = new TypePrinter(c, program, o, () => new Map(), true).print(t, "", false);
+      result = t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown) || /\bany\b/.test(text) ? { problem: `ClaimsOf<typeof config> is \`${text}\`` } : { text };
+    }
+    const files = program
+      .getSourceFiles()
+      .map((f) => f.fileName)
+      .filter((f) => resolve(f) !== probe);
+    this.claimsCache = { authConfig: o.authConfig, files, stamp: stampOf(files), result };
+    if (o.cacheFile) {
+      try {
+        mkdirSync(dirname(o.cacheFile), { recursive: true });
+        writeFileSync(o.cacheFile, JSON.stringify(this.claimsCache));
+      } catch {
+        // A cache: without it the next process checks again.
+      }
+    }
+    return result;
+  }
+
+  infer(o: InferOptions): InferResult {
+    const virtual = new Map([...o.virtualFiles].map(([k, v]) => [resolve(k), v]));
+    const host = this.host(virtual);
     const docsFile = resolve(o.generatedDir, "__ember_docs.ts");
     virtual.set(docsFile, DOCS_PROBE);
     const rootNames = [...o.modules.map((m) => m.file), docsFile];
@@ -494,14 +577,17 @@ class TypePrinter {
   trail = "";
   private readonly checker: ts.TypeChecker;
   private readonly program: ts.Program;
-  private readonly o: InferOptions;
+  private readonly o: Pick<InferOptions, "generatedDir" | "projectDir">;
   private readonly docsOf: () => Map<string, ts.Type>;
   private docsCache: Map<string, ts.Type> | undefined;
-  constructor(checker: ts.TypeChecker, program: ts.Program, o: InferOptions, docs: () => Map<string, ts.Type>) {
+  /** Print every type structurally (no names from the user's modules): for a file that imports nothing. */
+  private readonly inline: boolean;
+  constructor(checker: ts.TypeChecker, program: ts.Program, o: Pick<InferOptions, "generatedDir" | "projectDir">, docs: () => Map<string, ts.Type>, inline = false) {
     this.checker = checker;
     this.program = program;
     this.o = o;
     this.docsOf = docs;
+    this.inline = inline;
   }
 
   /** `t` is exactly the document type of a table (both ways assignable). */
@@ -584,6 +670,7 @@ class TypePrinter {
    * in `_generated/types.d.ts`.
    */
   private namedReference(t: ts.Type): string | undefined {
+    if (this.inline) return undefined;
     const sym = t.aliasSymbol ?? (t.flags & ts.TypeFlags.Object && (t as ts.ObjectType).objectFlags & ts.ObjectFlags.Interface ? t.getSymbol() : undefined);
     if (!sym || (t.aliasTypeArguments?.length ?? 0) > 0) return undefined;
     const decl = sym.declarations?.[0];
