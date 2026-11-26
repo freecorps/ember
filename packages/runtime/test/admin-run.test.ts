@@ -17,6 +17,36 @@ const admin = (path: string, body?: unknown) =>
   }).then(async (r) => ({ status: r.status, body: (await r.json()) as any }));
 
 describe("functions and the runner", () => {
+  it("readOnly: runs queries only, by this deployment's own function types (ember mcp without confirm)", async () => {
+    const shard = "dash:readonly";
+    const q = await admin("run", { fn: "messages:list", args: { channel: "ro" }, shard, readOnly: true });
+    expect(q.body).toMatchObject({ ok: true, type: "query" });
+    for (const [fn, args, type] of [["messages:send", { channel: "ro", body: "x" }, "mutation"], ["actions:combo", { channel: "ro" }, "action"]] as const) {
+      const r = await admin("run", { fn, args, shard, readOnly: true });
+      expect([fn, r.status, r.body.error.code]).toEqual([fn, 403, "confirm_required"]);
+      expect(r.body.error.message).toContain(`is a ${type} in this deployment`);
+    }
+    // Nothing was written by the refused mutation.
+    expect((await admin("run", { fn: "messages:list", args: { channel: "ro" }, shard })).body.value).toEqual([]);
+    expect((await admin("run", { fn: "messages:list", args: { channel: "ro" }, shard, readOnly: "yes" })).status).toBe(400);
+  });
+
+  it("x-ember-env: a caller naming another environment is refused before any admin endpoint runs", async () => {
+    const call = (path: string, envName: string, init: RequestInit = {}) =>
+      SELF.fetch(`http://ember/api/_ember/${path}`, { ...init, headers: { authorization: "Bearer admin-secret", "x-ember-env": envName, "content-type": "application/json" } });
+    // The test Worker's EMBER_ENV is "test".
+    expect((await call("status?shard=global:main", "test")).status).toBe(200);
+    for (const [path, init] of [["status?shard=global:main", {}], ["data?shard=global:main", {}], ["inspect?shard=global:main", {}], ["run", { method: "POST", body: JSON.stringify({ fn: "messages:send", args: { channel: "env", body: "x" }, shard: "dash:env" }) }]] as const) {
+      const r = await call(path, "prod", init);
+      const body = (await r.json()) as { error: { code: string; message: string } };
+      expect([path, r.status, body.error.code]).toEqual([path, 409, "wrong_environment"]);
+      expect(body.error.message).toMatch(/serves the environment "test", not "prod"/);
+    }
+    expect((await admin("run", { fn: "messages:list", args: { channel: "env" }, shard: "dash:env" })).body.value).toEqual([]);
+    // The admin token is still checked first.
+    expect((await SELF.fetch("http://ember/api/_ember/status", { headers: { "x-ember-env": "prod" } })).status).toBe(401);
+  });
+
   it("lists the app's functions with their args shape; not the dashboard's own module", async () => {
     const r = await admin("functions");
     const byName = new Map<string, any>(r.body.functions.map((f: { name: string }) => [f.name, f]));

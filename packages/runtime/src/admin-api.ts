@@ -16,7 +16,7 @@ import { parse } from "./wire.ts";
 import { validate, withDefaults } from "@freecorps/ember-values";
 
 /** Bumped whenever an admin endpoint is added or changes shape. */
-export const ADMIN_API_LEVEL = 13;
+export const ADMIN_API_LEVEL = 14;
 
 /** Issuer of the identities the dashboard runs functions as ("act as user"): functions can tell them apart. */
 export const DASHBOARD_ISSUER = "ember-dashboard";
@@ -81,7 +81,26 @@ export const ADMIN_FEATURES = [
   "dashboards",
   "dashboards/query",
   "dashboards/run",
+  // level 14: guards for callers that act on an environment by name (`ember mcp`): `run` with `readOnly: true` runs
+  // queries only, and an `x-ember-env` header that is not this Worker's EMBER_ENV refuses any admin call
+  "run/read-only",
+  "env-check",
 ] as const;
+
+/** Header naming the environment an admin caller means: a Worker of another environment refuses the call. */
+export const EXPECT_ENV_HEADER = "x-ember-env";
+
+/**
+ * The refusal of an admin call that names (`x-ember-env`) an environment other than this Worker's EMBER_ENV, or null.
+ * A caller that resolved "staging" never acts on prod because a URL on disk points there.
+ */
+export function wrongEnvironment(request: Request, env: { EMBER_ENV?: unknown }, error: (status: number, code: string, message: string) => Response): Response | null {
+  const want = request.headers.get(EXPECT_ENV_HEADER);
+  if (want === null) return null;
+  const have = typeof env.EMBER_ENV === "string" ? env.EMBER_ENV : null;
+  if (have === want) return null;
+  return error(409, "wrong_environment", `this Worker serves the environment ${have === null ? "(unknown: no EMBER_ENV)" : JSON.stringify(have)}, not ${JSON.stringify(want)}: the URL recorded for ${JSON.stringify(want)} points at another deployment`);
+}
 
 /** Variables the reveal endpoint refuses besides EMBER_*: listed as managed. */
 const MANAGED = new Set(["BETTER_AUTH_SECRET"]);
@@ -305,7 +324,7 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
       if (!b || typeof b !== "object" || Array.isArray(b)) throw new Error();
       body = b as Record<string, unknown>;
     } catch {
-      return deps.error(400, "bad_request", "body must be a JSON object { fn, args, shard, as? }");
+      return deps.error(400, "bad_request", "body must be a JSON object { fn, args, shard, as?, readOnly? }");
     }
     const name = typeof body.fn === "string" ? body.fn : "";
     const info = functionListing(deps.config).find((f) => f.name === name);
@@ -314,6 +333,10 @@ export async function handleAdminApi(request: Request, url: URL, deps: AdminDeps
     if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(body.shard)}`);
     const args = body.args ?? {};
     if (typeof args !== "object" || args === null || Array.isArray(args)) return deps.error(400, "bad_request", "args must be an object");
+    if (body.readOnly !== undefined && typeof body.readOnly !== "boolean") return deps.error(400, "bad_request", "readOnly must be a boolean");
+    // `readOnly`: the caller has not confirmed a write. The type that counts is this deployment's (the caller's local
+    // code may call it a query while the deployed one is a mutation), checked here, where it runs.
+    if (body.readOnly === true && info.type !== "query") return deps.error(403, "confirm_required", `${name} is a ${info.type} in this deployment: it changes data, and the caller has not confirmed a write (readOnly)`);
     const identity = actAs(body.as);
     if (identity && "error" in identity) return deps.error(400, "bad_request", identity.error);
     // A sensitive function checks the caller's live session on every call: there is none to check when acting.
