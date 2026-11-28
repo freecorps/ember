@@ -13,6 +13,7 @@ const VECTOR = {
   signature: "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=",
 };
 const at = VECTOR.timestamp * 1000;
+const fails = (p: Promise<unknown>, re: RegExp) => expect(p).rejects.toThrow(expect.objectContaining({ name: "WebhookVerificationError", message: expect.stringMatching(re) }));
 
 describe("signatures", () => {
   test("the specification's vector", async () => {
@@ -33,7 +34,6 @@ describe("signatures", () => {
 
   test("refusals: tampered body, wrong secret, missing headers, stale or future timestamp, unknown version", async () => {
     const headers = { "webhook-id": VECTOR.id, "webhook-timestamp": String(VECTOR.timestamp), "webhook-signature": VECTOR.signature };
-    const fails = (p: Promise<unknown>, re: RegExp) => expect(p).rejects.toThrow(expect.objectContaining({ name: "WebhookVerificationError", message: expect.stringMatching(re) }));
     await fails(verifyWebhook(VECTOR.secret, headers, '{"test": 2432232315}', { now: at }), /no matching signature/);
     await fails(verifyWebhook(generateWebhookSecret(), headers, VECTOR.body, { now: at }), /no matching signature/);
     await fails(verifyWebhook(VECTOR.secret, { ...headers, "webhook-id": "msg_other" }, VECTOR.body, { now: at }), /no matching signature/);
@@ -56,7 +56,38 @@ describe("signatures", () => {
     expect(await verifyWebhook([generateWebhookSecret(), next], h, VECTOR.body, { now: at })).toEqual({ test: 2432232314 });
   });
 
-  test("a repeated webhook-signature header (Node's req.headers: an array) is one space-separated list", async () => {
+  test("verification options: a NaN or negative tolerance and a NaN clock are refused, not treated as fresh", async () => {
+    const headers = { "webhook-id": VECTOR.id, "webhook-timestamp": String(VECTOR.timestamp), "webhook-signature": VECTOR.signature };
+    // Years after the timestamp: only a NaN comparison would let it through.
+    const late = at + 10 * 365 * 86_400_000;
+    await fails(verifyWebhook(VECTOR.secret, headers, VECTOR.body, { now: late, toleranceSeconds: Number.NaN }), /toleranceSeconds/);
+    await fails(verifyWebhook(VECTOR.secret, headers, VECTOR.body, { now: at, toleranceSeconds: -1 }), /toleranceSeconds/);
+    await fails(verifyWebhook(VECTOR.secret, headers, VECTOR.body, { now: Number.NaN }), /invalid now/);
+    // Omitted: the defaults (Date.now(), 300 s).
+    expect(await verifyWebhook(VECTOR.secret, { ...headers, "webhook-timestamp": String(Math.floor(Date.now() / 1000)), "webhook-signature": await signWebhook(VECTOR.secret, VECTOR.id, Math.floor(Date.now() / 1000), VECTOR.body) }, VECTOR.body)).toEqual({ test: 2432232314 });
+  });
+
+  test("a correctly signed body that is not JSON is a WebhookVerificationError (without the body)", async () => {
+    const body = "not json {secret}";
+    const headers = { "webhook-id": VECTOR.id, "webhook-timestamp": String(VECTOR.timestamp), "webhook-signature": await signWebhook(VECTOR.secret, VECTOR.id, VECTOR.timestamp, body) };
+    const err = await verifyWebhook(VECTOR.secret, headers, body, { now: at }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(WebhookVerificationError);
+    expect((err as Error).message).not.toContain("secret}");
+  });
+
+  test("a repeated webhook-signature header joined with \", \" (Node's req.headers, fetch's Headers.get) verifies", async () => {
+    const other = await signWebhook(generateWebhookSecret(), VECTOR.id, VECTOR.timestamp, VECTOR.body);
+    const base = { "webhook-id": VECTOR.id, "webhook-timestamp": String(VECTOR.timestamp) };
+    // The valid signature first: its entry carries the trailing ", " separator.
+    expect(await verifyWebhook(VECTOR.secret, { ...base, "webhook-signature": `${VECTOR.signature}, ${other}` }, VECTOR.body, { now: at })).toEqual({ test: 2432232314 });
+    expect(await verifyWebhook(VECTOR.secret, { ...base, "webhook-signature": `${other}, ${VECTOR.signature}` }, VECTOR.body, { now: at })).toEqual({ test: 2432232314 });
+    const h = new Headers(base);
+    h.append("webhook-signature", VECTOR.signature);
+    h.append("webhook-signature", other);
+    expect(await verifyWebhook(VECTOR.secret, h, VECTOR.body, { now: at })).toEqual({ test: 2432232314 });
+  });
+
+  test("a repeated webhook-signature header as an array (Node's req.headersDistinct) is one space-separated list", async () => {
     const other = await signWebhook(generateWebhookSecret(), VECTOR.id, VECTOR.timestamp, VECTOR.body);
     const headers = { "webhook-id": VECTOR.id, "webhook-timestamp": String(VECTOR.timestamp), "webhook-signature": [other, VECTOR.signature] };
     expect(await verifyWebhook(VECTOR.secret, headers, VECTOR.body, { now: at })).toEqual({ test: 2432232314 });

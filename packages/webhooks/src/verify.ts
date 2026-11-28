@@ -81,6 +81,7 @@ export async function webhookHeaders(secrets: readonly string[], id: string, tim
   return { "webhook-id": id, "webhook-timestamp": String(timestamp), "webhook-signature": sigs.join(" ") };
 }
 
+/** A fetch `Headers`, Node's `req.headers` (repeats joined with ", ") or `req.headersDistinct` (arrays). */
 type HeaderBag = Headers | Record<string, string | string[] | undefined>;
 
 function header(h: HeaderBag, name: string): string | undefined {
@@ -119,18 +120,31 @@ export async function verifyWebhook<T = unknown>(secret: string | readonly strin
   if (!id || !ts || !sig) throw new WebhookVerificationError("missing webhook-id, webhook-timestamp or webhook-signature");
   const t = Number(ts);
   if (!/^\d+$/.test(ts) || !Number.isSafeInteger(t)) throw new WebhookVerificationError("invalid webhook-timestamp");
-  const now = Math.floor((opts.now ?? Date.now()) / 1000);
+  // A NaN clock or tolerance would pass both freshness checks: refused, like a negative tolerance.
+  const clock = opts.now ?? Date.now();
   const tolerance = opts.toleranceSeconds ?? DEFAULT_TOLERANCE_SECONDS;
+  if (!Number.isFinite(clock)) throw new WebhookVerificationError("invalid now (a finite number of ms)");
+  if (!Number.isFinite(tolerance) || tolerance < 0) throw new WebhookVerificationError("invalid toleranceSeconds (a finite number ≥ 0)");
+  const now = Math.floor(clock / 1000);
   if (now - t > tolerance) throw new WebhookVerificationError("webhook-timestamp too old");
   if (t - now > tolerance) throw new WebhookVerificationError("webhook-timestamp too new");
-  // The `v1` entries' signatures (other versions are skipped); compared without the version prefix.
-  const given = sig.split(" ").filter(Boolean).flatMap((s) => {
+  // The `v1` entries' signatures (other versions are skipped); compared without the version prefix. A repeated
+  // header arrives joined with ", " (Node's `req.headers`, fetch's `Headers.get`): the trailing comma of an entry is
+  // that separator (base64 has no comma).
+  const given = sig.split(/\s+/).map((s) => s.replace(/,+$/, "")).filter(Boolean).flatMap((s) => {
     const comma = s.indexOf(",");
     return comma > 0 && s.slice(0, comma) === "v1" ? [s.slice(comma + 1)] : [];
   });
   for (const s of typeof secret === "string" ? [secret] : secret) {
     const want = await mac(s, id, t, body);
-    if (given.some((g) => equal(g, want))) return JSON.parse(body) as T;
+    if (given.some((g) => equal(g, want))) {
+      try {
+        return JSON.parse(body) as T;
+      } catch {
+        // Signed, but not JSON: the documented error (the body is not echoed).
+        throw new WebhookVerificationError("the body is not JSON");
+      }
+    }
   }
   throw new WebhookVerificationError("no matching signature");
 }
