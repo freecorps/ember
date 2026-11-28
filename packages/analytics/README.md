@@ -111,7 +111,9 @@ most 10 000 rows, the newest buckets.
 
 With `archive: true` (or `{ bucket, prefix }`), each accepted batch is also written to R2 by the same action as
 `analytics/YYYY/MM/DD/HH/<uuid>.ndjson.gz` (UTC hour of arrival, gzip NDJSON, `customMetadata.count`), with no
-Durable Object write. Best effort: a failed archive write is logged, the events are in Analytics Engine already.
+Durable Object write. Best effort, at most once per batch: a failed archive write is logged and not retried. With the
+Analytics Engine binding the events were written there already; **without it, a failed archive write loses the batch**
+(nothing else kept it).
 
 ## Dashboard
 

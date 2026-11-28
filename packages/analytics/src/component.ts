@@ -181,7 +181,8 @@ export async function ingest(ctx: ActCtx, events: TrackedEvent[], source: "clien
         const lines: ArchivedEvent[] = events.map((e) => ({ ...e, install: ctx.component.name, source, country }));
         archived = await archiveBatch(bucket, lines, { prefix: a.prefix ?? DEFAULT_ARCHIVE_PREFIX, now: events[0]?.receivedAt ?? Date.now() });
       } catch (e) {
-        // The events are in Analytics Engine already; the archive is best effort (at most once per batch).
+        // Best effort (at most once per batch): with the binding the events are in Analytics Engine already; without
+        // it, this batch is lost (documented).
         console.error(`ember-analytics: archive failed: ${(e as Error).message}`);
       }
     }
