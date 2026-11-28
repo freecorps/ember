@@ -472,10 +472,17 @@ const dashboard = {
       return q.paginate(a.paginationOpts);
     },
   }),
-  /** The maps of one release (by the `by_name` prefix). */
+  /**
+   * The maps of one release (by the `by_name` prefix). Its filters start empty in the Releases tab: until a project
+   * and a release are picked, an empty page, the table not read.
+   */
   artifacts: internalQuery({
-    args: { project: v.string(), release: v.string(), dist: v.optional(v.string()), paginationOpts: paginationOptsValidator },
-    handler: (ctx, a) => ctx.db.query("artifacts").withIndex("by_name", (q) => q.eq("project", a.project).eq("release", a.release).eq("dist", a.dist ?? "")).paginate(a.paginationOpts),
+    args: { project: v.optional(v.string()), release: v.optional(v.string()), dist: v.optional(v.string()), paginationOpts: paginationOptsValidator },
+    handler: (ctx, a) => {
+      const { project, release } = a;
+      if (!project || !release) return { page: [], isDone: true, continueCursor: "" };
+      return ctx.db.query("artifacts").withIndex("by_name", (q) => q.eq("project", project).eq("release", release).eq("dist", a.dist ?? "")).paginate(a.paginationOpts);
+    },
   }),
 };
 

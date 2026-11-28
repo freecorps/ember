@@ -454,6 +454,12 @@ describe("source maps in the consumer", () => {
     expect(rel.page).toMatchObject([{ release: "1.0.0", files: 2, bytes: 2 * utf8.encode(MAP).length }]);
     const files = (await h.t.query(fn("dashboard:artifacts"), { project: "web", release: "1.0.0", paginationOpts: { numItems: 10, cursor: null } })) as { page: Array<{ name: string }> };
     expect(files.page.map((f) => f.name)).toEqual(["~/assets/app.min.js", "~/assets/vendor.js"]);
+    // The tab opens with no project or release picked: an empty page, no validation error, no row read.
+    for (const args of [{}, { project: "web" }, { release: "1.0.0" }, { project: "", release: "" }]) {
+      const empty = await h.t.measure(() => h.t.query(fn("dashboard:artifacts"), { ...args, paginationOpts: { numItems: 10, cursor: null } }));
+      expect(empty.value).toEqual({ page: [], isDone: true, continueCursor: "" });
+      expect(empty.stats.rowsRead).toBe(0);
+    }
   });
 });
 
