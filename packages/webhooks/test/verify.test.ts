@@ -63,8 +63,9 @@ describe("signatures", () => {
     await fails(verifyWebhook(VECTOR.secret, headers, VECTOR.body, { now: late, toleranceSeconds: Number.NaN }), /toleranceSeconds/);
     await fails(verifyWebhook(VECTOR.secret, headers, VECTOR.body, { now: at, toleranceSeconds: -1 }), /toleranceSeconds/);
     await fails(verifyWebhook(VECTOR.secret, headers, VECTOR.body, { now: Number.NaN }), /invalid now/);
-    // Omitted: the defaults (Date.now(), 300 s).
-    expect(await verifyWebhook(VECTOR.secret, { ...headers, "webhook-timestamp": String(Math.floor(Date.now() / 1000)), "webhook-signature": await signWebhook(VECTOR.secret, VECTOR.id, Math.floor(Date.now() / 1000), VECTOR.body) }, VECTOR.body)).toEqual({ test: 2432232314 });
+    // Omitted: the defaults (Date.now(), 300 s). One timestamp for the header and the signature.
+    const now = Math.floor(Date.now() / 1000);
+    expect(await verifyWebhook(VECTOR.secret, { ...headers, "webhook-timestamp": String(now), "webhook-signature": await signWebhook(VECTOR.secret, VECTOR.id, now, VECTOR.body) }, VECTOR.body)).toEqual({ test: 2432232314 });
   });
 
   test("a correctly signed body that is not JSON is a WebhookVerificationError (without the body)", async () => {
