@@ -218,7 +218,7 @@ try {
        c.close();`,
     ]);
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, dashboard-sdk)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, expo-updates, dashboard-sdk)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
@@ -233,6 +233,8 @@ try {
        if (wp.workpool?.name !== "workpool" || typeof wp.Workpool !== "function") throw new Error("missing workpool exports");
        const pr = await import("@freecorps/ember-presence");
        if (typeof pr.Presence !== "function" || typeof pr.presenceChannel !== "function" || pr.presenceMessage().shape?.kind !== "union") throw new Error("missing presence exports");
+       const eu = await import("@freecorps/ember-expo-updates");
+       if (eu.expoUpdates?.name !== "expoUpdates" || typeof eu.renderResponse !== "function" || typeof eu.resolvePlan !== "function") throw new Error("missing expo-updates exports");
        const ds = await import("@freecorps/ember-dashboard-sdk");
        if (typeof ds.connect !== "function" || typeof ds.EMBED_SDK_SCRIPT !== "string" || !ds.embedPage({ title: "t", script: "1" }).includes(ds.EMBED_SDK_SCRIPT)) throw new Error("missing dashboard-sdk exports");
        if (!m[7].email.http?.routes?.some((r) => r.path === "/dashboard/preview")) throw new Error("the email component lost its preview route");`,
