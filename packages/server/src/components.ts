@@ -13,7 +13,7 @@
 // parent may only call the public functions of its direct children. Clients never reach component functions.
 
 import { toJSONValue, validate, type GenericValidator, type Infer, type ObjectShape, type ObjectType, type PropertyValidators, type Shape } from "@freecorps/ember-values";
-import { EmberError } from "./errors.ts";
+import { EmberError, type FunctionErrorHandler } from "./errors.ts";
 import { checkLimits, type Limits } from "./limits.ts";
 import { idPrefix } from "./ids.ts";
 import {
@@ -291,6 +291,8 @@ export interface AppDefinition<Components extends Record<string, AnyComponentDef
   readonly channels: Readonly<ChannelsConfig>;
   /** The app's own dashboard screens (`defineApp({ dashboard })`); its refs are resolved by `composeApp`. */
   readonly dashboard: DashboardSpecInput | undefined;
+  /** `defineApp({ onError })`: told of every unhandled function error (off when not given). */
+  readonly onError: FunctionErrorHandler | undefined;
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
     component: C,
     opts?: InstallOptions<ConfigOf<C>> & { name?: N },
@@ -331,6 +333,8 @@ function checkStorage(storage: unknown): Readonly<AppStorage> {
  * limits (`DEFAULT_LIMITS` otherwise; each function may set its own), at most `MAX_LIMITS`. `storage.compactFormat`: 2 makes
  * migrations create format 2 compact tables from now on (the rollback lever for format 3; default 3). `channels`: the
  * ephemeral channels sockets may join (`{ "room:*": { authorize: (identity, { param, shard }) => boolean, payload?, state? } }`).
+ * `onError`: called with each unhandled function error (`FunctionErrorReport`; not application errors, not refusals),
+ * after the caller got its failure: an error tracker's hook (`sentryErrorReporter` of `@freecorps/ember-sentry`).
  */
 export function defineApp<const Env extends PropertyValidators = {}>(
   opts: {
@@ -345,6 +349,11 @@ export function defineApp<const Env extends PropertyValidators = {}>(
     dashboard?: DashboardSpecInput;
     /** Ephemeral channels sockets may join (contracts.md "Feature `ephemeral`"). */
     channels?: ChannelsConfig;
+    /**
+     * Told of every unhandled function error (not `defineErrors` errors, not validation/auth refusals), wherever it
+     * happened; it never changes the caller's result, and its own failures are only logged. Off when not given.
+     */
+    onError?: FunctionErrorHandler;
   } = {},
 ): AppDefinition<{}, Env> {
   const env = (opts.env ?? {}) as Env;
@@ -353,6 +362,8 @@ export function defineApp<const Env extends PropertyValidators = {}>(
   const limits = checkLimits(opts.limits, "defineApp");
   const storage = checkStorage(opts.storage);
   const channels = checkChannels(opts.channels);
+  if (opts.onError !== undefined && typeof opts.onError !== "function") throw new Error("defineApp: onError must be a function ((report, env) => void | Promise<void>)");
+  const onError = opts.onError;
   for (const [k, val] of Object.entries(env)) {
     if (!ENV_NAME.test(k)) throw new Error(`defineApp: env ${JSON.stringify(k)} must be UPPER_SNAKE_CASE`);
     if (k.startsWith("EMBER_")) throw new Error(`defineApp: env ${k}: EMBER_* names are managed by ember`);
@@ -368,6 +379,7 @@ export function defineApp<const Env extends PropertyValidators = {}>(
       storage,
       channels,
       dashboard,
+      onError,
       use(c: AnyComponentDefinition, opts: InstallOptions<unknown> = {}) {
         return make([...components, install(c, opts, components)]);
       },

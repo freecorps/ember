@@ -176,3 +176,63 @@ export function errorInfo(e: unknown, fallback = "Error"): WireError {
 export function errorFromWire(w: WireError): EmberError<string> {
   return w.kind === "app" ? new AppError(w.code, w.message, w.data, w.status) : new EmberError(w.code, w.message, w.data);
 }
+
+// ------------------------------------------------------------------------------------------------ onError
+
+/** What kind of execution failed (`defineApp({ onError })`). */
+export type FunctionErrorKind = "query" | "mutation" | "action" | "job" | "http";
+
+/** An unhandled error of an Ember function, as `defineApp({ onError })` receives it. */
+export interface FunctionErrorReport {
+  /** The function (`messages:send`, `@email/lib:deliver`, `http:POST /hooks/*`). */
+  fn: string;
+  kind: FunctionErrorKind;
+  shard: string;
+  /** The error code (`"Error"` for a plain thrown value) and message, as the caller saw them. */
+  code: string;
+  message: string;
+  /** The stack where the runtime still has the thrown value (actions and HTTP routes); absent in queries and mutations. */
+  stack?: string;
+  /** When it failed (ms). */
+  at: number;
+}
+
+/**
+ * `defineApp({ onError })`: called once per unhandled error, wherever it happened (the Worker or a shard), after the
+ * failure was returned to the caller (it never changes what the caller sees). Its promise is waited on with
+ * `waitUntil` (or awaited in an action), and a throw or rejection is logged, never propagated. `env` is the Worker's.
+ */
+export type FunctionErrorHandler = (report: FunctionErrorReport, env: Record<string, unknown>) => void | Promise<void>;
+
+/**
+ * Codes the runtime answers with when it refuses a call (validation, auth, limits, a missing function or id): the
+ * caller's mistake or an expected condition, not a bug. `onError` is not called for them, nor for application errors
+ * (`defineErrors`).
+ */
+export const REFUSAL_CODES: ReadonlySet<string> = new Set([
+  "ValidationError",
+  "InvalidArgument",
+  "InvalidCursor",
+  "FunctionNotFound",
+  "InvalidFunction",
+  "NotFound",
+  "Unauthenticated",
+  "Unauthorized",
+  "Forbidden",
+  "WrongShard",
+  "RateLimited",
+  "EnvMissing",
+  "TooManyReads",
+  "TooManyWrites",
+  "TooManyDocumentsRead",
+  "DocumentTooLarge",
+  "IndexNotReady",
+  "MigrationRefused",
+  "ReadOnlyTable",
+  "bad_shard",
+]);
+
+/** Whether `onError` hears about this failure: not an application error, not a refusal. */
+export function isReportableError(e: { code: string; kind?: string }): boolean {
+  return e.kind !== "app" && !REFUSAL_CODES.has(e.code);
+}

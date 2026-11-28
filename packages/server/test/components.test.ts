@@ -22,6 +22,7 @@ import {
   v,
   type AppDefinition,
   type MutationCtx,
+  isReportableError,
 } from "../src/index.ts";
 
 // ------------------------------------------------------------------ a small component: counters with a log
@@ -560,5 +561,21 @@ describe("defineComponent({ omitIndexes })", () => {
   test("an unknown index name is refused", () => {
     const bad = defineComponent({ name: "bad", schema: notes.schema!, functions: {}, omitIndexes: () => ["notes.nope"] });
     expect(() => composeApp({ schema: base, app: defineApp().use(bad) })).toThrow(/omitIndexes names unknown index "notes.nope"/);
+  });
+});
+
+describe("defineApp({ onError })", () => {
+  test("kept on the app (and through .use), checked to be a function; refusals and app errors are not reportable", () => {
+    const onError = () => {};
+    const app = defineApp({ onError });
+    expect(app.onError).toBe(onError);
+    expect(app.use(defineComponent({ name: "c", functions: {} })).onError).toBe(onError);
+    expect(defineApp().onError).toBeUndefined();
+    expect(() => defineApp({ onError: "x" as never })).toThrow(/onError must be a function/);
+    expect(isReportableError({ code: "Error" })).toBe(true);
+    expect(isReportableError({ code: "StorageError" })).toBe(true);
+    expect(isReportableError({ code: "ValidationError" })).toBe(false);
+    expect(isReportableError({ code: "Unauthenticated" })).toBe(false);
+    expect(isReportableError({ code: "OutOfStock", kind: "app" })).toBe(false);
   });
 });

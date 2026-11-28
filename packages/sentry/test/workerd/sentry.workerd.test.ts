@@ -124,4 +124,30 @@ describe("sentry in workerd", () => {
     const issue = await runInDurableObject(stub(), async (_o, state) => state.storage.sql.exec(`SELECT * FROM "sentry$issues" WHERE "release" = '2.0.0'`).toArray()[0]);
     expect(JSON.stringify(issue)).toContain("at greet (src/app.ts:2:9)");
   });
+
+  it("defineApp({ onError }): Ember's unhandled errors (mutation, query, action) become events; app errors and refusals do not", async () => {
+    probes.sent.length = 0;
+    probes.reports.length = 0;
+    const call = (kind: string, fn: string, args: object = {}) => SELF.fetch(`http://ember/api/${kind}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ fn, args, shard: "global:main" }) });
+    // The caller's answer is what it was without the hook.
+    const m = await call("mutation", "boom:mutation");
+    expect(((await m.json()) as { ok: boolean; error: { code: string } }).error.code).toBe("Error");
+    await (await call("query", "boom:query")).body?.cancel();
+    const a = (await (await call("action", "boom:action")).json()) as { ok: boolean };
+    expect(a.ok).toBe(false);
+    await (await call("mutation", "boom:appError")).body?.cancel();
+    await (await call("mutation", "boom:validated", { n: "x" })).body?.cancel();
+    await vi.waitFor(() => expect(probes.reports.map((r) => `${r.kind} ${r.fn}`).sort()).toEqual(["action boom:action", "mutation boom:mutation", "query boom:query"]), { timeout: 5000 });
+    const action = probes.reports.find((r) => r.kind === "action")!;
+    expect(action.stack).toContain("TypeError");
+    expect(probes.reports.find((r) => r.kind === "mutation")).toMatchObject({ shard: "global:main", code: "Error", message: expect.stringContaining("null") });
+    // One event per report, on the sentry queue: grouped by the function and tagged.
+    await vi.waitFor(() => expect(probes.sent).toHaveLength(3));
+    const ev = probes.sent.find((q) => q.event?.tags?.["ember.function"] === "boom:mutation")!;
+    expect(ev.event).toMatchObject({ release: "api@1", fingerprint: ["{{ default }}", "boom:mutation"], transaction: "boom:mutation", tags: { "ember.kind": "mutation", "ember.shard": "global:main" } });
+    // The consumer groups them into three issues.
+    await deliver(probes.sent.splice(0));
+    const n = await runInDurableObject(stub(), async (_o, state) => state.storage.sql.exec(`SELECT COUNT(*) AS n FROM "sentry$issues" WHERE "release" = 'api@1'`).one().n);
+    expect(n).toBe(3);
+  });
 });

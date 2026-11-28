@@ -37,6 +37,7 @@ import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./c
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
 import { recordCall, recordExecution } from "./metrics.ts";
+import { reportFunctionError } from "./on-error.ts";
 import type { aiSearch, ExternalIndexRpc, SearchDeps, vectorSearch } from "./ai-indexes.ts";
 import type { JobInput, MutationOutcome } from "./shard.ts";
 import { stringify } from "./wire.ts";
@@ -231,7 +232,10 @@ export class ActionRunner {
       }
       return { ok: true, value, version: 0 };
     } catch (e) {
-      return failWith(errInfo(e));
+      const info = errInfo(e);
+      // `defineApp({ onError })`: a failed shard call was reported by its shard (or was a refusal), not again here.
+      if (!(e instanceof ActionCallError)) await reportFunctionError(this.config.app?.onError, this.env, { fn, kind: "action", shard, error: info, thrown: e });
+      return failWith(info);
     }
   }
 
@@ -292,6 +296,7 @@ export class ActionRunner {
       const info = errInfo(e);
       errorCode = info.code;
       console.error(`ember: ${label} failed: ${info.code}: ${info.message}`);
+      if (!(e instanceof ActionCallError)) await reportFunctionError(this.config.app?.onError, this.env, { fn: label, kind: "http", shard, error: info, thrown: e });
       return new Response(stringify({ ok: false, error: { code: "Error", message: "internal error" } }), { status: 500, headers: { "content-type": "application/json" } });
     } finally {
       recordExecution(this.env, {
