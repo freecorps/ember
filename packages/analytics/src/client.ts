@@ -118,6 +118,8 @@ export class AnalyticsClient {
    */
   private refusedAt = Number.POSITIVE_INFINITY;
   private passedAt = 0;
+  /** Events a fallback fetch already sent once more after `close()` (see `flushBeacon`): one retry each, no loop. */
+  private readonly retried = new WeakSet<QueuedEvent>();
   /** Requests sent (tests). */
   sent = 0;
 
@@ -377,6 +379,14 @@ export class AnalyticsClient {
           // Its body is in the page's keepalive quota until it settles: a regular send meanwhile counts it.
           this.inFlightBytes += bytes;
           const settled = () => (this.inFlightBytes -= bytes);
+          // Back in the queue. Closed, no timer is left to send it: once more now (as the drain does), only if some
+          // event of it was not sent again already; after that it waits for an explicit `flush()`.
+          const back = () => {
+            this.requeue(batch);
+            if (!this.closed || batch.every((e) => this.retried.has(e))) return;
+            for (const e of batch) this.retried.add(e);
+            this.flushBeacon();
+          };
           // Back for the regular drain when not delivered, or refused whole with more than one event (the drain splits
           // it); a refused singleton is dropped, as the drain does.
           sending.then(
@@ -384,11 +394,11 @@ export class AnalyticsClient {
               settled();
               this.learn(r.status, batch.length);
               const o = outcomeOf(r.status);
-              if (o === "retry" || (o === "split" && batch.length > 1)) this.requeue(batch);
+              if (o === "retry" || (o === "split" && batch.length > 1)) back();
             },
             () => {
               settled();
-              this.requeue(batch);
+              back();
             },
           );
         }
@@ -402,7 +412,8 @@ export class AnalyticsClient {
 
   /**
    * Sends what is left (as beacons) and stops the timer. A fetch still in flight is not waited for; if it then fails,
-   * its batch is beaconed as soon as it is back in the queue (no timer is left to send it).
+   * its batch is beaconed as soon as it is back in the queue (no timer is left to send it). Without `sendBeacon`, a
+   * keepalive fetch that fails after `close()` is sent once more; failing again, its batch stays for `flush()`.
    */
   close(): void {
     this.closed = true;

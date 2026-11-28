@@ -674,6 +674,33 @@ describe("analytics client", () => {
     expect(a.pending).toBe(0);
   });
 
+  test("close() without sendBeacon: a keepalive fetch that fails is sent once more, then waits for flush() (no loop)", async () => {
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("addEventListener", () => {});
+    vi.stubGlobal("removeEventListener", () => {});
+    const bodies: string[][] = [];
+    let status = 503;
+    const fetch = vi.fn(async (_u: string, init: RequestInit) => {
+      bodies.push((JSON.parse(String(init.body)) as Sent["body"]).events.map((e) => e.name));
+      return new Response(null, { status });
+    }) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    a.track("one");
+    a.track("two");
+    a.close();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bodies).toEqual([["one", "two"], ["one", "two"]]); // the 503, then one more try
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(bodies).toHaveLength(2); // never a third on its own
+    expect(a.pending).toBe(2);
+    status = 204;
+    await a.flush();
+    expect(bodies.at(-1)).toEqual(["one", "two"]);
+    expect(a.pending).toBe(0);
+  });
+
   test("the anonymous id: kept in storage across clients, a new one after reset", () => {
     const storage = memoryStorage();
     const { fetch } = fakeFetch();
