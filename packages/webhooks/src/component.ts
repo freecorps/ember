@@ -402,6 +402,19 @@ function release(ctx: Ctx, e: Endpoint, s: Settings): number {
   return Math.min(held.length, BATCH);
 }
 
+/**
+ * Half-open with no probe out: the oldest held delivery goes as the probe (nothing held: the next send or retry is
+ * the probe). A no-op otherwise (closed, open, disabled, or a probe already out).
+ */
+function probeNext(ctx: Ctx, e: Endpoint, s: Settings): void {
+  if (!e.enabled || e.breaker.state !== "halfOpen" || e.probing) return;
+  const first = ctx.db
+    .query("deliveries")
+    .withIndex("by_held", (q) => q.eq("endpointId", e._id).gte("heldAt", 0))
+    .first() as Delivery | null;
+  if (first) dispatch(ctx, first, e, s);
+}
+
 /** Opens (or reopens) the breaker: the probe job after the cooldown. */
 function scheduleProbe(ctx: Ctx, e: Endpoint, b: Breaker): string {
   if (e.probeJob) ctx.scheduler.cancel(e.probeJob);
@@ -577,7 +590,8 @@ export const functions = {
       errors: [webhookErrors.EndpointNotFound],
       handler: (ctx, a) => {
         const e = mustEndpoint(ctx, a.endpointId);
-        if (a.url !== undefined) checkUrl(a.url, settings(ctx).allowHttp);
+        const s = settings(ctx);
+        if (a.url !== undefined) checkUrl(a.url, s.allowHttp);
         if (a.events !== undefined) checkEvents(a.events);
         ctx.db.patch(e._id, {
           ...(a.url !== undefined ? { url: a.url } : {}),
@@ -585,6 +599,9 @@ export const functions = {
           ...(a.description !== undefined ? { description: a.description } : {}),
           ...(a.metadata !== undefined ? { metadata: a.metadata } : {}),
         });
+        // A new url, half-open with no probe out (the last probe was refused by the url policy): the oldest held
+        // delivery goes now as the probe, so the held ones get out without a disable and enable.
+        if (a.url !== undefined) probeNext(ctx, { ...e, url: a.url }, s);
         return null;
       },
     }),
@@ -811,9 +828,12 @@ export const functions = {
         // can take it again by now (`release` ran before it was held, so it would not see it).
         if ("held" in report) return dispatch(ctx, { ...d, attempt: d.attempt - 1 }, e, s);
         // Refused by the url policy: dead at once (a retry would be refused too), shown with why; the breaker is not
-        // the endpoint's answer, so it does not move.
+        // the endpoint's answer, so it does not move. A refused probe gives its reservation back (still half-open):
+        // the next send or retry is the probe, and so is the oldest held one when the url is changed
+        // (`updateEndpoint`). The held ones are not sent as probes here: the same url would refuse each of them.
         if ("refused" in report) {
           ctx.db.patch(d._id, { workId: undefined, updatedAt: ctx.now, status: "dead", lastError: report.refused, history: push(d.history, { at: ctx.now, attempt: d.attempt, event: "dead", error: report.refused }) });
+          if (e.probing === d._id) ctx.db.patch(e._id, { probing: undefined });
           ensureGc(ctx, s);
           return;
         }
@@ -880,13 +900,8 @@ export const functions = {
         const e = ctx.db.get(a.endpointId) as Endpoint | null;
         if (!e || e.breaker.state !== "open") return;
         const breaker = breakerHalfOpen(e.breaker);
-        const first = ctx.db
-          .query("deliveries")
-          .withIndex("by_held", (q) => q.eq("endpointId", e._id).gte("heldAt", 0))
-          .first() as Delivery | null;
         ctx.db.patch(e._id, { breaker, probeJob: undefined, probing: undefined });
-        // Nothing held: the next delivery (a send or a retry) is the probe.
-        if (first && e.enabled) dispatch(ctx, first, { ...e, breaker, probing: undefined }, settings(ctx));
+        probeNext(ctx, { ...e, breaker, probeJob: undefined, probing: undefined }, settings(ctx));
       },
     }),
     /** Releases the next batch of held deliveries. */

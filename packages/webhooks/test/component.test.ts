@@ -65,6 +65,7 @@ const modules = {
   },
   admin: {
     add: mutationGeneric({ args: { url: v.string(), events: v.optional(v.array(v.string())) }, handler: (ctx: any, a: any) => hooks.createEndpoint(ctx, a) }),
+    update: mutationGeneric({ args: { id: v.string(), url: v.string() }, handler: (ctx: any, a: any) => hooks.updateEndpoint(ctx, a.id, { url: a.url }) }),
     enable: mutationGeneric({ args: { id: v.string(), on: v.boolean() }, handler: (ctx: any, a: any) => hooks.setEnabled(ctx, a.id, a.on) }),
     rotate: mutationGeneric({ args: { id: v.string(), graceMs: v.optional(v.number()) }, handler: (ctx: any, a: any) => hooks.rotateSecret(ctx, a.id, a.graceMs !== undefined ? { graceMs: a.graceMs } : {}) }),
     remove: mutationGeneric({ args: { id: v.string() }, handler: (ctx: any, a: any) => hooks.deleteEndpoint(ctx, a.id) }),
@@ -301,6 +302,82 @@ describe("webhooks component", () => {
     await flush(t);
     expect(seen).toHaveLength(2);
     expect(await delivery(t, id!)).toMatchObject({ status: "delivered" });
+  });
+
+  /**
+   * An http:// endpoint (allowHttp on) whose breaker opened; B, C and D held. allowHttp is turned off, then the
+   * cooldown ends: B goes as the probe and is refused by the url policy.
+   */
+  const refusedProbe = async () => {
+    const config: WebhooksInstallConfig = { allowHttp: true, jitter: 0, breaker: { threshold: 1, cooldownMs: 60_000 }, retrySchedule: [] };
+    const t = harness(config);
+    const { endpointId } = await t.mutation(api.admin.add, { url: "http://p.test/hook" });
+    reply("http://p.test/hook", 500);
+    await t.mutation(api.billing.emit, { event: "e", payload: { a: true } });
+    await flush(t);
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.breaker).toMatchObject({ state: "open", failures: 1 });
+    const held: string[] = [];
+    for (const k of ["b", "c", "d"]) held.push((await t.mutation(api.billing.emit, { event: "e", payload: { [k]: true } })).deliveries[0]!);
+    await flush(t);
+    config.allowHttp = false;
+    await t.advance(60_000);
+    expect(seen).toHaveLength(1);
+    return { t, config, endpointId, held };
+  };
+  /** The endpoint row as stored (`probing` is not in the public view): read from a description write's changes. */
+  let checks = 0;
+  const storedEndpoint = (t: EmberTest, endpointId: string) => {
+    const r = t.engine().runMutation("@webhooks/lib:updateEndpoint", { endpointId, description: `check ${++checks}` }) as { changes: Array<{ table: string; after: { probing?: string; breaker: unknown } | null }> };
+    return r.changes.filter((c) => c.table === "webhooks$endpoints").at(-1)!.after!;
+  };
+
+  test("a half-open probe refused by the url policy is dead and gives the probe reservation back", async () => {
+    const { t, endpointId, held } = await refusedProbe();
+    const [b, c, d] = held as [string, string, string];
+    expect(await delivery(t, b)).toMatchObject({ status: "dead", lastError: expect.stringMatching(/allowHttp is off/) });
+    const row = storedEndpoint(t, endpointId);
+    expect(row.breaker).toMatchObject({ state: "halfOpen" });
+    expect(row.probing).toBeUndefined();
+    // The others are still held (the same url would refuse them too).
+    for (const id of [c, d]) expect(await delivery(t, id)).toMatchObject({ status: "pending", heldAt: expect.any(Number) });
+  });
+
+  test("after a refused probe, changing the url sends the held deliveries again (no disable and enable)", async () => {
+    const { t, endpointId, held } = await refusedProbe();
+    const [, c, d] = held as [string, string, string];
+    await t.mutation(api.admin.update, { id: endpointId, url: "https://p.test/hook" });
+    await flush(t);
+    // C (the oldest held) is the probe, it closes the breaker, and D is released.
+    expect(seen.slice(1).map((r) => r.url)).toEqual(["https://p.test/hook", "https://p.test/hook"]);
+    for (const id of [c, d]) expect(await delivery(t, id)).toMatchObject({ status: "delivered" });
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.breaker).toEqual({ state: "closed", failures: 0 });
+  });
+
+  test("a refused attempt that is not the probe leaves the probe and the breaker as they are", async () => {
+    const t = harness({ jitter: 0, breaker: { threshold: 1, cooldownMs: 60_000 }, retrySchedule: [1000] });
+    const eng = t.engine();
+    type Row = { _id: string; workId?: string; attempt: number };
+    const sent = (payload: unknown): Row => {
+      const r = eng.runMutation("@webhooks/lib:send", { event: "e", payload }) as { changes: Array<{ table: string; after: Row | null }> };
+      return r.changes.filter((ch) => ch.table === "webhooks$deliveries").at(-1)!.after!;
+    };
+    const settle = (d: Row, returnValue: unknown) => eng.runMutation("@webhooks/lib:settle", { workId: d.workId!, context: { deliveryId: d._id, attempt: d.attempt }, result: { kind: "success", returnValue } });
+    const { endpointId } = await t.mutation(api.admin.add, { url: "https://r.test/hook" });
+    // A and B go out while closed; B's failure opens the breaker; C is held, then sent as the probe.
+    const a = sent({ a: true });
+    const b = sent({ b: true });
+    settle(b, { status: 500, durationMs: 1 });
+    const [c] = (await t.mutation(api.billing.emit, { event: "e", payload: { c: true } })).deliveries;
+    await t.mutation(unsafeRef<"mutation">("@webhooks/lib:probe"), { endpointId });
+    expect(storedEndpoint(t, endpointId)).toMatchObject({ breaker: { state: "halfOpen" }, probing: c });
+    // A, prepared before, reports a refusal now: dead, and C is still the probe.
+    settle(a, { refused: "url must be https:// (got http:; allowHttp is off): not sent" });
+    expect(await delivery(t, a._id)).toMatchObject({ status: "dead" });
+    expect(storedEndpoint(t, endpointId)).toMatchObject({ breaker: { state: "halfOpen", failures: 1 }, probing: c });
+    // The probe goes and closes the breaker.
+    await flush(t);
+    expect(await delivery(t, c!)).toMatchObject({ status: "delivered" });
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.breaker).toEqual({ state: "closed", failures: 0 });
   });
 
   test("an attempt that waited on storage signs with the secrets current when it signs (graceMs: 0 revokes it)", async () => {
