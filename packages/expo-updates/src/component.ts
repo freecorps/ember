@@ -356,8 +356,10 @@ function promoteReady(ctx: Ctx["mutation"], row: AssetRow): boolean {
   }
   const file = [row.file, ...(row.pending ?? []).map((u) => u.file)].find((f) => fileState(ctx, f) === "ready");
   if (!file) return false;
-  const pending = pendingUploads(ctx, row).filter((u) => u.file !== file);
-  ctx.db.patch(row._id, { file, fileExpiresAt: undefined, pending: pending.length ? pending : undefined, pendingUntil: pendingUntilOf(undefined, pending) });
+  // Promotion keeps every other reference as it is (expired ones too): releasing them costs a write each, and a publish
+  // touching many assets must not spend its budget on it. The bounded daily sweep lets them go.
+  const others = [...(row.fileExpiresAt !== undefined ? [{ file: row.file, expiresAt: row.fileExpiresAt }] : []), ...(row.pending ?? [])].filter((u) => u.file !== file);
+  ctx.db.patch(row._id, { file, fileExpiresAt: undefined, pending: others.length ? others : undefined, pendingUntil: pendingUntilOf(undefined, others) });
   return true;
 }
 

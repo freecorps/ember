@@ -369,6 +369,35 @@ describe("expo updates component", () => {
     expect(((await t.mutation(m("publish"), { branch: "production", updates })) as { updates: unknown[] }).updates).toHaveLength(8);
   }, 300_000);
 
+  test("a publish promoting a secondary upload keeps the expired references for the sweep (no write budget spent)", async () => {
+    const t = harness();
+    const files: string[] = [];
+    for (let a = 0; a < 520; a++) {
+      const body = `second-${a}`;
+      files.push(body);
+      let first: { url: string; headers: Record<string, string>; storageId: string; shard: string; token: string } | undefined;
+      for (let i = 0; i < 16; i++) {
+        const up = ((await t.mutation(m("prepareAssets"), { assets: [{ sha256: hex(body), size: body.length, contentType: "image/png" }] })) as Array<{ upload?: typeof first }>)[0]!.upload;
+        first ??= up;
+      }
+      // Only the first ticket is confirmed: the row's file is the last (pending), the ready one a secondary.
+      expect((await t.fetch(first!.url, { method: "PUT", headers: first!.headers, body })).status).toBe(200);
+      expect((await t.fetch("/api/storage/confirm", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ shard: first!.shard, storageId: first!.storageId, token: first!.token }) })).status).toBe(200);
+    }
+    await t.advance(26 * 3600_000);
+    const updates = Array.from({ length: 8 }, (_, j) => ({
+      platform: (j % 2 ? "android" : "ios") as "ios" | "android",
+      runtimeVersion: `${j}.0.0`,
+      launchAsset: asset(files[j * 65]!, "b", "image/png"),
+      assets: files.slice(j * 65 + 1, (j + 1) * 65).map((f, i) => asset(f, `k${i}`, "image/png")),
+    }));
+    expect(((await t.mutation(m("publish"), { branch: "production", updates })) as { updates: unknown[] }).updates).toHaveLength(8);
+    // The sweep then lets the expired ones go, a bounded batch at a time.
+    let swept = 0;
+    for (let n = 1; n > 0; ) swept += n = (await t.mutation(unsafeRef<"mutation">("@expoUpdates/lib:sweepUploads"), {})) as number;
+    expect(swept).toBe(520);
+  }, 300_000);
+
   test("extra must be JSON (every committed update renders)", async () => {
     const t = harness();
     await upload(t, { bundle: "x" });
