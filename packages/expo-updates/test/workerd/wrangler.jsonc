@@ -1,0 +1,12 @@
+// Test-only Worker for the expo-updates component's workerd test (vitest.workerd.config.ts). Never deployed.
+{
+  "name": "ember-expo-updates-it",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "SHARD", "class_name": "Shard" }]
+  },
+  "r2_buckets": [{ "binding": "EMBER_FILES", "bucket_name": "ember-expo-updates-it-files" }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard"] }]
+}
