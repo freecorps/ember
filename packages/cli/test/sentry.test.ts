@@ -15,7 +15,7 @@ function fakeRuntime(prefix = "/sentry") {
   const blobs = new Map<string, Buffer>();
   const rows = new Map<string, { sha256: string; debugId?: string }>();
   const calls: string[] = [];
-  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
     calls.push(`${init?.method} ${url.pathname}`);
     if (new Headers(init?.headers).get("authorization") !== `Bearer ${TOKEN}`) return Response.json({ ok: false, error: { code: "unauthorized", message: "no" } }, { status: 401 });
@@ -41,7 +41,7 @@ function fakeRuntime(prefix = "/sentry") {
     }
     return new Response("not found", { status: 404 });
   }) as typeof fetch;
-  return { fetch, blobs, rows, calls };
+  return { fetch: fakeFetch, blobs, rows, calls };
 }
 
 const map = (file: string, extra: object = {}) => JSON.stringify({ version: 3, file, sources: ["src/app.ts"], names: [], mappings: "AAAA", ...extra });

@@ -10,12 +10,12 @@ afterEach(() => close());
 function endpoint() {
   const queue = new FakeQueue<QueuedEvent>();
   const requests: Request[] = [];
-  const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(String(input), init);
     requests.push(req.clone());
     return handleIngest(req, { config: { projects: [{ id: "web", keys: [KEY] }] }, install: "sentry", env: { EMBER_Q_SENTRY_EVENTS: queue, EMBER_FILES: new MemoryR2() }, buckets: new TokenBuckets() });
   }) as typeof fetch;
-  return { queue, requests, fetch };
+  return { queue, requests, fetch: fakeFetch };
 }
 
 describe("client", () => {
