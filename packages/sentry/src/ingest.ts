@@ -6,7 +6,7 @@
 // to the component's Queue (the consumer groups them into issues, one write per issue per batch); attachments, replays
 // and oversized events go to R2; sessions, transactions and drops are Analytics Engine points. 0 rows written per event.
 
-import { aeOf, INLINE_EVENT_MAX, limitsOf, queueOf, r2Of, DEFAULT_RATE, type RateLimitLike, type SentryInstallConfig, type SentryProjectConfig } from "./config.ts";
+import { aeOf, INLINE_EVENT_MAX, limitsOf, QUEUE_BATCH, queueOf, r2Of, DEFAULT_RATE, type RateLimitLike, type SentryInstallConfig, type SentryProjectConfig } from "./config.ts";
 import { decodeBody, EnvelopeError, itemJson, parseEnvelope, readCapped, utf8, type EnvelopeItem, type JsonObject } from "./envelope.ts";
 import { eventId, isObj, type SentryEvent } from "./event.ts";
 import { droppedPoint, sessionPoints, transactionPoint } from "./analytics.ts";
@@ -231,7 +231,7 @@ export async function handleIngest(request: Request, deps: IngestDeps): Promise<
   if (messages.length) {
     const queue = queueOf(deps.env, deps.install);
     if (queue) {
-      for (let i = 0; i < messages.length; i += 100) await queue.sendBatch(messages.slice(i, i + 100).map((body) => ({ body, contentType: "json" })));
+      for (const batch of queueBatches(messages)) await queue.sendBatch(batch.map((body) => ({ body, contentType: "json" })));
     } else if (deps.inline) {
       await deps.inline(messages);
     } else {
@@ -264,6 +264,28 @@ const validAggregates = (payload: JsonObject) => payload.aggregates === undefine
 const encoder = new TextEncoder();
 /** A queue message's size as sent (UTF-8 JSON). */
 export const messageBytes = (msg: QueuedEvent) => encoder.encode(JSON.stringify(msg)).length;
+
+/**
+ * Splits messages into `sendBatch` calls within `QUEUE_BATCH`: a batch is cut before either its count or its bytes (each
+ * message as sent plus the Queue's metadata) would go over. A message is at most `INLINE_EVENT_MAX`, so one always fits.
+ */
+export function queueBatches(messages: readonly QueuedEvent[], limits = QUEUE_BATCH): QueuedEvent[][] {
+  const out: QueuedEvent[][] = [];
+  let cur: QueuedEvent[] = [];
+  let bytes = 0;
+  for (const m of messages) {
+    const size = messageBytes(m) + limits.overhead;
+    if (cur.length && (cur.length >= limits.messages || bytes + size > limits.bytes)) {
+      out.push(cur);
+      cur = [];
+      bytes = 0;
+    }
+    cur.push(m);
+    bytes += size;
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
 
 /** The event without its breadcrumbs (usually what makes it big): what goes inline when there is no bucket to spill to. */
 const withoutBreadcrumbs = (ev: SentryEvent): SentryEvent => {

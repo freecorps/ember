@@ -87,6 +87,11 @@ export const DEFAULT_THROTTLE_MINUTES = 30;
 export const DEFAULT_MAX_ALERTS_PER_HOUR = 20;
 /** A queue message is at most 128 KB: events larger than this go to R2 first and the message carries the key. */
 export const INLINE_EVENT_MAX = 96 * 1024;
+/**
+ * What one `sendBatch` takes (Cloudflare Queues limits): at most 100 messages and 256 KB in all, 1 KB being 1000 bytes;
+ * each message carries up to ~100 bytes of internal metadata that count towards that total.
+ */
+export const QUEUE_BATCH = { messages: 100, bytes: 256_000, overhead: 100 };
 
 export const limitsOf = (c: SentryInstallConfig) => ({ ...DEFAULT_LIMITS, ...stripUndefined(c.limits ?? {}) });
 export const shardOf = (c: SentryInstallConfig | undefined) => c?.shard ?? "global:main";

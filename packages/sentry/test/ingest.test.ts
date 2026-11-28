@@ -4,7 +4,7 @@
 // Analytics Engine). No shard is involved anywhere here.
 import { describe, expect, it } from "vitest";
 import { gunzip, gzip, serializeEnvelope, utf8 } from "../src/envelope.ts";
-import { handleIngest, keyFromRequest, TokenBuckets, type IngestDeps, type QueuedEvent } from "../src/ingest.ts";
+import { handleIngest, keyFromRequest, queueBatches, TokenBuckets, type IngestDeps, type QueuedEvent } from "../src/ingest.ts";
 import { INLINE_EVENT_MAX, type SentryInstallConfig } from "../src/config.ts";
 import { FakeAnalytics, FakeQueue, KEY, MemoryR2 } from "./fakes.ts";
 
@@ -268,6 +268,18 @@ describe("ingest: items", () => {
     expect(r.status).toBe(413);
     expect(r.headers.get("x-sentry-error")).toMatch(/too large for a queue message/);
     expect(queue.sent).toHaveLength(1);
+  });
+
+  it("events near the inline limit are sent in batches within sendBatch's 256 KB (count and bytes)", async () => {
+    const { deps, queue } = setup();
+    // Three events of ~90 KiB each: every one fits a message, the three together do not fit one batch.
+    const items = [0, 1, 2].map((i) => ({ header: { type: "event" }, payload: ev({ event_id: String(i).repeat(32), extra: { pad: "x".repeat(90 * 1024) } }) }));
+    expect((await handleIngest(post(envelope(items)), deps)).status).toBe(200);
+    expect(queue.sent.map((m) => [m.id, !!m.event])).toEqual([["0".repeat(32), true], ["1".repeat(32), true], ["2".repeat(32), true]]);
+    expect(queue.calls).toBe(2);
+    // By count too: 150 small events are two batches.
+    const sizes = queueBatches(Array.from({ length: 150 }, (_, i) => ({ v: 1 as const, project: "web", id: String(i), receivedAt: NOW, event: { level: "error" } }))).map((b) => b.length);
+    expect(sizes).toEqual([100, 50]);
   });
 
   it("without the queue binding the messages go to the inline consumer", async () => {

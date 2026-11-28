@@ -53,9 +53,13 @@ export class FakeQueue<T = unknown> implements QueueLike<T> {
     this.calls++;
     this.sent.push(structuredClone(body));
   }
+  /** Refuses what a real Queue refuses: more than 100 messages, or more than 256 KB in all (with ~100 bytes each of metadata). */
   async sendBatch(messages: Iterable<{ body: T }>) {
     this.calls++;
-    for (const m of messages) this.sent.push(structuredClone(m.body));
+    const list = [...messages];
+    const bytes = list.reduce((n, m) => n + new TextEncoder().encode(JSON.stringify(m.body)).length + 100, 0);
+    if (list.length > 100 || bytes > 256_000) throw new Error(`Queue sendBatch() limit exceeded: ${list.length} messages, ${bytes} bytes`);
+    for (const m of list) this.sent.push(structuredClone(m.body));
   }
   take(): T[] {
     return this.sent.splice(0);
