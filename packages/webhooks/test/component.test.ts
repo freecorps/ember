@@ -380,6 +380,31 @@ describe("webhooks component", () => {
     expect((await t.query(api.admin.endpoint, { id: endpointId }))?.breaker).toEqual({ state: "closed", failures: 0 });
   });
 
+  test("a refused probe that settles after the url was repaired starts the oldest held one as the next probe", async () => {
+    const t = harness({ jitter: 0, breaker: { threshold: 1, cooldownMs: 60_000 }, retrySchedule: [1000] });
+    const eng = t.engine();
+    type Row = { _id: string; workId?: string; attempt: number };
+    const rowsOf = (r: unknown) => (r as { changes: Array<{ table: string; after: Row | null }> }).changes.filter((ch) => ch.table === "webhooks$deliveries").map((ch) => ch.after!);
+    const settle = (d: Row, returnValue: unknown) => eng.runMutation("@webhooks/lib:settle", { workId: d.workId!, context: { deliveryId: d._id, attempt: d.attempt }, result: { kind: "success", returnValue } });
+    const { endpointId } = await t.mutation(api.admin.add, { url: "https://r.test/hook" });
+    const b = rowsOf(eng.runMutation("@webhooks/lib:send", { event: "e", payload: { b: true } })).at(-1)!;
+    settle(b, { status: 500, durationMs: 1 }); // opens the breaker
+    const [c] = (await t.mutation(api.billing.emit, { event: "e", payload: { c: true } })).deliveries;
+    const [d] = (await t.mutation(api.billing.emit, { event: "e", payload: { d: true } })).deliveries;
+    const probe = rowsOf(eng.runMutation("@webhooks/lib:probe", { endpointId })).find((r) => r._id === c)!;
+    expect(storedEndpoint(t, endpointId)).toMatchObject({ breaker: { state: "halfOpen" }, probing: c });
+    // The url is repaired while C is out (updateEndpoint sees the probe out: nothing sent), then C reports the
+    // refusal `prepare` made with the old url.
+    await t.mutation(api.admin.update, { id: endpointId, url: "https://fixed.test/hook" });
+    // Through the harness (not the raw engine), so the jobs this settle schedules (D's attempt) run on flush.
+    await t.mutation(unsafeRef<"mutation">("@webhooks/lib:settle"), { workId: probe.workId!, context: { deliveryId: probe._id, attempt: probe.attempt }, result: { kind: "success", returnValue: { refused: "url must be https:// (got http:; allowHttp is off): not sent" } } });
+    expect(await delivery(t, c!)).toMatchObject({ status: "dead" });
+    expect(storedEndpoint(t, endpointId)).toMatchObject({ breaker: { state: "halfOpen" }, probing: d });
+    await flush(t);
+    expect(await delivery(t, d!)).toMatchObject({ status: "delivered" });
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.breaker).toEqual({ state: "closed", failures: 0 });
+  });
+
   test("an attempt that waited on storage signs with the secrets current when it signs (graceMs: 0 revokes it)", async () => {
     const t = harness({ jitter: 0, retrySchedule: [1000] });
     const { endpointId, secret: old } = await t.mutation(api.admin.add, { url: "https://slow.test/hook" });

@@ -833,7 +833,12 @@ export const functions = {
         // (`updateEndpoint`). The held ones are not sent as probes here: the same url would refuse each of them.
         if ("refused" in report) {
           ctx.db.patch(d._id, { workId: undefined, updatedAt: ctx.now, status: "dead", lastError: report.refused, history: push(d.history, { at: ctx.now, attempt: d.attempt, event: "dead", error: report.refused }) });
-          if (e.probing === d._id) ctx.db.patch(e._id, { probing: undefined });
+          if (e.probing === d._id) {
+            ctx.db.patch(e._id, { probing: undefined });
+            // The url may have been repaired after `prepare` refused it (`updateEndpoint` then saw this probe out and
+            // sent nothing): when the current url passes, the oldest held one goes now as the next probe.
+            if (!refusedUrl(e.url, s.allowHttp)) probeNext(ctx, { ...e, probing: undefined }, s);
+          }
           ensureGc(ctx, s);
           return;
         }
