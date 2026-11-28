@@ -293,6 +293,24 @@ describe("queries", () => {
     expect(calls[0]).toContain("ORDER BY t DESC, name");
   });
 
+  test("rolling reports end at the action's now, down to the cache step: one text per minute, still served by the cache", async () => {
+    const calls = sqlApi(() => ({ data: [] }));
+    const t = emberTest({ schema, modules: { events: { ...events, counts: actionGeneric({ args: {}, handler: (ctx: any) => tracker.counts(ctx, { bucket: "minute" }) }) } }, app, env: { EMBER_ANALYTICS: fakeDataset(), ...CREDS } });
+    const now = await t.run((ctx) => ctx.now);
+    const step = (ms: number) => Math.floor(ms / 60_000) * 60;
+    await t.action(unsafeRef<"action">("events:counts"), {});
+    expect(calls[0]).toContain(`toUnixTimestamp(toDateTime(double1 / 1000)) <= ${step(now)}`);
+    expect(calls[0]).not.toContain("NOW()");
+    const next = 60_000 - (now % 60_000); // the next minute: a new bound, a new text
+    await t.advance(next - 1);
+    await t.action(unsafeRef<"action">("events:counts"), {});
+    expect(calls).toHaveLength(1); // same minute: the cached answer
+    await t.advance(1);
+    await t.action(unsafeRef<"action">("events:counts"), {});
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toContain(`toUnixTimestamp(toDateTime(double1 / 1000)) <= ${step(now) + 60}`);
+  });
+
   test("two deployments on one account's default dataset: each report counts only its own events", async () => {
     // One dataset shared by staging and production (the account's), and a SQL API double that answers from its points,
     // filtering on the blob6 literal the statement carries (what Analytics Engine does with the WHERE).

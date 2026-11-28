@@ -101,11 +101,19 @@ const ET = "toUnixTimestamp(toDateTime(double1 / 1000))";
 const AHEAD_HOURS = Math.ceil(MAX_FUTURE_MS / 3_600_000);
 
 /**
- * Events that happened in the last `seconds`: by event time, with an arrival range (`timestamp`, what Analytics
- * Engine orders and prunes by) wide enough to never drop one (an event arrives at most `AHEAD_HOURS` before its `ts`).
+ * The statements' "now" (unix seconds), from `now` in ms (the action's `ctx.now`; default `Date.now()`). It is in the
+ * text, never `NOW()`: the text says what the answer covers, so the cache (keyed by text) never serves one answer for
+ * another moment.
  */
-function lastSeconds(where: string[], seconds: number): void {
-  where.push(`timestamp > NOW() - INTERVAL '${Math.ceil(seconds / 3600) + AHEAD_HOURS}' HOUR`, `${ET} > toUnixTimestamp(NOW()) - ${seconds}`);
+const nowSeconds = (now: unknown): number => int(Math.floor(typeof now === "number" ? now / 1000 : now === undefined ? Date.now() / 1000 : Number.NaN), 0, NEVER, "now");
+
+/**
+ * Events that happened in the last `seconds` before `end` (unix seconds), by event time: never after `end` (an event
+ * may be up to `MAX_FUTURE_MS` ahead of its arrival; it counts once its time has come). The arrival range (`timestamp`,
+ * what Analytics Engine orders and prunes by) starts `AHEAD_HOURS` earlier, so it never drops one.
+ */
+function lastSeconds(where: string[], seconds: number, end: number): void {
+  where.push(`toUnixTimestamp(timestamp) > ${end - (Math.ceil(seconds / 3600) + AHEAD_HOURS) * 3600}`, `${ET} > ${end - seconds}`, `${ET} <= ${end}`);
 }
 /** Sentinel time past any event (2100-01-01): "the user never did this step". */
 export const NEVER = 4102444800;
@@ -135,6 +143,8 @@ export interface CountsOptions {
   sinceHours?: number;
   /** Bucket size (default `hour`). */
   bucket?: Bucket;
+  /** Now (ms): the range ends there (default `Date.now()`; the component passes the action's `ctx.now`). */
+  now?: number;
 }
 
 /** Events per bucket and name: `t` (bucket start), `name`, `events`. */
@@ -143,7 +153,7 @@ export function countsSql(s: Scope, o: CountsOptions = {}): string {
   const since = int(o.sinceHours ?? 24, 1, 2160, "sinceHours");
   const bucket = o.bucket ?? "hour";
   if (typeof bucket !== "string" || !Object.hasOwn(BUCKET_UNIT, bucket)) throw new SqlInputError(`bucket must be minute, hour or day`);
-  lastSeconds(where, since * 3600);
+  lastSeconds(where, since * 3600, nowSeconds(o.now));
   if (o.names !== undefined) {
     const ns = uniqueNames(o.names, "names", 1, 20);
     where.push(`index1 IN (${names(ns)})`);
@@ -160,9 +170,9 @@ export function countsSql(s: Scope, o: CountsOptions = {}): string {
 }
 
 /** The most frequent events: `name`, `events`, `users`. */
-export function topEventsSql(s: Scope, o: { sinceHours?: number; limit?: number } = {}): string {
+export function topEventsSql(s: Scope, o: { sinceHours?: number; limit?: number; now?: number } = {}): string {
   const { table, where } = from(s);
-  lastSeconds(where, int(o.sinceHours ?? 24, 1, 2160, "sinceHours") * 3600);
+  lastSeconds(where, int(o.sinceHours ?? 24, 1, 2160, "sinceHours") * 3600, nowSeconds(o.now));
   return [
     `SELECT blob1 AS name, SUM(_sample_interval) AS events, ${USERS} AS users`,
     `FROM ${table}`,
@@ -174,14 +184,15 @@ export function topEventsSql(s: Scope, o: { sinceHours?: number; limit?: number 
 }
 
 /**
- * Events and distinct users of one UTC day (default today, by `now` in ms): `events`, `users`. The day's bounds are in
- * the text, not `NOW()`, so a cached answer is never one of the day before, and an event of tomorrow (ahead by at most
- * `MAX_FUTURE_MS`) is not counted today.
+ * Events and distinct users of one UTC day until `now` (ms; default today, now): `events`, `users`. The bounds are in
+ * the text, not `NOW()`, so a cached answer is never one of the day before, and an event of later today or tomorrow
+ * (ahead by at most `MAX_FUTURE_MS`) is not counted yet.
  */
 export function overviewSql(s: Scope, o: { now?: number } = {}): string {
   const { table, where } = from(s);
-  const day = Math.floor(Math.floor((o.now ?? Date.now()) / 1000) / 86400) * 86400;
-  where.push(`toUnixTimestamp(timestamp) >= ${day - AHEAD_HOURS * 3600}`, `${ET} >= ${day}`, `${ET} < ${day + 86400}`);
+  const end = nowSeconds(o.now);
+  const day = Math.floor(end / 86400) * 86400;
+  where.push(`toUnixTimestamp(timestamp) >= ${day - AHEAD_HOURS * 3600}`, `${ET} >= ${day}`, `${ET} < ${day + 86400}`, `${ET} <= ${end}`);
   return [`SELECT SUM(_sample_interval) AS events, ${USERS} AS users`, `FROM ${table}`, `WHERE ${where.join(" AND ")}`].join("\n");
 }
 
@@ -194,6 +205,8 @@ export interface FunnelOptions {
   windowSeconds?: number;
   /** How far back users are looked at, in days (1..90, default 7). */
   sinceDays?: number;
+  /** Now (ms): the range ends there (default `Date.now()`; the component passes the action's `ctx.now`). */
+  now?: number;
 }
 
 /**
@@ -209,7 +222,7 @@ export function funnelSql(s: Scope, o: FunnelOptions): string {
   const steps = uniqueNames(o.steps, "steps", 2, 8);
   const win = int(o.windowSeconds ?? 86400, 60, 30 * 86400, "windowSeconds");
   const days = int(o.sinceDays ?? 7, 1, 90, "sinceDays");
-  lastSeconds(where, days * 86400);
+  lastSeconds(where, days * 86400, nowSeconds(o.now));
   where.push(`index1 IN (${names(steps)})`, HAS_UID);
   // Step times in milliseconds (`double1`), not ET's whole seconds: two steps in the same second keep their order, and
   // the window edge is exact.
@@ -285,7 +298,7 @@ export interface RetentionOptions {
   periods?: number;
   /** The event that puts a user in a cohort and counts as a return (default: any event). */
   event?: string;
-  /** Now (ms), for the start of the range (tests). Default `Date.now()`. */
+  /** Now (ms): the start of the range, and its end (no event after it). Default `Date.now()`. */
   now?: number;
 }
 
@@ -319,7 +332,7 @@ export function retentionSql(s: Scope, o: RetentionOptions & { now: number }): s
   const n = int(o.periods ?? 8, 2, MAX_PERIODS, "periods");
   const p = PERIOD_SECONDS[period];
   const start = retentionStart(o);
-  where.push(`toUnixTimestamp(timestamp) >= ${start - AHEAD_HOURS * 3600}`, `${ET} >= ${start}`, HAS_UID);
+  where.push(`toUnixTimestamp(timestamp) >= ${start - AHEAD_HOURS * 3600}`, `${ET} >= ${start}`, `${ET} <= ${nowSeconds(o.now)}`, HAS_UID);
   if (o.event !== undefined) where.push(`index1 = ${lit(eventName(o.event))}`);
   const idx = `intDiv(${ET} - ${start}, ${p})`;
   const actives = Array.from({ length: n }, (_, j) => `    countIf(${idx} = ${j}) AS a${j}`);

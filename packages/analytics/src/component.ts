@@ -271,6 +271,17 @@ const configured = (ctx: ActCtx) => {
 
 const scopeOf = (ctx: ActCtx) => ({ dataset: ctx.component.config?.dataset ?? DEFAULT_DATASET, install: ctx.component.name, deployment: deploymentOf(ctx.env) });
 
+/**
+ * The statements' "now" (their upper bound: no event after it, even one up to 1 h ahead): the action's `ctx.now`, down
+ * to the cache step (`sql.cacheSeconds`, at most a minute). The bound is in the text, so one text holds for the step
+ * and the cache keeps serving it; an answer is at most that step behind, as a cached one already was. No cache: exact.
+ */
+function asOf(ctx: ActCtx): number {
+  const ttl = ctx.component.config?.sql?.cacheSeconds ?? DEFAULT_CACHE_SECONDS;
+  const step = (Number.isFinite(ttl) && ttl > 0 ? Math.min(ttl, 60) : 0) * 1000;
+  return step > 0 ? Math.floor(ctx.now / step) * step : ctx.now;
+}
+
 /** Builds (checked: `SqlInputError` → `ValidationError`) and runs one statement through the cache. */
 async function query(ctx: ActCtx, build: () => string): Promise<SqlResponse> {
   let sql: string;
@@ -308,24 +319,25 @@ const vEvent = v.object({ name: v.string(), props: v.optional(vProps), ts: v.opt
 
 /** Oldest first; at most `MAX_COUNT_ROWS` rows, the newest buckets of the range (a longer range loses its oldest). */
 const counts = (ctx: ActCtx, a: { names?: string[]; sinceHours?: number; bucket?: Bucket }) =>
-  query(ctx, () => countsSql(scopeOf(ctx), a)).then((r) =>
+  query(ctx, () => countsSql(scopeOf(ctx), { ...a, now: asOf(ctx) })).then((r) =>
     (r.data ?? [])
       .map((x): CountRow => ({ t: String(x.t ?? ""), name: String(x.name ?? ""), events: n(x.events) }))
       .sort((x, y) => (x.t < y.t ? -1 : x.t > y.t ? 1 : x.name < y.name ? -1 : x.name > y.name ? 1 : 0)),
   );
 const topEvents = (ctx: ActCtx, a: { sinceHours?: number; limit?: number }) =>
-  query(ctx, () => topEventsSql(scopeOf(ctx), a)).then((r) => (r.data ?? []).map((x): TopEvent => ({ name: String(x.name ?? ""), events: n(x.events), users: n(x.users) })));
+  query(ctx, () => topEventsSql(scopeOf(ctx), { ...a, now: asOf(ctx) })).then((r) => (r.data ?? []).map((x): TopEvent => ({ name: String(x.name ?? ""), events: n(x.events), users: n(x.users) })));
 const funnelOpts = (a: { steps: string[]; windowHours?: number; days?: number }) => ({
   steps: a.steps,
   ...(a.windowHours !== undefined ? { windowSeconds: a.windowHours * 3600 } : {}),
   ...(a.days !== undefined ? { sinceDays: a.days } : {}),
 });
 const funnel = async (ctx: ActCtx, a: { steps: string[]; windowHours?: number; days?: number }): Promise<FunnelResult> => {
-  const o = funnelOpts(a);
+  const o = { ...funnelOpts(a), now: asOf(ctx) };
   return parseFunnel(await query(ctx, () => funnelSql(scopeOf(ctx), o)), o);
 };
 const retention = async (ctx: ActCtx, a: { period?: Period; periods?: number; event?: string }): Promise<RetentionResult> => {
-  const o = { ...a, now: ctx.now };
+  // One `now` for the statement and the parse (the cohorts' origin).
+  const o = { ...a, now: asOf(ctx) };
   return parseRetention(await query(ctx, () => retentionSql(scopeOf(ctx), o)), o);
 };
 
@@ -340,7 +352,7 @@ async function refresh(ctx: ActCtx): Promise<Overview> {
     await ctx.runMutation(saveReport, { key: "overview", value, onlyIfExists: true });
     return value;
   }
-  const [today, top] = await Promise.all([query(ctx, () => overviewSql(scopeOf(ctx), { now: ctx.now })), topEvents(ctx, { sinceHours: 24, limit: 20 })]);
+  const [today, top] = await Promise.all([query(ctx, () => overviewSql(scopeOf(ctx), { now: asOf(ctx) })), topEvents(ctx, { sinceHours: 24, limit: 20 })]);
   const row = today.data?.[0] ?? {};
   const value: Overview = { eventsToday: n(row.events), usersToday: n(row.users), top, at: ctx.now, configured: true };
   // `at`: when this run computed it. Two refreshes can overlap (cron jobs and "Refresh now"): one that began earlier

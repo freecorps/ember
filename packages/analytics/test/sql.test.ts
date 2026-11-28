@@ -80,8 +80,10 @@ describe("SQL inputs are checked, never interpolated raw", () => {
   });
 
   test("numbers are clamped integers; a non-number is refused", () => {
-    expect(countsSql(scope, { sinceHours: 1e9 })).toContain(`toUnixTimestamp(NOW()) - ${2160 * 3600}`);
-    expect(countsSql(scope, { sinceHours: -5 })).toContain("toUnixTimestamp(NOW()) - 3600");
+    expect(countsSql(scope, { sinceHours: 1e9, now: 1e10 })).toContain(`${ET} > ${1e7 - 2160 * 3600}`);
+    expect(countsSql(scope, { sinceHours: -5, now: 1e10 })).toContain(`${ET} > ${1e7 - 3600}`);
+    expect(() => countsSql(scope, { now: "1; DROP" as unknown as number })).toThrow(SqlInputError);
+    expect(() => funnelSql(scope, { steps: ["a", "b"], now: Number.NaN })).toThrow(SqlInputError);
     expect(topEventsSql(scope, { limit: 3.9 })).toContain("LIMIT 3");
     expect(() => topEventsSql(scope, { limit: "1; DROP" as unknown as number })).toThrow(SqlInputError);
     expect(() => funnelSql(scope, { steps: ["a", "b"], windowSeconds: Number.NaN })).toThrow(SqlInputError);
@@ -147,9 +149,22 @@ describe("statement shapes", () => {
     // The day's bounds are in the text (a cached answer of yesterday never serves today): the arrival range starts the
     // 1 h an event may be ahead of its arrival earlier, and an event of tomorrow is not counted today.
     const day = Date.UTC(2026, 10, 26) / 1000;
-    expect(overviewSql(scope, { now: Date.UTC(2026, 10, 26, 23, 30) })).toContain(`toUnixTimestamp(timestamp) >= ${day - 3600} AND ${ET} >= ${day} AND ${ET} < ${day + 86400}`);
+    expect(overviewSql(scope, { now: Date.UTC(2026, 10, 26, 23, 30) })).toContain(`toUnixTimestamp(timestamp) >= ${day - 3600} AND ${ET} >= ${day} AND ${ET} < ${day + 86400} AND ${ET} <= ${day + 84600}`);
     expect(overviewSql(scope, { now: Date.UTC(2026, 10, 27, 0, 0, 10) })).toContain(`${ET} >= ${day + 86400} AND`);
     expect(overviewSql(scope)).not.toContain("NOW()");
+  });
+
+  test("rolling reports end at now: an event up to 1 h ahead of its arrival is not counted before its time", () => {
+    // Ingestion takes a `ts` up to 1 h ahead: without the upper bound a query at 10:01 counts an event of 10:40 (a
+    // future bucket, a funnel step done before its time). The bound is the action's now in the text, never NOW().
+    const now = Date.UTC(2026, 10, 26, 10, 1);
+    const end = now / 1000;
+    for (const sql of [countsSql(scope, { now }), topEventsSql(scope, { now }), funnelSql(scope, { steps: ["a", "b"], now }), retentionSql(scope, { now }), overviewSql(scope, { now })]) {
+      expect(sql).toContain(`${ET} <= ${end}`);
+      expect(sql).not.toContain("NOW()");
+    }
+    // The arrival range still starts the full skew earlier (pruning never drops a valid event).
+    expect(topEventsSql(scope, { sinceHours: 24, now })).toContain(`toUnixTimestamp(timestamp) > ${end - 25 * 3600} AND ${ET} > ${end - 86400} AND`);
   });
 
   test("users: a signed-in subject and an anonymous id with the same text are two users", () => {
@@ -165,11 +180,12 @@ describe("statement shapes", () => {
   });
 
   test("counts: buckets per name, scoped to the install, names on the sampling index", () => {
-    expect(countsSql(scope, { names: ["a", "b"], sinceHours: 48, bucket: "day" })).toBe(
+    const now = 1_764_000_000_000; // ms; 1_764_000_000 s
+    expect(countsSql(scope, { names: ["a", "b"], sinceHours: 48, bucket: "day", now })).toBe(
       [
         "SELECT toStartOfInterval(toDateTime(double1 / 1000), INTERVAL '1' DAY) AS t, blob1 AS name, SUM(_sample_interval) AS events",
         "FROM ember_analytics",
-        `WHERE blob6 = 'analytics' AND timestamp > NOW() - INTERVAL '49' HOUR AND ${ET} > toUnixTimestamp(NOW()) - 172800 AND index1 IN ('a', 'b')`,
+        `WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) > ${1_764_000_000 - 49 * 3600} AND ${ET} > ${1_764_000_000 - 172800} AND ${ET} <= 1764000000 AND index1 IN ('a', 'b')`,
         "GROUP BY t, name",
         "ORDER BY t DESC, name",
         "LIMIT 10000",
@@ -178,7 +194,7 @@ describe("statement shapes", () => {
   });
 
   test("funnel: per-user first times in a subquery, ordered and windowed counts outside, no JOIN", () => {
-    const sql = funnelSql(scope, { steps: ["view", "cart", "paid"], windowSeconds: 3600, sinceDays: 14 });
+    const sql = funnelSql(scope, { steps: ["view", "cart", "paid"], windowSeconds: 3600, sinceDays: 14, now: 1_764_000_000_500 });
     expect(sql).toBe(
       [
         "SELECT",
@@ -193,7 +209,7 @@ describe("statement shapes", () => {
         `    min(if(blob1 = 'cart', double1, ${NEVER_MS})) AS t1,`,
         `    min(if(blob1 = 'paid', double1, ${NEVER_MS})) AS t2`,
         "  FROM ember_analytics",
-        `  WHERE blob6 = 'analytics' AND timestamp > NOW() - INTERVAL '337' HOUR AND ${ET} > toUnixTimestamp(NOW()) - 1209600 AND index1 IN ('view', 'cart', 'paid') AND (blob2 != '' OR blob3 != '')`,
+        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) > ${1_764_000_000 - 337 * 3600} AND ${ET} > ${1_764_000_000 - 1209600} AND ${ET} <= 1764000000 AND index1 IN ('view', 'cart', 'paid') AND (blob2 != '' OR blob3 != '')`,
         "  GROUP BY uid",
         ")",
       ].join("\n"),
@@ -220,7 +236,7 @@ describe("statement shapes", () => {
         `    countIf(${idx} = 1) AS a1,`,
         `    countIf(${idx} = 2) AS a2`,
         "  FROM ember_analytics",
-        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) >= ${start - 3600} AND ${ET} >= ${start} AND (blob2 != '' OR blob3 != '') AND index1 = 'session'`,
+        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) >= ${start - 3600} AND ${ET} >= ${start} AND ${ET} <= ${now / 1000} AND (blob2 != '' OR blob3 != '') AND index1 = 'session'`,
         "  GROUP BY uid",
         ")",
         "GROUP BY cohort",
