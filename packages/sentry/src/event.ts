@@ -53,7 +53,7 @@ export interface SentryEvent {
   [k: string]: unknown;
 }
 
-const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
+export const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 const FRAME_STRINGS = ["filename", "abs_path", "module", "function", "context_line"] as const;
 const EVENT_STRINGS = ["event_id", "level", "platform", "release", "dist", "environment", "transaction", "culprit"] as const;
 
@@ -237,11 +237,18 @@ export function levelOf(e: SentryEvent): Level {
   return (LEVELS as readonly string[]).includes(l) ? (l as Level) : l === "warn" ? "warning" : l === "critical" ? "fatal" : "error";
 }
 
+/** The largest time a Date holds (±8.64e15 ms). */
+const MAX_DATE_MS = 8.64e15;
+
 /** The event time in ms (Sentry sends seconds, as a number or RFC 3339). */
 export function timestampOf(e: SentryEvent, fallback: number): number {
   const t = e.timestamp;
-  if (typeof t === "number" && Number.isFinite(t)) return Math.round(t * 1000);
-  if (typeof t === "string") {
+  // A finite number of seconds can still overflow as milliseconds (`1e308`) or fall outside what a Date holds: the
+  // fallback (the time it was received) then, never a non-finite `lastSeen` that later events could not pass.
+  if (typeof t === "number" && Number.isFinite(t)) {
+    const ms = Math.round(t * 1000);
+    if (Math.abs(ms) <= MAX_DATE_MS) return ms;
+  } else if (typeof t === "string") {
     const ms = Date.parse(t);
     if (Number.isFinite(ms)) return ms;
   }

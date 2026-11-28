@@ -11,6 +11,7 @@ import { chunkLookups, LOOKUP_LIMITS, type ArtifactLookup } from "../src/consume
 import { checkConfig } from "../src/config.ts";
 import { sentry } from "../src/component.ts";
 import { queueMessage } from "../src/ingest.ts";
+import { timestampOf } from "../src/event.ts";
 import { postWebhook } from "../src/alerts.ts";
 import { MemoryR2 } from "./fakes.ts";
 import { errorEvent, fn, harness } from "./harness.ts";
@@ -164,6 +165,15 @@ describe("grouping and the batched write", () => {
     expect(pending).toEqual([]);
     expect(calls).toBe(3); // slice 1, slice 2 (failed), slice 2 again
     expect([...counted.values()]).toEqual([20]);
+  });
+
+  it("a timestamp that overflows as milliseconds (1e308) or leaves the Date range falls back to the time received", async () => {
+    expect(timestampOf({ timestamp: 1e308 }, 5)).toBe(5);
+    expect(timestampOf({ timestamp: -1e13 }, 5)).toBe(5);
+    expect(timestampOf({ timestamp: 1_700_000_000.5 }, 5)).toBe(1_700_000_000_500);
+    const { consume, issues, t } = harness(noAlerts);
+    await consume([{ ...errorEvent(), timestamp: 1e308 }]);
+    expect((await issues())[0]!.lastSeen).toBe(t.now());
   });
 
   it("hourly buckets shift with time and keep 24 hours", () => {
