@@ -389,6 +389,49 @@ describe("analytics client", () => {
     expect(sent.flatMap((s) => s.body.events.map((e) => e.name))).toEqual(["a1", "a2", "b1", "b2", "c1"]);
   });
 
+  test("requeue merges by sequence: a retried A + C that fails after B came back goes A, B, C", async () => {
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    const answers: Array<(r: Response) => void> = [];
+    const bodies: string[][] = [];
+    const fetch = vi.fn((_u: string, init: RequestInit) => {
+      bodies.push((JSON.parse(String(init.body)) as Sent["body"]).events.map((e) => e.name));
+      return new Promise<Response>((r) => answers.push(r));
+    }) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 3, flushIntervalMs: 60_000 });
+    const fat = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`k${i}`, "z".repeat(250)])); // ~6 KiB per event
+    for (const n of ["e1", "e2"]) a.track(n, fat);
+    a.track("e3", fat);
+    // the full batch started a regular flush: fail it, so all three are queued, then hide the page
+    await vi.advanceTimersByTimeAsync(0);
+    answers.shift()!(new Response(null, { status: 503 }));
+    await vi.advanceTimersByTimeAsync(0);
+    bodies.length = 0;
+    // Force two pagehide batches: A = e1, e2 and B = e3 (the route's cap is simulated by a smaller batch for B).
+    (a as unknown as { batchSize: number }).batchSize = 2;
+    listeners.get("pagehide")!();
+    expect(bodies).toEqual([["e1", "e2"], ["e3"]]);
+    const [failA, failB] = [answers.shift()!, answers.shift()!];
+    failA(new Response(null, { status: 503 })); // A back, B still in flight
+    await vi.advanceTimersByTimeAsync(0);
+    (a as unknown as { batchSize: number }).batchSize = 3;
+    a.track("c");
+    const p = a.flush(); // sends A + C
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bodies.at(-1)).toEqual(["e1", "e2", "c"]);
+    failB(new Response(null, { status: 503 })); // B back
+    await vi.advanceTimersByTimeAsync(0);
+    answers.shift()!(new Response(null, { status: 503 })); // then A + C fails
+    await p;
+    const { sent, fetch: ok } = fakeFetch();
+    (a as unknown as { o: { fetch: typeof globalThis.fetch } }).o.fetch = ok;
+    await a.flush();
+    expect(sent.flatMap((x) => x.body.events.map((e) => e.name))).toEqual(["e1", "e2", "e3", "c"]);
+  });
+
   test("without sendBeacon, a pagehide batch refused whole (400) comes back to be split; a refused singleton is dropped", async () => {
     const listeners = new Map<string, () => void>();
     vi.stubGlobal("document", {});

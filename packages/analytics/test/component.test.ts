@@ -267,6 +267,31 @@ describe("queries", () => {
     expect(calls[0]).toContain("ORDER BY t DESC, name");
   });
 
+  test("two deployments on one account's default dataset: each report counts only its own events", async () => {
+    // One dataset shared by staging and production (the account's), and a SQL API double that answers from its points,
+    // filtering on the blob6 literal the statement carries (what Analytics Engine does with the WHERE).
+    const ds = fakeDataset();
+    sqlApi((sql) => {
+      const key = /blob6 = '([^']*)'/.exec(sql)?.[1];
+      const rows = ds.points.filter((p) => p.blobs[5] === key);
+      if (sql.includes("GROUP BY name")) {
+        const by = new Map<string, number>();
+        for (const r of rows) by.set(String(r.blobs[0]), (by.get(String(r.blobs[0])) ?? 0) + 1);
+        return { data: [...by].map(([name, events]) => ({ name, events, users: 1 })) };
+      }
+      return { data: [{ events: rows.length, users: new Set(rows.map((r) => r.blobs[1])).size }] };
+    });
+    const deploy = (env: string) => emberTest({ schema, modules: { events }, app, env: { EMBER_ANALYTICS: ds, ...CREDS, EMBER_PROJECT: "shop", EMBER_ENV: env } });
+    const prod = deploy("production");
+    const staging = deploy("staging");
+    for (let i = 0; i < 3; i++) await prod.withIdentity({ subject: `p${i}` }).action(unsafeRef<"action">("events:signup"), { plan: "pro" });
+    await staging.withIdentity({ subject: "s0" }).action(unsafeRef<"action">("events:signup"), { plan: "free" });
+    expect(ds.points).toHaveLength(4);
+    const refresh = (t: typeof prod) => (t as unknown as { _action(n: string, a: unknown, s: string): Promise<unknown> })._action("@analytics/dashboard:refresh", {}, "global:main");
+    expect(await refresh(prod)).toMatchObject({ eventsToday: 3, usersToday: 3, top: [{ name: "signed_up", events: 3 }] });
+    expect(await refresh(staging)).toMatchObject({ eventsToday: 1, usersToday: 1, top: [{ name: "signed_up", events: 1 }] });
+  });
+
   test("refresh without the SQL API: nothing queried, nothing written", async () => {
     const calls = sqlApi(() => ({ data: [] }));
     const { t } = setup();

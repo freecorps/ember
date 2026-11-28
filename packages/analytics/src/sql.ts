@@ -312,7 +312,7 @@ function checkPeriod(period: unknown): asserts period is Period {
  * per cohort, the users active `k` periods after it (`r1`..). Users active before the range start in the cohort of
  * its first period (the range is the cohort horizon; Analytics Engine keeps three months).
  */
-export function retentionSql(s: Scope, o: RetentionOptions = {}): string {
+export function retentionSql(s: Scope, o: RetentionOptions & { now: number }): string {
   const { table, where } = from(s);
   const period = o.period ?? "week";
   checkPeriod(period);
@@ -362,7 +362,8 @@ export interface RetentionResult {
 
 /**
  * Reads a retention answer. Pass the same options, `now` included, given to `retentionSql`: the cohort labels come from
- * that origin, so `now` is required here (two clock reads could fall on either side of a period boundary).
+ * that origin. `now` is required by both (no implicit clock read: two reads could fall on either side of a period
+ * boundary), so composing them means capturing it once.
  */
 export function parseRetention(body: SqlResponse, o: RetentionOptions & { now: number }): RetentionResult {
   const period = o.period ?? "week";

@@ -67,7 +67,7 @@ describe("SQL inputs are checked, never interpolated raw", () => {
     for (const bad of ADVERSARIAL) {
       expect(() => funnelSql(scope, { steps: ["signup", bad] })).toThrow(SqlInputError);
       expect(() => countsSql(scope, { names: [bad] })).toThrow(SqlInputError);
-      expect(() => retentionSql(scope, { event: bad })).toThrow(SqlInputError);
+      expect(() => retentionSql(scope, { event: bad, now: 0 })).toThrow(SqlInputError);
     }
     expect(() => funnelSql(scope, { steps: ["a", 1 as unknown as string] })).toThrow(SqlInputError);
     expect(() => funnelSql(scope, { steps: "a,b" as unknown as string[] })).toThrow(SqlInputError);
@@ -91,7 +91,7 @@ describe("SQL inputs are checked, never interpolated raw", () => {
   test("bucket and period are own keys: Object.prototype names are refused", () => {
     for (const bad of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
       expect(() => countsSql(scope, { bucket: bad as never })).toThrow(/minute, hour or day/);
-      expect(() => retentionSql(scope, { period: bad as never })).toThrow(/day or week/);
+      expect(() => retentionSql(scope, { period: bad as never, now: 0 })).toThrow(/day or week/);
       expect(() => retentionStart({ period: bad as never })).toThrow(/day or week/);
       expect(() => parseRetention({ data: [{ cohort: 0, users: 1 }] }, { period: bad as never, now: 0 })).toThrow(/day or week/);
     }
@@ -128,7 +128,7 @@ describe("SQL inputs are checked, never interpolated raw", () => {
     expect([prod, staging]).toEqual(["shop/production", "shop/staging"]);
     expect(deploymentOf({})).toBe("");
     expect(deploymentOf({ EMBER_PROJECT: "a'b c", EMBER_ENV: "x" })).toBe("a_b_c/x");
-    for (const sql of [countsSql({ ...scope, deployment: prod }), overviewSql({ ...scope, deployment: prod }), funnelSql({ ...scope, deployment: prod }, { steps: ["a", "b"] }), retentionSql({ ...scope, deployment: prod })]) {
+    for (const sql of [countsSql({ ...scope, deployment: prod }), overviewSql({ ...scope, deployment: prod }), funnelSql({ ...scope, deployment: prod }, { steps: ["a", "b"] }), retentionSql({ ...scope, deployment: prod }, { now: 0 })]) {
       expect(sql).toContain("blob6 = 'shop/production:analytics'");
       expect(sql).not.toContain("staging");
     }
@@ -140,7 +140,7 @@ describe("SQL inputs are checked, never interpolated raw", () => {
 describe("statement shapes", () => {
   test("event time, not arrival time: double1 (the batch's ts) orders funnels, buckets counts, places cohorts", () => {
     // A batch sent late (offline, beacons) arrives with one `timestamp` for every event: only double1 keeps the order.
-    for (const sql of [funnelSql(scope, { steps: ["a", "b"] }), retentionSql(scope, {}), countsSql(scope), topEventsSql(scope), overviewSql(scope)]) {
+    for (const sql of [funnelSql(scope, { steps: ["a", "b"] }), retentionSql(scope, { now: 0 }), countsSql(scope), topEventsSql(scope), overviewSql(scope)]) {
       expect(sql).toContain(ET);
       expect(sql).not.toMatch(/toUnixTimestamp\(timestamp\) -|toStartOfInterval\(timestamp|if\(blob1 = [^,]+, toUnixTimestamp\(timestamp\)/);
     }
@@ -153,7 +153,7 @@ describe("statement shapes", () => {
   });
 
   test("users: a signed-in subject and an anonymous id with the same text are two users", () => {
-    for (const sql of [topEventsSql(scope), overviewSql(scope), funnelSql(scope, { steps: ["a", "b"] }), retentionSql(scope, {})]) {
+    for (const sql of [topEventsSql(scope), overviewSql(scope), funnelSql(scope, { steps: ["a", "b"] }), retentionSql(scope, { now: 0 })]) {
       expect(sql).toContain("if(blob2 != '', format('u:{}', blob2), format('a:{}', blob3))");
     }
   });
@@ -227,9 +227,9 @@ describe("statement shapes", () => {
         "ORDER BY cohort",
       ].join("\n"),
     );
-    expect(() => retentionSql(scope, { period: "month" as never })).toThrow(/day or week/);
-    expect(retentionSql(scope, { periods: 99 })).toContain("a12"); // clamped to 13 periods
-    expect(retentionSql(scope, { periods: 99 })).not.toContain("a13");
+    expect(() => retentionSql(scope, { period: "month" as never, now: 0 })).toThrow(/day or week/);
+    expect(retentionSql(scope, { periods: 99, now: 0 })).toContain("a12"); // clamped to 13 periods
+    expect(retentionSql(scope, { periods: 99, now: 0 })).not.toContain("a13");
   });
 });
 

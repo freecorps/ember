@@ -217,14 +217,15 @@ export class AnalyticsClient {
     return k;
   }
 
-  /** Puts a batch back where it was in enqueue order (before the first queued event tracked after it). */
+  /**
+   * Puts a batch back in enqueue order: its events are merged into the queue by sequence, one by one (a batch can mix
+   * events older and newer than ones already queued again, e.g. a retried A + C after B came back).
+   */
   private requeue(batch: QueuedEvent[]): void {
-    const first = batch[0];
-    if (!first) return;
-    const s = this.seq.get(first) ?? -1;
-    let at = this.queue.findIndex((e) => (this.seq.get(e) ?? Infinity) > s);
-    if (at < 0) at = this.queue.length;
-    this.queue.splice(at, 0, ...batch);
+    if (!batch.length) return;
+    const at = (e: QueuedEvent) => this.seq.get(e) ?? Number.MAX_SAFE_INTEGER;
+    this.queue.push(...batch);
+    this.queue.sort((x, y) => at(x) - at(y));
     if (this.queue.length > this.maxQueue) this.queue.splice(0, this.queue.length - this.maxQueue);
   }
 
