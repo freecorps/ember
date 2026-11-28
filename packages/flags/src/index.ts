@@ -101,7 +101,7 @@ export class FeatureFlags<Specs extends FlagSpecs = {}> {
   detail<K extends keyof Specs & string>(ctx: AsyncCtx, key: K, context?: FlagContext): Promise<Evaluation<SpecValue<Specs[K]>>>;
   detail(ctx: SyncCtx | AsyncCtx, key: string, context: FlagContext = {}): Evaluation | Promise<Evaluation> {
     const flag = ctx.runQuery(this.component.lib.get, { key }) as StoredFlag | null | Promise<StoredFlag | null>;
-    return then(flag, (f) => this.typed(key, evaluateDetail(f, context, this.specs[key]?.default)));
+    return then(flag, (f) => this.typed(key, evaluateDetail(f, context, this.spec(key)?.default)));
   }
 
   /** Any flag's value, declared or not (`fallback` when it does not exist). */
@@ -136,7 +136,7 @@ export class FeatureFlags<Specs extends FlagSpecs = {}> {
     return then(r, (values) => {
       const out: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(values)) {
-        const s = this.specs[k];
+        const s = this.spec(k);
         out[k] = s && flagValueError(s.type, v) !== null ? s.default : v;
       }
       return out;
@@ -185,9 +185,14 @@ export class FeatureFlags<Specs extends FlagSpecs = {}> {
 
   // ------------------------------------------------------------------------------------------------ internals
 
+  /** The declared spec of `key`: own properties only (`toString`, `constructor` are valid keys, not specs). */
+  private spec(key: string): FlagSpec | undefined {
+    return Object.hasOwn(this.specs, key) ? (this.specs as Record<string, FlagSpec>)[key] : undefined;
+  }
+
   /** A declared flag whose stored value has another type serves its declared default (reason kept). */
   private typed(key: string, e: Evaluation): Evaluation {
-    const s = this.specs[key];
+    const s = this.spec(key);
     if (s && flagValueError(s.type, e.value) !== null) return { ...e, value: s.default };
     return e;
   }

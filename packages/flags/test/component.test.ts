@@ -27,6 +27,8 @@ const ff = new FeatureFlags(components.flags, {
   checkoutTheme: { type: "string", default: "classic" },
   maxItems: { type: "number", default: 10 },
 });
+/** No specs: every key is undeclared (`toString`, `constructor` too, though `{}` inherits them). */
+const bare = new FeatureFlags(components.flags);
 
 const schema = defineSchema({
   shards: { org: defineShard({ key: v.string() }) },
@@ -55,6 +57,12 @@ const modules = {
     order: queryGeneric({ args: { id: v.string() }, handler: (ctx: any, a: any) => ctx.db.get(a.id) }),
     detail: queryGeneric({ args: { key: v.string(), context: vFlagContext }, handler: (ctx: any, a: any) => ff.detail(ctx, a.key, a.context) }),
     all: queryGeneric({ args: { context: vFlagContext }, handler: (ctx: any, a: any) => ff.all(ctx, a.context) }),
+  },
+  bare: {
+    read: queryGeneric({
+      args: { key: v.string() },
+      handler: (ctx: any, a: any) => ({ evaluate: bare.evaluate(ctx, a.key as never), detail: bare.detail(ctx, a.key as never), value: bare.value(ctx, a.key), all: bare.all(ctx), forClient: bare.forClient(ctx) }),
+    }),
   },
   flags: {
     forClient: queryGeneric({ args: { context: vFlagContext }, handler: (ctx: any, a: any) => ff.forClient(ctx, a.context) }),
@@ -130,6 +138,17 @@ describe("flags component", () => {
     // The delete is replicated (the org shard's copy is gone, not kept stale): the flag is missing there, with no version.
     expect(await t.query(api.flags.get, { key: "newCheckout" }, ORG)).toBeNull();
     expect(await t.query(api.checkout.detail, { key: "newCheckout", context: {} }, ORG)).toEqual({ value: false, reason: "missing" });
+  });
+
+  test("keys named like Object.prototype members (toString, constructor) are flags, not inherited specs", async () => {
+    const t = await setup();
+    await t.mutation(api.admin.set, { flag: { key: "toString", type: "boolean", defaultValue: true, clientVisible: true } });
+    await t.mutation(api.admin.set, { flag: { key: "constructor", type: "string", defaultValue: "on", clientVisible: true } });
+    await t.syncReplicas();
+    const ts = await t.query(api.bare.read, { key: "toString" }, ORG);
+    expect(ts).toMatchObject({ evaluate: true, detail: { value: true, reason: "on" }, value: true, forClient: { toString: true, constructor: "on" } });
+    expect(ts.all).toEqual({ toString: true, constructor: "on" });
+    expect((await t.query(api.bare.read, { key: "constructor" }, ORG)).evaluate).toBe("on");
   });
 
   test("forClient: only clientVisible flags; a declared flag of the wrong stored type serves its default", async () => {
