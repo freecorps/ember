@@ -3,7 +3,8 @@
 // `pagehide` (`navigator.sendBeacon`) and on `close()`. Bodies are `text/plain` JSON, a "simple" request with no CORS
 // preflight (like the RUM client). One request at a time; a batch that is not delivered (network, 3xx, 429, 5xx) goes
 // back to the queue; one the server refuses whole (400, 413) is sent again in halves, and only an event refused on
-// its own (or a batch refused with another 4xx) is dropped. On `pagehide` the beacons stay within the
+// its own (or a batch refused with another 4xx) is dropped; a beacon is never bigger than a batch the route was seen to
+// take after a 400 (an install's `maxEvents` under `batchSize`). On `pagehide` the beacons stay within the
 // browser's keepalive budget (64 KiB in flight per page, shared with the pending fetch): what does not fit stays
 // queued (a page restored from the back/forward cache sends it). The anonymous id lives in localStorage when there is
 // one; `reset()` (sign-out) is an identity boundary: what was queued before it never goes with the next user's token.
@@ -21,7 +22,11 @@ export interface AnalyticsClientOptions {
   path?: string;
   /** How often queued events are posted (default 10 s). */
   flushIntervalMs?: number;
-  /** Events per request (default 20, at most 50: what the server takes). */
+  /**
+   * Events per request (default 20, at most 50: what the server takes). Keep it within the install's `maxEvents`:
+   * over it, the server refuses the batch (400) and the client splits it; the beacons of `pagehide` use the size the
+   * client has seen pass since (a beacon has no answer to split by), and the full `batchSize` before any refusal.
+   */
   batchSize?: number;
   /** Most events kept while the network is down (default 500; the oldest go first). */
   maxQueue?: number;
@@ -105,6 +110,14 @@ export class AnalyticsClient {
   /** Enqueue order of each event (not sent): a batch put back goes where it was, whatever order the answers come in. */
   private readonly seq = new WeakMap<QueuedEvent, number>();
   private nextSeq = 0;
+  /**
+   * What the client learned of the route's event cap, for the beacons (which cannot be split after the fact): the
+   * smallest batch of more than one event refused with 400 since, and the largest one delivered after that refusal.
+   * No refusal seen: `batchSize`. A delivered batch at least as big as the refused one (the 400 was a bad event, or the
+   * cap went up) forgets it.
+   */
+  private refusedAt = Number.POSITIVE_INFINITY;
+  private passedAt = 0;
   /** Requests sent (tests). */
   sent = 0;
 
@@ -212,6 +225,23 @@ export class AnalyticsClient {
     return this.flushing;
   }
 
+  /** Learns the route's event cap from an answer to a batch of `n` events (see `refusedAt`). */
+  private learn(status: number, n: number): void {
+    if (status === 400 && n > 1) {
+      this.refusedAt = Math.min(this.refusedAt, n);
+      this.passedAt = 0;
+    } else if (status >= 200 && status < 300) {
+      if (n >= this.refusedAt) this.refusedAt = Number.POSITIVE_INFINITY;
+      this.passedAt = Math.max(this.passedAt, n);
+    }
+  }
+
+  /** Events per beacon: `batchSize`, or below the smallest refused batch, as big as one that passed since (at least 1). */
+  private beaconSize(): number {
+    if (this.refusedAt === Number.POSITIVE_INFINITY) return this.batchSize;
+    return Math.max(1, Math.min(this.batchSize, this.refusedAt - 1, this.passedAt));
+  }
+
   /** How many of the first `n` queued events go together: one anonymous id per batch (an identity boundary). */
   private run(n: number): number {
     const aid = this.queue[0]?.anonymousId;
@@ -295,6 +325,7 @@ export class AnalyticsClient {
         ctrl?.abort();
         return "retry";
       }
+      this.learn(r.status, batch.length);
       return outcomeOf(r.status);
     } catch {
       return "retry";
@@ -316,7 +347,8 @@ export class AnalyticsClient {
     while (this.queue.length) {
       // Fewer events while the body is over what the server takes; one event that alone is over it stays queued
       // (the regular send drops it when the server answers 413).
-      let batch = this.queue.slice(0, this.run(this.batchSize));
+      // At most the events per request the route was seen to take (a beacon refused with 400 does not come back).
+      let batch = this.queue.slice(0, this.run(this.beaconSize()));
       let body = JSON.stringify({ events: batch });
       let bytes = byteLength(body);
       while (bytes > MAX_BODY_BYTES && batch.length > 1) {
@@ -350,6 +382,7 @@ export class AnalyticsClient {
           sending.then(
             (r) => {
               settled();
+              this.learn(r.status, batch.length);
               const o = outcomeOf(r.status);
               if (o === "retry" || (o === "split" && batch.length > 1)) this.requeue(batch);
             },

@@ -341,6 +341,60 @@ describe("analytics client", () => {
     expect(a.pending).toBe(0);
   });
 
+  test("pagehide: beacons keep to the event cap the route was seen to take (maxEvents under batchSize), and forget it once a bigger batch passes", async () => {
+    const beacons: number[] = [];
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    vi.stubGlobal("navigator", { sendBeacon: (_u: string, d: Blob) => (void d.text().then((t) => beacons.push((JSON.parse(t) as Sent["body"]).events.length)), true) });
+    let maxEvents = 1; // the install's cap, under the client's default batchSize (20)
+    const sizes: number[] = [];
+    const fetch = (async (_u: string, init: RequestInit) => {
+      const n = (JSON.parse(String(init.body)) as Sent["body"]).events.length;
+      sizes.push(n);
+      return new Response(null, { status: n > maxEvents ? 400 : 204 });
+    }) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    for (const n of ["a", "b", "c"]) a.track(n);
+    await a.flush();
+    expect(sizes).toEqual([3, 2, 1, 1, 1]);
+    a.track("d");
+    a.track("e");
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(beacons).toEqual([1, 1]); // one beacon of two would be refused whole, and never come back
+    // The cap goes up: a regular batch bigger than the refused one passes, and the beacons take the full batchSize again.
+    maxEvents = 50;
+    for (const n of ["f", "g", "h"]) a.track(n);
+    await a.flush();
+    for (const n of ["i", "j", "k", "l"]) a.track(n);
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(beacons).toEqual([1, 1, 4]);
+  });
+
+  test("pagehide: after a 400, the beacons use the biggest batch that passed since, not a bigger one that passed before", async () => {
+    const beacons: number[] = [];
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    vi.stubGlobal("navigator", { sendBeacon: (_u: string, d: Blob) => (void d.text().then((t) => beacons.push((JSON.parse(t) as Sent["body"]).events.length)), true) });
+    let maxEvents = 50;
+    const fetch = (async (_u: string, init: RequestInit) => new Response(null, { status: (JSON.parse(String(init.body)) as Sent["body"]).events.length > maxEvents ? 400 : 204 })) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 20, flushIntervalMs: 60_000 });
+    for (let i = 0; i < 20; i++) a.track("e");
+    await a.flush(); // 20 passed
+    maxEvents = 5; // the install's config changed
+    for (let i = 0; i < 20; i++) a.track("e");
+    await a.flush(); // 20 refused, 10 refused, 5 passed
+    for (let i = 0; i < 12; i++) a.track("e");
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(beacons).toEqual([5, 5, 2]);
+  });
+
   test("pagehide: every beacon body is within what the server takes (32 KiB), whatever the batch size", () => {
     expect(MAX_BODY_BYTES).toBe(SERVER_MAX_BODY_BYTES);
     const beacons: Array<{ size: number }> = [];
