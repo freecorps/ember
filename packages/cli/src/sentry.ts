@@ -143,10 +143,14 @@ async function call(o: UploadOptions, method: "POST" | "PUT", path: string, body
   return { status: res.status, json };
 }
 
+/** Rounds of "send the missing blobs, post the manifest again" before giving up. */
+export const UPLOAD_ROUNDS = 3;
+
 /** Registers the maps of `dir` for a release: sends the manifest, the maps R2 lacks, then the manifest again. */
 export async function uploadSourceMaps(dir: string, o: UploadOptions): Promise<UploadResult> {
   const log = o.log ?? ((l: string) => console.log(l));
   if (!o.release) throw new Error("--release is required");
+  if (o.httpPrefix !== undefined && !o.httpPrefix.startsWith("/")) throw new Error(`--prefix must start with "/" (got ${JSON.stringify(o.httpPrefix)})`);
   const files = collectSourceMaps(dir, o.urlPrefix);
   if (!files.length) throw new Error(`No source maps (*.map) under ${dir}: build with source maps on (vite: build.sourcemap = true)`);
   for (const f of files) log(`  ${f.name}  ${(f.size / 1024).toFixed(1)} KiB${f.debugId ? `  debugId ${f.debugId}` : ""}`);
@@ -158,14 +162,18 @@ export async function uploadSourceMaps(dir: string, o: UploadOptions): Promise<U
   const json = { "content-type": "application/json" };
   let r = await call(o, "POST", "/admin/sourcemaps", manifest, json);
   let uploaded = 0;
-  const missing = Array.isArray(r.json.missing) ? (r.json.missing as string[]) : [];
-  for (const sha of missing) {
-    const f = files.find((x) => x.sha256 === sha);
-    if (!f) continue;
-    await call(o, "PUT", `/admin/sourcemaps/blobs/${sha}`, gzipSync(readFileSync(f.path)), { "content-type": "application/json", "content-encoding": "gzip" });
-    uploaded++;
+  const missingOf = (x: typeof r) => (Array.isArray(x.json.missing) ? (x.json.missing as string[]) : []);
+  // The blobs the component still lacks, then the manifest again; a blob that did not land is sent again (3 rounds).
+  // Each map is read from disk only when it is sent (not kept from collectSourceMaps: a build's maps can be GBs).
+  for (let round = 0, missing = missingOf(r); missing.length && round < UPLOAD_ROUNDS; round++, missing = missingOf(r)) {
+    for (const sha of missing) {
+      const f = files.find((x) => x.sha256 === sha);
+      if (!f) continue;
+      await call(o, "PUT", `/admin/sourcemaps/blobs/${sha}`, gzipSync(readFileSync(f.path)), { "content-type": "application/json", "content-encoding": "gzip" });
+      uploaded++;
+    }
+    r = await call(o, "POST", "/admin/sourcemaps", manifest, json);
   }
-  if (missing.length) r = await call(o, "POST", "/admin/sourcemaps", manifest, json);
   if (r.json.ok !== true) throw new Error(`The upload did not complete: ${JSON.stringify(r.json)}`);
   const added = typeof r.json.added === "number" ? r.json.added : 0;
   log(`Uploaded ${uploaded} new map(s) of ${files.length} (${files.length - uploaded} already stored) for ${o.project}@${o.release}${o.dist ? ` (${o.dist})` : ""}; ${added} file(s) registered`);

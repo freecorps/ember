@@ -6,12 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { describe, expect, test } from "vitest";
-import { artifactNameFor, collectSourceMaps, scriptComments, sentryPrefix, uploadSourceMaps } from "../src/sentry.ts";
+import { artifactNameFor, collectSourceMaps, scriptComments, sentryPrefix, UPLOAD_ROUNDS, uploadSourceMaps } from "../src/sentry.ts";
 
 const TOKEN = "upload-token";
 
 /** The component's upload protocol, in memory: blobs by sha256, rows by (project, release, dist, name). */
-function fakeRuntime(prefix = "/sentry") {
+function fakeRuntime(prefix = "/sentry", o: { dropPuts?: number } = {}) {
+  let drops = o.dropPuts ?? 0;
   const blobs = new Map<string, Buffer>();
   const rows = new Map<string, { sha256: string; debugId?: string }>();
   const calls: string[] = [];
@@ -24,6 +25,8 @@ function fakeRuntime(prefix = "/sentry") {
       const raw = Buffer.from(init.body as Uint8Array);
       const body = new Headers(init.headers).get("content-encoding") === "gzip" ? gunzipSync(raw) : raw;
       if (createHash("sha256").update(body).digest("hex") !== sha) return Response.json({ ok: false, error: { code: "hash_mismatch", message: "x" } }, { status: 400 });
+      // A PUT that answered but did not land (a concurrent cleanup, an eventually consistent store).
+      if (drops-- > 0) return Response.json({ ok: true, sha256: sha, stored: true });
       blobs.set(sha, body);
       return Response.json({ ok: true, sha256: sha, stored: true });
     }
@@ -103,6 +106,20 @@ describe("ember sentry sourcemaps upload", () => {
     await expect(uploadSourceMaps(mkdtempSync(join(tmpdir(), "ember-empty-")), { url: "https://app.test", token: TOKEN, project: "web", release: "1", fetch: rt.fetch, log })).rejects.toThrow(/No source maps/);
     await expect(uploadSourceMaps(dir, { url: "http://example.com", token: TOKEN, project: "web", release: "1", fetch: rt.fetch, log })).rejects.toThrow(/Refusing to send/);
     await expect(uploadSourceMaps(dir, { url: "https://app.test", token: TOKEN, project: "web", release: "1", fetch: rt.fetch, log })).rejects.toThrow(/No sentry component/);
+  });
+
+  test("a blob the manifest still reports missing is sent again (bounded rounds); a --prefix without / is refused", async () => {
+    const dir = build();
+    const log = () => {};
+    const o = { url: "https://app.test", token: TOKEN, project: "web", release: "1", log };
+    const rt = fakeRuntime("/sentry", { dropPuts: 1 });
+    await expect(uploadSourceMaps(dir, { ...o, fetch: rt.fetch })).resolves.toMatchObject({ uploaded: 3, added: 2 });
+    expect(rt.calls.filter((c) => c.startsWith("POST"))).toHaveLength(3);
+    // Never lands: gives up after the rounds, with the component's answer.
+    const lost = fakeRuntime("/sentry", { dropPuts: 1000 });
+    await expect(uploadSourceMaps(dir, { ...o, fetch: lost.fetch })).rejects.toThrow(/did not complete.*missing/);
+    expect(lost.calls.filter((c) => c.startsWith("POST"))).toHaveLength(1 + UPLOAD_ROUNDS);
+    await expect(uploadSourceMaps(dir, { ...o, httpPrefix: "sentry", fetch: rt.fetch })).rejects.toThrow('--prefix must start with "/" (got "sentry")');
   });
 
   test("the install's prefix from the manifest", () => {
