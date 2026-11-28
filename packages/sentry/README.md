@@ -98,8 +98,8 @@ ignored issues keep counting and never alert.
 
 New issue and regression (on by default) and spike (`spike: { events, windowMinutes }`), decided in the same
 transaction as the issue write, throttled per issue (`throttleMinutes`, 30) and per project (`maxPerHour`, 20).
-Delivered as signed webhooks (`x-ember-sentry-signature: t=<unix>,v1=<HMAC-SHA256 hex of "t.body">`, check it with
-`verifyWebhook`) and/or through a mutation of your app, where you send them with the email or push component:
+Delivered as signed webhooks (`https://` only, `http://` just for localhost; redirects are not followed;
+`x-ember-sentry-signature: t=<unix>,v1=<HMAC-SHA256 hex of "t.body">`, check it with `verifyWebhook`) and/or through a mutation of your app, where you send them with the email or push component:
 
 ```ts
 // ember/alerts.ts
