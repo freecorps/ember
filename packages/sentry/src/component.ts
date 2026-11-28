@@ -219,7 +219,7 @@ function applyGroups(ctx: MCtx, groups: readonly IssueGroup[]): { issues: number
   return { issues: groups.length, created, alerts: alerts.length };
 }
 
-async function consumeIn(ctx: ACtx, messages: readonly QueuedEvent[]) {
+async function consumeIn(ctx: ACtx, messages: readonly QueuedEvent[], committed?: (indexes: readonly number[]) => void) {
   const config = ctx.component.config;
   const shard = ctx.onShard(shardOf(config));
   return consume(
@@ -230,6 +230,7 @@ async function consumeIn(ctx: ACtx, messages: readonly QueuedEvent[]) {
       now: ctx.now,
       findArtifacts: (lookups) => shard.runQuery(ref.findArtifacts, { lookups }) as Promise<Record<string, string>>,
       apply: (groups) => shard.runMutation(ref.apply, { groups }) as Promise<{ issues: number; created: number; alerts: number }>,
+      ...(committed ? { committed } : {}),
     },
     messages,
   );
@@ -598,8 +599,13 @@ export const sentry = defineComponent({
     events: {
       shard: (config) => shardOf(config),
       consumer: { maxBatchSize: 100, maxBatchTimeoutSeconds: 5, maxRetries: 5 },
+      // Each slice's messages are acked as soon as its `lib:apply` commits: if a later slice throws, the Queue redelivers
+      // only the rest, and the slices already applied are not counted again (consumer.ts, "Retries").
       handler: async (ctx, batch) => {
-        await consumeIn(ctx as unknown as ACtx, batch.messages.map((m) => m.body as QueuedEvent));
+        const messages = batch.messages;
+        await consumeIn(ctx as unknown as ACtx, messages.map((m) => m.body as QueuedEvent), (indexes) => {
+          for (const i of indexes) messages[i]!.ack();
+        });
         batch.ackAll();
       },
     },

@@ -8,12 +8,16 @@
 //   5. one mutation (`lib:apply`): one insert or patch per issue, whatever the number of its events; alerts decided there;
 //   6. one Analytics Engine point per event.
 //
-// At-least-once: a batch the Queue redelivers is counted again (issue counts are approximate under retries); an alert
-// is tied to the state change it reports (new / resolved → seen / window crossed), so it is not sent twice.
-//
 // Memory: a batch is consumed in slices of at most `maxSliceBytes` of event JSON (steps 2-6 per slice, one R2 object
 // and one `lib:apply` each), so 100 spilled 1 MiB events never sit in memory at once. A malformed event is dropped
 // (logged) instead of failing the batch it came in.
+//
+// Retries: once a slice's `lib:apply` commits, `committed` gets the indexes of the messages it covered (with the ones
+// skipped or dropped since the previous slice) and the Queue handler acks them one by one; a later slice that throws
+// makes the Queue redeliver only the messages not acked yet, so a committed slice is never counted twice. What is left
+// at-least-once is the window between the commit and the ack (an RPC that commits and then fails): those events count
+// again. An alert is tied to the state change it reports (new / resolved → seen / window crossed), so it is not sent
+// twice.
 
 import { aeOf, r2Of, type SentryInstallConfig } from "./config.ts";
 import { eventPoint } from "./analytics.ts";
@@ -60,6 +64,8 @@ export interface ConsumerDeps {
   apply(groups: IssueGroup[]): Promise<{ issues: number; created: number; alerts: number }>;
   /** Event JSON consumed per slice (default `SLICE_BYTES`). */
   maxSliceBytes?: number;
+  /** Called after each slice is applied with the indexes (into `messages`) it settled: the Queue handler acks them. */
+  committed?(indexes: readonly number[]): void;
 }
 
 export interface ConsumeResult {
@@ -119,8 +125,20 @@ export async function consume(deps: ConsumerDeps, messages: readonly QueuedEvent
   // 1. Events, a slice at a time (a spilled event is read when its slice is next, not the whole batch up front).
   let slice: Loaded[] = [];
   let bytes = 0;
-  for (const m of messages) {
-    if (!m || m.v !== 1 || typeof m.project !== "string") continue;
+  // Messages seen since the last applied slice (events, and the ones skipped or dropped): settled with that slice.
+  let settled: number[] = [];
+  const flush = async () => {
+    if (slice.length) add(await consumeSlice(deps, bucket, slice));
+    if (settled.length) deps.committed?.(settled);
+    slice = [];
+    bytes = 0;
+    settled = [];
+  };
+  for (const [i, m] of messages.entries()) {
+    if (!m || m.v !== 1 || typeof m.project !== "string") {
+      settled.push(i);
+      continue;
+    }
     let e: unknown = m.event;
     let size = 0;
     try {
@@ -132,18 +150,19 @@ export async function consume(deps: ConsumerDeps, messages: readonly QueuedEvent
     } catch (err) {
       console.error(`ember-sentry: event ${String(m.id)} could not be read (${m.spill ?? "inline"}): ${(err as Error).message}`);
       total.dropped++;
+      settled.push(i);
       continue;
     }
-    if (!e || typeof e !== "object" || Array.isArray(e)) continue;
-    if (slice.length && bytes + size > budget) {
-      add(await consumeSlice(deps, bucket, slice));
-      slice = [];
-      bytes = 0;
+    if (!e || typeof e !== "object" || Array.isArray(e)) {
+      settled.push(i);
+      continue;
     }
+    if (slice.length && bytes + size > budget) await flush();
     slice.push({ m, e: normalizeEvent(e as SentryEvent) });
+    settled.push(i);
     bytes += size;
   }
-  if (slice.length) add(await consumeSlice(deps, bucket, slice));
+  await flush();
   return total;
 }
 

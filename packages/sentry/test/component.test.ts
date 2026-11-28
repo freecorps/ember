@@ -9,6 +9,8 @@ import { gzip, utf8 } from "../src/envelope.ts";
 import { bumpHourly, consume as consumeBatch, sha256Hex, storageKeys, verifyWebhook, type QueuedEvent, type SentryAlert } from "../src/index.ts";
 import { chunkLookups, LOOKUP_LIMITS, type ArtifactLookup } from "../src/consumer.ts";
 import { checkConfig } from "../src/config.ts";
+import { sentry } from "../src/component.ts";
+import { queueMessage } from "../src/ingest.ts";
 import { postWebhook } from "../src/alerts.ts";
 import { MemoryR2 } from "./fakes.ts";
 import { errorEvent, fn, harness } from "./harness.ts";
@@ -123,6 +125,45 @@ describe("grouping and the batched write", () => {
     expect(bucket.keys("sentry/sentry/events/")).toHaveLength(r.objects.length);
     expect(applied.reduce((a, b) => a + b, 0)).toBe(10);
     expect(applied.length).toBe(r.objects.length);
+  });
+
+  it("a retry after a later slice fails does not count the slices already applied: each slice's messages are acked", async () => {
+    const bucket = new MemoryR2();
+    const counted = new Map<string, number>();
+    let calls = 0;
+    let failOnCall = 2;
+    // The Queue handler with a ctx whose shard RPCs are fakes: `lib:apply` fails once, on the second slice.
+    const ctx = {
+      component: { name: "sentry", config: noAlerts },
+      env: { EMBER_FILES: bucket },
+      now: Date.UTC(2026, 10, 20, 12),
+      onShard: () => ({
+        runQuery: async () => ({}),
+        runMutation: async (_ref: unknown, a: { groups: Array<{ fingerprint: string; n: number }> }) => {
+          if (++calls === failOnCall) throw new Error("shard unavailable");
+          for (const g of a.groups) counted.set(g.fingerprint, (counted.get(g.fingerprint) ?? 0) + g.n);
+          return { issues: a.groups.length, created: 0, alerts: 0 };
+        },
+      }),
+    };
+    // ~1 MiB spilled events: 20 of them make two 16 MiB slices.
+    const pad = "x".repeat(1024 * 1024);
+    const bodies: QueuedEvent[] = [];
+    for (let i = 0; i < 20; i++) bodies.push((await queueMessage("sentry", bucket as never, "web", String(i).padStart(32, "0"), { ...errorEvent(), extra: { pad } }, 1))!);
+    expect(bodies.every((b) => b.spill)).toBe(true);
+    // The Queue: an acked message is never redelivered, even when the handler throws afterwards (and retryAll runs).
+    let pending = bodies.map((body, i) => ({ id: `m${i}`, body }));
+    const handler = sentry.queues!.events!.handler;
+    for (let delivery = 0; pending.length && delivery < 3; delivery++) {
+      const acked = new Set<string>();
+      const batch = { queue: "q", messages: pending.map((m) => ({ ...m, timestamp: new Date(), attempts: delivery + 1, ack: () => void acked.add(m.id), retry: () => {} })), ackAll: () => pending.forEach((m) => acked.add(m.id)), retryAll: () => {} };
+      await handler(ctx as never, batch as never).catch(() => batch.retryAll());
+      pending = pending.filter((m) => !acked.has(m.id));
+      failOnCall = Infinity;
+    }
+    expect(pending).toEqual([]);
+    expect(calls).toBe(3); // slice 1, slice 2 (failed), slice 2 again
+    expect([...counted.values()]).toEqual([20]);
   });
 
   it("hourly buckets shift with time and keep 24 hours", () => {
