@@ -111,6 +111,7 @@ import {
   syncBroadcastTargets,
 } from "./replicated.ts";
 import { REPLICA_APPLY_FN } from "./replication.ts";
+import { reportFunctionError } from "./on-error.ts";
 import { catalogDue, metricsEnabled, recordExecution, reportShard, sampleExecution, share, usageMetrics, type CallMetrics, type ExecutionKind, type Timing } from "./metrics.ts";
 import { parse, stableStringify, stringify } from "./wire.ts";
 import { deflateFrame, ZFRAME_MIN_CHARS, zframeSupported } from "./zframe.ts";
@@ -1772,6 +1773,14 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
     return metricsEnabled(this.env) ? { t: performance.now(), r: this.driver.rowsRead, w: this.driver.rowsWritten } : null;
   }
 
+  /** `defineApp({ onError })`: tells the app's handler of an unhandled failure (on-error.ts), after the caller got it. */
+  private reportError(kind: "query" | "mutation" | "job", fn: string, error: { code: string; message?: string; kind?: string }): void {
+    const onError = this.cfg.app?.onError;
+    if (!onError) return;
+    const done = reportFunctionError(onError, this.env as unknown as Record<string, unknown>, { fn, kind, shard: this.shardName, error });
+    if (done) this.ctx.waitUntil(done);
+  }
+
   private emit(p: { t: number; r: number; w: number } | null, kind: ExecutionKind, fn: string, error: { code: string } | null, bytesOut: (() => number) | undefined, timing: Timing, usage?: Usage): void {
     if (!p) return;
     recordExecution(this.env, {
@@ -1794,6 +1803,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
    * commit (the DO clock advances on that storage I/O; the synchronous transaction alone would read 0 ms).
    */
   private emitAfterCommit(kind: ExecutionKind, all: Array<{ fn: string; at: number; error: { code: string } | null; rowsRead: number; rowsWritten: number; bytesOut?: () => number; usage?: Usage | undefined }>): void {
+    if (kind === "job") for (const it of all) if (it.error) this.reportError("job", it.fn, it.error);
     if (!all.length || !metricsEnabled(this.env)) return;
     // Sampled first: when every point is dropped, nothing waits for the commit (the object is not kept awake for it).
     const trace = this.env.EMBER_TRACE === "1";
@@ -2871,6 +2881,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       const m = perItem[j];
       const it = batch[i]!;
       if (!m) return;
+      if (m.error) this.reportError("mutation", it.fn, m.error);
       if (it.caller) {
         const o = outcomes[i];
         encoded[i] = undefined;
@@ -4008,6 +4019,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
           this.send(ws, { t: "qres", qid: msg.qid, ok: true, value, version: this.version });
         } catch (e) {
           const error = errInfo(e, "Error");
+          this.reportError("query", msg.fn, error);
           this.emit(p, "query", msg.fn, error, undefined, "none");
           this.send(ws, { t: "qres", qid: msg.qid, ok: false, error });
         }
@@ -4474,6 +4486,7 @@ export class Shard extends DurableObject<EmberEnv> implements FileRpc, ExternalI
       return { ok: true, value, ...at };
     } catch (e) {
       const error = errInfo(e, "Error");
+      this.reportError("query", fn, error);
       if (opts.caller) return { ok: false, error, metrics: metrics(0, error) };
       this.emit(p, "query", fn, error, undefined, "none");
       return { ok: false, error };

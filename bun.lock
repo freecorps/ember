@@ -573,6 +573,22 @@
         "wrangler": "^4.157.0",
       },
     },
+    "packages/sentry": {
+      "name": "@freecorps/ember-sentry",
+      "version": "0.9.0",
+      "dependencies": {
+        "@freecorps/ember-dashboard-sdk": "workspace:*",
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@freecorps/ember-testing": "workspace:*",
+        "wrangler": "^4.157.0",
+      },
+    },
     "packages/server": {
       "name": "@freecorps/ember-server",
       "version": "0.9.0",
@@ -1027,6 +1043,8 @@
     "@freecorps/ember-react-query": ["@freecorps/ember-react-query@workspace:packages/react-query"],
 
     "@freecorps/ember-runtime": ["@freecorps/ember-runtime@workspace:packages/runtime"],
+
+    "@freecorps/ember-sentry": ["@freecorps/ember-sentry@workspace:packages/sentry"],
 
     "@freecorps/ember-server": ["@freecorps/ember-server@workspace:packages/server"],
 

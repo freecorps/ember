@@ -37,6 +37,7 @@ Node >= 22. `wrangler` (>= 4.40) is an optional peer: `ember dev --remote` needs
 | `files orphans [--grace 24h] [--delete [--yes]] [--json]` | objects of the files bucket no file row references: lists them (dry run) or deletes them, page by page |
 | `import convex <snapshot.zip>`, `import convex --from-deployment …`, `import verify convex`, `export`, `import ember` | move data in from Convex (keeping ids) or between Ember environments |
 | `migrations run\|status\|cancel <name> [--all]` | drive `@freecorps/ember-migrations` data migrations across shards |
+| `sentry sourcemaps upload --project <id> --release <r> <dir>` | source maps of a build to `@freecorps/ember-sentry` (named after their scripts, debug ids, dedup by SHA-256) |
 | `migrate convex [--src convex] [--out ember] [--strict]` | codemod: port a Convex functions folder (queries and mutations become synchronous). First checks the libraries the functions import (and the `package.json` next to them) against what runs in an Ember action (workerd + `nodejs_compat`), warning about the ones that do not; `--strict` stops there |
 | `dashboard deploy\|token\|destroy` | the Ember Dashboard in your account |
 

@@ -218,6 +218,12 @@ describe("codegen with components", () => {
       expect(() => componentBindings({ rl: { bindings: [{ type: "ratelimit", name, limit: 1, period: 60 }] } }, "p", "e"), name).toThrow(/reserved/);
     }
     expect(() => componentBindings({ a: { bindings: [{ type: "analytics_engine", name: "A", dataset: "bad-name" }] } }, "p", "e")).toThrow(/dataset/);
+    // Analytics Engine (the sentry component's time series): only the binding, the dataset is created by its first write.
+    expect(componentBindings({ s: { bindings: [{ type: "analytics_engine", name: "EMBER_SENTRY_SENTRY_AE", dataset: "ember_sentry" }] } }, "p", "e")).toEqual([
+      { type: "analytics_engine", name: "EMBER_SENTRY_SENTRY_AE", dataset: "ember_sentry" },
+    ]);
+    expect(() => componentBindings({ s: { bindings: [{ type: "analytics_engine", name: "AE" }] } }, "p", "e")).toThrow(/dataset/);
+    expect(() => componentBindings({ s: { bindings: [{ type: "analytics_engine", name: "AE", dataset: "bad-name" }] } }, "p", "e")).toThrow(/dataset/);
     // Workers AI: one EMBER_AI however many installs ask for it (two agents), and only under that name.
     expect(componentBindings({ a: { bindings: [{ type: "ai", name: "EMBER_AI" }] }, b: { bindings: [{ type: "ai", name: "EMBER_AI" }] } }, "p", "e")).toEqual([{ type: "ai", name: "EMBER_AI" }]);
     expect(() => componentBindings({ a: { bindings: [{ type: "ai", name: "AI" }] } }, "p", "e")).toThrow(/EMBER_AI/);

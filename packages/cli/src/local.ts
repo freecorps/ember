@@ -14,7 +14,7 @@ export interface LocalOptions {
   persist?: boolean;
   /** Extra plain-text vars. */
   vars?: Record<string, string>;
-  /** `manifest.components` of the composed app: component queues and `send_email` bindings run locally too. */
+  /** `manifest.components` of the composed app: component queues, `send_email` and `analytics_engine` bindings run locally too. */
   components?: Record<string, { queues?: Array<{ queue: string; binding: string }>; bindings?: Array<{ type: string; name: string } & Record<string, unknown>> }>;
   /** `ember dev --remote`: bindings proxied to real Cloudflare resources (remote.ts). */
   remote?: RemoteBindings;

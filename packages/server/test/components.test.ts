@@ -22,6 +22,7 @@ import {
   v,
   type AppDefinition,
   type MutationCtx,
+  isReportableError,
 } from "../src/index.ts";
 
 // ------------------------------------------------------------------ a small component: counters with a log
@@ -479,6 +480,15 @@ describe("component hooks (crons, queues, email)", () => {
     expect(() => composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(fixed).use(fixed, { name: "again" }) })).toThrow(/binding MY_Q is declared twice/);
   });
 
+  test("an Analytics Engine binding (type analytics_engine) goes to the manifest per install, and may not clash with a queue's", () => {
+    const ae = defineComponent({ name: "ae", functions: {}, bindings: (_c, install) => [{ type: "analytics_engine", name: `AE_${install.toUpperCase()}`, dataset: "ds" }], queues: { q: { handler: async () => {} } } });
+    const c = composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(ae).use(ae, { name: "two" }) });
+    expect(c.schema.manifest.components!.ae!.bindings).toEqual([{ type: "analytics_engine", name: "AE_AE", dataset: "ds" }]);
+    expect(c.schema.manifest.components!.two!.bindings).toEqual([{ type: "analytics_engine", name: "AE_TWO", dataset: "ds" }]);
+    const clash = defineComponent({ name: "clash", functions: {}, bindings: () => [{ type: "analytics_engine", name: "EMBER_Q_CLASH_Q", dataset: "ds" }], queues: { q: { handler: async () => {} } } });
+    expect(() => composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: defineApp().use(clash) })).toThrow(/declared twice/);
+  });
+
   test("validation: queue names, handlers, cron targets, duplicate bindings", () => {
     expect(() => defineComponent({ name: "q", functions: {}, queues: { Bad_Name: { handler: async () => {} } } })).toThrow(/queue name/);
     expect(() => defineComponent({ name: "q", functions: {}, queues: { ok: {} as any } })).toThrow(/needs a handler/);
@@ -551,5 +561,21 @@ describe("defineComponent({ omitIndexes })", () => {
   test("an unknown index name is refused", () => {
     const bad = defineComponent({ name: "bad", schema: notes.schema!, functions: {}, omitIndexes: () => ["notes.nope"] });
     expect(() => composeApp({ schema: base, app: defineApp().use(bad) })).toThrow(/omitIndexes names unknown index "notes.nope"/);
+  });
+});
+
+describe("defineApp({ onError })", () => {
+  test("kept on the app (and through .use), checked to be a function; refusals and app errors are not reportable", () => {
+    const onError = () => {};
+    const app = defineApp({ onError });
+    expect(app.onError).toBe(onError);
+    expect(app.use(defineComponent({ name: "c", functions: {} })).onError).toBe(onError);
+    expect(defineApp().onError).toBeUndefined();
+    expect(() => defineApp({ onError: "x" as never })).toThrow(/onError must be a function/);
+    expect(isReportableError({ code: "Error" })).toBe(true);
+    expect(isReportableError({ code: "StorageError" })).toBe(true);
+    expect(isReportableError({ code: "ValidationError" })).toBe(false);
+    expect(isReportableError({ code: "Unauthenticated" })).toBe(false);
+    expect(isReportableError({ code: "OutOfStock", kind: "app" })).toBe(false);
   });
 });

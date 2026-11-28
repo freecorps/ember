@@ -37,6 +37,7 @@ import { indexEnv, isValidShardName, type EmberConfig, type EmberEnv } from "./c
 import type { Identity } from "./engine-types.ts";
 import { actionImages, actionStorage, type FileRpc, type ImagesBindingLike } from "./files.ts";
 import { recordCall, recordExecution } from "./metrics.ts";
+import { reportFunctionError } from "./on-error.ts";
 import type { aiSearch, ExternalIndexRpc, SearchDeps, vectorSearch } from "./ai-indexes.ts";
 import type { JobInput, MutationOutcome } from "./shard.ts";
 import { stringify } from "./wire.ts";
@@ -211,7 +212,10 @@ export class ActionRunner {
       // A lazy action (a module of actions only, `lazyActions`): its module is imported now, on first use.
       f = await loadFunction(lookup(this.config).fns.get(fn) as AnyRegisteredFunction);
     } catch (e) {
-      return failWith(errInfo(e));
+      // A module that cannot load fails every call: `onError` hears of it like a handler's throw.
+      const info = errInfo(e);
+      await reportFunctionError(this.config.app?.onError, this.env, { fn, kind: "action", shard, error: info, thrown: e });
+      return failWith(info);
     }
     // `check` saw the stand-in; the loaded definition gets the same rule (`lazyActions` already refuses one that
     // differs from the build's metadata: this keeps the gate here even if that check changes).
@@ -231,7 +235,10 @@ export class ActionRunner {
       }
       return { ok: true, value, version: 0 };
     } catch (e) {
-      return failWith(errInfo(e));
+      const info = errInfo(e);
+      // `defineApp({ onError })`: a failed shard call was reported by its shard (or was a refusal), not again here.
+      if (!(e instanceof ActionCallError)) await reportFunctionError(this.config.app?.onError, this.env, { fn, kind: "action", shard, error: info, thrown: e });
+      return failWith(info);
     }
   }
 
@@ -272,8 +279,11 @@ export class ActionRunner {
     return this.ctx(shard, null, scope, true);
   }
 
-  /** Runs an HTTP route's httpAction (ember/http.ts or a component's router) and returns its Response. */
-  async runHttp(route: HttpRoute & { scope: string[] }, request: Request, identity: Identity | null): Promise<Response> {
+  /**
+   * Runs an HTTP route's httpAction (ember/http.ts or a component's router) and returns its Response. A failure's
+   * `onError` report goes to `waitUntil` (the 500 does not wait for it); without one it is awaited.
+   */
+  async runHttp(route: HttpRoute & { scope: string[] }, request: Request, identity: Identity | null, waitUntil?: (p: Promise<unknown>) => void): Promise<Response> {
     const { scopes } = lookup(this.config);
     const scope = scopes.scope(route.scope) ?? scopes.root;
     const t = performance.now();
@@ -292,6 +302,11 @@ export class ActionRunner {
       const info = errInfo(e);
       errorCode = info.code;
       console.error(`ember: ${label} failed: ${info.code}: ${info.message}`);
+      const report = e instanceof ActionCallError ? undefined : reportFunctionError(this.config.app?.onError, this.env, { fn: label, kind: "http", shard, error: info, thrown: e });
+      if (report) {
+        if (waitUntil) waitUntil(report);
+        else await report;
+      }
       return new Response(stringify({ ok: false, error: { code: "Error", message: "internal error" } }), { status: 500, headers: { "content-type": "application/json" } });
     } finally {
       recordExecution(this.env, {

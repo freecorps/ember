@@ -1,0 +1,15 @@
+// Test-only Worker for the sentry component's workerd test (vitest.workerd.config.ts). Never deployed.
+{
+  "name": "ember-sentry-it",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "SHARD", "class_name": "Shard" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard"] }],
+  "r2_buckets": [{ "binding": "EMBER_FILES", "bucket_name": "ember-sentry-it" }],
+  "analytics_engine_datasets": [{ "binding": "EMBER_SENTRY_SENTRY_AE", "dataset": "ember_sentry" }],
+  // EMBER_TRACE: every execution is logged with its rows (how the test reads what the shard wrote).
+  "vars": { "EMBER_PROJECT": "it", "EMBER_ENV": "test", "EMBER_TRACE": "1", "EMBER_SENTRY_UPLOAD_TOKEN": "upload-token-for-tests" }
+}

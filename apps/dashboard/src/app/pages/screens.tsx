@@ -61,6 +61,8 @@ export interface Spec {
   icon: string;
   description?: string;
   scope: "shard" | "global";
+  /** Scope "global": the shard the screens run on, when not global:main (a component's `dashboardShard`). */
+  shard?: string;
   tabs: Array<{ id: string; label: string; blocks: Block[] }>;
   functions: Record<string, { type: "query" | "mutation" | "action"; args: ObjectShape; destructive?: true }>;
 }
@@ -187,7 +189,7 @@ export function Screens({ project, env, shard, kind, rest }: { project: string; 
         </span>,
         <Mono>{d.key}</Mono>,
         <Mono>{d.component ?? "—"}</Mono>,
-        d.scope === "global" ? <Mono>global:main</Mono> : "the picked shard",
+        d.scope === "global" ? <Mono>{d.shard ?? "global:main"}</Mono> : "the picked shard",
         d.tabs.map((t) => t.label).join(", "),
       ])}
     />
@@ -196,7 +198,7 @@ export function Screens({ project, env, shard, kind, rest }: { project: string; 
 
 function Screen({ project, env, shard: picked, spec, tab, link }: { project: string; env: string; shard: string; spec: Spec; tab: string | undefined; link: (tab: string | null) => string }) {
   const [version, setVersion] = useState(0);
-  const shard = spec.scope === "global" ? "global:main" : picked;
+  const shard = spec.scope === "global" ? (spec.shard ?? "global:main") : picked;
   const current = spec.tabs.find((t) => t.id === tab) ?? spec.tabs[0];
   const c: ScreenCtx = useMemo(() => ({ project, env, shard, spec, version, changed: () => setVersion((n) => n + 1) }), [project, env, shard, spec, version]);
   return (
@@ -207,7 +209,7 @@ function Screen({ project, env, shard: picked, spec, tab, link }: { project: str
         </span>
         <h1 className="page-title">{spec.label}</h1>
         {spec.component && <Badge>{spec.component === spec.key ? spec.component : `${spec.component} as ${spec.key}`}</Badge>}
-        <Badge tone="info" title={spec.scope === "global" ? "This screen always runs on global:main" : "Pick the shard in the top bar"}>
+        <Badge tone="info" title={spec.scope === "global" ? `This screen always runs on ${spec.shard ?? "global:main"}` : "Pick the shard in the top bar"}>
           {shard}
         </Badge>
         <span className="spacer" />

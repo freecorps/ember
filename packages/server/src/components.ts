@@ -13,7 +13,7 @@
 // parent may only call the public functions of its direct children. Clients never reach component functions.
 
 import { toJSONValue, validate, type GenericValidator, type Infer, type ObjectShape, type ObjectType, type PropertyValidators, type Shape } from "@freecorps/ember-values";
-import { EmberError } from "./errors.ts";
+import { EmberError, type FunctionErrorHandler } from "./errors.ts";
 import { checkLimits, type Limits } from "./limits.ts";
 import { idPrefix } from "./ids.ts";
 import {
@@ -154,6 +154,8 @@ export interface ComponentDefinition<
   readonly omitIndexes: ((config: Config, installName: string) => string[]) | undefined;
   /** Its dashboard screens (`DefineComponentOptions.dashboard`), checked, with function names local to it. */
   readonly dashboard: DashboardSpec | undefined;
+  /** The shard a `scope: "global"` screen runs on for an install config (`DefineComponentOptions.dashboardShard`). */
+  readonly dashboardShard: string | ((config: Config) => string) | undefined;
   readonly children: readonly Installed[];
   /** Installs a child component (nested: its tables are `<this>$<child>$<table>`). */
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
@@ -197,6 +199,11 @@ export interface DefineComponentOptions<Name extends string, Modules extends Rec
    * function, args that fit its validators.
    */
   dashboard?: DashboardSpecInput;
+  /**
+   * With `dashboard.scope: "global"`: the shard the screens run on for an install (default `global:main`), for a
+   * component whose config picks the shard of its tables (`config.shard`), so every screen reads and writes there.
+   */
+  dashboardShard?: string | ((config: CV extends GenericValidator ? Infer<CV> : undefined) => string);
 }
 
 function checkName(what: string, name: string) {
@@ -239,6 +246,7 @@ export function defineComponent<const Name extends string, Modules extends Recor
   }
   if (def.email && typeof def.email.handler !== "function") throw new Error(`Component ${def.name}: email needs a handler`);
   const dashboard = def.dashboard === undefined ? undefined : resolveDashboard(def.dashboard, flattenFunctions(def.functions ?? {}), `Component ${def.name}`, "component", def.http?.routes ?? []);
+  if (def.dashboardShard !== undefined && dashboard?.scope !== "global") throw new Error(`Component ${def.name}: dashboardShard needs a dashboard with scope "global"`);
   return makeComponent({
     name: def.name,
     schema: def.schema,
@@ -251,6 +259,7 @@ export function defineComponent<const Name extends string, Modules extends Recor
     email: def.email as AnyComponentDefinition["email"],
     omitIndexes: def.omitIndexes as AnyComponentDefinition["omitIndexes"],
     dashboard,
+    dashboardShard: def.dashboardShard as AnyComponentDefinition["dashboardShard"],
     children: [],
   }) as any;
 }
@@ -291,6 +300,8 @@ export interface AppDefinition<Components extends Record<string, AnyComponentDef
   readonly channels: Readonly<ChannelsConfig>;
   /** The app's own dashboard screens (`defineApp({ dashboard })`); its refs are resolved by `composeApp`. */
   readonly dashboard: DashboardSpecInput | undefined;
+  /** `defineApp({ onError })`: told of every unhandled function error (off when not given). */
+  readonly onError: FunctionErrorHandler | undefined;
   use<C extends AnyComponentDefinition, const N extends string = C["name"]>(
     component: C,
     opts?: InstallOptions<ConfigOf<C>> & { name?: N },
@@ -331,6 +342,8 @@ function checkStorage(storage: unknown): Readonly<AppStorage> {
  * limits (`DEFAULT_LIMITS` otherwise; each function may set its own), at most `MAX_LIMITS`. `storage.compactFormat`: 2 makes
  * migrations create format 2 compact tables from now on (the rollback lever for format 3; default 3). `channels`: the
  * ephemeral channels sockets may join (`{ "room:*": { authorize: (identity, { param, shard }) => boolean, payload?, state? } }`).
+ * `onError`: called with each unhandled function error (`FunctionErrorReport`; not application errors, not refusals),
+ * after the caller got its failure: an error tracker's hook (`sentryErrorReporter` of `@freecorps/ember-sentry`).
  */
 export function defineApp<const Env extends PropertyValidators = {}>(
   opts: {
@@ -345,6 +358,11 @@ export function defineApp<const Env extends PropertyValidators = {}>(
     dashboard?: DashboardSpecInput;
     /** Ephemeral channels sockets may join (contracts.md "Feature `ephemeral`"). */
     channels?: ChannelsConfig;
+    /**
+     * Told of every unhandled function error (not `defineErrors` errors, not validation/auth refusals), wherever it
+     * happened; it never changes the caller's result, and its own failures are only logged. Off when not given.
+     */
+    onError?: FunctionErrorHandler;
   } = {},
 ): AppDefinition<{}, Env> {
   const env = (opts.env ?? {}) as Env;
@@ -353,6 +371,8 @@ export function defineApp<const Env extends PropertyValidators = {}>(
   const limits = checkLimits(opts.limits, "defineApp");
   const storage = checkStorage(opts.storage);
   const channels = checkChannels(opts.channels);
+  if (opts.onError !== undefined && typeof opts.onError !== "function") throw new Error("defineApp: onError must be a function ((report, env) => void | Promise<void>)");
+  const onError = opts.onError;
   for (const [k, val] of Object.entries(env)) {
     if (!ENV_NAME.test(k)) throw new Error(`defineApp: env ${JSON.stringify(k)} must be UPPER_SNAKE_CASE`);
     if (k.startsWith("EMBER_")) throw new Error(`defineApp: env ${k}: EMBER_* names are managed by ember`);
@@ -368,6 +388,7 @@ export function defineApp<const Env extends PropertyValidators = {}>(
       storage,
       channels,
       dashboard,
+      onError,
       use(c: AnyComponentDefinition, opts: InstallOptions<unknown> = {}) {
         return make([...components, install(c, opts, components)]);
       },
@@ -724,7 +745,11 @@ export function composeApp(input: { schema: SchemaDefinition<any, any>; function
         ...(c.email ? { email: true as const } : {}),
       };
       configs.set(key, inst.config);
-      if (c.dashboard) dashboards.push({ key, component: c.name, ...mountDashboard(prefixDashboard(c.dashboard, scopePrefix(p)), prefix) });
+      if (c.dashboard) {
+        const shard = c.dashboardShard === undefined ? "global:main" : hookShard(c.dashboardShard, inst.config);
+        if (typeof shard !== "string" || !/^[A-Za-z][A-Za-z0-9_]*:.+$/.test(shard)) throw new Error(`Component ${key}: dashboardShard must be "<kind>:<key>" (got ${JSON.stringify(shard)})`);
+        dashboards.push({ key, component: c.name, ...mountDashboard(prefixDashboard(c.dashboard, scopePrefix(p)), prefix), ...(shard !== "global:main" ? { shard } : {}) });
+      }
       const ownFns = flattenFunctions(c.functions);
       for (const [name, f] of ownFns) {
         if (name.startsWith("@") || name.startsWith("&")) throw new Error(`Component ${key}: function name ${name} is reserved`);

@@ -220,7 +220,7 @@ try {
        c.close();`,
     ]);
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, flags, flags/eval, webhooks, webhooks/verify, expo-updates, dashboard-sdk)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, flags, flags/eval, webhooks, webhooks/verify, expo-updates, dashboard-sdk, sentry, sentry/client)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
@@ -248,7 +248,12 @@ try {
        if (eu.expoUpdates?.name !== "expoUpdates" || typeof eu.renderResponse !== "function" || typeof eu.resolvePlan !== "function") throw new Error("missing expo-updates exports");
        const ds = await import("@freecorps/ember-dashboard-sdk");
        if (typeof ds.connect !== "function" || typeof ds.EMBED_SDK_SCRIPT !== "string" || !ds.embedPage({ title: "t", script: "1" }).includes(ds.EMBED_SDK_SCRIPT)) throw new Error("missing dashboard-sdk exports");
-       if (!m[7].email.http?.routes?.some((r) => r.path === "/dashboard/preview")) throw new Error("the email component lost its preview route");`,
+       if (!m[7].email.http?.routes?.some((r) => r.path === "/dashboard/preview")) throw new Error("the email component lost its preview route");
+       const se = await import("@freecorps/ember-sentry");
+       const sc = await import("@freecorps/ember-sentry/client");
+       if (se.sentry?.name !== "sentry" || typeof se.parseEnvelope !== "function" || typeof se.symbolicate !== "function" || typeof se.sentryErrorReporter !== "function" || typeof sc.init !== "function" || typeof sc.captureException !== "function") throw new Error("missing sentry exports");
+       const env = se.parseEnvelope(se.serializeEnvelope({ event_id: "a" }, [{ header: { type: "event" }, payload: { message: "m" } }]));
+       if (env.items.length !== 1 || env.items[0].header.type !== "event") throw new Error("sentry envelope round trip");`,
     ]);
   });
   await step("analytics + audit on node: components, the analytics client, SQL builders, the audit diff", () => {
