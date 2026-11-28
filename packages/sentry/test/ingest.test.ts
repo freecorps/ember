@@ -220,6 +220,41 @@ describe("ingest: items", () => {
     expect(ae.of("session")).toHaveLength(1);
   });
 
+  it("a sessions item whose aggregates are not objects refuses the envelope before any write", async () => {
+    const { deps, ae, queue } = setup();
+    const items = [
+      { header: { type: "session" }, payload: { sid: "s1", status: "ok", attrs: { release: "1" } } },
+      { header: { type: "event" }, payload: ev() },
+    ];
+    for (const aggregates of [[null], [5], [[]], "x"]) {
+      const r = await handleIngest(post(envelope([...items, { header: { type: "sessions" }, payload: { aggregates } }])), deps);
+      expect(r.status).toBe(400);
+      expect(r.headers.get("x-sentry-error")).toMatch(/aggregates/);
+    }
+    expect(ae.of("session")).toEqual([]);
+    expect(queue.sent).toEqual([]);
+    // Valid aggregates (and none at all) still go through.
+    expect((await handleIngest(post(envelope([...items, { header: { type: "sessions" }, payload: { aggregates: [{ exited: 2 }] } }, { header: { type: "sessions" }, payload: { attrs: {} } }])), deps)).status).toBe(200);
+    expect(ae.of("session")).toHaveLength(2);
+  });
+
+  it("without a bucket, the size check measures the event with the event_id it gets (an event near the limit is 413, never a lost message)", async () => {
+    const { deps, queue } = setup({}, { EMBER_FILES: undefined });
+    // No event_id in the event or the envelope header: the id added in pass 2 used to push it over the limit unseen.
+    const base = { level: "error", extra: { pad: "" } };
+    const size = (pad: number) => new TextEncoder().encode(JSON.stringify({ v: 1, project: "web", id: "0".repeat(32), receivedAt: NOW, event: { ...base, extra: { pad: "x".repeat(pad) } } })).length;
+    const pad = INLINE_EVENT_MAX - size(0) - 5;
+    expect(size(pad)).toBe(INLINE_EVENT_MAX - 5);
+    const r = await handleIngest(post(envelope([{ header: { type: "event" }, payload: { ...base, extra: { pad: "x".repeat(pad) } } }], {})), deps);
+    expect(r.status).toBe(413);
+    expect(queue.sent).toEqual([]);
+    // With room for the id, it is queued with that id.
+    const ok = await handleIngest(post(envelope([{ header: { type: "event" }, payload: { ...base, extra: { pad: "x".repeat(pad - 100) } } }], {})), deps);
+    expect(ok.status).toBe(200);
+    const { id } = (await ok.json()) as { id: string };
+    expect(queue.sent.map((m) => [m.id, m.event?.event_id])).toEqual([[id, id]]);
+  });
+
   it("without a bucket: an event is sent without its breadcrumbs only when that fits a queue message (UTF-8 bytes), else 413", async () => {
     const { deps, queue } = setup({}, { EMBER_FILES: undefined });
     // ~120 KB of 2-byte characters: under 96 Ki UTF-16 units, over 96 KiB as UTF-8.

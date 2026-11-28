@@ -8,7 +8,7 @@
 
 import { aeOf, INLINE_EVENT_MAX, limitsOf, queueOf, r2Of, DEFAULT_RATE, type RateLimitLike, type SentryInstallConfig, type SentryProjectConfig } from "./config.ts";
 import { decodeBody, EnvelopeError, itemJson, parseEnvelope, readCapped, utf8, type EnvelopeItem, type JsonObject } from "./envelope.ts";
-import { eventId, type SentryEvent } from "./event.ts";
+import { eventId, isObj, type SentryEvent } from "./event.ts";
 import { droppedPoint, sessionPoints, transactionPoint } from "./analytics.ts";
 import { keys, putGzip } from "./storage.ts";
 
@@ -173,6 +173,12 @@ export async function handleIngest(request: Request, deps: IngestDeps): Promise<
       if ((type === "event" || type === "transaction") && item.payload.length > limits.maxEventBytes) return tooLarge(ae, project.id);
       const parse = type === "event" || type === "transaction" || type === "session" || type === "sessions" || (type === "replay_event" && !!bucket && item.payload.length <= limits.maxReplayBytes);
       const json = parse ? itemJson(item) : undefined;
+      if (type === "sessions" && !validAggregates(json!)) return refuse(400, "sessions payload: aggregates must be a list of objects");
+      if (type === "event") {
+        // The final id now, so the size check below measures the message that is queued.
+        const ev = json as SentryEvent;
+        ev.event_id = (typeof ev.event_id === "string" && ev.event_id) || headerId || eventId();
+      }
       if (type === "event" && !bucket && !fitsInline(json as SentryEvent, project.id, now)) return refuse(413, "event too large for a queue message (no R2 bucket to spill it to)");
       plan.push({ type, item, ...(json ? { json } : {}) });
     }
@@ -188,8 +194,7 @@ export async function handleIngest(request: Request, deps: IngestDeps): Promise<
   for (const { type, item, json } of plan) {
     if (type === "event") {
       const ev = json as SentryEvent;
-      const id = (typeof ev.event_id === "string" && ev.event_id) || headerId || eventId();
-      ev.event_id = id;
+      const id = ev.event_id as string; // set in pass 1
       firstId ??= id;
       if (random() >= (project.sampleRate ?? 1)) {
         droppedPoint(ae, project.id, "sampled", "event");
@@ -252,6 +257,9 @@ function segmentOf(item: EnvelopeItem): number {
     return 0;
   }
 }
+
+/** A `sessions` payload's `aggregates`: absent, or a list of objects (what `sessionPoints` reads). */
+const validAggregates = (payload: JsonObject) => payload.aggregates === undefined || (Array.isArray(payload.aggregates) && payload.aggregates.every(isObj));
 
 const encoder = new TextEncoder();
 /** A queue message's size as sent (UTF-8 JSON). */

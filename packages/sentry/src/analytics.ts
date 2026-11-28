@@ -15,6 +15,7 @@
 
 import type { AnalyticsEngineLike } from "./config.ts";
 import type { JsonObject } from "./envelope.ts";
+import { isObj } from "./event.ts";
 
 const s = (x: unknown, n = 256) => (typeof x === "string" ? x.slice(0, n) : "");
 
@@ -51,6 +52,7 @@ export function sessionPoints(ae: AnalyticsEngineLike | null, project: string, t
   }
   let n = 0;
   for (const a of Array.isArray(payload.aggregates) ? (payload.aggregates as JsonObject[]) : []) {
+    if (!isObj(a)) continue; // ingest refuses these before any write; skipped here all the same
     const num = (k: string) => (typeof a[k] === "number" ? (a[k] as number) : 0);
     const exited = num("exited"), errored = num("errored"), abnormal = num("abnormal"), crashed = num("crashed");
     write(ae, project, ["session", project, release, environment, "aggregate"], [exited + errored + abnormal + crashed, crashed, errored, abnormal, exited]);
