@@ -294,6 +294,9 @@ describe("the SQL API and results", () => {
     await expect(runSql({ ...base, fetch: offline }, "SELECT 1")).rejects.toMatchObject({ name: "SqlApiError", status: 502 });
     const brokenBody = (async () => ({ ok: true, status: 200, text: async () => Promise.reject(new Error("reset")) })) as unknown as typeof fetch;
     await expect(runSql({ ...base, fetch: brokenBody }, "SELECT 1")).rejects.toMatchObject({ name: "SqlApiError", status: 502 });
+    // A non-2xx whose body read fails keeps the upstream status.
+    const brokenDenied = (async () => ({ ok: false, status: 401, text: async () => Promise.reject(new Error("reset")) })) as unknown as typeof fetch;
+    await expect(runSql({ ...base, fetch: brokenDenied }, "SELECT 1")).rejects.toMatchObject({ name: "SqlApiError", status: 401 });
     for (const bad of [{}, { data: {} }, { data: [1] }, { data: [[]] }, null]) {
       await expect(runSql(recorded(bad).api, "SELECT 1")).rejects.toMatchObject({ name: "SqlApiError", status: 502 });
     }

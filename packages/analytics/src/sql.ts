@@ -437,13 +437,19 @@ export async function runSql(api: SqlApi, sql: string): Promise<SqlResponse> {
   // `redirect: "manual"`: the bearer token never follows a redirect to another origin (older compatibility dates
   // forward `Authorization`); a 3xx is a non-2xx, so an error.
   // A request or body read that fails (network, reset) is a 502 like any other upstream failure: never cached.
+  const failed = (what: string, e: unknown) => `Analytics Engine SQL API: ${what} (${e instanceof Error ? e.message : String(e)})`.slice(0, 300);
   let res: Response;
-  let text: string;
   try {
     res = await f(url, { method: "POST", redirect: "manual", headers: { authorization: `Bearer ${api.token}`, "content-type": "text/plain" }, body: sql });
+  } catch (e) {
+    throw new SqlApiError(failed("request failed", e), 502);
+  }
+  let text: string;
+  try {
     text = await res.text();
   } catch (e) {
-    throw new SqlApiError(`Analytics Engine SQL API: request failed (${e instanceof Error ? e.message : String(e)})`.slice(0, 300), 502);
+    // A non-2xx keeps its own status (a 401 is still a 401) even when its body cannot be read.
+    throw new SqlApiError(failed(`${res.status}, body read failed`, e), res.ok ? 502 : res.status);
   }
   if (!res.ok) throw new SqlApiError(`Analytics Engine SQL API: ${res.status} ${text.slice(0, 300)}`, res.status);
   let body: unknown;
