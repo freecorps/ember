@@ -662,7 +662,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
             const own = (config.routes ?? []).filter((r) => r.scope.join("/") === scope.join("/"));
             const hit = matchRoute(own, "GET", path);
             if (!hit || "methodMismatch" in hit) return null;
-            return actions(env).runHttp(hit.route, new Request(new URL(path, url.origin), { headers: { accept: "text/html" } }), null);
+            return actions(env).runHttp(hit.route, new Request(new URL(path, url.origin), { headers: { accept: "text/html" } }), null, (p) => ctx.waitUntil(p));
           } });
           if (extra) return extra;
           if (url.pathname === "/api/_ember/keys/rotate") {
@@ -846,7 +846,7 @@ export function createEmberWorker(input: EmberConfig): EmberWorker {
         if (hit) {
           // Optional auth: a valid bearer token sets ctx.auth; a missing or invalid one runs anonymous (webhooks).
           const identity = (await verify(bearer(request, url), false, ctx)) ?? null;
-          return actions(env).runHttp(hit.route, request, identity);
+          return actions(env).runHttp(hit.route, request, identity, (p) => ctx.waitUntil(p));
         }
       }
 
