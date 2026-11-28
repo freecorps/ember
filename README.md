@@ -39,6 +39,7 @@ Front ends add `@freecorps/ember-react` (hooks), `@freecorps/ember-react-query` 
 | `@freecorps/ember-workflows` | `workflows` component: durable multi-step functions on the shard scheduler |
 | `@freecorps/ember-migrations` | `migrations` component: data migrations in batches per shard (cursor, dry run, reactive status), `ember migrations run --all` |
 | `@freecorps/ember-workpool` | `workpool` component: at most N actions/mutations running per pool, retries with backoff, a transactional `onComplete`, reactive status |
+| `@freecorps/ember-sentry` | error tracking compatible with the Sentry Envelope API (official SDKs as is): 0 rows written at ingest, issues grouped per Queue batch, source maps symbolicated in pure JS, alerts, dashboard screen |
 | `@freecorps/ember-testing` | typed test harness in Node (real engine over `node:sqlite`): `t.query(api.x, args)`, identities, scheduled jobs, `expectError` |
 | `@freecorps/eslint-plugin-ember` | ESLint rules: typed references, synchronous queries/mutations, validated args, handled mutation promises |
 | `@freecorps/ember-email` | `email` component: send (atomic, scheduled, idempotent) via Cloudflare Email Service, templates, suppressions, delivery events, inbound mail into mailboxes and threads, attachments in files |

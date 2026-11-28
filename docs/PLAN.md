@@ -46,15 +46,15 @@ ember/                     (monorepo, MIT)
     presence      presença (online por sala), digitando e cursores sobre o canal efêmero do Shard; /react: usePresence, useTyping, useCursors (✅ 0.10)
     plugins/
       search-fts5   vector-vectorize   ai-search
-    components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, migrations, workpool, push, email, agent — files e auth embutidos)
-      auth (better-auth)   files   push   rate-limit   workflows   migrations   workpool   email   agent
+    components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, migrations, workpool, push, email, agent, sentry — files e auth embutidos)
+      auth (better-auth)   files   push   rate-limit   workflows   migrations   workpool   email   agent   sentry
     cli           ember init/dev/codegen/deploy/logs/data/export/import/env/restore/shards
   apps/
     dashboard     painel (dados, logs, tamanho por shard, crons, deploys)
     examples/     chat, todo, files-auth-jobs, email-lite   (✅ todos existem; tests no workerd, `bun run check` os cobre)
 ```
 
-**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-workpool`, `ember-email`, `ember-agent`, `ember-presence`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
+**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-workpool`, `ember-email`, `ember-agent`, `ember-presence`, `ember-sentry`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
 
 ---
 
@@ -426,7 +426,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 ## 12. Componentes (estilo Convex)
 
 `ember/ember.config.ts` → `app.use(component)`. Cada componente traz tabelas isoladas com namespace, funções próprias e configuração.
-- Oficiais: `auth`, `files`, `push`, `rateLimit`, `workflows`, `migrations`, `workpool`, `agent`.
+- Oficiais: `auth`, `files`, `push`, `rateLimit`, `workflows`, `migrations`, `workpool`, `agent`, `sentry`.
 - O `email` (`send`, `scheduled`, eventos, inbound) também é oficial; o produto de email (freecorps/mail) é um app que o instala.
 - Isso dá ao serviço de email o mesmo mecanismo que um usuário usaria para empacotar features.
 - ✅ **Como ficou** — contrato em `docs/design/contracts.md` ("Componentes"), E2E real em `docs/spikes/remote/components-e2e.md`:
@@ -451,6 +451,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
   - Oficiais: `rateLimit` (token bucket e fixed window por chave, transacional; binding da Cloudflare opcional para actions/HTTP), `workflows` (diário + replay sobre o scheduler, ver §8), `migrations` (migrações de dados em lotes por shard, §22 L10), `workpool` (paralelismo limitado por pool e por shard, retries e `onComplete` na transação do resultado; §22 L11), `push` (componente sobre os helpers existentes). `files` e `auth` continuam embutidos (decisão e motivo em contracts.md).
   - ✅ Ganchos (Fase 6): componentes declaram **crons** (`crons: (config) => cronJobs(...)`), **Queues próprias** (`queues: { events: { handler } }`: o deploy cria `ember-<project>-<env>-<install>-<nome>`, liga o producer e o consumer; o `queue()` entrega o lote ao componente) e o **`email()` do Worker** (`email: { match, handler }`); binding `send_email`. Contrato em contracts.md ("Componentes", ganchos).
   - ✅ `agent` (`@freecorps/ember-agent`, §22 L12): threads, mensagens e deltas de streaming no shard de quem chama; geração numa action do app (`assistant.action()`) agendada atomicamente pelo `sendMessage`; tool calls até `maxSteps`; `onUsage` na transação do passo; Workers AI e modelos do AI SDK (estrutural). Contrato em contracts.md ("Agent").
+  - ✅ `sentry` (`@freecorps/ember-sentry`, 0.10): ingestão compatível com a Sentry Envelope API (`POST /sentry/api/<projeto>/envelope/`, SDKs oficiais sem mudança) que **não escreve linha em DO**: eventos vão para a Queue do componente; o consumer (lotes de 100) simboliza com source maps em JS puro (VLQ + busca binária, LRU por isolate), agrupa por fingerprint e escreve ~1 linha por issue por lote; payloads, anexos e replays gzip no R2 por dia (30 dias, cron de retenção); séries e sessões livres de crash no Analytics Engine; alertas (nova, regressão, pico) com throttle; `ember sentry sourcemaps upload`; `defineApp({ onError })` para os erros do próprio Ember. Contrato em contracts.md ("Sentry").
   - ✅ Passos paralelos em workflows (`Promise.all` de passos vira um lote do diário, 0.10), `list` e retenção.
 
 ---
