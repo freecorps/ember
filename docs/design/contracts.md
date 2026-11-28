@@ -1370,7 +1370,7 @@ Rastreamento de erros compatível com a **Sentry Envelope API** (spec pública `
 
 ```ts
 // ember/ember.config.ts
-export default defineApp({ onError: sentryErrorReporter({ project: "api", release }) })      // opcional: erros do próprio Ember
+export default defineApp({ onError: sentryErrorReporter({ project: "web", release }) })      // opcional: erros do próprio Ember
   .use(sentry, { config: { projects: [{ id: "web", keys: ["<chave>"], sampleRate?, transactionSampleRate?, alerts? }],
                            shard?, bucket?: "EMBER_FILES", retentionDays?: 30, limits?, rateLimit?, analytics?, alerts?, uploadTokenEnv? } });
 // numa action: await sentryCapture(ctx, components.sentry, e, { project?, level?, tags? })
