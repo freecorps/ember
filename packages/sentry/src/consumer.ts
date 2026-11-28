@@ -10,7 +10,8 @@
 //
 // Memory: a batch is consumed in slices of at most `maxSliceBytes` of event JSON (steps 2-6 per slice, one R2 object
 // and one `lib:apply` each), so 100 spilled 1 MiB events never sit in memory at once. A malformed event is dropped
-// (logged) instead of failing the batch it came in.
+// (logged) instead of failing the batch it came in; so is a spill object that is gone. A spill that R2 fails to read
+// (a transient error) is not: that message is retried (`retry`), the rest of the batch goes on.
 //
 // Retries: once a slice's `lib:apply` commits, `committed` gets the indexes of the messages it covered (with the ones
 // skipped or dropped since the previous slice) and the Queue handler acks them one by one; a later slice that throws
@@ -25,7 +26,7 @@ import { artifactName, culpritOf, fingerprintOf, levelOf, normalizeEvent, stackT
 import type { QueuedEvent } from "./ingest.ts";
 import { batchObject, getGunzip, keys, type EventPointer } from "./storage.ts";
 import { cachedMap, lookupsOf, symbolicate } from "./symbolicate.ts";
-import { utf8 } from "./envelope.ts";
+import { gunzip, utf8 } from "./envelope.ts";
 
 /** One issue's share of a batch: what `lib:apply` writes in one statement. */
 export interface IssueGroup {
@@ -66,6 +67,11 @@ export interface ConsumerDeps {
   maxSliceBytes?: number;
   /** Called after each slice is applied with the indexes (into `messages`) it settled: the Queue handler acks them. */
   committed?(indexes: readonly number[]): void;
+  /**
+   * Called at the end with the indexes whose spill object R2 failed to read (a transient error): the Queue handler
+   * retries them. Without it (the inline consumer) such a failure throws, after the rest of the batch is applied.
+   */
+  retry?(indexes: readonly number[]): void;
 }
 
 export interface ConsumeResult {
@@ -78,8 +84,10 @@ export interface ConsumeResult {
   object: string | null;
   /** Every object written, one per slice. */
   objects: string[];
-  /** Events dropped as malformed. */
+  /** Events dropped as malformed (or whose spill object is gone). */
   dropped: number;
+  /** Messages left for the Queue to redeliver (their spill object could not be read). */
+  retried: number;
 }
 
 export const artifactKey = (project: string, release: string, dist: string, name: string) => `${project}\n${release}\n${dist}\n${name}`;
@@ -111,8 +119,8 @@ interface Loaded {
 export async function consume(deps: ConsumerDeps, messages: readonly QueuedEvent[]): Promise<ConsumeResult> {
   const bucket = r2Of(deps.env, deps.config);
   const budget = deps.maxSliceBytes ?? SLICE_BYTES;
-  const total: ConsumeResult = { events: 0, issues: 0, created: 0, alerts: 0, symbolicated: 0, object: null, objects: [], dropped: 0 };
-  const add = (r: Omit<ConsumeResult, "dropped" | "object" | "objects"> & { object: string | null; dropped: number }) => {
+  const total: ConsumeResult = { events: 0, issues: 0, created: 0, alerts: 0, symbolicated: 0, object: null, objects: [], dropped: 0, retried: 0 };
+  const add = (r: Omit<ConsumeResult, "dropped" | "object" | "objects" | "retried"> & { object: string | null; dropped: number }) => {
     total.events += r.events;
     total.issues += r.issues;
     total.created += r.created;
@@ -127,6 +135,8 @@ export async function consume(deps: ConsumerDeps, messages: readonly QueuedEvent
   let bytes = 0;
   // Messages seen since the last applied slice (events, and the ones skipped or dropped): settled with that slice.
   let settled: number[] = [];
+  // Messages whose spill could not be read (a storage failure): never settled, the Queue redelivers them.
+  const retry: number[] = [];
   const flush = async () => {
     if (slice.length) add(await consumeSlice(deps, bucket, slice));
     if (settled.length) deps.committed?.(settled);
@@ -141,17 +151,38 @@ export async function consume(deps: ConsumerDeps, messages: readonly QueuedEvent
     }
     let e: unknown = m.event;
     let size = 0;
-    try {
-      if (!e && m.spill && bucket) {
-        const raw = await getGunzip(bucket, m.spill);
-        size = raw?.length ?? 0;
-        e = raw ? JSON.parse(utf8.decode(raw)) : undefined;
-      } else size = e ? JSON.stringify(e).length : 0;
-    } catch (err) {
-      console.error(`ember-sentry: event ${String(m.id)} could not be read (${m.spill ?? "inline"}): ${(err as Error).message}`);
-      total.dropped++;
-      settled.push(i);
-      continue;
+    if (!e && m.spill && bucket) {
+      // Reading the spill object: a storage failure is transient (the message is retried, never acked), a missing
+      // object (404, or expired) is permanent and dropped, like one that does not decompress or parse.
+      let stored: ArrayBuffer | null;
+      try {
+        const obj = await bucket.get(m.spill);
+        stored = obj ? await obj.arrayBuffer() : null;
+      } catch (err) {
+        console.error(`ember-sentry: event ${String(m.id)} spill ${m.spill} could not be read, retried: ${(err as Error).message}`);
+        retry.push(i);
+        continue;
+      }
+      try {
+        if (!stored) throw new Error("the spill object is missing");
+        const raw = await gunzip(stored);
+        size = raw.length;
+        e = JSON.parse(utf8.decode(raw));
+      } catch (err) {
+        console.error(`ember-sentry: event ${String(m.id)} dropped, its spill ${m.spill} is unreadable: ${(err as Error).message}`);
+        total.dropped++;
+        settled.push(i);
+        continue;
+      }
+    } else {
+      try {
+        size = e ? JSON.stringify(e).length : 0;
+      } catch (err) {
+        console.error(`ember-sentry: event ${String(m.id)} could not be read (inline): ${(err as Error).message}`);
+        total.dropped++;
+        settled.push(i);
+        continue;
+      }
     }
     if (!e || typeof e !== "object" || Array.isArray(e)) {
       settled.push(i);
@@ -163,6 +194,12 @@ export async function consume(deps: ConsumerDeps, messages: readonly QueuedEvent
     bytes += size;
   }
   await flush();
+  if (retry.length) {
+    total.retried = retry.length;
+    if (deps.retry) deps.retry(retry);
+    // Inline (no Queue to redeliver it): the caller sees the failure instead of an event lost quietly.
+    else throw new Error(`ember-sentry: ${retry.length} spilled event(s) could not be read from R2`);
+  }
   return total;
 }
 

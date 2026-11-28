@@ -219,7 +219,7 @@ function applyGroups(ctx: MCtx, groups: readonly IssueGroup[]): { issues: number
   return { issues: groups.length, created, alerts: alerts.length };
 }
 
-async function consumeIn(ctx: ACtx, messages: readonly QueuedEvent[], committed?: (indexes: readonly number[]) => void) {
+async function consumeIn(ctx: ACtx, messages: readonly QueuedEvent[], queue?: { committed(indexes: readonly number[]): void; retry(indexes: readonly number[]): void }) {
   const config = ctx.component.config;
   const shard = ctx.onShard(shardOf(config));
   return consume(
@@ -230,7 +230,7 @@ async function consumeIn(ctx: ACtx, messages: readonly QueuedEvent[], committed?
       now: ctx.now,
       findArtifacts: (lookups) => shard.runQuery(ref.findArtifacts, { lookups }) as Promise<Record<string, string>>,
       apply: (groups) => shard.runMutation(ref.apply, { groups }) as Promise<{ issues: number; created: number; alerts: number }>,
-      ...(committed ? { committed } : {}),
+      ...(queue ? { committed: queue.committed, retry: queue.retry } : {}),
     },
     messages,
   );
@@ -603,8 +603,10 @@ export const sentry = defineComponent({
       // only the rest, and the slices already applied are not counted again (consumer.ts, "Retries").
       handler: async (ctx, batch) => {
         const messages = batch.messages;
-        await consumeIn(ctx as unknown as ACtx, messages.map((m) => m.body as QueuedEvent), (indexes) => {
-          for (const i of indexes) messages[i]!.ack();
+        await consumeIn(ctx as unknown as ACtx, messages.map((m) => m.body as QueuedEvent), {
+          committed: (indexes) => indexes.forEach((i) => messages[i]!.ack()),
+          // A spill R2 failed to read: that message alone comes back (a call on one message wins over `ackAll`).
+          retry: (indexes) => indexes.forEach((i) => messages[i]!.retry()),
         });
         batch.ackAll();
       },

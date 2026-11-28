@@ -167,6 +167,47 @@ describe("grouping and the batched write", () => {
     expect([...counted.values()]).toEqual([20]);
   });
 
+  it("a spill R2 fails to read is retried, not acked; a spill that is gone is dropped; the rest of the batch is applied", async () => {
+    const bucket = new MemoryR2();
+    const counted: string[] = [];
+    const ctx = {
+      component: { name: "sentry", config: noAlerts },
+      env: { EMBER_FILES: bucket },
+      now: Date.UTC(2026, 10, 20, 12),
+      onShard: () => ({
+        runQuery: async () => ({}),
+        runMutation: async (_ref: unknown, a: { groups: Array<{ eventId: string; n: number }> }) => (a.groups.forEach((g) => counted.push(g.eventId)), { issues: a.groups.length, created: 0, alerts: 0 }),
+      }),
+    };
+    const pad = "x".repeat(200 * 1024);
+    const flaky = (await queueMessage("sentry", bucket as never, "web", "f".repeat(32), { ...errorEvent({ type: "Flaky" }), extra: { pad } }, 1))!;
+    const gone: QueuedEvent = { v: 1, project: "web", id: "g".repeat(32), receivedAt: 1, spill: "sentry/sentry/spill/x/web/gone.json.gz" };
+    const fine: QueuedEvent = { v: 1, project: "web", id: "0".repeat(32), receivedAt: 1, event: errorEvent({ type: "Fine" }) };
+    const get = bucket.get.bind(bucket);
+    let failures = 1;
+    bucket.get = async (key, o) => {
+      if (key === flaky.spill && failures-- > 0) throw new Error("R2 internal error (10001)");
+      return get(key, o);
+    };
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    // The Queue: the first call on a message wins (an ack or retry on one message takes precedence over `ackAll`).
+    const run = async (bodies: QueuedEvent[]) => {
+      const outcome = new Map<number, "ack" | "retry">();
+      const set = (i: number, o: "ack" | "retry") => void (outcome.has(i) || outcome.set(i, o));
+      const batch = { queue: "q", messages: bodies.map((body, i) => ({ id: `m${i}`, body, timestamp: new Date(), attempts: 1, ack: () => set(i, "ack"), retry: () => set(i, "retry") })), ackAll: () => bodies.forEach((_, i) => set(i, "ack")), retryAll: () => bodies.forEach((_, i) => set(i, "retry")) };
+      await sentry.queues!.events!.handler(ctx as never, batch as never);
+      return bodies.map((_, i) => outcome.get(i));
+    };
+    expect(await run([flaky, gone, fine])).toEqual(["retry", "ack", "ack"]);
+    expect(counted).toEqual(["0".repeat(32)]);
+    // Redelivered, R2 answers: the event is counted once.
+    expect(await run([flaky])).toEqual(["ack"]);
+    expect(counted).toEqual(["0".repeat(32), "f".repeat(32)]);
+    // The inline consumer has no Queue to redeliver: it fails instead of dropping the event quietly.
+    failures = 1;
+    await expect(consumeBatch({ install: "sentry", config: noAlerts, env: { EMBER_FILES: bucket }, now: 1, findArtifacts: async () => ({}), apply: async () => ({ issues: 0, created: 0, alerts: 0 }) }, [flaky])).rejects.toThrow(/could not be read from R2/);
+  });
+
   it("a timestamp that overflows as milliseconds (1e308) or leaves the Date range falls back to the time received", async () => {
     expect(timestampOf({ timestamp: 1e308 }, 5)).toBe(5);
     expect(timestampOf({ timestamp: -1e13 }, 5)).toBe(5);
