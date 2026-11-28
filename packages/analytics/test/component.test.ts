@@ -297,9 +297,9 @@ describe("queries", () => {
     const calls = sqlApi(() => ({ data: [] }));
     const t = emberTest({ schema, modules: { events: { ...events, counts: actionGeneric({ args: {}, handler: (ctx: any) => tracker.counts(ctx, { bucket: "minute" }) }) } }, app, env: { EMBER_ANALYTICS: fakeDataset(), ...CREDS } });
     const now = await t.run((ctx) => ctx.now);
-    const step = (ms: number) => Math.floor(ms / 60_000) * 60;
+    const step = (ms: number) => Math.floor(ms / 60_000) * 60_000;
     await t.action(unsafeRef<"action">("events:counts"), {});
-    expect(calls[0]).toContain(`toUnixTimestamp(toDateTime(double1 / 1000)) <= ${step(now)}`);
+    expect(calls[0]).toContain(`double1 <= ${step(now)}`);
     expect(calls[0]).not.toContain("NOW()");
     const next = 60_000 - (now % 60_000); // the next minute: a new bound, a new text
     await t.advance(next - 1);
@@ -308,7 +308,19 @@ describe("queries", () => {
     await t.advance(1);
     await t.action(unsafeRef<"action">("events:counts"), {});
     expect(calls).toHaveLength(2);
-    expect(calls[1]).toContain(`toUnixTimestamp(toDateTime(double1 / 1000)) <= ${step(now) + 60}`);
+    expect(calls[1]).toContain(`double1 <= ${step(now) + 60_000}`);
+  });
+
+  test("a refresh at UTC midnight with a cache step that does not divide a day counts the new day, not the last one", async () => {
+    const calls = sqlApi((sql) => (sql.includes("GROUP BY name") ? { data: [] } : { data: [{ events: "3", users: "2" }] }));
+    const midnight = Date.UTC(2023, 10, 15); // 1700006400 s: 7 s steps round it down to 23:59:59 of Nov 14
+    expect((midnight / 1000) % 7).not.toBe(0);
+    const app7 = defineApp().use(analytics, { config: { ...config, sql: { cacheSeconds: 7 } } });
+    const t = emberTest({ schema, modules: { events }, app: app7, env: { EMBER_ANALYTICS: fakeDataset(), ...CREDS }, now: midnight });
+    await (t as unknown as { _action(n: string, a: unknown, s: string): Promise<unknown> })._action("@analytics/dashboard:refresh", {}, "global:main");
+    const overview = calls.find((c) => !c.includes("GROUP BY name"))!;
+    expect(overview).toContain(`double1 >= ${midnight} AND double1 < ${midnight + 86400_000} AND double1 <= ${midnight}`);
+    expect(await t.query(unsafeRef<"query">("@analytics/dashboard:overview"), {})).toMatchObject({ eventsToday: 3, usersToday: 2, at: midnight });
   });
 
   test("two deployments on one account's default dataset: each report counts only its own events", async () => {

@@ -275,11 +275,15 @@ const scopeOf = (ctx: ActCtx) => ({ dataset: ctx.component.config?.dataset ?? DE
  * The statements' "now" (their upper bound: no event after it, even one up to 1 h ahead): the action's `ctx.now`, down
  * to the cache step (`sql.cacheSeconds`, at most a minute). The bound is in the text, so one text holds for the step
  * and the cache keeps serving it; an answer is at most that step behind, as a cached one already was. No cache: exact.
+ * Never before the start of `ctx.now`'s UTC day (a step need not divide a day: 7 s at 00:00:00 would round to 23:59:59):
+ * the overview's day and the retention's periods are those of the action, not of the day before.
  */
 function asOf(ctx: ActCtx): number {
   const ttl = ctx.component.config?.sql?.cacheSeconds ?? DEFAULT_CACHE_SECONDS;
   const step = (Number.isFinite(ttl) && ttl > 0 ? Math.min(ttl, 60) : 0) * 1000;
-  return step > 0 ? Math.floor(ctx.now / step) * step : ctx.now;
+  if (step <= 0) return ctx.now;
+  const day = Math.floor(ctx.now / 86_400_000) * 86_400_000;
+  return Math.max(day, Math.floor(ctx.now / step) * step);
 }
 
 /** Builds (checked: `SqlInputError` → `ValidationError`) and runs one statement through the cache. */

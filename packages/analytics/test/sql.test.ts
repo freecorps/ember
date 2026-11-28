@@ -80,8 +80,8 @@ describe("SQL inputs are checked, never interpolated raw", () => {
   });
 
   test("numbers are clamped integers; a non-number is refused", () => {
-    expect(countsSql(scope, { sinceHours: 1e9, now: 1e10 })).toContain(`${ET} > ${1e7 - 2160 * 3600}`);
-    expect(countsSql(scope, { sinceHours: -5, now: 1e10 })).toContain(`${ET} > ${1e7 - 3600}`);
+    expect(countsSql(scope, { sinceHours: 1e9, now: 1e10 })).toContain(`double1 > ${1e10 - 2160 * 3600_000}`);
+    expect(countsSql(scope, { sinceHours: -5, now: 1e10 })).toContain(`double1 > ${1e10 - 3600_000}`);
     expect(() => countsSql(scope, { now: "1; DROP" as unknown as number })).toThrow(SqlInputError);
     expect(() => funnelSql(scope, { steps: ["a", "b"], now: Number.NaN })).toThrow(SqlInputError);
     expect(topEventsSql(scope, { limit: 3.9 })).toContain("LIMIT 3");
@@ -143,14 +143,16 @@ describe("statement shapes", () => {
   test("event time, not arrival time: double1 (the batch's ts) orders funnels, buckets counts, places cohorts", () => {
     // A batch sent late (offline, beacons) arrives with one `timestamp` for every event: only double1 keeps the order.
     for (const sql of [funnelSql(scope, { steps: ["a", "b"] }), retentionSql(scope, { now: 0 }), countsSql(scope), topEventsSql(scope), overviewSql(scope)]) {
-      expect(sql).toContain(ET);
+      expect(sql).toContain("double1 <= ");
       expect(sql).not.toMatch(/toUnixTimestamp\(timestamp\) -|toStartOfInterval\(timestamp|if\(blob1 = [^,]+, toUnixTimestamp\(timestamp\)/);
     }
     // The day's bounds are in the text (a cached answer of yesterday never serves today): the arrival range starts the
     // 1 h an event may be ahead of its arrival earlier, and an event of tomorrow is not counted today.
     const day = Date.UTC(2026, 10, 26) / 1000;
-    expect(overviewSql(scope, { now: Date.UTC(2026, 10, 26, 23, 30) })).toContain(`toUnixTimestamp(timestamp) >= ${day - 3600} AND ${ET} >= ${day} AND ${ET} < ${day + 86400} AND ${ET} <= ${day + 84600}`);
-    expect(overviewSql(scope, { now: Date.UTC(2026, 10, 27, 0, 0, 10) })).toContain(`${ET} >= ${day + 86400} AND`);
+    expect(overviewSql(scope, { now: Date.UTC(2026, 10, 26, 23, 30) })).toContain(
+      `toUnixTimestamp(timestamp) >= ${day - 3600} AND double1 >= ${day * 1000} AND double1 < ${(day + 86400) * 1000} AND double1 <= ${(day + 84600) * 1000}`,
+    );
+    expect(overviewSql(scope, { now: Date.UTC(2026, 10, 27, 0, 0, 10) })).toContain(`double1 >= ${(day + 86400) * 1000} AND`);
     expect(overviewSql(scope)).not.toContain("NOW()");
   });
 
@@ -160,11 +162,15 @@ describe("statement shapes", () => {
     const now = Date.UTC(2026, 10, 26, 10, 1);
     const end = now / 1000;
     for (const sql of [countsSql(scope, { now }), topEventsSql(scope, { now }), funnelSql(scope, { steps: ["a", "b"], now }), retentionSql(scope, { now }), overviewSql(scope, { now })]) {
-      expect(sql).toContain(`${ET} <= ${end}`);
+      // In ms (`double1`), not ET's whole seconds: an event at 10:01:00.001 is after a cutoff of 10:01:00.000.
+      expect(sql).toContain(`double1 <= ${now}`);
+      expect(sql).not.toContain(`${ET} <=`);
       expect(sql).not.toContain("NOW()");
     }
+    // A cutoff with milliseconds keeps them (no rounding to whole seconds).
+    expect(countsSql(scope, { now: now + 500 })).toContain(`double1 <= ${now + 500}`);
     // The arrival range still starts the full skew earlier (pruning never drops a valid event).
-    expect(topEventsSql(scope, { sinceHours: 24, now })).toContain(`toUnixTimestamp(timestamp) > ${end - 25 * 3600} AND ${ET} > ${end - 86400} AND`);
+    expect(topEventsSql(scope, { sinceHours: 24, now })).toContain(`toUnixTimestamp(timestamp) > ${end - 25 * 3600} AND double1 > ${now - 86400_000} AND`);
   });
 
   test("users: a signed-in subject and an anonymous id with the same text are two users", () => {
@@ -185,7 +191,7 @@ describe("statement shapes", () => {
       [
         "SELECT toStartOfInterval(toDateTime(double1 / 1000), INTERVAL '1' DAY) AS t, blob1 AS name, SUM(_sample_interval) AS events",
         "FROM ember_analytics",
-        `WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) > ${1_764_000_000 - 49 * 3600} AND ${ET} > ${1_764_000_000 - 172800} AND ${ET} <= 1764000000 AND index1 IN ('a', 'b')`,
+        `WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) > ${1_764_000_000 - 49 * 3600} AND double1 > ${now - 172800_000} AND double1 <= ${now} AND index1 IN ('a', 'b')`,
         "GROUP BY t, name",
         "ORDER BY t DESC, name",
         "LIMIT 10000",
@@ -209,7 +215,7 @@ describe("statement shapes", () => {
         `    min(if(blob1 = 'cart', double1, ${NEVER_MS})) AS t1,`,
         `    min(if(blob1 = 'paid', double1, ${NEVER_MS})) AS t2`,
         "  FROM ember_analytics",
-        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) > ${1_764_000_000 - 337 * 3600} AND ${ET} > ${1_764_000_000 - 1209600} AND ${ET} <= 1764000000 AND index1 IN ('view', 'cart', 'paid') AND (blob2 != '' OR blob3 != '')`,
+        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) > ${1_764_000_000 - 337 * 3600} AND double1 > ${1_764_000_000_500 - 1209600_000} AND double1 <= 1764000000500 AND index1 IN ('view', 'cart', 'paid') AND (blob2 != '' OR blob3 != '')`,
         "  GROUP BY uid",
         ")",
       ].join("\n"),
@@ -236,7 +242,7 @@ describe("statement shapes", () => {
         `    countIf(${idx} = 1) AS a1,`,
         `    countIf(${idx} = 2) AS a2`,
         "  FROM ember_analytics",
-        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) >= ${start - 3600} AND ${ET} >= ${start} AND ${ET} <= ${now / 1000} AND (blob2 != '' OR blob3 != '') AND index1 = 'session'`,
+        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) >= ${start - 3600} AND double1 >= ${start * 1000} AND double1 <= ${now} AND (blob2 != '' OR blob3 != '') AND index1 = 'session'`,
         "  GROUP BY uid",
         ")",
         "GROUP BY cohort",
@@ -265,7 +271,8 @@ describe("the SQL API and results", () => {
   afterEach(() => clearSqlCache());
 
   test("funnel against a recorded answer: conversions from step 1 and from the step before", async () => {
-    const o = { steps: ["view", "cart", "paid"], windowSeconds: 86400 };
+    // A fixed now: the statement sent and the one it is compared with have the same cutoff, whatever the clock does.
+    const o = { steps: ["view", "cart", "paid"], windowSeconds: 86400, now: Date.UTC(2026, 10, 26, 10, 1) };
     // FORMAT JSON as the API answers it (UInt64 counts come back as strings).
     const { calls, api } = recorded({ meta: [{ name: "step0", type: "UInt64" }], data: [{ step0: "200", step1: "50", step2: 10 }], rows: 1 });
     const r = parseFunnel(await runSql(api, funnelSql(scope, o)), o);
