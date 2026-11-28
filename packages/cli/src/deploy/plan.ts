@@ -123,9 +123,33 @@ export interface MetadataInput {
 type ComponentsLike = Record<
   string,
   {
-    bindings?: Array<{ type: string; name: string; limit?: number; period?: number; destination_address?: string; allowed_destination_addresses?: string[]; allowed_sender_addresses?: string[] }>;
+    bindings?: Array<{ type: string; name: string; limit?: number; period?: number; dataset?: string; destination_address?: string; allowed_destination_addresses?: string[]; allowed_sender_addresses?: string[] }>;
   }
 >;
+
+/**
+ * Binding names the deploy itself adds (`buildMetadata`, the AI resources): a component may not ask for one, or the
+ * Worker would get two bindings of that name (the runtime would read the component's as the platform's, or the
+ * upload would fail late). `EMBER_AI` is shared on purpose (`{ type: "ai" }`).
+ */
+const PLATFORM_BINDINGS = new Set([
+  ...doClasses(true).map((d) => d.binding),
+  "EMBER_ENV",
+  "EMBER_PROJECT",
+  "EMBER_LOCATION_HINT",
+  "EMBER_VERSION",
+  "EMBER_FILES",
+  "EMBER_R2_BUCKET",
+  "EMBER_R2_ACCOUNT_ID",
+  "EMBER_IMAGES",
+  "EMBER_BROWSER",
+  "EMBER_REGISTRY",
+  "EMBER_METRICS",
+  "EMBER_METRICS_SAMPLE",
+  "EMBER_ACTIONS",
+  "EMBER_INDEXING",
+]);
+const PLATFORM_PREFIXES = ["EMBER_VEC__", "EMBER_AIS__"];
 
 /**
  * Bindings that installed components declared in the composed manifest (`manifest.components[*].bindings`).
@@ -145,6 +169,10 @@ export function componentBindings(components: ComponentsLike | undefined, projec
       }
       // EMBER_AI is the Workers AI binding every install shares: no other binding may take the name.
       if (b.name === "EMBER_AI") throw new Error(`Component ${key}: EMBER_AI is reserved for the Workers AI binding ({ type: "ai" })`);
+      if (b.name === "EMBER_METRICS") throw new Error(`Component ${key}: EMBER_METRICS is reserved for Ember's metrics dataset`);
+      if (PLATFORM_BINDINGS.has(b.name) || PLATFORM_PREFIXES.some((p) => b.name.startsWith(p))) {
+        throw new Error(`Component ${key}: the binding name ${b.name} is reserved (ember deploy adds a platform binding with that name)`);
+      }
       if (seen.has(b.name)) throw new Error(`Components ask for the binding ${b.name} twice (component ${key})`);
       seen.add(b.name);
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name)) throw new Error(`Component ${key}: invalid binding name ${b.name}`);
@@ -156,6 +184,11 @@ export function componentBindings(components: ComponentsLike | undefined, projec
           ...(b.allowed_destination_addresses?.length ? { allowed_destination_addresses: b.allowed_destination_addresses } : {}),
           ...(b.allowed_sender_addresses?.length ? { allowed_sender_addresses: b.allowed_sender_addresses } : {}),
         });
+        continue;
+      }
+      if (b.type === "analytics_engine") {
+        if (!b.dataset || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(b.dataset)) throw new Error(`Component ${key}: analytics_engine ${b.name} needs a dataset name ([A-Za-z_][A-Za-z0-9_]*)`);
+        out.push({ type: "analytics_engine", name: b.name, dataset: b.dataset });
         continue;
       }
       if (b.type !== "ratelimit") throw new Error(`Component ${key}: unknown binding type ${b.type}`);

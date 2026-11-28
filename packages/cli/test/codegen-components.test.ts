@@ -207,6 +207,17 @@ describe("codegen with components", () => {
     expect(componentBindings({ a: { bindings: [{ type: "send_email", name: "EMAIL", allowed_sender_addresses: ["x@y.z"] }] } }, "p", "e")).toEqual([
       { type: "send_email", name: "EMAIL", allowed_sender_addresses: ["x@y.z"] },
     ]);
+    // Analytics Engine (the analytics component): a dataset per binding; EMBER_METRICS stays the runtime's.
+    expect(componentBindings({ a: { bindings: [{ type: "analytics_engine", name: "EMBER_ANALYTICS", dataset: "ember_analytics" }] } }, "p", "e")).toEqual([
+      { type: "analytics_engine", name: "EMBER_ANALYTICS", dataset: "ember_analytics" },
+    ]);
+    expect(() => componentBindings({ a: { bindings: [{ type: "analytics_engine", name: "EMBER_METRICS", dataset: "x" }] } }, "p", "e")).toThrow(/reserved/);
+    // Every name the deploy adds itself is reserved (an install's `binding: "EMBER_FILES"` would shadow the R2 bucket).
+    for (const name of ["EMBER_FILES", "EMBER_REGISTRY", "EMBER_IMAGES", "EMBER_BROWSER", "EMBER_ACTIONS", "EMBER_ENV", "EMBER_INDEXING", "SHARD", "EMBER_VEC__docs__emb", "EMBER_AIS__docs__s"]) {
+      expect(() => componentBindings({ analytics: { bindings: [{ type: "analytics_engine", name, dataset: "x" }] } }, "p", "e"), name).toThrow(new RegExp(`analytics: the binding name ${name} is reserved`));
+      expect(() => componentBindings({ rl: { bindings: [{ type: "ratelimit", name, limit: 1, period: 60 }] } }, "p", "e"), name).toThrow(/reserved/);
+    }
+    expect(() => componentBindings({ a: { bindings: [{ type: "analytics_engine", name: "A", dataset: "bad-name" }] } }, "p", "e")).toThrow(/dataset/);
     // Workers AI: one EMBER_AI however many installs ask for it (two agents), and only under that name.
     expect(componentBindings({ a: { bindings: [{ type: "ai", name: "EMBER_AI" }] }, b: { bindings: [{ type: "ai", name: "EMBER_AI" }] } }, "p", "e")).toEqual([{ type: "ai", name: "EMBER_AI" }]);
     expect(() => componentBindings({ a: { bindings: [{ type: "ai", name: "AI" }] } }, "p", "e")).toThrow(/EMBER_AI/);

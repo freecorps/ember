@@ -1,0 +1,15 @@
+// Test-only Worker for the audit component's workerd test (vitest.workerd.config.ts). Never deployed.
+{
+  "name": "ember-audit-it",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "SHARD", "class_name": "Shard" },
+      { "name": "SYSTEM", "class_name": "System" }
+    ]
+  },
+  "r2_buckets": [{ "binding": "EMBER_FILES", "bucket_name": "ember-audit-it" }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Shard", "System"] }]
+}

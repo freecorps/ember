@@ -68,7 +68,9 @@ export type ComponentBinding =
   /** Email Service / Email Routing `send_email` binding (optionally restricted to senders or destinations). */
   | { type: "send_email"; name: string; destination_address?: string; allowed_destination_addresses?: string[]; allowed_sender_addresses?: string[] }
   /** Workers AI (only `EMBER_AI`, shared with the embeddings of `vectorIndex`; asked for by the agent component). */
-  | { type: "ai"; name: "EMBER_AI" };
+  | { type: "ai"; name: "EMBER_AI" }
+  /** A Workers Analytics Engine dataset (`env.<name>.writeDataPoint`; asked for by the analytics component). */
+  | { type: "analytics_engine"; name: string; dataset: string };
 
 /** A Queue message as a component's consumer sees it (the Workers `Message`). */
 export interface ComponentQueueMessage<Body = unknown> {
