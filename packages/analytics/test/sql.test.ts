@@ -170,7 +170,9 @@ describe("statement shapes", () => {
     // A cutoff with milliseconds keeps them (no rounding to whole seconds).
     expect(countsSql(scope, { now: now + 500 })).toContain(`double1 <= ${now + 500}`);
     // The arrival range still starts the full skew earlier (pruning never drops a valid event).
-    expect(topEventsSql(scope, { sinceHours: 24, now })).toContain(`toUnixTimestamp(timestamp) > ${end - 25 * 3600} AND double1 > ${now - 86400_000} AND`);
+    expect(topEventsSql(scope, { sinceHours: 24, now })).toContain(`toUnixTimestamp(timestamp) >= ${end - 25 * 3600} AND double1 > ${now - 86400_000} AND`);
+    // Inclusive: an event 1 h ahead of its arrival can be written in exactly the first second of the arrival range.
+    expect(topEventsSql(scope, { sinceHours: 24, now })).not.toContain("toUnixTimestamp(timestamp) > ");
   });
 
   test("users: a signed-in subject and an anonymous id with the same text are two users", () => {
@@ -191,7 +193,7 @@ describe("statement shapes", () => {
       [
         "SELECT toStartOfInterval(toDateTime(double1 / 1000), INTERVAL '1' DAY) AS t, blob1 AS name, SUM(_sample_interval) AS events",
         "FROM ember_analytics",
-        `WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) > ${1_764_000_000 - 49 * 3600} AND double1 > ${now - 172800_000} AND double1 <= ${now} AND index1 IN ('a', 'b')`,
+        `WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) >= ${1_764_000_000 - 49 * 3600} AND double1 > ${now - 172800_000} AND double1 <= ${now} AND index1 IN ('a', 'b')`,
         "GROUP BY t, name",
         "ORDER BY t DESC, name",
         "LIMIT 10000",
@@ -215,7 +217,7 @@ describe("statement shapes", () => {
         `    min(if(blob1 = 'cart', double1, ${NEVER_MS})) AS t1,`,
         `    min(if(blob1 = 'paid', double1, ${NEVER_MS})) AS t2`,
         "  FROM ember_analytics",
-        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) > ${1_764_000_000 - 337 * 3600} AND double1 > ${1_764_000_000_500 - 1209600_000} AND double1 <= 1764000000500 AND index1 IN ('view', 'cart', 'paid') AND (blob2 != '' OR blob3 != '')`,
+        `  WHERE blob6 = 'analytics' AND toUnixTimestamp(timestamp) >= ${1_764_000_000 - 337 * 3600} AND double1 > ${1_764_000_000_500 - 1209600_000} AND double1 <= 1764000000500 AND index1 IN ('view', 'cart', 'paid') AND (blob2 != '' OR blob3 != '')`,
         "  GROUP BY uid",
         ")",
       ].join("\n"),

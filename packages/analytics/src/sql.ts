@@ -120,7 +120,7 @@ const nowMs = (now: unknown): number => int(typeof now === "number" ? now : now 
  */
 function lastSeconds(where: string[], seconds: number, end: number): void {
   const endS = Math.floor(end / 1000);
-  where.push(`toUnixTimestamp(timestamp) > ${endS - (Math.ceil(seconds / 3600) + AHEAD_HOURS) * 3600}`, `double1 > ${end - seconds * 1000}`, `double1 <= ${end}`);
+  where.push(`toUnixTimestamp(timestamp) >= ${endS - (Math.ceil(seconds / 3600) + AHEAD_HOURS) * 3600}`, `double1 > ${end - seconds * 1000}`, `double1 <= ${end}`);
 }
 
 const names = (xs: readonly string[]) => xs.map((n) => lit(n)).join(", ");
