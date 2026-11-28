@@ -105,6 +105,7 @@ const groupValidator = v.object({
   n: v.number(),
   firstSeen: v.number(),
   lastSeen: v.number(),
+  receivedAt: v.optional(v.number()),
   title: v.string(),
   culprit: v.string(),
   level: v.string(),
@@ -171,8 +172,10 @@ function applyGroups(ctx: MCtx, groups: readonly IssueGroup[]): { issues: number
       doc = { ...rest, ...(latest(existing) ? fields : {}), count: existing.count + g.n, firstSeen: Math.min(existing.firstSeen, g.firstSeen), lastSeen: Math.max(existing.lastSeen, g.lastSeen), hourly: bumpHourly(existing.hourly, existing.hourlyAt, hour, g.n), hourlyAt: Math.max(hour, existing.hourlyAt) };
       // The latest event's pointer comes with its id: a newer event stored nowhere (no bucket) leaves none.
       if (latest(existing) && !g.pointer) delete doc.lastEvent;
-      if (existing.status === "resolved") {
-        // A regression: seen again after it was resolved.
+      // A regression: an event received after the issue was resolved. One the Queue delivers late (received before
+      // the resolve) is counted and leaves it resolved.
+      const after = g.receivedAt === undefined || existing.resolvedAt === undefined || g.receivedAt >= existing.resolvedAt;
+      if (existing.status === "resolved" && after) {
         doc.status = "unresolved";
         doc.regressedAt = now;
         delete doc.resolvedAt;

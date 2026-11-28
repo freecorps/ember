@@ -35,6 +35,8 @@ export interface IssueGroup {
   n: number;
   firstSeen: number;
   lastSeen: number;
+  /** The latest time an event of the group was received (ingest's clock, not the event's): what a resolve is compared with. */
+  receivedAt?: number;
   title: string;
   culprit: string;
   level: string;
@@ -243,7 +245,7 @@ async function consumeSlice(deps: ConsumerDeps, bucket: ReturnType<typeof r2Of>,
   }
   // 3. Grouping: an event whose fields cannot be read is dropped, the rest of the slice goes on.
   let dropped = 0;
-  const prepared: Array<{ m: QueuedEvent; e: SentryEvent; fingerprint: string; at: number; line: string; latest: Omit<IssueGroup, "project" | "fingerprint" | "n" | "firstSeen" | "lastSeen" | "pointer"> }> = [];
+  const prepared: Array<{ m: QueuedEvent; e: SentryEvent; fingerprint: string; at: number; line: string; latest: Omit<IssueGroup, "project" | "fingerprint" | "n" | "firstSeen" | "lastSeen" | "receivedAt" | "pointer"> }> = [];
   for (const { m, e } of loaded) {
     try {
       const latest = { title: titleOf(e), culprit: culpritOf(e), level: levelOf(e), release: e.release ?? "", environment: e.environment ?? "", platform: e.platform ?? "", eventId: m.id, stack: stackText(e) };
@@ -270,8 +272,9 @@ async function consumeSlice(deps: ConsumerDeps, bucket: ReturnType<typeof r2Of>,
     const k = `${m.project}\n${fingerprint}`;
     const g = groups.get(k);
     const latest = !g || at >= g.lastSeen;
-    const next: IssueGroup = g ?? { project: m.project, fingerprint, n: 0, firstSeen: at, lastSeen: at, title: "", culprit: "", level: "", release: "", environment: "", platform: "", eventId: "", stack: "" };
+    const next: IssueGroup = g ?? { project: m.project, fingerprint, n: 0, firstSeen: at, lastSeen: at, receivedAt: m.receivedAt, title: "", culprit: "", level: "", release: "", environment: "", platform: "", eventId: "", stack: "" };
     next.n++;
+    next.receivedAt = Math.max(next.receivedAt ?? 0, m.receivedAt);
     next.firstSeen = Math.min(next.firstSeen, at);
     if (latest) {
       Object.assign(next, { lastSeen: at, ...fields });

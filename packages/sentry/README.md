@@ -91,7 +91,7 @@ An issue is one `(project, fingerprint)`. The default fingerprint is the excepti
 `{{ default }}` expanded). Each row keeps `count`, `firstSeen`, `lastSeen`, `level`, `status`, `title`, `culprit`,
 `release`, events per hour (24 h) and the symbolicated stack of the latest event; the full event is read back from R2.
 
-`lib:setStatus` resolves, ignores or reopens an issue. A new event of a resolved issue reopens it (a regression);
+`lib:setStatus` resolves, ignores or reopens an issue. An event received after an issue was resolved reopens it (a regression; one received before and delivered late only counts);
 ignored issues keep counting and never alert.
 
 ## Alerts

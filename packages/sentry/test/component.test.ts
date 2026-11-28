@@ -279,6 +279,24 @@ describe("status, regression and alerts", () => {
     expect(await t.mutation(fn("lib:setStatus"), { id, status: "unresolved" })).toBe("unresolved");
   });
 
+  it("an event received before the resolve and consumed after it counts, but neither reopens the issue nor alerts", async () => {
+    stubFetch();
+    const { t, consume, issues, internalAction, msg } = harness(config);
+    await consume([errorEvent()]);
+    await t.finishScheduled();
+    const id = (await issues())[0]!._id;
+    // Accepted by ingest (in the Queue), then the operator resolves the issue, then the consumer runs.
+    const queued = msg(errorEvent());
+    await t.advance(60_000);
+    await t.mutation(fn("lib:setStatus"), { id, status: "resolved" });
+    await t.advance(60_000);
+    expect(((await internalAction("lib:consume", { messages: [queued] })) as { alerts: number }).alerts).toBe(0);
+    expect((await issues())[0]).toMatchObject({ status: "resolved", count: 2 });
+    // One received after the resolve is a regression.
+    expect((await consume([errorEvent()])).alerts).toBe(1);
+    expect((await issues())[0]).toMatchObject({ status: "unresolved", count: 3 });
+  });
+
   it("a spike: N events inside the window alert once; the next window may alert again after the throttle", async () => {
     stubFetch();
     const { t, consume } = harness({ ...config, alerts: { ...config.alerts, newIssue: false } });
