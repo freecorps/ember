@@ -5,7 +5,7 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { EmberClient, anyApi, unsafeRef } from "@freecorps/ember-client";
 import { FakeEmberServer } from "@freecorps/ember-client/testing";
 import { EmberProvider } from "@freecorps/ember-react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
 import { evaluateAll, type FlagDefinition } from "../src/eval.ts";
 import { FlagsProvider, useFlag, useFlags, type FlagsQuery } from "../src/react.ts";
 
@@ -88,6 +88,21 @@ describe("useFlag", () => {
     } finally {
       client.close();
     }
+  });
+
+  it("primitive fallbacks widen: a \"classic\" fallback is a string (compared with \"fresh\"), 10 a number, false a boolean", () => {
+    // Types only (never called): `const` would otherwise keep the fallback's literal type.
+    const typed = () => {
+      const theme = useFlag("theme", "classic");
+      const limit = useFlag("limit", 10);
+      const fresh = useFlag("newCheckout", false);
+      expectTypeOf(theme).toEqualTypeOf<string>();
+      expectTypeOf(limit).toEqualTypeOf<number>();
+      expectTypeOf(fresh).toEqualTypeOf<boolean>();
+      expectTypeOf(useFlag("x", { a: 1 })).toEqualTypeOf<{ a: number }>();
+      return theme === "fresh" && limit === 20 && fresh === true;
+    };
+    void typed;
   });
 
   it("outside a FlagsProvider: a clear error", () => {

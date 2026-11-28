@@ -33,6 +33,10 @@ export const ff = new FeatureFlags(components.flags, {
 });
 
 // ember/checkout.ts: on any shard, inside the mutation's transaction
+import { v } from "@freecorps/ember-server";
+import { mutation } from "./_generated/server";
+import { ff } from "./flags";
+
 export const start = mutation({
   args: { plan: v.string() },
   handler: (ctx, a) => {
@@ -98,6 +102,7 @@ import { FlagsProvider, useFlag } from "@freecorps/ember-flags/react";
 </FlagsProvider>;
 
 const fresh = useFlag("newCheckout", false); // false while loading, when missing, or when the value has another type
+const theme = useFlag("checkoutTheme", "classic"); // a string (the fallback's type, widened), not "classic"
 ```
 
 Offline, or for your own UI, use the pure evaluator over a snapshot. Get the snapshot from `ff.definitions(ctx, {

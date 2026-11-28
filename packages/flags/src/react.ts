@@ -69,13 +69,16 @@ export function useFlags(): FlagsState {
   return s;
 }
 
+/** A primitive fallback's type, widened (`"classic"` → `string`): the flag may hold any value of that type. */
+export type FlagFallbackType<V> = V extends string ? string : V extends number ? number : V extends boolean ? boolean : V;
+
 /**
  * A flag's value, or `fallback` while loading, when the flag is missing or not client-visible, or when its value is
- * not of the fallback's type (`typeof`). A `null` or `undefined` fallback accepts any value, so the result is then
- * `unknown` (narrow it yourself).
+ * not of the fallback's type (`typeof`). The result has the fallback's type, widened (`useFlag("theme", "classic")` is
+ * a `string`). A `null` or `undefined` fallback accepts any value, so the result is then `unknown` (narrow it yourself).
  */
 export function useFlag(key: string, fallback: null | undefined): unknown;
-export function useFlag<V>(key: string, fallback: V): V;
+export function useFlag<V>(key: string, fallback: V): FlagFallbackType<V>;
 export function useFlag<V>(key: string, fallback: V): V {
   const { values } = useFlags();
   const value = values?.[key];
