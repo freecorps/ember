@@ -341,7 +341,7 @@ describe("analytics client", () => {
     expect(a.pending).toBe(0);
   });
 
-  test("pagehide: beacons keep to the event cap the route was seen to take (maxEvents under batchSize), and forget it once a bigger batch passes", async () => {
+  test("pagehide: beacons keep to a size the route took (maxEvents under batchSize), and the full batchSize only once a batch of it passes", async () => {
     const beacons: number[] = [];
     const listeners = new Map<string, () => void>();
     vi.stubGlobal("document", {});
@@ -364,14 +364,29 @@ describe("analytics client", () => {
     listeners.get("pagehide")!();
     await vi.advanceTimersByTimeAsync(0);
     expect(beacons).toEqual([1, 1]); // one beacon of two would be refused whole, and never come back
-    // The cap goes up: a regular batch bigger than the refused one passes, and the beacons take the full batchSize again.
-    maxEvents = 50;
-    for (const n of ["f", "g", "h"]) a.track(n);
+    // The cap goes up to 2: a batch of 2 passes, the size of the refused one. Beacons of 3 would still be refused (a
+    // beacon's `true` only says the browser queued it): they keep to the 2 the route took.
+    maxEvents = 2;
+    for (const n of ["f", "g"]) a.track(n);
     await a.flush();
-    for (const n of ["i", "j", "k", "l"]) a.track(n);
+    for (const n of ["h", "i", "j"]) a.track(n);
     listeners.get("pagehide")!();
     await vi.advanceTimersByTimeAsync(0);
-    expect(beacons).toEqual([1, 1, 4]);
+    expect(beacons).toEqual([1, 1, 2, 1]);
+    // The cap goes up again: a smaller batch passing is not enough; one of the full batchSize (20) is.
+    maxEvents = 50;
+    for (const n of ["k", "l", "m"]) a.track(n);
+    await a.flush();
+    for (const n of ["n", "o", "p", "q"]) a.track(n);
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(beacons).toEqual([1, 1, 2, 1, 3, 1]);
+    for (let i = 0; i < 20; i++) a.track("r");
+    await a.flush();
+    for (let i = 0; i < 4; i++) a.track("s");
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(beacons).toEqual([1, 1, 2, 1, 3, 1, 4]);
   });
 
   test("pagehide: after a 400, the beacons use the biggest batch that passed since, not a bigger one that passed before", async () => {
@@ -698,6 +713,78 @@ describe("analytics client", () => {
     status = 204;
     await a.flush();
     expect(bodies.at(-1)).toEqual(["one", "two"]);
+    expect(a.pending).toBe(0);
+  });
+
+  test("close() without sendBeacon: a batch that used its last try is not sent again when another batch fails", async () => {
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("addEventListener", () => {});
+    vi.stubGlobal("removeEventListener", () => {});
+    const bodies: string[][] = [];
+    const answers: Array<(r: Response) => void> = [];
+    const fetch = vi.fn(async (_u: string, init: RequestInit) => {
+      bodies.push((JSON.parse(String(init.body)) as Sent["body"]).events.map((e) => e.name));
+      return new Promise<Response>((resolve) => answers.push(resolve));
+    }) as unknown as typeof globalThis.fetch;
+    // A and B under different anonymous ids: two keepalive fetches on close().
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    a.track("A");
+    a.reset();
+    a.track("B");
+    a.close();
+    expect(bodies).toEqual([["A"], ["B"]]);
+    const [failA, failB] = answers.splice(0);
+    failA!(new Response(null, { status: 503 })); // A fails: once more
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bodies).toEqual([["A"], ["B"], ["A"]]);
+    answers.shift()!(new Response(null, { status: 503 })); // A fails again: it waits for flush()
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bodies).toHaveLength(3);
+    failB!(new Response(null, { status: 503 })); // B fails for the first time: only B goes again, not A a third time
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bodies).toEqual([["A"], ["B"], ["A"], ["B"]]);
+    expect(a.pending).toBe(1);
+    answers.shift()!(new Response(null, { status: 503 }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bodies).toHaveLength(4);
+    expect(a.pending).toBe(2);
+  });
+
+  test("without sendBeacon, a keepalive fetch that never settles gives its budget back after timeoutMs (batch kept)", async () => {
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    const signals: AbortSignal[] = [];
+    const sizes: number[] = [];
+    let hang = true;
+    const fetch = vi.fn(async (_u: string, init: RequestInit) => {
+      if (init.signal) signals.push(init.signal);
+      sizes.push(String(init.body).length);
+      return hang ? new Promise<Response>(() => {}) : new Response(null, { status: 204 });
+    }) as unknown as typeof globalThis.fetch;
+    // ~27 KiB per beacon of 5 (cut to the 32 KiB a body may be): two fit in the 60 KiB budget, a third does not while
+    // they hold it. 15 events under batchSize 20: no regular send starts.
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 600_000, timeoutMs: 2000 });
+    const big = Object.fromEntries(Array.from({ length: 20 }, (_, j) => [`p${j}`, "x".repeat(256)]));
+    for (let i = 0; i < 15; i++) a.track("e", big);
+    listeners.get("pagehide")!();
+    expect(sizes).toHaveLength(2);
+    expect(a.pending).toBe(5);
+    listeners.get("pagehide")!();
+    expect(sizes).toHaveLength(2); // the hung fetches still hold the budget
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(signals.every((s) => s.aborted)).toBe(true);
+    expect(a.pending).toBe(15); // both batches back, in order
+    hang = false;
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sizes).toHaveLength(4); // the budget is free again: two more go
+    await vi.advanceTimersByTimeAsync(0);
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
     expect(a.pending).toBe(0);
   });
 

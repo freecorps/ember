@@ -3,12 +3,13 @@
 // `pagehide` (`navigator.sendBeacon`) and on `close()`. Bodies are `text/plain` JSON, a "simple" request with no CORS
 // preflight (like the RUM client). One request at a time; a batch that is not delivered (network, 3xx, 429, 5xx) goes
 // back to the queue; one the server refuses whole (400, 413) is sent again in halves, and only an event refused on
-// its own (or a batch refused with another 4xx) is dropped; a beacon is never bigger than a batch the route was seen to
-// take after a 400 (an install's `maxEvents` under `batchSize`). On `pagehide` the beacons stay within the
+// its own (or a batch refused with another 4xx) is dropped; after a 400, a beacon is never bigger than a batch the
+// route answered 2xx since (an install's `maxEvents` under `batchSize`). On `pagehide` the beacons stay within the
 // browser's keepalive budget (64 KiB in flight per page, shared with the pending fetch): what does not fit stays
 // queued (a page restored from the back/forward cache sends it). The anonymous id lives in localStorage when there is
 // one; `reset()` (sign-out) is an identity boundary: what was queued before it never goes with the next user's token.
-// A send that hangs (token or fetch) gives up after `timeoutMs` and is retried; redirects are never followed.
+// A send that hangs (token, fetch or a pagehide fallback fetch) gives up after `timeoutMs` and is retried; redirects are
+// never followed.
 //
 //   const analytics = createAnalytics({ url: "https://my-app.example.com" });
 //   analytics.track("viewed_pricing", { plan: "pro" });
@@ -24,8 +25,9 @@ export interface AnalyticsClientOptions {
   flushIntervalMs?: number;
   /**
    * Events per request (default 20, at most 50: what the server takes). Keep it within the install's `maxEvents`:
-   * over it, the server refuses the batch (400) and the client splits it; the beacons of `pagehide` use the size the
-   * client has seen pass since (a beacon has no answer to split by), and the full `batchSize` before any refusal.
+   * over it, the server refuses the batch (400) and the client splits it; the beacons of `pagehide` use the biggest
+   * batch the route answered 2xx since (a beacon has no answer to split by), and the full `batchSize` before any
+   * refusal or once a batch of `batchSize` is delivered again.
    */
   batchSize?: number;
   /** Most events kept while the network is down (default 500; the oldest go first). */
@@ -111,15 +113,18 @@ export class AnalyticsClient {
   private readonly seq = new WeakMap<QueuedEvent, number>();
   private nextSeq = 0;
   /**
-   * What the client learned of the route's event cap, for the beacons (which cannot be split after the fact): the
-   * smallest batch of more than one event refused with 400 since, and the largest one delivered after that refusal.
-   * No refusal seen: `batchSize`. A delivered batch at least as big as the refused one (the 400 was a bad event, or the
-   * cap went up) forgets it.
+   * What the client learned of the route's event cap, for the beacons (which cannot be split after the fact, and whose
+   * `true` only says the browser queued them): a batch of more than one event was refused with 400, and the biggest
+   * batch answered 2xx since that refusal. A beacon is never bigger than that (at least 1): only a size the route took.
+   * No refusal seen, or a batch of the full `batchSize` delivered since: `batchSize`.
    */
-  private refusedAt = Number.POSITIVE_INFINITY;
+  private capped = false;
   private passedAt = 0;
-  /** Events a fallback fetch already sent once more after `close()` (see `flushBeacon`): one retry each, no loop. */
-  private readonly retried = new WeakSet<QueuedEvent>();
+  /**
+   * Keepalive fallback fetches of each event that failed after `close()` (see `flushBeacon`): an event goes again on its
+   * own at most once after a failed one (two failures, it waits for an explicit `flush()`), whatever other batch fails.
+   */
+  private readonly failures = new WeakMap<QueuedEvent, number>();
   /** Requests sent (tests). */
   sent = 0;
 
@@ -230,27 +235,29 @@ export class AnalyticsClient {
   /** Learns the route's event cap from an answer to a batch of `n` events (see `refusedAt`). */
   private learn(status: number, n: number): void {
     if (status === 400 && n > 1) {
-      this.refusedAt = Math.min(this.refusedAt, n);
+      this.capped = true;
       this.passedAt = 0;
     } else if (status >= 200 && status < 300) {
-      if (n >= this.refusedAt) this.refusedAt = Number.POSITIVE_INFINITY;
       this.passedAt = Math.max(this.passedAt, n);
+      if (n >= this.batchSize) this.capped = false;
     }
   }
 
-  /** Events per beacon: `batchSize`, or below the smallest refused batch, as big as one that passed since (at least 1). */
+  /** Events per beacon: `batchSize`, or after a refusal the biggest batch delivered since (at least 1). */
   private beaconSize(): number {
-    if (this.refusedAt === Number.POSITIVE_INFINITY) return this.batchSize;
-    return Math.max(1, Math.min(this.batchSize, this.refusedAt - 1, this.passedAt));
+    return this.capped ? Math.max(1, Math.min(this.batchSize, this.passedAt)) : this.batchSize;
   }
 
-  /** How many of the first `n` queued events go together: one anonymous id per batch (an identity boundary). */
-  private run(n: number): number {
-    const aid = this.queue[0]?.anonymousId;
+  /** How many of the first `n` events of `from` go together: one anonymous id per batch (an identity boundary). */
+  private run(n: number, from: QueuedEvent[] = this.queue): number {
+    const aid = from[0]?.anonymousId;
     let k = 0;
-    while (k < n && k < this.queue.length && this.queue[k]!.anonymousId === aid) k++;
+    while (k < n && k < from.length && from[k]!.anonymousId === aid) k++;
     return k;
   }
+
+  /** May go on its own after `close()` (the drain's or a failed fallback's pass): fewer than two failed fallbacks. */
+  private readonly eligible = (e: QueuedEvent) => (this.failures.get(e) ?? 0) < 2;
 
   /**
    * Puts a batch back in enqueue order: its events are merged into the queue by sequence, one by one (a batch can mix
@@ -279,7 +286,7 @@ export class AnalyticsClient {
       if (r === "retry") {
         // Back to the front, for the next flush (keeping the cap). Closed: no timer will come, so beacon it now.
         this.requeue(batch);
-        if (this.closed) this.flushBeacon();
+        if (this.closed) this.beacon(this.eligible);
         return;
       }
     }
@@ -344,13 +351,20 @@ export class AnalyticsClient {
    * in the queue, and each event carries its own `ts`, so the order the server gets them in does not matter.
    */
   flushBeacon(): void {
+    this.beacon();
+  }
+
+  /** `flushBeacon` over the queued events `only` takes (all of them by default), in queue order. */
+  private beacon(only?: (e: QueuedEvent) => boolean): void {
     const nav = (globalThis as { navigator?: { sendBeacon?: (url: string, data: Blob | string) => boolean } }).navigator;
     let budget = BEACON_BUDGET_BYTES - this.inFlightBytes;
-    while (this.queue.length) {
+    for (;;) {
+      const pool = only ? this.queue.filter(only) : this.queue;
+      if (!pool.length) return;
       // Fewer events while the body is over what the server takes; one event that alone is over it stays queued
       // (the regular send drops it when the server answers 413).
       // At most the events per request the route was seen to take (a beacon refused with 400 does not come back).
-      let batch = this.queue.slice(0, this.run(this.beaconSize()));
+      let batch = pool.slice(0, this.run(this.beaconSize(), pool));
       let body = JSON.stringify({ events: batch });
       let bytes = byteLength(body);
       while (bytes > MAX_BODY_BYTES && batch.length > 1) {
@@ -362,43 +376,58 @@ export class AnalyticsClient {
       try {
         if (typeof nav?.sendBeacon === "function" && typeof Blob !== "undefined") {
           if (!nav.sendBeacon(this.endpoint, new Blob([body], { type: "text/plain" }))) return; // over the browser's quota
-          this.queue.splice(0, batch.length);
+          this.take(batch);
         } else {
           const f = this.o.fetch ?? (globalThis as { fetch?: typeof fetch }).fetch;
           if (!f) return;
           // Out of the queue while the keepalive fetch is pending (never sent twice); back in front if it is not
           // delivered (network, 3xx, 429, 5xx), for a page restored from the back/forward cache.
-          this.queue.splice(0, batch.length);
+          this.take(batch);
+          const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
           let sending: Promise<Response>;
           try {
-            sending = f(this.endpoint, { method: "POST", headers: { "content-type": "text/plain" }, body, keepalive: true, redirect: "manual" });
+            sending = f(this.endpoint, { method: "POST", headers: { "content-type": "text/plain" }, body, keepalive: true, redirect: "manual", ...(ctrl ? { signal: ctrl.signal } : {}) });
           } catch (e) {
             this.requeue(batch);
             throw e;
           }
-          // Its body is in the page's keepalive quota until it settles: a regular send meanwhile counts it.
+          // Its body is in the page's keepalive quota until it settles or is given up: a regular send meanwhile counts
+          // it. One answer per attempt: the first of the response, the failure and the deadline (`timeoutMs`, so a fetch
+          // that never settles does not hold the budget for good); a later one changes nothing.
           this.inFlightBytes += bytes;
-          const settled = () => (this.inFlightBytes -= bytes);
-          // Back in the queue. Closed, no timer is left to send it: once more now (as the drain does), only if some
-          // event of it was not sent again already; after that it waits for an explicit `flush()`.
+          let done = false;
+          const settle = (): boolean => {
+            if (done) return false;
+            done = true;
+            clearTimeout(timer);
+            this.inFlightBytes -= bytes;
+            return true;
+          };
+          // Back in the queue. Closed, no timer is left to send it: its events go once more now (as the drain does),
+          // each only after its first failed fallback; after a second one it waits for an explicit `flush()`.
           const back = () => {
             this.requeue(batch);
-            if (!this.closed || batch.every((e) => this.retried.has(e))) return;
-            for (const e of batch) this.retried.add(e);
-            this.flushBeacon();
+            if (!this.closed) return;
+            for (const e of batch) this.failures.set(e, (this.failures.get(e) ?? 0) + 1);
+            this.beacon(this.eligible);
           };
+          const timer = setTimeout(() => {
+            if (!settle()) return;
+            ctrl?.abort();
+            back();
+          }, this.timeoutMs);
+          (timer as { unref?: () => void }).unref?.();
           // Back for the regular drain when not delivered, or refused whole with more than one event (the drain splits
           // it); a refused singleton is dropped, as the drain does.
           sending.then(
             (r) => {
-              settled();
+              if (!settle()) return;
               this.learn(r.status, batch.length);
               const o = outcomeOf(r.status);
               if (o === "retry" || (o === "split" && batch.length > 1)) back();
             },
             () => {
-              settled();
-              back();
+              if (settle()) back();
             },
           );
         }
@@ -410,10 +439,17 @@ export class AnalyticsClient {
     }
   }
 
+  /** Takes the events of `batch` out of the queue (not always its first ones: `beacon` may skip some). */
+  private take(batch: QueuedEvent[]): void {
+    const out = new Set(batch);
+    this.queue = this.queue.filter((e) => !out.has(e));
+  }
+
   /**
    * Sends what is left (as beacons) and stops the timer. A fetch still in flight is not waited for; if it then fails,
-   * its batch is beaconed as soon as it is back in the queue (no timer is left to send it). Without `sendBeacon`, a
-   * keepalive fetch that fails after `close()` is sent once more; failing again, its batch stays for `flush()`.
+   * its batch is beaconed as soon as it is back in the queue (no timer is left to send it). Without `sendBeacon`, an
+   * event whose keepalive fetch fails (or hangs past `timeoutMs`) after `close()` is sent once more; failing again, it
+   * stays for `flush()`, even when another batch fails later.
    */
   close(): void {
     this.closed = true;
