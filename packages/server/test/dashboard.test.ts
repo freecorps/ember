@@ -182,6 +182,15 @@ describe("composeApp: dashboards in the manifest", () => {
   };
   const appSchema = defineSchema({ tables: { notes: defineTable({ text: v.string() }) } });
 
+  test("dashboardShard: a global screen pinned per install config; only with scope global, a valid shard", () => {
+    const pinned = defineComponent({ name: "pinned", schema, functions, config: v.object({ shard: v.optional(v.string()) }), dashboard: { ...spec(), scope: "global" }, dashboardShard: (c) => c.shard ?? "global:main" });
+    const compose = (config: { shard?: string }) => composeApp({ schema: appSchema, functions: appFns, app: defineApp().use(pinned, { config }) }).dashboards[0]!;
+    expect(compose({}).shard).toBeUndefined();
+    expect(compose({ shard: "global:errors" })).toMatchObject({ scope: "global", shard: "global:errors" });
+    expect(() => compose({ shard: "nope" })).toThrow(/dashboardShard must be "<kind>:<key>"/);
+    expect(() => defineComponent({ name: "loose", schema, functions, dashboard: spec(), dashboardShard: "global:x" })).toThrow(/dashboardShard needs a dashboard with scope "global"/);
+  });
+
   test("the app's spec (key \"\") and each install's, with absolute names; nested installs too", () => {
     const outer = defineComponent({ name: "outer", functions: {} }).use(items, { name: "inner" });
     const app = defineApp({

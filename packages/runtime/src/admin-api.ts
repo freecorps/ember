@@ -545,8 +545,10 @@ async function handleDashboards(request: Request, url: URL, deps: AdminDeps): Pr
   if (input.shard !== undefined && (typeof input.shard !== "string" || !input.shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(input.shard)}`);
   let shard = typeof input.shard === "string" ? input.shard : "global:main";
   if (spec.scope === "global") {
-    if (shard !== "global:main") return deps.error(400, "bad_shard", `the ${spec.key || "app"} dashboard runs on global:main only (scope "global")`);
-    shard = "global:main";
+    // A component may pin its screens to the shard its config keeps its tables in (`dashboardShard`).
+    const fixed = spec.shard ?? "global:main";
+    if (input.shard !== undefined && shard !== fixed) return deps.error(400, "bad_shard", `the ${spec.key || "app"} dashboard runs on ${fixed} only (scope "global")`);
+    shard = fixed;
   }
   if (!deps.validShard(shard)) return deps.error(400, "bad_shard", `invalid shard ${JSON.stringify(input.shard)}`);
   // A destructive write runs only when the caller saw it as one (`destructive: true`): the dashboard decides the typed

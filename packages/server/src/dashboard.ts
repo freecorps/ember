@@ -251,6 +251,8 @@ export interface DashboardManifest extends DashboardSpec {
   key: string;
   /** The component's definition name (`workpool`); null for the app. */
   component: string | null;
+  /** Scope `"global"` only: the shard its screens run on, when not `global:main` (`defineComponent({ dashboardShard })`). */
+  shard?: string;
 }
 
 // ------------------------------------------------------------------------------------------------ validation
