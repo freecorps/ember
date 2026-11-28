@@ -343,7 +343,9 @@ async function refresh(ctx: ActCtx): Promise<Overview> {
   const [today, top] = await Promise.all([query(ctx, () => overviewSql(scopeOf(ctx), { now: ctx.now })), topEvents(ctx, { sinceHours: 24, limit: 20 })]);
   const row = today.data?.[0] ?? {};
   const value: Overview = { eventsToday: n(row.events), usersToday: n(row.users), top, at: ctx.now, configured: true };
-  await ctx.runMutation(saveReport, { key: "overview", value });
+  // `at`: when this run computed it. Two refreshes can overlap (cron jobs and "Refresh now"): one that began earlier
+  // and saves later never replaces the newer report.
+  await ctx.runMutation(saveReport, { key: "overview", value, at: ctx.now });
   return value;
 }
 
@@ -394,13 +396,20 @@ export const functions = {
     }),
     /** Recomputes the dashboard overview (the summary cron). Without the SQL API configured: nothing, no write. */
     refresh: internalAction({ args: {}, handler: (ctx) => refresh(ctx) }),
+    /**
+     * Replaces (or inserts) one report. With `at` (when the action computed it), only over an older one: a run that
+     * began earlier and saves later leaves the newer report. Without `at`: always (`onlyIfExists`, the unconfigured
+     * overview), stamped with the write's time.
+     */
     saveReport: internalMutation({
-      args: { key: v.string(), value: v.any(), onlyIfExists: v.optional(v.boolean()) },
+      args: { key: v.string(), value: v.any(), onlyIfExists: v.optional(v.boolean()), at: v.optional(v.number()) },
       handler: (ctx, a) => {
         const row = ctx.db.query("reports").withIndex("by_key", (q) => q.eq("key", a.key)).first();
         if (!row && a.onlyIfExists) return;
-        if (row) ctx.db.replace(row._id, { key: a.key, at: ctx.now, value: a.value });
-        else ctx.db.insert("reports", { key: a.key, at: ctx.now, value: a.value });
+        if (row && a.at !== undefined && !(a.at > row.at)) return;
+        const doc = { key: a.key, at: a.at ?? ctx.now, value: a.value };
+        if (row) ctx.db.replace(row._id, doc);
+        else ctx.db.insert("reports", doc);
       },
     }),
   },

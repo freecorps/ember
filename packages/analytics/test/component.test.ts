@@ -243,6 +243,32 @@ describe("queries", () => {
     expect(((await read("overview")) as { at: number }).at).toBeGreaterThan(before);
   });
 
+  test("two refreshes overlap: the one that began earlier and saves later never replaces the newer overview", async () => {
+    // The first run's SQL calls hang until released; the second's answer at once, with other numbers.
+    let hold: Array<() => void> | null = [];
+    vi.stubGlobal("fetch", async (_url: string, init: RequestInit) => {
+      const sql = String(init.body);
+      const old = hold !== null;
+      if (hold) await new Promise<void>((r) => hold!.push(r));
+      const events = old ? "1" : "2";
+      return new Response(JSON.stringify(sql.includes("GROUP BY name") ? { data: [] } : { data: [{ events, users: "1" }] }));
+    });
+    const { t } = setup(CREDS);
+    const run = () => (t as unknown as { _action(n: string, a: unknown, s: string): Promise<unknown> })._action("@analytics/dashboard:refresh", {}, "global:main");
+    const read = () => t.query(unsafeRef<"query">("@analytics/dashboard:overview"), {}) as Promise<{ eventsToday: number; at: number }>;
+    const older = run();
+    await vi.waitFor(() => expect(hold).toHaveLength(2));
+    const release = hold!;
+    hold = null;
+    await t.advance(60_000);
+    await run();
+    expect(await read()).toMatchObject({ eventsToday: 2 });
+    const newer = (await read()).at;
+    for (const r of release) r();
+    await older;
+    expect(await read()).toMatchObject({ eventsToday: 2, at: newer });
+  });
+
   test("credentials removed after a refresh: the saved overview stops showing the old numbers as configured", async () => {
     sqlApi((sql) => (sql.includes("GROUP BY name") ? { data: [] } : { data: [{ events: "30", users: "7" }] }));
     const env: Record<string, unknown> = { EMBER_ANALYTICS: fakeDataset(), ...CREDS };
