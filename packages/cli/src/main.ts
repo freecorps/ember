@@ -1,4 +1,5 @@
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 // `ember` entry: init | codegen | dev | deploy | run | logs.
 
 import { parseArgs } from "node:util";
@@ -22,6 +23,7 @@ import { init } from "./init.ts";
 import { resolveBaseUrl, run } from "./run.ts";
 import { restoreCommand } from "./restore.ts";
 import { cancelMigration, exitCode, migrationStatus, runMigration } from "./migrations.ts";
+import { sentryPrefix, uploadSourceMaps } from "./sentry.ts";
 import { importConvex, verifyConvex, type ConvexImportReport } from "./import-convex.ts";
 import { importConvexDeltas } from "./import-convex-delta.ts";
 import { exportEmber, importEmber } from "./export.ts";
@@ -156,6 +158,12 @@ Commands:
                                           unless done on every shard (gate for making a field required)
   migrations cancel <name> [--shard kind:key | --all [--kind org]]
                                           Stop it after the current batch (run again to resume)
+  sentry sourcemaps upload --project <id> --release <r> [--dist d] [--url-prefix ~/] [--component sentry]
+                           [--env name | --url URL] [--token T] [--dry-run] <dir>
+                                          Source maps of a build (*.map under <dir>) to @freecorps/ember-sentry for
+                                          that release, named after the scripts they map (~/assets/app.js) with their
+                                          debug ids; stored once per content (sha256). Token: EMBER_SENTRY_UPLOAD_TOKEN
+                                          (or EMBER_ADMIN_TOKEN). Outside an Ember project: --url and --prefix /sentry
   env list [--env name] [--local] [--json]
                                           Secrets (on the Worker) and vars (ember.json) of an environment; values are
                                           never shown. --local: the names in .dev.vars (what \`ember dev\` loads)
@@ -812,6 +820,54 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         name!,
       );
       return exitCode(outs, values.wait && !values["dry-run"] ? "wait" : "run");
+    }
+    case "sentry": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          project: { type: "string" },
+          release: { type: "string" },
+          dist: { type: "string" },
+          "url-prefix": { type: "string" },
+          component: { type: "string" },
+          prefix: { type: "string" },
+          env: { type: "string" },
+          url: { type: "string" },
+          token: { type: "string" },
+          "dry-run": { type: "boolean" },
+        },
+      });
+      const [area, sub, dir] = positionals;
+      const usage = "usage: ember sentry sourcemaps upload --project <id> --release <r> [--dist d] [--url-prefix ~/] <dir>";
+      if (area !== "sourcemaps" || sub !== "upload" || !dir) throw new Error(usage);
+      if (!values.project || !values.release) throw new Error(usage);
+      // In an Ember project: the deployment's URL and the install's prefix from the manifest. In CI outside one: --url.
+      let project: ReturnType<typeof loadProject> | null = null;
+      try {
+        project = loadProject();
+      } catch (e) {
+        if (!values.url) throw e;
+      }
+      let httpPrefix = values.prefix;
+      if (!httpPrefix && project) {
+        const m = join(project.generatedDir, "manifest.json");
+        if (existsSync(m)) httpPrefix = sentryPrefix((JSON.parse(readFileSync(m, "utf8")) as { schema: { components?: Record<string, { component: string; httpPrefix: string }> } }).schema.components ?? {}, values.component);
+      }
+      const url = project ? resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(values.env ? { env: values.env } : {}) }) : values.url!;
+      const token = values.token ?? process.env.EMBER_SENTRY_UPLOAD_TOKEN ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!token && !values["dry-run"]) throw new Error("sentry sourcemaps upload needs a token: set EMBER_SENTRY_UPLOAD_TOKEN (or EMBER_ADMIN_TOKEN, or pass --token)");
+      await uploadSourceMaps(dir, {
+        url,
+        token: token ?? "",
+        project: values.project,
+        release: values.release,
+        ...(values.dist ? { dist: values.dist } : {}),
+        ...(httpPrefix ? { httpPrefix } : {}),
+        ...(values["url-prefix"] ? { urlPrefix: values["url-prefix"] } : {}),
+        ...(values["dry-run"] ? { dryRun: true } : {}),
+      });
+      return 0;
     }
     case "export": {
       const { values } = parseArgs({
