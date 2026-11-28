@@ -29,15 +29,28 @@ export function classify(status: number | undefined, retryAfterMs?: number): Att
   return { kind: "terminal" };
 }
 
+// The three HTTP-date forms (RFC 9110 §5.6.7): IMF-fixdate, the obsolete RFC 850 form and asctime. Anything else
+// (an ISO timestamp, which `Date.parse` would read too) is not a `Retry-After`.
+const DAY_NAME = "(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)";
+const MONTH = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
+const TIME = "\\d{2}:\\d{2}:\\d{2}";
+const HTTP_DATE = new RegExp(
+  `^(?:${DAY_NAME}, \\d{2} ${MONTH} \\d{4} ${TIME} GMT` +
+    `|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \\d{2}-${MONTH}-\\d{2} ${TIME} GMT` +
+    `|${DAY_NAME} ${MONTH} [ \\d]\\d ${TIME} \\d{4})$`,
+);
+
 /**
- * `Retry-After` (delta seconds or an HTTP date) in ms from `now`, at most `MAX_RETRY_AFTER_MS`; undefined when absent
- * or unreadable.
+ * `Retry-After` (delta seconds or an HTTP-date) in ms from `now`, at most `MAX_RETRY_AFTER_MS`; undefined when absent
+ * or unreadable (an ISO timestamp is not an HTTP-date: the schedule's delay applies).
  */
 export function parseRetryAfter(value: string | null | undefined, now: number): number | undefined {
   if (value === null || value === undefined) return undefined;
   const v = value.trim();
   if (/^\d+$/.test(v)) return Math.min(MAX_RETRY_AFTER_MS, Number(v) * SECOND);
-  const at = Date.parse(v);
+  if (!HTTP_DATE.test(v)) return undefined;
+  // asctime carries no zone but is GMT too (`Date.parse` would read it as local time).
+  const at = Date.parse(v.endsWith(" GMT") ? v : `${v} GMT`);
   return Number.isNaN(at) ? undefined : Math.min(MAX_RETRY_AFTER_MS, Math.max(0, at - now));
 }
 

@@ -32,6 +32,13 @@ describe("classify", () => {
     expect(parseRetryAfter("Thu, 26 Nov 2026 12:00:30 GMT", now)).toBe(30_000);
     expect(parseRetryAfter("Thu, 26 Nov 2026 11:00:00 GMT", now)).toBe(0);
     expect(parseRetryAfter("soon", now)).toBeUndefined();
+    // The obsolete HTTP-date forms (RFC 850, asctime: GMT without saying so).
+    expect(parseRetryAfter("Thursday, 26-Nov-26 12:00:30 GMT", now)).toBe(30_000);
+    expect(parseRetryAfter("Thu Nov 26 12:00:30 2026", now)).toBe(30_000);
+    // Not an HTTP-date (`Date.parse` reads them, `Retry-After` does not allow them): no override.
+    expect(parseRetryAfter("2099-12-31T00:00:00Z", now)).toBeUndefined();
+    expect(parseRetryAfter("2026-11-26T12:00:30Z", now)).toBeUndefined();
+    expect(parseRetryAfter("Nov 26 2026", now)).toBeUndefined();
     expect(parseRetryAfter(null, now)).toBeUndefined();
     // Capped at MAX_RETRY_AFTER_MS (24 h), both forms.
     expect(parseRetryAfter("999999999", now)).toBe(86_400_000);
