@@ -21,6 +21,7 @@ import { dev } from "./dev.ts";
 import { init } from "./init.ts";
 import { resolveBaseUrl, run } from "./run.ts";
 import { restoreCommand } from "./restore.ts";
+import { expoChannel, expoList, expoPause, expoPublish, expoRollback, expoRollout, type ExpoOptions, type ExpoPlatform } from "./expo.ts";
 import { cancelMigration, exitCode, migrationStatus, runMigration } from "./migrations.ts";
 import { importConvex, verifyConvex, type ConvexImportReport } from "./import-convex.ts";
 import { importConvexDeltas } from "./import-convex-delta.ts";
@@ -156,6 +157,21 @@ Commands:
                                           unless done on every shard (gate for making a field required)
   migrations cancel <name> [--shard kind:key | --all [--kind org]]
                                           Stop it after the current batch (run again to resume)
+  expo publish --branch <b> [--dir dist] [--message m] [--rollout 0-100] [--platform ios|android]
+               [--runtime-version v] [--expo-config file] [--no-channel] [--env name | --url URL] [--admin-token T]
+                                          Self-hosted EAS Update (@freecorps/ember-expo-updates): reads \`npx expo
+                                          export\` (dist/metadata.json), uploads only the files the project lacks
+                                          (SHA-256) and publishes one update per platform on the branch
+  expo rollback --branch <b> [--platform p] [--runtime-version v] [--to-embedded]
+                                          Take the branch's newest update out: clients get the previous one again
+                                          (or the update embedded in the build)
+  expo rollout <0-100> --branch <b> [--platform p] [--runtime-version v]
+                                          Change the share of installs that get the update in a partial rollout
+  expo kill|resume (--channel c | --branch b)
+                                          Kill switch: clients get noUpdateAvailable and keep what they run
+  expo channel <name> --branch <b> [--rollout-branch x --rollout-percent n | --no-rollout]
+                                          Point a channel at a branch, optionally with a share on a second branch
+  expo list [--json]                      Channels and branches
   env list [--env name] [--local] [--json]
                                           Secrets (on the Worker) and vars (ember.json) of an environment; values are
                                           never shown. --local: the names in .dev.vars (what \`ember dev\` loads)
@@ -186,7 +202,7 @@ Environment: CLOUDFLARE_API_TOKEN (else \`npx wrangler auth token\`), CLOUDFLARE
 EMBER_ADMIN_TOKEN (uploaded as a Worker secret by deploy; enables GET /api/_ember/status|data|crons and --wait),
 EMBER_METRICS_DATASET (default ember_metrics), EMBER_ANALYTICS_TOKEN / EMBER_TAIL_TOKEN / EMBER_DASHBOARD_TOKEN (dashboard deploy).
 
-Credentials and --url: commands that send the admin token (restore, import, export, migrations, keys rotate,
+Credentials and --url: commands that send the admin token (restore, import, export, migrations, expo, keys rotate,
 env get --reveal, deploy --wait), \`run --token\` and \`import convex --from-deployment\` only talk to https:// URLs,
 or to plain http:// on localhost, 127.0.0.1 and [::1] (\`ember dev\`); any other http:// URL is refused before a request
 is made. EMBER_ALLOW_INSECURE_HTTP=1 allows it (a dev runtime on another machine of a trusted network) with a warning.`;
@@ -812,6 +828,94 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         name!,
       );
       return exitCode(outs, values.wait && !values["dry-run"] ? "wait" : "run");
+    }
+    case "expo": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          env: { type: "string" },
+          url: { type: "string" },
+          "admin-token": { type: "string" },
+          component: { type: "string" },
+          dir: { type: "string" },
+          branch: { type: "string" },
+          channel: { type: "string" },
+          message: { type: "string" },
+          rollout: { type: "string" },
+          platform: { type: "string" },
+          "runtime-version": { type: "string" },
+          "expo-config": { type: "string" },
+          "no-channel": { type: "boolean" },
+          "to-embedded": { type: "boolean" },
+          "rollout-branch": { type: "string" },
+          "rollout-percent": { type: "string" },
+          "no-rollout": { type: "boolean" },
+          json: { type: "boolean" },
+        },
+      });
+      const [sub, arg] = positionals;
+      const subs = ["publish", "rollback", "rollout", "kill", "resume", "channel", "list"];
+      if (!sub || !subs.includes(sub)) throw new Error(`usage: ember expo ${subs.join("|")} (see ember --help)`);
+      const project = loadProject();
+      const env = values.env ? resolveEnv(project, values.env) : null;
+      const adminToken = values["admin-token"] ?? process.env.EMBER_ADMIN_TOKEN;
+      if (!adminToken) throw new Error("expo needs the project's admin token: set EMBER_ADMIN_TOKEN (or pass --admin-token; for `ember dev`, start it with EMBER_ADMIN_TOKEN set)");
+      const url = resolveBaseUrl(project, { ...(values.url ? { url: values.url } : {}), ...(env ? { env: env.name } : {}) });
+      const o: ExpoOptions = { url, adminToken, project, ...(values.component ? { component: values.component } : {}), ...(values.json ? { json: true } : {}) };
+      const platform = (): ExpoPlatform | undefined => {
+        const p = values.platform;
+        if (p === undefined || p === "all") return undefined;
+        if (p !== "ios" && p !== "android") throw new Error("--platform must be ios, android or all");
+        return p;
+      };
+      const percent = (s: string | undefined, what: string): number => {
+        const n = Number(s);
+        if (s === undefined || s === "" || !Number.isInteger(n) || n < 0 || n > 100) throw new Error(`${what} must be an integer in 0..100`);
+        return n;
+      };
+      const branch = () => {
+        if (!values.branch) throw new Error(`ember expo ${sub} needs --branch <name>`);
+        return values.branch;
+      };
+      const pl = platform();
+      const scope = { branch: "", ...(pl ? { platform: pl } : {}), ...(values["runtime-version"] ? { runtimeVersion: values["runtime-version"] } : {}) };
+      switch (sub) {
+        case "publish":
+          await expoPublish(o, {
+            dir: values.dir ?? "dist",
+            branch: branch(),
+            ...(values.message !== undefined ? { message: values.message } : {}),
+            ...(values.rollout !== undefined ? { rollout: percent(values.rollout, "--rollout") } : {}),
+            ...(pl ? { platforms: [pl] } : {}),
+            ...(values["runtime-version"] ? { runtimeVersion: values["runtime-version"] } : {}),
+            ...(values["expo-config"] ? { expoConfig: values["expo-config"] } : {}),
+            ...(values["no-channel"] ? { createChannel: false } : {}),
+          });
+          return 0;
+        case "rollback":
+          await expoRollback(o, { ...scope, branch: branch(), ...(values["to-embedded"] ? { toEmbedded: true } : {}), ...(values.message ? { message: values.message } : {}) });
+          return 0;
+        case "rollout":
+          await expoRollout(o, { ...scope, branch: branch(), percent: percent(arg, "the rollout percentage") });
+          return 0;
+        case "kill":
+        case "resume":
+          await expoPause(o, { ...(values.channel ? { channel: values.channel } : {}), ...(values.branch ? { branch: values.branch } : {}), paused: sub === "kill" });
+          return 0;
+        case "channel":
+          if (!arg) throw new Error("usage: ember expo channel <name> --branch <b>");
+          await expoChannel(o, {
+            name: arg,
+            branch: branch(),
+            ...(values["no-rollout"] ? { rolloutBranch: null } : values["rollout-branch"] ? { rolloutBranch: values["rollout-branch"] } : {}),
+            ...(values["rollout-percent"] !== undefined ? { rolloutPercent: percent(values["rollout-percent"], "--rollout-percent") } : {}),
+          });
+          return 0;
+        default:
+          await expoList(o);
+          return 0;
+      }
     }
     case "export": {
       const { values } = parseArgs({

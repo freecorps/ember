@@ -95,7 +95,8 @@ export function resolveMigration(manifest: EmberManifest, name: string): string 
   return fn;
 }
 
-async function adminRun<T>(o: MigrationsOptions, fn: string, args: Record<string, unknown>, shard: string): Promise<T> {
+/** Runs a function through the admin function runner (`POST /api/_ember/run`); throws with the error code and message. */
+export async function adminRun<T>(o: Pick<MigrationsOptions, "url" | "adminToken" | "fetch">, fn: string, args: Record<string, unknown>, shard: string): Promise<T> {
   const res = await (o.fetch ?? fetch)(apiUrl(checkCredentialUrl(o.url), "/api/_ember/run"), {
     method: "POST",
     headers: { authorization: `Bearer ${o.adminToken}`, "content-type": "application/json" },
@@ -113,7 +114,8 @@ async function adminRun<T>(o: MigrationsOptions, fn: string, args: Record<string
   return body.value as T;
 }
 
-async function pool<T, R>(items: T[], n: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+/** `fn` over `items`, at most `n` at a time, results in order. */
+export async function pool<T, R>(items: T[], n: number, fn: (t: T) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);
   let next = 0;
   await Promise.all(

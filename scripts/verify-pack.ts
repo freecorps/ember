@@ -220,7 +220,7 @@ try {
        c.close();`,
     ]);
   });
-  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, flags, flags/eval, webhooks, webhooks/verify, dashboard-sdk)", () => {
+  await step("runtime imports on node (values, server, server/testing, client, push, rate-limit, workflows, migrations, email, email/cloudflare, email/schema, agent, workpool, presence, flags, flags/eval, webhooks, webhooks/verify, expo-updates, dashboard-sdk)", () => {
     run(NODE, [
       "--input-type=module",
       "-e",
@@ -244,6 +244,8 @@ try {
        // The Standard Webhooks test vector, through the published /verify entry (WebCrypto on Node).
        const sig = await wv.signWebhook("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw", "msg_p5jXN8AQM9LWM0D4loKWxJek", 1614265330, '{"test": 2432232314}');
        if (sig !== "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=") throw new Error("webhook signature vector: " + sig);
+       const eu = await import("@freecorps/ember-expo-updates");
+       if (eu.expoUpdates?.name !== "expoUpdates" || typeof eu.renderResponse !== "function" || typeof eu.resolvePlan !== "function") throw new Error("missing expo-updates exports");
        const ds = await import("@freecorps/ember-dashboard-sdk");
        if (typeof ds.connect !== "function" || typeof ds.EMBED_SDK_SCRIPT !== "string" || !ds.embedPage({ title: "t", script: "1" }).includes(ds.EMBED_SDK_SCRIPT)) throw new Error("missing dashboard-sdk exports");
        if (!m[7].email.http?.routes?.some((r) => r.path === "/dashboard/preview")) throw new Error("the email component lost its preview route");`,

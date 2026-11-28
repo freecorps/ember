@@ -42,21 +42,22 @@ ember/                     (monorepo, MIT)
     react-query   emberQuery(), EmberQueryClient, mutation helpers
     react-native  adaptador de reconexão (AppState/NetInfo), helpers Expo, registro de push (token Expo ou nativo)
     expo-push     lado do aparelho do push E2E: plugin Expo (NSE no iOS), chave do aparelho, tarefa Android (✅)
+    expo-updates  EAS Update self-hosted (componente): Expo Updates Protocol v1 assinado, canais/branches, rollout, rollback, kill switch, cache de borda, `ember expo publish` (✅ 0.10)
     offline       StorageAdapter: memory, indexeddb, sqlite, expo-sqlite (✅ Fase 5a); opfs (SQLite-Wasm), tinybase, abas (✅ Fase 5c)
     presence      presença (online por sala), digitando e cursores sobre o canal efêmero do Shard; /react: usePresence, useTyping, useCursors (✅ 0.10)
     flags         feature flags e remote config numa tabela .replicated() (avaliação local, 0 RTT); /eval puro, /react: useFlag (✅ 0.10)
     webhooks      webhooks de saída: Standard Webhooks (HMAC, rotação), retries, breaker, DLQ, replay sobre o workpool; /verify (✅ 0.10)
     plugins/
       search-fts5   vector-vectorize   ai-search
-    components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, migrations, workpool, push, email, agent, flags, webhooks — files e auth embutidos)
-      auth (better-auth)   files   push   rate-limit   workflows   migrations   workpool   email   agent   flags   webhooks
+    components/            (✅ mecanismo em server/runtime/cli; oficiais: rate-limit, workflows, migrations, workpool, push, email, agent, flags, webhooks, expo-updates — files e auth embutidos)
+      auth (better-auth)   files   push   rate-limit   workflows   migrations   workpool   email   agent   flags   webhooks   expo-updates
     cli           ember init/dev/codegen/deploy/logs/data/export/import/env/restore/shards
   apps/
     dashboard     painel (dados, logs, tamanho por shard, crons, deploys)
     examples/     chat, todo, files-auth-jobs, email-lite   (✅ todos existem; tests no workerd, `bun run check` os cobre)
 ```
 
-**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-workpool`, `ember-email`, `ember-agent`, `ember-presence`, `ember-flags`, `ember-webhooks`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
+**Distribuição (npm):** escopo `@freecorps`, nomes `@freecorps/ember-<pacote>` (`ember-values`, `ember-server`, `ember-runtime`, `ember-client`, `ember-react`, `ember-react-query`, `ember-react-native`, `ember-offline`, `ember-push`, `ember-expo-push`, `ember-auth`, `ember-rate-limit`, `ember-workflows`, `ember-migrations`, `ember-workpool`, `ember-email`, `ember-agent`, `ember-presence`, `ember-flags`, `ember-webhooks`, `ember-expo-updates`, `ember-cli`), todos na mesma versão. Cada pacote publica `dist/` (ESM + `.d.ts`; `tsc`, e o CLI num bundle esbuild). No repo, a condição de export `@freecorps/ember-source` aponta para `src/*.ts`, então testes, typecheck e `ember dev` rodam sem build. O release (`docs/RELEASING.md`) prepara cópias em `.release/`: fixa `workspace:*` na versão, remove a condição e publica com `npm publish --provenance` a partir de uma tag `v*`. `apps/*` são privados.
 
 ---
 
@@ -428,7 +429,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
 ## 12. Componentes (estilo Convex)
 
 `ember/ember.config.ts` → `app.use(component)`. Cada componente traz tabelas isoladas com namespace, funções próprias e configuração.
-- Oficiais: `auth`, `files`, `push`, `rateLimit`, `workflows`, `migrations`, `workpool`, `agent`, `flags`, `webhooks`.
+- Oficiais: `auth`, `files`, `push`, `rateLimit`, `workflows`, `migrations`, `workpool`, `agent`, `flags`, `webhooks`, `expoUpdates`.
 - O `email` (`send`, `scheduled`, eventos, inbound) também é oficial; o produto de email (freecorps/mail) é um app que o instala.
 - Isso dá ao serviço de email o mesmo mecanismo que um usuário usaria para empacotar features.
 - ✅ **Como ficou** — contrato em `docs/design/contracts.md` ("Componentes"), E2E real em `docs/spikes/remote/components-e2e.md`:
@@ -455,6 +456,7 @@ Distribuído como `@freecorps/ember-cli` (binário `ember`, Node >= 22, sem flag
   - ✅ `agent` (`@freecorps/ember-agent`, §22 L12): threads, mensagens e deltas de streaming no shard de quem chama; geração numa action do app (`assistant.action()`) agendada atomicamente pelo `sendMessage`; tool calls até `maxSteps`; `onUsage` na transação do passo; Workers AI e modelos do AI SDK (estrutural). Contrato em contracts.md ("Agent").
   - ✅ `flags` (`@freecorps/ember-flags`, 0.10): flags e remote config numa tabela **`.replicated()` do componente** (escrita no `global:main`, copiada para todo shard). A avaliação dentro de qualquer query ou mutation é uma leitura síncrona da cópia local (0 RTT), com regras ordenadas, rollout determinístico (`hash(salt.key.unitId)`) e o mesmo avaliador puro no cliente (`/eval`, `useFlag`). Contrato em contracts.md ("Flags").
   - ✅ `webhooks` (`@freecorps/ember-webhooks`, 0.10): o `send` grava as entregas na transação de quem chama; o HTTP vai em actions de um `workpool` aninhado. Assinatura Standard Webhooks com rotação, retries com backoff/jitter e `Retry-After`, breaker por endpoint, DLQ e replay; `/verify` para receptores. Contrato em contracts.md ("Webhooks").
+  - ✅ `expoUpdates` (`@freecorps/ember-expo-updates`, 0.10): EAS Update self-hosted. Expo Updates Protocol v1 (`GET /<install>/manifest`, multipart assinado RSA-SHA256 via WebCrypto, diretivas `noUpdateAvailable`/`rollBackToEmbedded`), canais → branches com rollout determinístico (hash do install id + id do update), rollback que republica o anterior, kill switch por canal/branch, assets content-addressed no R2 (`GET /<install>/assets`, `immutable`). **Cache de borda obrigatório:** o plano do canal (com a `version` que toda escrita relevante sobe) e a resposta assinada ficam no `caches.default`, chaveados pelo lado do rollout e não pelo aparelho: abrir o app não acorda o `global:main` (medido: 0 RPCs em 50 aberturas; 1 leitura por local a cada `planTtlSeconds`, 30 s). `ember expo publish|rollback|rollout|kill|resume|channel|list` pelo executor admin, upload só do que falta (SHA-256). Contrato em contracts.md ("Expo Updates").
   - ✅ Passos paralelos em workflows (`Promise.all` de passos vira um lote do diário, 0.10), `list` e retenção.
 
 ---
