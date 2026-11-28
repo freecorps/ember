@@ -208,6 +208,14 @@ describe("grouping and the batched write", () => {
     await expect(consumeBatch({ install: "sentry", config: noAlerts, env: { EMBER_FILES: bucket }, now: 1, findArtifacts: async () => ({}), apply: async () => ({ issues: 0, created: 0, alerts: 0 }) }, [flaky])).rejects.toThrow(/could not be read from R2/);
   });
 
+  it("lib:capture refuses an event that is not an object (an array included) and takes one without an id", async () => {
+    const { t, issues } = harness(noAlerts);
+    for (const event of [[], [errorEvent()], null, "boom", 5]) await expect(t.action(fn("lib:capture"), { event })).rejects.toThrow(/event must be an object/);
+    expect(await issues()).toEqual([]);
+    expect(await t.action(fn("lib:capture"), { event: errorEvent() })).toMatch(/^[0-9a-f]{32}$/);
+    expect(await issues()).toHaveLength(1);
+  });
+
   it("a timestamp that overflows as milliseconds (1e308) or leaves the Date range falls back to the time received", async () => {
     expect(timestampOf({ timestamp: 1e308 }, 5)).toBe(5);
     expect(timestampOf({ timestamp: -1e13 }, 5)).toBe(5);

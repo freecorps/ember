@@ -288,7 +288,7 @@ const lib = {
       const project = a.project ?? config.projects[0]?.id;
       if (!project || !config.projects.some((p) => p.id === project)) throw new EmberError("ValidationError", `sentry: unknown project ${JSON.stringify(project)}`);
       const ev = a.event as SentryEvent;
-      if (!ev || typeof ev !== "object") throw new EmberError("ValidationError", "sentry: event must be an object");
+      if (!ev || typeof ev !== "object" || Array.isArray(ev)) throw new EmberError("ValidationError", "sentry: event must be an object");
       const id = typeof ev.event_id === "string" ? ev.event_id : eventId();
       // The same budget as ingest: inline up to INLINE_EVENT_MAX bytes, else spilled to R2, else refused.
       const msg = await queueMessage(ctx.component.name, r2Of(ctx.env, config), project, id, { ...ev, event_id: id }, Date.now());
