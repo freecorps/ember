@@ -39,4 +39,14 @@ describe("client", () => {
     expect(msg!.event).toMatchObject({ message: "hello", level: "warning" });
     expect(ep.queue.sent).toHaveLength(2);
   });
+
+  it("a throwing beforeSend (or a failing fetch) resolves to null: a capture never rejects, so a global handler cannot loop", async () => {
+    const ep = endpoint();
+    init({ dsn: `https://${KEY}@app.test/sentry/web`, fetch: ep.fetch, globalHandlers: false, beforeSend: () => { throw new Error("beforeSend bug"); } });
+    await expect(captureException(new Error("x"))).resolves.toBeNull();
+    await expect(captureMessage("m")).resolves.toBeNull();
+    expect(ep.requests).toHaveLength(0);
+    init({ dsn: `https://${KEY}@app.test/sentry/web`, fetch: (async () => { throw new TypeError("offline"); }) as typeof fetch, globalHandlers: false });
+    await expect(captureException(new Error("x"))).resolves.toBeNull();
+  });
 });

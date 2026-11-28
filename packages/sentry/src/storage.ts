@@ -42,7 +42,9 @@ export interface EventPointer {
  * ranged GET of its member alone, and the whole object still decompresses as one NDJSON file (`zcat`).
  */
 export async function batchObject(lines: readonly string[]): Promise<{ bytes: Uint8Array; ranges: Array<{ offset: number; length: number }> }> {
-  const members = await Promise.all(lines.map((l) => gzip(l + "\n")));
+  // One member at a time: compression buffers for one event, not for the whole batch at once.
+  const members: Uint8Array[] = [];
+  for (const l of lines) members.push(await gzip(l + "\n"));
   const ranges: Array<{ offset: number; length: number }> = [];
   let n = 0;
   for (const m of members) {

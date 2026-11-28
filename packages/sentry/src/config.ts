@@ -108,6 +108,18 @@ function stripUndefined<T extends object>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o).filter(([, x]) => x !== undefined)) as Partial<T>;
 }
 
+/** A webhook URL alerts may be posted to: `https://`, or `http://` on a loopback host (local development). */
+export function webhookUrlAllowed(url: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.protocol === "https:") return true;
+  return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]");
+}
+
 /** Checks values `v.*` cannot express (ranges, ids). Throws with the field. */
 export function checkConfig(c: SentryInstallConfig): void {
   const bad = (m: string): never => {
@@ -128,7 +140,7 @@ export function checkConfig(c: SentryInstallConfig): void {
   for (const a of alerts) {
     if (!a) continue;
     if (a.spike && !(Number.isInteger(a.spike.events) && a.spike.events > 0 && a.spike.windowMinutes > 0)) bad("alerts.spike needs events (integer > 0) and windowMinutes (> 0)");
-    for (const w of a.webhooks ?? []) if (!/^https?:\/\//.test(w.url)) bad(`alerts.webhooks: ${w.url} is not an http(s) URL`);
+    for (const w of a.webhooks ?? []) if (!webhookUrlAllowed(w.url)) bad(`alerts.webhooks: ${w.url} must be an https:// URL (http:// only for localhost)`);
   }
 }
 

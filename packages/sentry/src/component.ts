@@ -10,10 +10,10 @@
 import { componentBuilders, cronJobs, defineComponent, defineSchema, defineTable, EmberError, httpRouter, paginationOptsValidator, unsafeRef, v, type ComponentCtx, type DataModelFromSchema } from "@freecorps/ember-server";
 import { alertValidator, postWebhook, type SentryAlert } from "./alerts.ts";
 import { alertsFor, analyticsBinding, checkConfig, DEFAULT_DATASET, DEFAULT_MAX_ALERTS_PER_HOUR, DEFAULT_RETENTION_DAYS, DEFAULT_THROTTLE_MINUTES, installConfigValidator, MiB, queueOf, r2Of, shardOf, type SentryInstallConfig } from "./config.ts";
-import { artifactKey, consume, type ArtifactLookup, type IssueGroup } from "./consumer.ts";
+import { artifactKey, consume, debugKey, LOOKUP_LIMITS, type ArtifactLookup, type IssueGroup } from "./consumer.ts";
 import { decodeBody, EnvelopeError, readCapped, utf8 } from "./envelope.ts";
 import { eventId, type SentryEvent } from "./event.ts";
-import { handleIngest, type QueuedEvent } from "./ingest.ts";
+import { handleIngest, queueMessage, type QueuedEvent } from "./ingest.ts";
 import { EVENT_PAGE, EVENT_PAGE_ROUTE } from "./page.ts";
 import { keys, putGzip, readEvent, sweepExpired } from "./storage.ts";
 import { normalizeDebugId } from "./sourcemap.ts";
@@ -64,7 +64,7 @@ const schema = defineSchema({
     /** Source maps per release: the artifact name frames are matched by (`~/assets/app.js`) and the map's content hash. */
     artifacts: defineTable({ project: v.string(), release: v.string(), dist: v.string(), name: v.string(), sha256: v.string(), size: v.number(), debugId: v.optional(v.string()), uploadedAt: v.number() })
       .index("by_name", ["project", "release", "dist", "name"])
-      .index("by_debug_id", ["debugId"], { sparse: true }),
+      .index("by_debug_id", ["project", "debugId"], { sparse: true }),
     releases: defineTable({ project: v.string(), release: v.string(), dist: v.string(), files: v.number(), bytes: v.number(), firstUploadAt: v.number(), lastUploadAt: v.number() })
       .index("by_key", ["project", "release", "dist"])
       .index("by_uploaded", ["lastUploadAt"]),
@@ -167,6 +167,8 @@ function applyGroups(ctx: MCtx, groups: readonly IssueGroup[]): { issues: number
     } else {
       const { _id, _creationTime, ...rest } = existing;
       doc = { ...rest, ...(latest(existing) ? fields : {}), count: existing.count + g.n, firstSeen: Math.min(existing.firstSeen, g.firstSeen), lastSeen: Math.max(existing.lastSeen, g.lastSeen), hourly: bumpHourly(existing.hourly, existing.hourlyAt, hour, g.n), hourlyAt: Math.max(hour, existing.hourlyAt) };
+      // The latest event's pointer comes with its id: a newer event stored nowhere (no bucket) leaves none.
+      if (latest(existing) && !g.pointer) delete doc.lastEvent;
       if (existing.status === "resolved") {
         // A regression: seen again after it was resolved.
         doc.status = "unresolved";
@@ -282,7 +284,9 @@ const lib = {
       const ev = a.event as SentryEvent;
       if (!ev || typeof ev !== "object") throw new EmberError("ValidationError", "sentry: event must be an object");
       const id = typeof ev.event_id === "string" ? ev.event_id : eventId();
-      const msg: QueuedEvent = { v: 1, project, id, receivedAt: Date.now(), event: { ...ev, event_id: id } };
+      // The same budget as ingest: inline up to INLINE_EVENT_MAX bytes, else spilled to R2, else refused.
+      const msg = await queueMessage(ctx.component.name, r2Of(ctx.env, config), project, id, { ...ev, event_id: id }, Date.now());
+      if (!msg) throw new EmberError("ValidationError", "sentry: event too large for a queue message (no R2 bucket to spill it to)");
       const q = queueOf(ctx.env, ctx.component.name);
       if (q) await q.send(msg, { contentType: "json" });
       else await consumeIn(ctx, [msg]);
@@ -309,13 +313,21 @@ const lib = {
     },
   }),
   apply: internalMutation({ args: { groups: v.array(groupValidator) }, handler: (ctx, a) => applyGroups(ctx, a.groups) }),
-  /** sha256 of the maps a batch needs: `"<project>\n<release>\n<dist>\n<name>"` and `"debug:<id>"` keys. */
+  /**
+   * sha256 of the maps a batch needs: `artifactKey` and `debugKey` keys, both within the event's project (a debug id
+   * never resolves to another project's map). Bounded per call (the consumer splits a batch's lookups to fit:
+   * `chunkLookups`); a bigger call is refused, not cut short.
+   */
   findArtifacts: internalQuery({
     args: { lookups: v.array(lookupValidator) },
     handler: (ctx, a) => {
       const out: Record<string, string> = {};
-      for (const l of a.lookups.slice(0, 50) as ArtifactLookup[]) {
-        for (const name of l.names.slice(0, 200)) {
+      const lookups = a.lookups as ArtifactLookup[];
+      if (lookups.length > LOOKUP_LIMITS.lookups || lookups.some((l) => l.names.length > LOOKUP_LIMITS.names || l.debugIds.length > LOOKUP_LIMITS.debugIds)) {
+        throw new EmberError("ValidationError", `sentry: findArtifacts takes at most ${LOOKUP_LIMITS.lookups} lookups of ${LOOKUP_LIMITS.names} names and ${LOOKUP_LIMITS.debugIds} debug ids`);
+      }
+      for (const l of lookups) {
+        for (const name of l.names) {
           for (const dist of l.dist ? [l.dist, ""] : [""]) {
             const hit = ctx.db.query("artifacts").withIndex("by_name", (q) => q.eq("project", l.project).eq("release", l.release).eq("dist", dist).eq("name", name)).first();
             if (hit) {
@@ -324,9 +336,9 @@ const lib = {
             }
           }
         }
-        for (const id of l.debugIds.slice(0, 200)) {
-          const hit = ctx.db.query("artifacts").withIndex("by_debug_id", (q) => q.eq("debugId", id)).first();
-          if (hit) out[`debug:${id}`] = hit.sha256;
+        for (const id of l.debugIds) {
+          const hit = ctx.db.query("artifacts").withIndex("by_debug_id", (q) => q.eq("project", l.project).eq("debugId", id)).first();
+          if (hit) out[debugKey(l.project, id)] = hit.sha256;
         }
       }
       return out;
@@ -580,6 +592,8 @@ export const sentry = defineComponent({
     return name ? [{ type: "analytics_engine" as const, name, dataset: (config?.analytics !== false && config?.analytics?.dataset) || DEFAULT_DATASET }] : [];
   },
   crons: (config) => cronJobs({ shard: shardOf(config) }).daily("retention", { hour: 3, minute: 17 }, "lib:retention"),
+  // The issue tables live on `config.shard`: the screens (scope "global") read and change them there.
+  dashboardShard: (config) => shardOf(config),
   queues: {
     events: {
       shard: (config) => shardOf(config),

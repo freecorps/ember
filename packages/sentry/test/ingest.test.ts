@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { gunzip, gzip, serializeEnvelope, utf8 } from "../src/envelope.ts";
 import { handleIngest, keyFromRequest, TokenBuckets, type IngestDeps, type QueuedEvent } from "../src/ingest.ts";
-import type { SentryInstallConfig } from "../src/config.ts";
+import { INLINE_EVENT_MAX, type SentryInstallConfig } from "../src/config.ts";
 import { FakeAnalytics, FakeQueue, KEY, MemoryR2 } from "./fakes.ts";
 
 const URL0 = "https://app.test/sentry/api/web/envelope/";
@@ -189,9 +189,50 @@ describe("ingest: items", () => {
     expect((await handleIngest(post(envelope([{ header: { type: "event" }, payload: big }])), deps)).status).toBe(200);
     const [m] = queue.sent;
     expect(m!.event).toBeUndefined();
-    expect(m!.spill).toBe("sentry/sentry/spill/2026-11-20/web/0123456789abcdef0123456789abcdef.json.gz");
+    expect(m!.spill).toMatch(/^sentry\/sentry\/spill\/2026-11-20\/web\/0123456789abcdef0123456789abcdef-[0-9a-f]{8}\.json\.gz$/);
     const stored = JSON.parse(utf8.decode(await gunzip(bucket.objects.get(m!.spill!)!.bytes)));
     expect(stored.breadcrumbs.values).toHaveLength(2000);
+    // The same event id spilled again (a resend before the first was consumed): its own key, the first one untouched.
+    const big2 = ev({ breadcrumbs: { values: Array.from({ length: 2000 }, (_, i) => ({ message: `other ${i} ${"y".repeat(60)}` })) } });
+    await handleIngest(post(envelope([{ header: { type: "event" }, payload: big2 }])), deps);
+    const [, m2] = queue.sent;
+    expect(m2!.spill).not.toBe(m!.spill);
+    expect(JSON.parse(utf8.decode(await gunzip(bucket.objects.get(m!.spill!)!.bytes))).breadcrumbs.values[0].message).toMatch(/^crumb 0/);
+  });
+
+  it("an envelope refused as a whole wrote nothing first (sessions, attachments, replays come after the checks)", async () => {
+    const { deps, bucket, ae, queue } = setup({ limits: { maxEventBytes: 1024 } });
+    const items = [
+      { header: { type: "session" }, payload: { sid: "s1", status: "ok", attrs: { release: "1" } } },
+      { header: { type: "attachment", filename: "log.txt" }, payload: "line" },
+      { header: { type: "replay_event" }, payload: { replay_id: "r".repeat(32), segment_id: 0 } },
+    ];
+    const tooBig = await handleIngest(post(envelope([...items, { header: { type: "transaction" }, payload: { transaction: "x".repeat(2000) } }])), deps);
+    expect(tooBig.status).toBe(413);
+    const invalid = await handleIngest(post(envelope([...items, { header: { type: "event" }, payload: "{not json" }])), deps);
+    expect(invalid.status).toBe(400);
+    expect(bucket.keys()).toEqual([]);
+    expect(ae.of("session")).toEqual([]);
+    expect(queue.sent).toEqual([]);
+    // The corrected resend is stored once.
+    expect((await handleIngest(post(envelope(items)), deps)).status).toBe(200);
+    expect(bucket.keys()).toHaveLength(2);
+    expect(ae.of("session")).toHaveLength(1);
+  });
+
+  it("without a bucket: an event is sent without its breadcrumbs only when that fits a queue message (UTF-8 bytes), else 413", async () => {
+    const { deps, queue } = setup({}, { EMBER_FILES: undefined });
+    // ~120 KB of 2-byte characters: under 96 Ki UTF-16 units, over 96 KiB as UTF-8.
+    const wide = ev({ breadcrumbs: { values: [{ message: "é".repeat(60_000) }] } });
+    expect((await handleIngest(post(envelope([{ header: { type: "event" }, payload: wide }])), deps)).status).toBe(200);
+    expect(queue.sent[0]!.event!.breadcrumbs).toEqual({ values: [] });
+    expect(new TextEncoder().encode(JSON.stringify(queue.sent[0])).length).toBeLessThanOrEqual(INLINE_EVENT_MAX);
+    // A 200 KB `extra` is still too big without breadcrumbs: refused, nothing sent.
+    const huge = ev({ extra: { blob: "x".repeat(200_000) } });
+    const r = await handleIngest(post(envelope([{ header: { type: "event" }, payload: huge }])), deps);
+    expect(r.status).toBe(413);
+    expect(r.headers.get("x-sentry-error")).toMatch(/too large for a queue message/);
+    expect(queue.sent).toHaveLength(1);
   });
 
   it("without the queue binding the messages go to the inline consumer", async () => {

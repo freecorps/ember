@@ -4,6 +4,7 @@
 // `lib:deliver` job: signed webhooks and/or a mutation of the app (which sends them with the email or push component).
 
 import { v, type Infer } from "@freecorps/ember-values";
+import { webhookUrlAllowed } from "./config.ts";
 
 export const alertValidator = v.object({
   kind: v.union(v.literal("new"), v.literal("regression"), v.literal("spike")),
@@ -79,13 +80,20 @@ export async function verifyWebhook(secret: string, body: string, header: string
   return d === 0;
 }
 
-/** Posts an alert to one webhook. Returns the HTTP status (0 on a network error). */
+/**
+ * Posts an alert to one webhook. Returns the HTTP status (0 on a network error, or a URL that is not https). Redirects
+ * are not followed (a 3xx is returned as is, a failure): the body never goes to a hop that was not checked.
+ */
 export async function postWebhook(url: string, alert: SentryAlert, secret: string | undefined, nowMs: number, fetchImpl: typeof fetch = fetch): Promise<number> {
+  if (!webhookUrlAllowed(url)) {
+    console.error(`ember-sentry: webhook ${url} is not an https:// URL; not sent`);
+    return 0;
+  }
   const body = JSON.stringify({ type: "ember.sentry.alert", alert });
   const headers: Record<string, string> = { "content-type": "application/json", "user-agent": "ember-sentry" };
   if (secret) headers["x-ember-sentry-signature"] = await signWebhook(secret, body, nowMs);
   try {
-    const res = await fetchImpl(url, { method: "POST", headers, body });
+    const res = await fetchImpl(url, { method: "POST", headers, body, redirect: "manual" });
     await res.body?.cancel();
     return res.status;
   } catch (e) {

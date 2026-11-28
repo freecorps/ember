@@ -133,6 +133,17 @@ describe("Lru", () => {
     expect(lru.get("e")).toBeUndefined();
   });
 
+  it("a map's weight counts its decoded segments (20 bytes each, more than their VLQ text) and sources twice", () => {
+    // 100k one-field segments (",C": 2 characters of text each), 20 bytes each decoded.
+    const mappings = "A" + ",C".repeat(100_000);
+    const m = parseSourceMap({ version: 3, sources: ["a.ts"], sourcesContent: ["x".repeat(1000)], names: [], mappings });
+    expect(m.weight).toBeGreaterThanOrEqual(100_001 * 20 + 1000 * 4);
+    expect(m.weight).toBeGreaterThan(mappings.length * 5);
+    // An index map weighs its sections (not the length of its JSON text).
+    const idx = parseSourceMap(JSON.stringify({ version: 3, sections: [{ offset: { line: 0, column: 0 }, map: { version: 3, sources: ["a.ts"], names: [], mappings } }] }));
+    expect(idx.weight).toBeGreaterThanOrEqual(100_001 * 20);
+  });
+
   it("cachedMap parses a map once per hash", async () => {
     const lru = new Lru<ReturnType<typeof parseSourceMap>>(4, 1 << 20);
     let fetches = 0;

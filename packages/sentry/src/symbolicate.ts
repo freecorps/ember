@@ -49,7 +49,7 @@ export class Lru<V extends { weight: number }> {
   }
 }
 
-/** Parsed maps by content hash, shared by every batch of this isolate (64 maps, ~48 MB of mappings and sources). */
+/** Parsed maps by content hash, shared by every batch of this isolate (64 maps, ~48 MB by `SourceMap.weight`: decoded segments and sources). */
 export const mapCache = new Lru<SourceMap>(64, 48 * 1024 * 1024);
 
 /** What to look up for one event: artifact names of its frames and the debug ids its `debug_meta` names. */

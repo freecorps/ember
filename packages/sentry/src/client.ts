@@ -45,8 +45,10 @@ export function init(o: ClientOptions): void {
   let off = () => {};
   const g = globalThis as { addEventListener?: (t: string, f: (e: unknown) => void) => void; removeEventListener?: (t: string, f: (e: unknown) => void) => void };
   if (o.globalHandlers !== false && typeof g.addEventListener === "function") {
-    const onError = (e: unknown) => void captureException((e as { error?: unknown; message?: string }).error ?? (e as { message?: string }).message, { handled: false });
-    const onRejection = (e: unknown) => void captureException((e as { reason?: unknown }).reason, { handled: false });
+    // A capture never rejects (send catches), and these handlers still swallow one: a failing report must not raise
+    // another `unhandledrejection` that would report again, forever.
+    const onError = (e: unknown) => void captureException((e as { error?: unknown; message?: string }).error ?? (e as { message?: string }).message, { handled: false }).catch(() => null);
+    const onRejection = (e: unknown) => void captureException((e as { reason?: unknown }).reason, { handled: false }).catch(() => null);
     g.addEventListener("error", onError);
     g.addEventListener("unhandledrejection", onRejection);
     off = () => {
@@ -62,26 +64,30 @@ export function close(): void {
   current = null;
 }
 
-/** Sends an error; resolves to the event id (or null when not initialized, sampled out or dropped). */
+/** Sends an error; resolves to the event id (or null when not initialized, sampled out, dropped or not sent). Never rejects. */
 export function captureException(error: unknown, o: { level?: Level; tags?: Record<string, string>; extra?: Record<string, unknown>; handled?: boolean } = {}): Promise<string | null> {
-  if (!current) return Promise.resolve(null);
-  return send(eventFromError(error, { ...o, platform: "javascript", ...(current.o.release ? { release: current.o.release } : {}), ...(current.o.environment ? { environment: current.o.environment } : {}) }));
+  const c = current;
+  if (!c) return Promise.resolve(null);
+  return send(() => eventFromError(error, { ...o, platform: "javascript", ...(c.o.release ? { release: c.o.release } : {}), ...(c.o.environment ? { environment: c.o.environment } : {}) }));
 }
 
+/** Sends a message; resolves like `captureException`. Never rejects. */
 export function captureMessage(message: string, level: Level = "info"): Promise<string | null> {
-  if (!current) return Promise.resolve(null);
-  const c = current.o;
-  return send({ event_id: eventId(), timestamp: Date.now() / 1000, platform: "javascript", level, message, ...(c.release ? { release: c.release } : {}), ...(c.environment ? { environment: c.environment } : {}) });
+  const c = current;
+  if (!c) return Promise.resolve(null);
+  return send(() => ({ event_id: eventId(), timestamp: Date.now() / 1000, platform: "javascript", level, message, ...(c.o.release ? { release: c.o.release } : {}), ...(c.o.environment ? { environment: c.o.environment } : {}) }));
 }
 
-async function send(event: SentryEvent): Promise<string | null> {
+/** Everything inside one boundary: building the event, `beforeSend`, serializing and posting (a throw is a null). */
+async function send(build: () => SentryEvent): Promise<string | null> {
   const c = current;
   if (!c || Math.random() >= (c.o.sampleRate ?? 1)) return null;
-  const e = c.o.beforeSend ? c.o.beforeSend(event) : event;
-  if (!e) return null;
-  const id = e.event_id ?? eventId();
-  const body = serializeEnvelope({ event_id: id, sent_at: new Date().toISOString(), sdk: { name: "ember-sentry.client", version: "1" } }, [{ header: { type: "event" }, payload: { ...e, event_id: id } }]);
   try {
+    const event = build();
+    const e = c.o.beforeSend ? c.o.beforeSend(event) : event;
+    if (!e) return null;
+    const id = e.event_id ?? eventId();
+    const body = serializeEnvelope({ event_id: id, sent_at: new Date().toISOString(), sdk: { name: "ember-sentry.client", version: "1" } }, [{ header: { type: "event" }, payload: { ...e, event_id: id } }]);
     // text/plain keeps it a simple CORS request (no preflight), like the official SDKs.
     const res = await (c.o.fetch ?? fetch)(c.dsn.url, { method: "POST", body: body as BodyInit, headers: { "content-type": "text/plain;charset=UTF-8" }, keepalive: body.length < 60_000 });
     return res.ok ? id : null;

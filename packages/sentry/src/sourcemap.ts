@@ -93,7 +93,10 @@ export interface OriginalPosition {
 export interface SourceMap {
   /** `line` is 1-based, `column` 0-based (a Sentry frame's `colno` - 1). */
   lookup(line: number, column: number): OriginalPosition | null;
-  /** Rough memory weight (for the LRU). */
+  /**
+   * Rough memory weight in bytes (for the LRU): the decoded segments (20 bytes each, 5 to 7 times their VLQ text),
+   * per-line arrays, and `sourcesContent` twice (the strings and their split lines), UTF-16.
+   */
   readonly weight: number;
 }
 
@@ -111,7 +114,7 @@ interface RawMap {
 export function parseSourceMap(input: string | object): SourceMap {
   const raw = (typeof input === "string" ? JSON.parse(input.replace(/^\)\]\}'[^\n]*\n/, "")) : input) as RawMap;
   if (!raw || typeof raw !== "object") throw new Error("source map: not an object");
-  if (Array.isArray(raw.sections)) return indexMap(raw, typeof input === "string" ? input.length : 0);
+  if (Array.isArray(raw.sections)) return indexMap(raw);
   if (typeof raw.mappings !== "string") throw new Error("source map: no mappings");
   const root = raw.sourceRoot ? raw.sourceRoot.replace(/\/?$/, "/") : "";
   const sources = (raw.sources ?? []).map((s) => (s === null ? "" : root && !/^[a-z][a-z0-9+.-]*:|^\//i.test(s) ? root + s : s));
@@ -120,7 +123,7 @@ export function parseSourceMap(input: string | object): SourceMap {
   const split = new Map<number, string[]>();
   const lines = decodeMappings(raw.mappings);
   return {
-    weight: raw.mappings.length + contents.reduce((n, c) => n + (c?.length ?? 0), 0),
+    weight: weightOf(lines, contents, sources, names),
     lookup(line, column) {
       const segs = lines[line - 1];
       if (!segs || !segs.length) return null;
@@ -144,10 +147,22 @@ export function parseSourceMap(input: string | object): SourceMap {
   };
 }
 
-function indexMap(raw: RawMap, weight: number): SourceMap {
+/** Per typed array (header, backing store bookkeeping) and per retained string. */
+const ARRAY_OVERHEAD = 64;
+
+function weightOf(lines: readonly LineSegments[], contents: ReadonlyArray<string | null>, sources: readonly string[], names: readonly string[]): number {
+  let n = 0;
+  for (const l of lines) n += l.byteLength + ARRAY_OVERHEAD;
+  for (const c of contents) if (c) n += c.length * 4 + ARRAY_OVERHEAD;
+  for (const x of sources) n += x.length * 2 + ARRAY_OVERHEAD;
+  for (const x of names) n += (typeof x === "string" ? x.length * 2 : 0) + ARRAY_OVERHEAD;
+  return n;
+}
+
+function indexMap(raw: RawMap): SourceMap {
   const sections = raw.sections!.map((s) => ({ line: s.offset.line, column: s.offset.column, map: parseSourceMap(s.map) }));
   return {
-    weight: weight || sections.reduce((n, s) => n + s.map.weight, 0),
+    weight: sections.reduce((n, s) => n + s.map.weight, ARRAY_OVERHEAD * sections.length),
     lookup(line, column) {
       const l0 = line - 1;
       let pick: (typeof sections)[number] | undefined;

@@ -7,5 +7,5 @@
     "types": ["@cloudflare/workers-types", "@cloudflare/vitest-plugin/types"]
   },
   "include": ["."],
-  "references": [{ "path": "../.." }, { "path": "../../../runtime" }]
+  "references": [{ "path": "../.." }, { "path": "../../../runtime" }, { "path": "../../../dashboard-sdk" }]
 }

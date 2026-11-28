@@ -163,54 +163,65 @@ export async function handleIngest(request: Request, deps: IngestDeps): Promise<
 
   const bucket = r2Of(deps.env, deps.config);
   const headerId = typeof envelope.header.event_id === "string" ? envelope.header.event_id : undefined;
-  const messages: QueuedEvent[] = [];
-  let replayId: string | undefined;
-  let attachments = 0;
-  let firstId: string | undefined = headerId;
+  // Pass 1, no writes: every condition that refuses the whole envelope (an oversized event or transaction, an item
+  // that is not JSON, an event too big for a queue message with nowhere to spill it), so a refused envelope stored
+  // nothing and its corrected resend counts once. Oversized attachments and replays are dropped per item (pass 2).
+  const plan: Array<{ type: unknown; item: EnvelopeItem; json?: JsonObject }> = [];
   try {
     for (const item of envelope.items) {
       const type = item.header.type;
       if ((type === "event" || type === "transaction") && item.payload.length > limits.maxEventBytes) return tooLarge(ae, project.id);
-      if (type === "event") {
-        const ev = itemJson(item) as SentryEvent;
-        const id = (typeof ev.event_id === "string" && ev.event_id) || headerId || eventId();
-        ev.event_id = id;
-        firstId ??= id;
-        if (random() >= (project.sampleRate ?? 1)) {
-          droppedPoint(ae, project.id, "sampled", "event");
-          continue;
-        }
-        messages.push(await toMessage(deps, bucket, project.id, id, ev, now, item));
-      } else if (type === "transaction") {
-        const tx = itemJson(item);
-        firstId ??= typeof tx.event_id === "string" ? tx.event_id : undefined;
-        if (random() < (project.transactionSampleRate ?? 0)) transactionPoint(ae, project.id, tx);
-        else droppedPoint(ae, project.id, "sampled", "transaction");
-      } else if (type === "session" || type === "sessions") {
-        sessionPoints(ae, project.id, type, itemJson(item));
-      } else if (type === "attachment") {
-        if (!bucket || item.payload.length > limits.maxAttachmentBytes) {
-          droppedPoint(ae, project.id, bucket ? "too_large" : "no_bucket", "attachment");
-          continue;
-        }
-        const filename = typeof item.header.filename === "string" ? item.header.filename : "attachment";
-        await putGzip(bucket, keys.attachment(deps.install, now, project.id, headerId ?? "unknown", attachments++, filename), item.payload, typeof item.header.content_type === "string" ? item.header.content_type : "application/octet-stream");
-      } else if (type === "replay_event" || type === "replay_recording") {
-        if (!bucket || item.payload.length > limits.maxReplayBytes) {
-          droppedPoint(ae, project.id, bucket ? "too_large" : "no_bucket", type);
-          continue;
-        }
-        const replay = type === "replay_event" ? itemJson(item) : null;
-        replayId = (replay && typeof replay.replay_id === "string" ? replay.replay_id : undefined) ?? replayId ?? headerId ?? eventId();
-        const segment = replay && typeof replay.segment_id === "number" ? replay.segment_id : segmentOf(item);
-        await putGzip(bucket, keys.replay(deps.install, now, project.id, replayId, segment, type === "replay_event" ? "event" : "recording"), item.payload, type === "replay_event" ? "application/json" : "application/octet-stream");
-        firstId ??= replayId;
-      }
-      // client_report, check_in, profile, statsd, span, feedback...: accepted and not stored.
+      const parse = type === "event" || type === "transaction" || type === "session" || type === "sessions" || (type === "replay_event" && !!bucket && item.payload.length <= limits.maxReplayBytes);
+      const json = parse ? itemJson(item) : undefined;
+      if (type === "event" && !bucket && !fitsInline(json as SentryEvent, project.id, now)) return refuse(413, "event too large for a queue message (no R2 bucket to spill it to)");
+      plan.push({ type, item, ...(json ? { json } : {}) });
     }
   } catch (e) {
     if (e instanceof EnvelopeError) return refuse(400, e.message);
     throw e;
+  }
+  // Pass 2: sampling and writes.
+  const messages: QueuedEvent[] = [];
+  let replayId: string | undefined;
+  let attachments = 0;
+  let firstId: string | undefined = headerId;
+  for (const { type, item, json } of plan) {
+    if (type === "event") {
+      const ev = json as SentryEvent;
+      const id = (typeof ev.event_id === "string" && ev.event_id) || headerId || eventId();
+      ev.event_id = id;
+      firstId ??= id;
+      if (random() >= (project.sampleRate ?? 1)) {
+        droppedPoint(ae, project.id, "sampled", "event");
+        continue;
+      }
+      messages.push((await queueMessage(deps.install, bucket, project.id, id, ev, now))!);
+    } else if (type === "transaction") {
+      const tx = json!;
+      firstId ??= typeof tx.event_id === "string" ? tx.event_id : undefined;
+      if (random() < (project.transactionSampleRate ?? 0)) transactionPoint(ae, project.id, tx);
+      else droppedPoint(ae, project.id, "sampled", "transaction");
+    } else if (type === "session" || type === "sessions") {
+      sessionPoints(ae, project.id, type, json!);
+    } else if (type === "attachment") {
+      if (!bucket || item.payload.length > limits.maxAttachmentBytes) {
+        droppedPoint(ae, project.id, bucket ? "too_large" : "no_bucket", "attachment");
+        continue;
+      }
+      const filename = typeof item.header.filename === "string" ? item.header.filename : "attachment";
+      await putGzip(bucket, keys.attachment(deps.install, now, project.id, headerId ?? "unknown", attachments++, filename), item.payload, typeof item.header.content_type === "string" ? item.header.content_type : "application/octet-stream");
+    } else if (type === "replay_event" || type === "replay_recording") {
+      if (!bucket || item.payload.length > limits.maxReplayBytes) {
+        droppedPoint(ae, project.id, bucket ? "too_large" : "no_bucket", type);
+        continue;
+      }
+      const replay = type === "replay_event" ? json! : null;
+      replayId = (replay && typeof replay.replay_id === "string" ? replay.replay_id : undefined) ?? replayId ?? headerId ?? eventId();
+      const segment = replay && typeof replay.segment_id === "number" ? replay.segment_id : segmentOf(item);
+      await putGzip(bucket, keys.replay(deps.install, now, project.id, replayId, segment, type === "replay_event" ? "event" : "recording"), item.payload, type === "replay_event" ? "application/json" : "application/octet-stream");
+      firstId ??= replayId;
+    }
+    // client_report, check_in, profile, statsd, span, feedback...: accepted and not stored.
   }
   if (messages.length) {
     const queue = queueOf(deps.env, deps.install);
@@ -242,15 +253,35 @@ function segmentOf(item: EnvelopeItem): number {
   }
 }
 
-async function toMessage(deps: IngestDeps, bucket: ReturnType<typeof r2Of>, project: string, id: string, ev: SentryEvent, now: number, item: EnvelopeItem): Promise<QueuedEvent> {
+const encoder = new TextEncoder();
+/** A queue message's size as sent (UTF-8 JSON). */
+export const messageBytes = (msg: QueuedEvent) => encoder.encode(JSON.stringify(msg)).length;
+
+/** The event without its breadcrumbs (usually what makes it big): what goes inline when there is no bucket to spill to. */
+const withoutBreadcrumbs = (ev: SentryEvent): SentryEvent => {
+  const { breadcrumbs: _b, ...rest } = ev;
+  return { ...rest, breadcrumbs: { values: [] } };
+};
+
+/** Whether the event fits in a queue message without spilling (as is, or without its breadcrumbs). */
+export function fitsInline(ev: SentryEvent, project: string, now: number): boolean {
+  const msg: QueuedEvent = { v: 1, project, id: typeof ev.event_id === "string" ? ev.event_id : "0".repeat(32), receivedAt: now, event: ev };
+  return messageBytes(msg) <= INLINE_EVENT_MAX || messageBytes({ ...msg, event: withoutBreadcrumbs(ev) }) <= INLINE_EVENT_MAX;
+}
+
+/**
+ * The queue message for one event: inline when it fits `INLINE_EVENT_MAX` (UTF-8 bytes, headroom under the Queue's
+ * 128 KB), else spilled to R2 under a key of its own (never shared by two messages, even for the same event id), else
+ * inline without breadcrumbs. Null when it does not fit at all (no bucket, still too big): the caller refuses it.
+ */
+export async function queueMessage(install: string, bucket: ReturnType<typeof r2Of>, project: string, id: string, ev: SentryEvent, now: number): Promise<QueuedEvent | null> {
   const msg: QueuedEvent = { v: 1, project, id, receivedAt: now, event: ev };
-  if (item.payload.length <= INLINE_EVENT_MAX && JSON.stringify(msg).length <= INLINE_EVENT_MAX) return msg;
+  if (messageBytes(msg) <= INLINE_EVENT_MAX) return msg;
   if (bucket) {
-    const spill = keys.spill(deps.install, now, project, id);
+    const spill = keys.spill(install, now, project, `${id}-${crypto.randomUUID().slice(0, 8)}`);
     await putGzip(bucket, spill, JSON.stringify(ev));
     return { v: 1, project, id, receivedAt: now, spill };
   }
-  // No bucket to spill to: the event goes without its breadcrumbs (usually what makes it big).
-  const { breadcrumbs: _b, ...rest } = ev;
-  return { v: 1, project, id, receivedAt: now, event: { ...rest, breadcrumbs: { values: [] } } };
+  const stripped: QueuedEvent = { ...msg, event: withoutBreadcrumbs(ev) };
+  return messageBytes(stripped) <= INLINE_EVENT_MAX ? stripped : null;
 }

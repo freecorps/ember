@@ -53,6 +53,85 @@ export interface SentryEvent {
   [k: string]: unknown;
 }
 
+const isObj = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
+const FRAME_STRINGS = ["filename", "abs_path", "module", "function", "context_line"] as const;
+const EVENT_STRINGS = ["event_id", "level", "platform", "release", "dist", "environment", "transaction", "culprit"] as const;
+
+function cleanFrames(st: unknown): { frames: StackFrame[] } | undefined {
+  if (!isObj(st) || !Array.isArray(st.frames)) return undefined;
+  const frames = st.frames.filter(isObj).map((x) => {
+    const f: StackFrame = { ...x };
+    for (const k of FRAME_STRINGS) if (f[k] !== undefined && typeof f[k] !== "string") delete f[k];
+    for (const k of ["lineno", "colno"] as const) if (f[k] !== undefined && !(typeof f[k] === "number" && Number.isFinite(f[k]))) delete f[k];
+    if (f.in_app !== undefined && typeof f.in_app !== "boolean") delete f.in_app;
+    for (const k of ["pre_context", "post_context"] as const) if (f[k] !== undefined && !(Array.isArray(f[k]) && f[k].every((l) => typeof l === "string"))) delete f[k];
+    if (f.data !== undefined && !isObj(f.data)) delete f.data;
+    return f;
+  });
+  return { ...st, frames };
+}
+
+/**
+ * The event with the shapes this component reads made safe (an SDK or a client may send anything that is JSON):
+ * `exception.values`, frames, threads and `debug_meta.images` keep only objects, and the fields read as strings or
+ * numbers are dropped when they are not. Everything else is kept as sent.
+ */
+export function normalizeEvent(input: SentryEvent): SentryEvent {
+  const e: SentryEvent = { ...input };
+  for (const k of EVENT_STRINGS) if (e[k] !== undefined && typeof e[k] !== "string") delete e[k];
+  if (e.fingerprint !== undefined && !Array.isArray(e.fingerprint)) delete e.fingerprint;
+  if (e.message !== undefined && typeof e.message !== "string" && !isObj(e.message)) delete e.message;
+  if (e.logentry !== undefined && !isObj(e.logentry)) delete e.logentry;
+  for (const k of ["message", "logentry"] as const) {
+    const o = e[k];
+    if (!isObj(o)) continue;
+    const c: Record<string, unknown> = { ...o };
+    for (const f of ["message", "formatted"]) if (c[f] !== undefined && typeof c[f] !== "string") delete c[f];
+    e[k] = c as { message?: string; formatted?: string };
+  }
+  if (e.exception !== undefined) {
+    const values = isObj(e.exception) && Array.isArray(e.exception.values) ? e.exception.values : [];
+    e.exception = {
+      ...(isObj(e.exception) ? e.exception : {}),
+      values: values.filter(isObj).map((x) => {
+        const y: ExceptionValue = { ...x };
+        for (const k of ["type", "value", "module"] as const) if (y[k] !== undefined && typeof y[k] !== "string") delete y[k];
+        const st = cleanFrames(y.stacktrace);
+        if (st) y.stacktrace = st;
+        else delete y.stacktrace;
+        return y;
+      }),
+    };
+  }
+  if (e.stacktrace !== undefined) {
+    const st = cleanFrames(e.stacktrace);
+    if (st) e.stacktrace = st;
+    else delete e.stacktrace;
+  }
+  if (e.threads !== undefined) {
+    const values = isObj(e.threads) && Array.isArray(e.threads.values) ? e.threads.values : [];
+    e.threads = {
+      values: values.filter(isObj).map((t) => {
+        const st = cleanFrames(t.stacktrace);
+        const { stacktrace: _s, ...rest } = t;
+        return { ...rest, ...(st ? { stacktrace: st } : {}) } as { stacktrace?: { frames?: StackFrame[] }; crashed?: boolean; current?: boolean };
+      }),
+    };
+  }
+  if (e.debug_meta !== undefined) {
+    const images = isObj(e.debug_meta) && Array.isArray(e.debug_meta.images) ? e.debug_meta.images : [];
+    e.debug_meta = {
+      ...(isObj(e.debug_meta) ? e.debug_meta : {}),
+      images: images.filter(isObj).map((im) => {
+        const y = { ...im } as Record<string, unknown>;
+        for (const k of ["type", "code_file", "debug_id"]) if (y[k] !== undefined && typeof y[k] !== "string") delete y[k];
+        return y as { type?: string; code_file?: string; debug_id?: string };
+      }),
+    };
+  }
+  return e;
+}
+
 /** Every stack of the event (exceptions, then the top-level or thread stack), frames oldest first as sent. */
 export function stacksOf(e: SentryEvent): StackFrame[][] {
   const out: StackFrame[][] = [];

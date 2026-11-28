@@ -6,7 +6,11 @@ import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { composeApp, defineSchema, unsafeRef } from "@freecorps/ember-server";
 import { gzip, utf8 } from "../src/envelope.ts";
-import { bumpHourly, sha256Hex, storageKeys, verifyWebhook, type SentryAlert } from "../src/index.ts";
+import { bumpHourly, consume as consumeBatch, sha256Hex, storageKeys, verifyWebhook, type QueuedEvent, type SentryAlert } from "../src/index.ts";
+import { chunkLookups, LOOKUP_LIMITS, type ArtifactLookup } from "../src/consumer.ts";
+import { checkConfig } from "../src/config.ts";
+import { postWebhook } from "../src/alerts.ts";
+import { MemoryR2 } from "./fakes.ts";
 import { errorEvent, fn, harness } from "./harness.ts";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -76,6 +80,49 @@ describe("grouping and the batched write", () => {
     const latest = (await t.action(fn("lib:latestEvent"), { id: (await issues()).find((i) => i.title.startsWith("RangeError"))!._id })) as { event: { exception: { values: Array<{ type: string }> } } };
     expect(latest.event.exception.values[0]!.type).toBe("RangeError");
     expect(ae.of("event").map((p) => [p.indexes, p.blobs?.slice(0, 5)])).toEqual(Array(3).fill([["web"], ["event", "web", "1.0.0", "", "error"]]));
+  });
+
+  it("a newer event with no raw pointer clears the issue's lastEvent; an older one leaves it", async () => {
+    const { t, consume, issues } = harness(noAlerts);
+    await consume([errorEvent({ at: Date.UTC(2026, 10, 20, 11) })]);
+    const [issue] = await issues();
+    const detail = (await t.query(fn("dashboard:issue"), { id: issue!._id })) as { fingerprint: string; lastEvent: object | null };
+    expect(detail.lastEvent).not.toBeNull();
+    const group = (lastSeen: number, eventId: string) => ({ project: "web", fingerprint: detail.fingerprint, n: 1, firstSeen: lastSeen, lastSeen, title: "t", culprit: "c", level: "error", release: "", environment: "", platform: "", eventId, stack: "" });
+    await t.mutation(fn("lib:apply"), { groups: [group(Date.UTC(2026, 10, 20, 10), "older")] });
+    expect(((await t.query(fn("dashboard:issue"), { id: issue!._id })) as { lastEvent: object | null }).lastEvent).not.toBeNull();
+    await t.mutation(fn("lib:apply"), { groups: [group(Date.UTC(2026, 10, 20, 12), "newer")] });
+    const after = (await t.query(fn("dashboard:issue"), { id: issue!._id })) as { lastEventId: string; lastEvent: object | null };
+    expect(after).toMatchObject({ lastEventId: "newer", lastEvent: null });
+    expect(await t.action(fn("lib:latestEvent"), { id: issue!._id })).toBeNull();
+  });
+
+  it("malformed events never fail the batch: shapes are normalized, an unreadable spill is dropped, the rest is stored", async () => {
+    const { consume, issues, internalAction, msg } = harness(noAlerts);
+    const bad = [
+      { exception: { values: [null, 5, "x", { type: 7, value: { a: 1 }, stacktrace: { frames: [null, { abs_path: 7, lineno: "x" }, { abs_path: "https://app.test/a.js", lineno: 1, colno: 2, in_app: "yes" }] } }] } },
+      { exception: "nope", stacktrace: { frames: "x" }, threads: { values: [null, { crashed: true, stacktrace: { frames: [3] } }] } },
+      { message: 5, logentry: { message: { x: 1 } }, fingerprint: "not-an-array", release: 3, debug_meta: { images: [null, { type: "sourcemap", debug_id: 5, code_file: {} }] } },
+    ] as never[];
+    const r = await consume([...bad, errorEvent()]);
+    expect(r).toMatchObject({ events: 4 });
+    expect((await issues()).reduce((n, i) => n + i.count, 0)).toBe(4);
+    // A spill object that is gone or not JSON: that message is dropped, its batch goes on.
+    const out = (await internalAction("lib:consume", { messages: [{ v: 1, project: "web", id: "gone", receivedAt: 1, spill: "sentry/sentry/spill/x/web/gone.json.gz" }, msg(errorEvent({ type: "Fine" }))] })) as { events: number };
+    expect(out.events).toBe(1);
+  });
+
+  it("a batch is consumed in slices bounded by bytes: one object and one apply per slice, every event counted", async () => {
+    const bucket = new MemoryR2();
+    const applied: number[] = [];
+    const deps = { install: "sentry", config: noAlerts, env: { EMBER_FILES: bucket }, now: Date.UTC(2026, 10, 20, 12), findArtifacts: async () => ({}), apply: async (g: Array<{ n: number }>) => (applied.push(g.reduce((n, x) => n + x.n, 0)), { issues: g.length, created: 0, alerts: 0 }), maxSliceBytes: 4096 };
+    const big = (i: number): QueuedEvent => ({ v: 1, project: "web", id: String(i).padStart(32, "0"), receivedAt: 1, event: { ...errorEvent(), extra: { pad: "x".repeat(1500) } } });
+    const r = await consumeBatch(deps, Array.from({ length: 10 }, (_, i) => big(i)));
+    expect(r.events).toBe(10);
+    expect(r.objects.length).toBeGreaterThanOrEqual(4);
+    expect(bucket.keys("sentry/sentry/events/")).toHaveLength(r.objects.length);
+    expect(applied.reduce((a, b) => a + b, 0)).toBe(10);
+    expect(applied.length).toBe(r.objects.length);
   });
 
   it("hourly buckets shift with time and keep 24 hours", () => {
@@ -171,6 +218,20 @@ describe("status, regression and alerts", () => {
     expect((await consume([errorEvent({ type: "D" })])).alerts).toBe(1);
   });
 
+  it("webhooks must be https (http only on localhost); redirects are not followed", async () => {
+    const base = { projects: [{ id: "web", keys: ["pubkey0123456789"] }] };
+    expect(() => checkConfig({ ...base, alerts: { webhooks: [{ url: "http://hooks.test/x" }] } })).toThrow(/must be an https:\/\/ URL/);
+    expect(() => checkConfig({ ...base, alerts: { webhooks: [{ url: "http://localhost:8787/x" }] } })).not.toThrow();
+    const seen: RequestInit[] = [];
+    const f = (async (_u: string, init: RequestInit) => (seen.push(init), new Response(null, { status: 302, headers: { location: "http://plain.test/" } }))) as unknown as typeof fetch;
+    const alert = { kind: "new", project: "web", issueId: "i", title: "t", culprit: "c", level: "error", count: 1, release: "", environment: "", firstSeen: 1, lastSeen: 1, at: 1 } as SentryAlert;
+    expect(await postWebhook("https://hooks.test/x", alert, undefined, 1, f)).toBe(302);
+    expect(seen[0]!.redirect).toBe("manual");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(await postWebhook("http://hooks.test/x", alert, undefined, 1, f)).toBe(0);
+    expect(seen).toHaveLength(1);
+  });
+
   it("a project with alerts: false never alerts", async () => {
     const { consume } = harness({ ...noAlerts, alerts: { webhooks: [{ url: "https://hooks.test/x" }] } });
     expect((await consume([errorEvent()])).alerts).toBe(0);
@@ -219,6 +280,28 @@ describe("source maps in the consumer", () => {
     expect(r.symbolicated).toBe(2);
   });
 
+  it("a debug id never resolves to another project's map", async () => {
+    const h = harness({ projects: [{ id: "web", keys: ["pubkey0123456789"], alerts: false }, { id: "api", keys: ["pubkey0123456789"], alerts: false }] });
+    const id = "8a0b6f4c-1e2d-4f3a-9b8c-7d6e5f4a3b2c";
+    await upload(h, { release: "any", name: "~/other.js", debugId: id });
+    const ev = () => minified(undefined, { debug_meta: { images: [{ type: "sourcemap", code_file: "https://cdn.test/assets/app.min.js", debug_id: id }] } });
+    expect((await h.consume([ev()], "api")).symbolicated).toBe(0);
+    expect((await h.consume([ev()], "web")).symbolicated).toBe(2);
+  });
+
+  it("every release of a big batch is looked up (split into bounded calls, never cut short)", async () => {
+    const h = harness(noAlerts);
+    for (let i = 0; i < 55; i++) await upload(h, { release: `r${i}` });
+    const r = await h.consume(Array.from({ length: 55 }, (_, i) => minified(`r${i}`)));
+    expect(r.symbolicated).toBe(110);
+    // The query refuses a call over its limits instead of skipping part of it.
+    const many = Array.from({ length: LOOKUP_LIMITS.lookups + 1 }, (_, i): ArtifactLookup => ({ project: "web", release: `r${i}`, dist: "", names: ["~/a.js"], debugIds: [] }));
+    await expect(h.t.query(fn("lib:findArtifacts"), { lookups: many })).rejects.toThrow(/at most 50 lookups/);
+    const chunks = chunkLookups([...many, { project: "web", release: "x", dist: "", names: Array.from({ length: 450 }, (_, i) => `~/${i}.js`), debugIds: [] }]);
+    expect(chunks.every((c) => c.length <= LOOKUP_LIMITS.lookups && c.every((l) => l.names.length <= LOOKUP_LIMITS.names && l.debugIds.length <= LOOKUP_LIMITS.debugIds))).toBe(true);
+    expect(chunks.flat().reduce((n, l) => n + l.names.length, 0)).toBe(51 + 450);
+  });
+
   it("registerArtifacts dedups by name and hash and keeps per-release totals for the Releases tab", async () => {
     const h = harness(noAlerts);
     await upload(h, { release: "1.0.0" });
@@ -258,6 +341,10 @@ describe("dashboard", () => {
     expect(Object.keys(spec!.functions).sort()).toEqual(["@sentry/dashboard:artifacts", "@sentry/dashboard:issue", "@sentry/dashboard:issues", "@sentry/dashboard:releases", "@sentry/lib:latestEvent", "@sentry/lib:setStatus"]);
     expect(spec!.tabs[0]!.blocks[0]).toMatchObject({ kind: "table", query: "@sentry/dashboard:issues", filters: ["status", "level", "release", "project"] });
     expect(spec!.tabs[1]!.blocks[0]).toMatchObject({ kind: "embed", path: "/sentry/dashboard/event" });
+    expect(spec!.shard).toBeUndefined();
+    // config.shard moves the issue tables: the screens run there too.
+    const moved = harness({ shard: "global:errors" });
+    expect(composeApp({ schema: defineSchema({ tables: {} }), functions: {}, app: moved.app }).dashboards[0]).toMatchObject({ scope: "global", shard: "global:errors" });
   });
 
   it("issues filter by status, level, release and project, last seen first, each a range of an index", async () => {

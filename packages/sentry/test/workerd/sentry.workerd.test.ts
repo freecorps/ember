@@ -132,22 +132,40 @@ describe("sentry in workerd", () => {
     // The caller's answer is what it was without the hook.
     const m = await call("mutation", "boom:mutation");
     expect(((await m.json()) as { ok: boolean; error: { code: string } }).error.code).toBe("Error");
-    await (await call("query", "boom:query")).body?.cancel();
+    // Bodies read to the end (the report does not depend on it: shards report after answering, through waitUntil).
+    await (await call("query", "boom:query")).text();
     const a = (await (await call("action", "boom:action")).json()) as { ok: boolean };
     expect(a.ok).toBe(false);
-    await (await call("mutation", "boom:appError")).body?.cancel();
-    await (await call("mutation", "boom:validated", { n: "x" })).body?.cancel();
+    await (await call("mutation", "boom:appError")).text();
+    await (await call("mutation", "boom:validated", { n: "x" })).text();
     await vi.waitFor(() => expect(probes.reports.map((r) => `${r.kind} ${r.fn}`).sort()).toEqual(["action boom:action", "mutation boom:mutation", "query boom:query"]), { timeout: 5000 });
     const action = probes.reports.find((r) => r.kind === "action")!;
     expect(action.stack).toContain("TypeError");
     expect(probes.reports.find((r) => r.kind === "mutation")).toMatchObject({ shard: "global:main", code: "Error", message: expect.stringContaining("null") });
     // One event per report, on the sentry queue: grouped by the function and tagged.
     await vi.waitFor(() => expect(probes.sent).toHaveLength(3));
-    const ev = probes.sent.find((q) => q.event?.tags?.["ember.function"] === "boom:mutation")!;
+    const ev = probes.sent.find((q) => (q.event?.tags as Record<string, string> | undefined)?.["ember.function"] === "boom:mutation")!;
     expect(ev.event).toMatchObject({ release: "api@1", fingerprint: ["{{ default }}", "boom:mutation"], transaction: "boom:mutation", tags: { "ember.kind": "mutation", "ember.shard": "global:main" } });
     // The consumer groups them into three issues.
     await deliver(probes.sent.splice(0));
     const n = await runInDurableObject(stub(), async (_o, state) => state.storage.sql.exec(`SELECT COUNT(*) AS n FROM "sentry$issues" WHERE "release" = 'api@1'`).one().n);
     expect(n).toBe(3);
+  });
+
+  it("onError hears of a lazy action whose module fails to load, and of an HTTP route's throw without delaying its 500", async () => {
+    probes.sent.length = 0;
+    probes.reports.length = 0;
+    probes.httpReportsDone = 0;
+    const r = await SELF.fetch("http://ember/api/action", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ fn: "lazy:broken", args: {}, shard: "global:main" }) });
+    expect(((await r.json()) as { ok: boolean }).ok).toBe(false);
+    await vi.waitFor(() => expect(probes.reports.map((x) => `${x.kind} ${x.fn}`)).toContain("action lazy:broken"));
+    expect(probes.reports.find((x) => x.fn === "lazy:broken")!.message).toContain("the module failed to load");
+    // The route's onError takes a second: the 500 is back while it still runs (waitUntil), then it finishes.
+    const res = await SELF.fetch("http://ember/hooks/boom", { method: "POST" });
+    expect(res.status).toBe(500);
+    await res.text();
+    expect(probes.reports.find((x) => x.kind === "http")).toMatchObject({ fn: "http:POST /hooks/boom", message: "hook failed" });
+    expect(probes.httpReportsDone).toBe(0);
+    await vi.waitFor(() => expect(probes.httpReportsDone).toBe(1), { timeout: 5000 });
   });
 });
