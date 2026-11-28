@@ -1382,7 +1382,7 @@ export default defineApp({ onError: sentryErrorReporter({ project: "api", releas
 | Rota | O quê |
 |---|---|
 | `POST /api/:projectId/envelope/` (+ `OPTIONS`, CORS `*`) | Ingestão. Chave: `X-Sentry-Auth: Sentry sentry_key=…` (ou `Authorization`), `?sentry_key=`, ou o `dsn` do header do envelope; checada contra `projects[].keys` em tempo constante (header/query antes de ler o corpo). `content-encoding` gzip, deflate (zlib ou raw) ou identity |
-| `POST /admin/sourcemaps` | Manifesto `{ project, release, dist?, files: [{ name, sha256, size, debugId? }] }` (≤ 2000 arquivos). Sem todos os blobs no R2: `{ ok: false, missing: [sha256…] }` e nada registrado; com todos: uma mutation registra e devolve `{ ok: true, added, files }` |
+| `POST /admin/sourcemaps` | Manifesto `{ project, release, dist?, files: [{ name, sha256, size, debugId? }] }` (≤ 2000 arquivos; `size` inteiro de 0 a 64 MiB, senão 400 sem registrar nada). Sem todos os blobs no R2: `{ ok: false, missing: [sha256…] }` e nada registrado; com todos: uma mutation registra e devolve `{ ok: true, added, files }` |
 | `PUT /admin/sourcemaps/blobs/:sha256` | Um mapa (gzip aceito, ≤ 64 MiB): o hash do corpo decodificado tem de bater com o da rota; guardado gzip uma vez por conteúdo (dedup) |
 | `GET /dashboard/event` | A página do bloco `embed` (último evento de uma issue) |
 

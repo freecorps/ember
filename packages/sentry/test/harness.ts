@@ -36,12 +36,14 @@ const modules = {
 };
 
 export const fn = (name: string) => unsafeRef(`@sentry/${name}`);
+/** The upload routes' token in the harness env. */
+export const UPLOAD_TOKEN = "upload-token-for-tests";
 
 export function harness(config: Partial<SentryInstallConfig> = {}, now = Date.UTC(2026, 10, 20, 12)) {
   const bucket = new MemoryR2();
   const ae = new FakeAnalytics();
   const app = defineApp().use(sentry, { config: { projects: [{ id: "web", keys: [KEY] }], ...config } });
-  const t = emberTest({ schema, modules, app, env: { EMBER_FILES: bucket, EMBER_SENTRY_SENTRY_AE: ae, ALERT_SECRET: "whsec_test" }, now });
+  const t = emberTest({ schema, modules, app, env: { EMBER_FILES: bucket, EMBER_SENTRY_SENTRY_AE: ae, ALERT_SECRET: "whsec_test", EMBER_SENTRY_UPLOAD_TOKEN: UPLOAD_TOKEN }, now });
   // Internal component actions (the consumer, retention) as the scheduler and the Queue run them: `t.action` only
   // takes public ones, `_action` is the harness's internal path (the one its scheduler uses).
   const internalAction = (name: string, args: unknown) => (t as unknown as { _action(n: string, a: unknown, s: string): Promise<unknown> })._action(`@sentry/${name}`, args, "global:main");

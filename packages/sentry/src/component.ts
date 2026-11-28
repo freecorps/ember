@@ -354,6 +354,8 @@ const lib = {
   registerArtifacts: internalMutation({
     args: { project: v.string(), release: v.string(), dist: v.string(), files: v.array(v.object({ name: v.string(), sha256: v.string(), size: v.number(), debugId: v.optional(v.string()) })) },
     handler: (ctx, a) => {
+      const bad = a.files.find((f) => !validMapSize(f.size));
+      if (bad) throw new EmberError("ValidationError", `sentry: ${bad.name}: size must be an integer from 0 to ${MAX_MAP_BYTES}`);
       let added = 0;
       let bytes = 0;
       for (const f of a.files) {
@@ -528,6 +530,9 @@ const putBlob = httpAction(async (ctx, request) => {
   return json(200, { ok: true, sha256: sha, stored: !existed });
 });
 
+/** A map's size in a manifest: an integer from 0 to `MAX_MAP_BYTES` (what `putBlob` stores at most). */
+const validMapSize = (n: number) => Number.isInteger(n) && n >= 0 && n <= MAX_MAP_BYTES;
+
 const fileV = v.object({ name: v.string(), sha256: v.string(), size: v.number(), debugId: v.optional(v.string()) });
 const manifestV = v.object({ project: v.string(), release: v.string(), dist: v.optional(v.string()), files: v.array(fileV) });
 
@@ -553,6 +558,7 @@ const postManifest = httpAction(async (ctx, request) => {
   for (const f of m.files) {
     if (!/^[0-9a-f]{64}$/.test(f.sha256)) return err(400, "bad_request", `${f.name}: sha256 must be 64 hex`);
     if (!f.name || f.name.length > 1024) return err(400, "bad_request", "file names must be 1-1024 characters");
+    if (!validMapSize(f.size)) return err(400, "bad_request", `${f.name}: size must be an integer from 0 to ${MAX_MAP_BYTES}`);
     if (f.debugId !== undefined) f.debugId = normalizeDebugId(f.debugId);
   }
   const bucket = r2Of(ctx.env, config);

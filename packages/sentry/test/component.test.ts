@@ -14,7 +14,7 @@ import { queueMessage } from "../src/ingest.ts";
 import { timestampOf } from "../src/event.ts";
 import { postWebhook } from "../src/alerts.ts";
 import { MemoryR2 } from "./fakes.ts";
-import { errorEvent, fn, harness } from "./harness.ts";
+import { errorEvent, fn, harness, UPLOAD_TOKEN } from "./harness.ts";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -383,6 +383,22 @@ describe("source maps in the consumer", () => {
     await h.t.mutation(fn("lib:registerArtifacts"), { project: "web", release: o.release, dist: "", files: [{ name: o.name ?? "~/assets/app.min.js", sha256: sha, size: bytes.length, ...(o.debugId ? { debugId: o.debugId } : {}) }] });
     return sha;
   }
+
+  it("a manifest whose map sizes are not integers from 0 to 64 MiB is refused before anything is registered", async () => {
+    const h = harness(noAlerts);
+    const sha = await upload(h, { release: "0.9.0" });
+    const post = (size: number) => h.t.fetch("/sentry/admin/sourcemaps", { method: "POST", headers: { authorization: `Bearer ${UPLOAD_TOKEN}` }, body: JSON.stringify({ project: "web", release: "1.0.0", files: [{ name: "~/assets/app.min.js", sha256: sha, size }] }) });
+    for (const size of [-1, 1.5, 64 * 1024 * 1024 + 1]) {
+      const r = await post(size);
+      expect(r.status).toBe(400);
+      expect(((await r.json()) as { error: { message: string } }).error.message).toMatch(/size must be an integer/);
+    }
+    await expect(h.t.mutation(fn("lib:registerArtifacts"), { project: "web", release: "1.0.0", dist: "", files: [{ name: "a.js", sha256: sha, size: -1 }] })).rejects.toThrow(/size must be an integer/);
+    const releases = async () => ((await h.t.query(fn("dashboard:releases"), { paginationOpts: { numItems: 10, cursor: null } })) as { page: Array<{ release: string; bytes: number }> }).page;
+    expect((await releases()).map((r) => r.release)).toEqual(["0.9.0"]);
+    expect(await (await post(MAP.length)).json()).toEqual({ ok: true, added: 1, files: 1 });
+    expect((await releases()).find((r) => r.release === "1.0.0")).toMatchObject({ bytes: MAP.length });
+  });
 
   it("a minified event of a release with uploaded maps is grouped and stored symbolicated", async () => {
     const h = harness(noAlerts);
