@@ -526,6 +526,12 @@ export function resolveReference(from: readonly string[], ref: AnyFunctionRefere
 /** Everything the engine and runtime need about an app's components; cached per schema. */
 export class ComponentScopes {
   readonly root: Scope;
+  /**
+   * The replication applier's scope (`_ember:replicaApply`, replica.ts): the app's scope, plus every component table
+   * under its physical name, so a component's `.replicated()` table (`flags$flags`) gets its copies like an app's.
+   * Only the applier runs in it; every other function keeps its own scope.
+   */
+  readonly applier: Scope;
   private readonly byKey = new Map<string, Scope>();
   private readonly prefixToTable = new Map<string, string>();
 
@@ -533,6 +539,7 @@ export class ComponentScopes {
     const rootTables = new Map<string, string>();
     for (const t of Object.keys(manifest.tables)) if (!t.includes(TABLE_SEP)) rootTables.set(t, t);
     this.root = scope([], rootTables, undefined);
+    this.applier = scope([], new Map(Object.keys(manifest.tables).map((t) => [t, t])), undefined);
     this.byKey.set("", this.root);
     for (const [key, c] of Object.entries(manifest.components ?? {})) {
       const path = key.split("/");
