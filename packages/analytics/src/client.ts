@@ -99,6 +99,9 @@ export class AnalyticsClient {
   private flushing: Promise<void> | null = null;
   /** Bytes of the keepalive fetch in flight (they count against the beacon budget). */
   private inFlightBytes = 0;
+  /** Enqueue order of each event (not sent): a batch put back goes where it was, whatever order the answers come in. */
+  private readonly seq = new WeakMap<QueuedEvent, number>();
+  private nextSeq = 0;
   /** Requests sent (tests). */
   sent = 0;
 
@@ -183,7 +186,9 @@ export class AnalyticsClient {
         kept++;
       }
     }
-    this.queue.push({ name, ...(p && Object.keys(p).length ? { props: p } : {}), ts: Date.now(), anonymousId: this.aid });
+    const e: QueuedEvent = { name, ...(p && Object.keys(p).length ? { props: p } : {}), ts: Date.now(), anonymousId: this.aid };
+    this.seq.set(e, this.nextSeq++);
+    this.queue.push(e);
     if (this.queue.length > this.maxQueue) this.queue.splice(0, this.queue.length - this.maxQueue);
     if (this.queue.length >= this.batchSize && !this.flushing) void this.flush();
   }
@@ -212,8 +217,14 @@ export class AnalyticsClient {
     return k;
   }
 
+  /** Puts a batch back where it was in enqueue order (before the first queued event tracked after it). */
   private requeue(batch: QueuedEvent[]): void {
-    this.queue.unshift(...batch);
+    const first = batch[0];
+    if (!first) return;
+    const s = this.seq.get(first) ?? -1;
+    let at = this.queue.findIndex((e) => (this.seq.get(e) ?? Infinity) > s);
+    if (at < 0) at = this.queue.length;
+    this.queue.splice(at, 0, ...batch);
     if (this.queue.length > this.maxQueue) this.queue.splice(0, this.queue.length - this.maxQueue);
   }
 
@@ -225,7 +236,7 @@ export class AnalyticsClient {
       const batch = this.queue.splice(0, this.run(size));
       const r = await this.post(batch);
       if (r === "split" && batch.length > 1) {
-        this.queue.unshift(...batch);
+        this.requeue(batch);
         size = Math.ceil(batch.length / 2);
         continue;
       }
@@ -242,9 +253,14 @@ export class AnalyticsClient {
   private async post(batch: QueuedEvent[]): Promise<Outcome> {
     const f = this.o.fetch ?? (globalThis as { fetch?: typeof fetch }).fetch;
     if (!f) return "ok";
-    this.sent++;
     const body = JSON.stringify({ events: batch });
     const bytes = byteLength(body);
+    // Over what the route takes: it would answer 413, so it is split before it goes (and never offered to keepalive,
+    // whose quota a big body would pass: the browser would refuse it before the server could answer).
+    if (bytes > MAX_BODY_BYTES && batch.length > 1) return "split";
+    // keepalive (the send survives the page) only while it fits in the page's keepalive quota with what is in flight.
+    const keepalive = bytes + this.inFlightBytes <= BEACON_BUDGET_BYTES;
+    this.sent++;
     // One deadline for the token and the request: a send that hangs is given up (aborted) and retried, so the flush
     // never stays held. A late answer of a given-up send changes nothing (the batch is already back in the queue).
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -260,13 +276,14 @@ export class AnalyticsClient {
       if (this.o.getToken && batch[0]?.anonymousId === this.aid) {
         const token = await Promise.race([Promise.resolve().then(() => this.o.getToken!()), timeout]);
         if (token === "timeout") return "retry";
-        if (token) headers.authorization = `Bearer ${token}`;
+        // Again after the await: a `reset()` while the token was pending makes this batch the previous visitor's.
+        if (token && batch[0]?.anonymousId === this.aid) headers.authorization = `Bearer ${token}`;
       }
-      this.inFlightBytes += bytes;
+      if (keepalive) this.inFlightBytes += bytes;
       try {
         // `redirect: "manual"`: a redirect is never followed (a 301 to a landing page would turn the POST into a GET
         // and answer 200): it comes back as a 3xx or an opaque redirect (status 0), retried.
-        const sending = f(this.endpoint, { method: "POST", headers, body, keepalive: true, redirect: "manual", ...(ctrl ? { signal: ctrl.signal } : {}) });
+        const sending = f(this.endpoint, { method: "POST", headers, body, keepalive, redirect: "manual", ...(ctrl ? { signal: ctrl.signal } : {}) });
         sending.catch(() => undefined);
         const r = await Promise.race([sending, timeout]);
         if (r === "timeout") {
@@ -275,7 +292,7 @@ export class AnalyticsClient {
         }
         return outcomeOf(r.status);
       } finally {
-        this.inFlightBytes -= bytes;
+        if (keepalive) this.inFlightBytes -= bytes;
       }
     } catch {
       return "retry";
@@ -319,11 +336,16 @@ export class AnalyticsClient {
           try {
             sending = f(this.endpoint, { method: "POST", headers: { "content-type": "text/plain" }, body, keepalive: true, redirect: "manual" });
           } catch (e) {
-            this.queue.unshift(...batch);
+            this.requeue(batch);
             throw e;
           }
+          // Back for the regular drain when not delivered, or refused whole with more than one event (the drain splits
+          // it); a refused singleton is dropped, as the drain does.
           sending.then(
-            (r) => void (outcomeOf(r.status) === "retry" && this.requeue(batch)),
+            (r) => {
+              const o = outcomeOf(r.status);
+              if (o === "retry" || (o === "split" && batch.length > 1)) this.requeue(batch);
+            },
             () => this.requeue(batch),
           );
         }

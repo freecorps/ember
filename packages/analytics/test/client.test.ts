@@ -333,6 +333,83 @@ describe("analytics client", () => {
     expect(sent[0]!.aids[0]).not.toBe(a.anonymousId);
   });
 
+  test("reset() while the token is pending: the earlier batch goes without the token that arrives", async () => {
+    const auths: Array<string | undefined> = [];
+    const fetch = (async (_url: string, init: RequestInit) => {
+      auths.push((init.headers as Record<string, string>).authorization);
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof globalThis.fetch;
+    let give!: (t: string) => void;
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000, getToken: () => new Promise<string>((r) => (give = r)) });
+    a.track("a1");
+    const p = a.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    a.reset(); // A signs out while the token is on its way; the provider then answers with B's
+    give("token-of-b");
+    await p;
+    expect(auths).toEqual([undefined]);
+  });
+
+  test("a regular flush over the route's body cap is split before it goes, and never passes the keepalive quota", async () => {
+    const { sent, fetch } = fakeFetch();
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    const big = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`p${i}`, "x".repeat(256)]));
+    for (let i = 0; i < 20; i++) a.track("e", big); // ~100 KiB as one batch: over 64 KiB, the browser would refuse it
+    await a.flush();
+    expect(a.pending).toBe(0);
+    expect(sent.reduce((n, s) => n + s.body.events.length, 0)).toBe(20);
+    for (const s of sent) expect(new TextEncoder().encode(JSON.stringify(s.body)).length).toBeLessThanOrEqual(MAX_BODY_BYTES);
+  });
+
+  test("without sendBeacon, failed pagehide batches come back in enqueue order, whatever order the answers arrive in", async () => {
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    const answers: Array<(r: Response) => void> = [];
+    const fetch = vi.fn(() => new Promise<Response>((r) => answers.push(r))) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 2, flushIntervalMs: 60_000 });
+    for (const n of ["a1", "a2", "b1", "b2"]) a.track(n);
+    await vi.advanceTimersByTimeAsync(0);
+    // the full batch started a regular flush: let it fail first, then hide the page with all four queued
+    answers.shift()!(new Response(null, { status: 503 }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(a.pending).toBe(4);
+    listeners.get("pagehide")!();
+    expect(answers).toHaveLength(2);
+    a.track("c1");
+    answers[0]!(new Response(null, { status: 503 })); // A fails first
+    await vi.advanceTimersByTimeAsync(0);
+    answers[1]!(new Response(null, { status: 503 })); // then B: it goes after A, not in front of it
+    await vi.advanceTimersByTimeAsync(0);
+    const { sent, fetch: ok } = fakeFetch();
+    (a as unknown as { o: { fetch: typeof globalThis.fetch } }).o.fetch = ok;
+    await a.flush();
+    expect(sent.flatMap((s) => s.body.events.map((e) => e.name))).toEqual(["a1", "a2", "b1", "b2", "c1"]);
+  });
+
+  test("without sendBeacon, a pagehide batch refused whole (400) comes back to be split; a refused singleton is dropped", async () => {
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    const fetch = vi.fn(async () => new Response(null, { status: 400 })) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    a.track("one");
+    a.track("two");
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(a.pending).toBe(2);
+    a.close();
+    const solo = make({ url: "https://app.test", fetch, storage: null, flushIntervalMs: 60_000 });
+    solo.track("alone");
+    listeners.get("pagehide")!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(solo.pending).toBe(0);
+  });
+
   test("non-finite options fall back to the defaults (NaN batchSize never posts empty batches)", async () => {
     const { sent, fetch } = fakeFetch();
     const a = make({ url: "https://app.test", fetch, storage: null, batchSize: Number.NaN, maxQueue: Number.NaN, flushIntervalMs: Number.NaN });
