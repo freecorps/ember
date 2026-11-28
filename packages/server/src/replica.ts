@@ -255,6 +255,7 @@ type ReplicaDb = {
   insert(t: string, d: Record<string, unknown>): string;
   replace(id: string, d: Record<string, unknown>): void;
   delete(id: string): void;
+  normalizeId(t: string, id: string): string | null;
   query(t: string): { withIndex(i: string, f: (q: { eq(f: string, x: unknown): unknown }) => unknown): { first(): { _id: string } | null } };
 };
 
@@ -307,12 +308,22 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
   };
   const insertAs = (ctx.db as Record<symbol, unknown>)[REPLICA_INSERT] as (table: string, id: string, creationTime: number, doc: Record<string, unknown>) => void;
   const find = (table: string, id: string | number) => db.query(table).withIndex(REPLICA_ID_INDEX, (q) => q.eq("id", id)).first();
+  /**
+   * A `.replicated()` row's `_id`, checked against the declared table: the applier's scope sees every table (component
+   * ones included), and `get`/`replace`/`delete` resolve the table from the id, so a row naming another table's id
+   * would reach that table. Refused instead (the whole batch rolls back).
+   */
+  const ownId = (table: string, id: string | number): string => {
+    const sid = String(id);
+    if (db.normalizeId(table, sid) === null) throw new EmberError("ValidationError", `replicaApply: ${sid} is not an id of ${table}`);
+    return sid;
+  };
   const upsert = (table: string, id: string | number, doc: Record<string, unknown> | undefined) => {
     const t = tableOf(table);
     if (t.replicated) {
       // Same `_id` and `_creationTime` as in the source: tenant rows may hold the id (`v.id(table)`).
       const { _id: _i, _creationTime, ...fields } = doc ?? {};
-      const sid = String(id);
+      const sid = ownId(table, id);
       if (db.get(sid)) db.replace(sid, fields);
       else insertAs(table, sid, typeof _creationTime === "number" ? _creationTime : (ctx.now as number), fields);
       return;
@@ -324,7 +335,8 @@ function applyArgs(ctx: Record<string | symbol, unknown>, args: ReplicaApplyArgs
   };
   const remove = (table: string, id: string | number) => {
     if (tableOf(table).replicated) {
-      if (db.get(String(id))) db.delete(String(id));
+      const sid = ownId(table, id);
+      if (db.get(sid)) db.delete(sid);
       return;
     }
     const cur = find(table, id);

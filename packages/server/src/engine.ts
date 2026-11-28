@@ -1825,9 +1825,11 @@ class EngineImpl implements Engine {
     args = withDefaults(fn.args, args ?? {});
     this.checkArgs(fnName, fn.args, args);
     checkShard(fnName, fn.shard, this.shardName(), args, st.auth);
-    const scope = this.scopeOf(fnName);
-    // The replication applier (replica.ts) alone may write replica tables; its triggers' ctx may not.
-    const c = this.mutationCtx(scope, st, isReplicaApplier(fn));
+    // The replication applier (replica.ts) alone may write replica tables; its triggers' ctx may not. It runs in a
+    // scope that also sees component tables, so a component's `.replicated()` table is copied like an app's.
+    const applier = isReplicaApplier(fn);
+    const scope = applier ? this.scopes.applier : this.scopeOf(fnName);
+    const c = this.mutationCtx(scope, st, applier);
     c.fail = failApi(fn);
     const value = fn.handler(c, args ?? {});
     if (isThenable(value)) {
@@ -1954,7 +1956,7 @@ class EngineImpl implements Engine {
   /** `ctx.db` of a mutation. Components never reach the app's tables, and only app tables have triggers. */
   private mutationDb(scope: Scope, st: MutationState, applier: boolean, filesExec: Tx["exec"]) {
     // (Replica tables too: their changes fire the app's triggers when the applier writes them.)
-    return this.writer(st.tx, st.now, st.random, st.changes, scope, filesExec, scope === this.scopes.root ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
+    return this.writer(st.tx, st.now, st.random, st.changes, scope, filesExec, scope === this.scopes.root || scope === this.scopes.applier ? this.triggerHooks(st) : undefined, applier, (op) => this.savepoint(st, op));
   }
 
   /** `ctx.storage` of a mutation (its `FileStore` on first use). */
