@@ -2,7 +2,7 @@
 // signatures a receiver verifies, the retry schedule on the harness clock, Retry-After, terminal refusals, the
 // breaker (open, held deliveries, half-open probe, release), the dead state and replays, rotation headers, R2
 // offload of large payloads, the response cap and the timeout.
-import { anyApi, componentsOf, composeApp, defineApp, defineSchema, defineTable, mutationGeneric, queryGeneric, v, type ApiFromModules } from "@freecorps/ember-server";
+import { anyApi, componentsOf, composeApp, defineApp, defineSchema, defineTable, mutationGeneric, queryGeneric, unsafeRef, v, type ApiFromModules } from "@freecorps/ember-server";
 import { emberTest, type EmberTest } from "@freecorps/ember-testing";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { verifyWebhook, webhooks, Webhooks, type WebhookDelivery, type WebhooksComponentApi, type WebhooksInstallConfig } from "../src/index.ts";
@@ -219,6 +219,141 @@ describe("webhooks component", () => {
     await flush(t);
     expect(seen).toHaveLength(before + 1);
     expect(await delivery(t, late!)).toMatchObject({ status: "delivered", attempt: 1 });
+  });
+
+  test("half-open: an attempt sent before the breaker opened that reports now does not settle it (only the probe does)", async () => {
+    const t = harness({ jitter: 0, breaker: { threshold: 1, cooldownMs: 60_000 }, retrySchedule: [1000] });
+    // Direct engine calls (their jobs are not queued: A and B never run by themselves, the test reports for them).
+    const eng = t.engine();
+    type Row = { _id: string; workId?: string; attempt: number };
+    const sent = (event: string, payload: unknown): Row => {
+      const r = eng.runMutation("@webhooks/lib:send", { event, payload }) as { changes: Array<{ table: string; after: Row | null }> };
+      return r.changes.filter((c) => c.table === "webhooks$deliveries").at(-1)!.after!;
+    };
+    /** The pool's report for attempt `d.attempt` of `d`, as if its POST answered `status` now. */
+    const settle = (d: Row, status: number) => eng.runMutation("@webhooks/lib:settle", { workId: d.workId!, context: { deliveryId: d._id, attempt: d.attempt }, result: { kind: "success", returnValue: { status, durationMs: 1 } } });
+    const breaker = async (id: string) => (await t.query(api.admin.endpoint, { id }))?.breaker;
+
+    const ids: Record<number, string> = {};
+    for (const late of [200, 500]) {
+      const { endpointId } = await t.mutation(api.admin.add, { url: `https://half${late}.test/hook`, events: [`e${late}`] });
+      ids[late] = endpointId;
+      // A and B go out while the breaker is closed; B's failure opens it; C, sent then, is held.
+      const a = sent(`e${late}`, { late });
+      const b = sent(`e${late}`, { b: true });
+      settle(b, 500);
+      expect(await breaker(endpointId)).toMatchObject({ state: "open", failures: 1 });
+      const [c] = (await t.mutation(api.billing.emit, { event: `e${late}`, payload: { c: true } })).deliveries;
+      expect(await delivery(t, c!)).toMatchObject({ heldAt: expect.any(Number) });
+      // The cooldown ends: half-open, C is the probe.
+      await t.mutation(unsafeRef<"mutation">("@webhooks/lib:probe"), { endpointId });
+      expect(await breaker(endpointId)).toMatchObject({ state: "halfOpen" });
+      // A reports now: recorded, but the breaker stays half-open with C as its probe.
+      settle(a, late);
+      expect(await delivery(t, a._id)).toMatchObject({ status: late === 200 ? "delivered" : "failed" });
+      expect(await breaker(endpointId)).toMatchObject({ state: "halfOpen" });
+      const probe = await delivery(t, c!);
+      expect(probe.status).toBe("pending");
+      expect(probe.heldAt).toBeUndefined();
+      expect(probe.history.map((h) => h.event)).toEqual(["held", "probe"]);
+    }
+    // The probes go (they succeed): only now does each breaker close.
+    await flush(t);
+    for (const late of [200, 500]) {
+      const ep = ((await t.query(api.admin.endpoint, { id: ids[late]! })) as { breaker: unknown }).breaker;
+      expect(ep).toEqual({ state: "closed", failures: 0 });
+    }
+  });
+
+  test("listing one status is in creation order (newest first), not by the last transition", async () => {
+    const t = harness({ jitter: 0, retrySchedule: [1000] });
+    await t.mutation(api.admin.add, { url: "https://order.test/hook" });
+    // A fails once, B (newer) is delivered, then A's retry is delivered after B.
+    reply("https://order.test/hook", 500, 200, 200);
+    const [a] = (await t.mutation(api.billing.emit, { event: "e", payload: { a: true } })).deliveries;
+    await flush(t);
+    await t.advance(1);
+    const [b] = (await t.mutation(api.billing.emit, { event: "e", payload: { b: true } })).deliveries;
+    await flush(t);
+    await t.advance(1000);
+    expect(await delivery(t, a!)).toMatchObject({ status: "delivered", attempt: 2 });
+    const page = (await t.query(api.admin.deliveries, { status: "delivered" })).page as WebhookDelivery[];
+    expect(page.map((d) => d._id)).toEqual([b, a]);
+  });
+
+  test("the https policy applies when an attempt starts: a stored http:// url after allowHttp is turned off is not sent", async () => {
+    const config: WebhooksInstallConfig = { allowHttp: true, retrySchedule: [1000] };
+    const t = harness(config);
+    const { endpointId } = await t.mutation(api.admin.add, { url: "http://local.test/hook" });
+    await t.mutation(api.billing.emit, { event: "e", payload: { n: 1 } });
+    await flush(t);
+    expect(seen).toHaveLength(1);
+    // A redeploy with allowHttp off: the stored url is refused at send time (dead, with why), the breaker untouched.
+    config.allowHttp = false;
+    const [id] = (await t.mutation(api.billing.emit, { event: "e", payload: { n: 2 } })).deliveries;
+    await flush(t);
+    expect(seen).toHaveLength(1);
+    expect(await delivery(t, id!)).toMatchObject({ status: "dead", lastError: expect.stringMatching(/https.*allowHttp is off/) });
+    expect((await t.query(api.admin.endpoint, { id: endpointId }))?.breaker).toEqual({ state: "closed", failures: 0 });
+    // Opting in again sends it (a replay).
+    config.allowHttp = true;
+    await t.mutation(api.admin.replay, { id: id! });
+    await flush(t);
+    expect(seen).toHaveLength(2);
+    expect(await delivery(t, id!)).toMatchObject({ status: "delivered" });
+  });
+
+  test("an attempt that waited on storage signs with the secrets current when it signs (graceMs: 0 revokes it)", async () => {
+    const t = harness({ jitter: 0, retrySchedule: [1000] });
+    const { endpointId, secret: old } = await t.mutation(api.admin.add, { url: "https://slow.test/hook" });
+    reply("https://slow.test/hook", 500, 200);
+    // Large: offloaded to R2 by the first attempt; the retry reads it back from storage.
+    const [id] = (await t.mutation(api.billing.emit, { event: "e", payload: { blob: "y".repeat(20_000) } })).deliveries;
+    await flush(t);
+    expect(await delivery(t, id!)).toMatchObject({ status: "failed" });
+    // While the retry reads the payload from storage, the secret is rotated with no grace period.
+    let fresh: string | undefined;
+    const text = Response.prototype.text;
+    const spy = vi.spyOn(Response.prototype, "text").mockImplementation(async function (this: Response) {
+      if (fresh === undefined) fresh = (t.engine().runMutation("@webhooks/lib:rotateSecret", { endpointId, graceMs: 0 }).value as { secret: string }).secret;
+      return text.call(this);
+    });
+    try {
+      await t.advance(1000);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fresh).toBeDefined();
+    const req = seen.at(-1)!;
+    expect(req.headers["webhook-signature"]!.split(" ")).toHaveLength(1);
+    expect(await verifyWebhook(fresh!, req.headers, req.body)).toEqual({ blob: "y".repeat(20_000) });
+    await expect(verifyWebhook(old, req.headers, req.body)).rejects.toThrow(/no matching signature/);
+  });
+
+  test("replayDead goes through every dead delivery in batches, even when replayed ones die again first", async () => {
+    const t = harness({ jitter: 0, retrySchedule: [], breaker: { threshold: 10_000 }, retentionMs: 0 });
+    const { endpointId } = await t.mutation(api.admin.add, { url: "https://many.test/hook" });
+    reply("https://many.test/hook", 410);
+    const n = 120;
+    for (let i = 0; i < n; i++) await t.mutation(api.billing.emit, { event: "e", payload: { i } });
+    await flush(t);
+    const dead = async () => (await t.engine().runQuery("@webhooks/dashboard:stats", {})).value as { dead: number };
+    expect((await dead()).dead).toBe(n);
+    const before = seen.length;
+    // 100 now; their attempts (refused again: dead again) run before the job with the rest.
+    expect(await t.mutation(api.admin.replayDead, { id: endpointId })).toBe(100);
+    const rest = t.scheduled().find((j) => String(j.fn).endsWith("lib:replayDeadRest"))!;
+    expect(rest).toBeDefined();
+    // The pool works through them (10 at a time) while the continuation waits.
+    for (let others = t.scheduled().filter((j) => j.id !== rest.id); others.length; others = t.scheduled().filter((j) => j.id !== rest.id)) {
+      for (const j of others) await t.runScheduled(j.id);
+    }
+    expect(seen.length - before).toBe(100);
+    await flush(t);
+    // Every dead delivery was replayed exactly once.
+    expect(seen.length - before).toBe(n);
+    const bodies = seen.slice(before).map((r) => (JSON.parse(r.body) as { i: number }).i);
+    expect(new Set(bodies).size).toBe(n);
   });
 
   test("retrySchedule: [] is no retry (a transient failure is dead after one attempt)", async () => {

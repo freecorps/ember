@@ -112,7 +112,10 @@ const schema = defineSchema({
     })
       .index("by_endpoint", ["endpointId", "createdAt"])
       .index("by_endpoint_status", ["endpointId", "status", "createdAt"])
+      // Retention (gc) and counts: by the time of the last transition.
       .index("by_status", ["status", "updatedAt"])
+      // Listing one status: in creation order, like an endpoint's list.
+      .index("by_status_created", ["status", "createdAt"])
       // Sparse: only held deliveries (a few, while a breaker is open) are in it.
       .index("by_held", ["endpointId", "heldAt"], { sparse: true }),
     /** One row while a GC job is scheduled in this shard. */
@@ -285,6 +288,18 @@ function checkUrl(url: string, allowHttp: boolean) {
   if (u.username || u.password) invalid("url must not carry credentials");
 }
 
+/** Why the install's current policy refuses an endpoint's stored url now (`allowHttp` turned off since), if it does. */
+function refusedUrl(url: string, allowHttp: boolean): string | undefined {
+  let protocol: string;
+  try {
+    protocol = new URL(url).protocol;
+  } catch {
+    return "url is not a URL";
+  }
+  if (protocol === "https:" || (allowHttp && protocol === "http:")) return undefined;
+  return `url must be https:// (got ${protocol}; allowHttp is off): not sent`;
+}
+
 function checkEvents(events: string[]) {
   if (!events.length) invalid("events must name at least one event (or \"*\")");
   for (const e of events) if (typeof e !== "string" || !e || e.length > 200) invalid(`event pattern ${JSON.stringify(e)}`);
@@ -417,6 +432,22 @@ function dropDelivery(ctx: Ctx, d: Delivery): void {
   else ctx.db.patch(m._id, { refs: m.refs - 1 });
 }
 
+/**
+ * Replays up to `BATCH` dead deliveries of `e` after `cursor` (oldest first); the rest in a `lib:replayDeadRest` job
+ * that continues after the last one replayed here (a replayed row that dies again before it runs is not taken again,
+ * and the newer ones are not skipped). Returns how many now.
+ */
+function replayDeadFrom(ctx: Ctx, e: Endpoint, cursor: string | null): number {
+  const s = settings(ctx);
+  const page = ctx.db
+    .query("deliveries")
+    .withIndex("by_endpoint_status", (q) => q.eq("endpointId", e._id).eq("status", "dead"))
+    .paginate({ numItems: BATCH, cursor }) as { page: Delivery[]; isDone: boolean; continueCursor: string };
+  for (const d of page.page) replayOne(ctx, d, s);
+  if (!page.isDone) ctx.scheduler.runAfter(0, "lib:replayDeadRest", { endpointId: e._id, cursor: page.continueCursor });
+  return page.page.length;
+}
+
 /** Re-sends `d` from attempt 1 of a new round (same message id: receivers dedupe on it). */
 function replayOne(ctx: Ctx, d: Delivery, s: Settings): void {
   if (d.retryJob) ctx.scheduler.cancel(d.retryJob);
@@ -434,6 +465,8 @@ export type AttemptReport =
   | { skipped: true }
   /** Not sent: the endpoint was disabled or its breaker open when the attempt started. */
   | { held: true }
+  /** Not sent: the stored url is no longer allowed (`http://` after `allowHttp` was turned off). */
+  | { refused: string }
   | { status?: number; error?: string; retryAfterMs?: number; durationMs: number; body?: string };
 
 const vReport = v.any();
@@ -634,14 +667,7 @@ export const functions = {
       errors: [webhookErrors.EndpointNotFound],
       handler: (ctx, a) => {
         const e = mustEndpoint(ctx, a.endpointId);
-        const s = settings(ctx);
-        const dead = ctx.db
-          .query("deliveries")
-          .withIndex("by_endpoint_status", (q) => q.eq("endpointId", e._id).eq("status", "dead"))
-          .take(BATCH + 1) as Delivery[];
-        for (const d of dead.slice(0, BATCH)) replayOne(ctx, d, s);
-        if (dead.length > BATCH) ctx.scheduler.runAfter(0, "lib:replayDeadRest", { endpointId: e._id });
-        return Math.min(dead.length, BATCH);
+        return replayDeadFrom(ctx, e, null);
       },
     }),
 
@@ -695,6 +721,9 @@ export const functions = {
         if (!e || !m) return null;
         if (!maySend(e, d)) return { hold: true as const };
         const s = settings(ctx);
+        // The https policy applies to every attempt, not only when the url was set.
+        const refused = refusedUrl(e.url, s.allowHttp);
+        if (refused) return { refused };
         return {
           url: e.url,
           secrets: signing(e, ctx.now),
@@ -714,10 +743,12 @@ export const functions = {
       args: { deliveryId: v.id("deliveries"), attempt: v.number() },
       handler: async (ctx, a): Promise<AttemptReport> => {
         type Prep = { url: string; secrets: string[]; msgId: string; messageId: string; body: string | null; file: string | null; size: number; offload: boolean; timeoutMs: number; maxResponseBytes: number };
-        const p = (await ctx.runQuery(unsafeRef<"query">("lib:prepare"), a)) as Prep | { hold: true } | null;
+        type Prepared = Prep | { hold: true } | { refused: string } | null;
+        const p = (await ctx.runQuery(unsafeRef<"query">("lib:prepare"), a)) as Prepared;
         if (!p) return { skipped: true };
         // No POST: settle holds it until the endpoint can take it (the probe or `release` sends it then).
         if ("hold" in p) return { held: true };
+        if ("refused" in p) return { refused: p.refused };
         let body = p.body;
         if (body === null && p.file) {
           const f = await ctx.storage.get(p.file);
@@ -734,11 +765,21 @@ export const functions = {
             console.error("webhooks: payload offload failed (kept in the shard)", e);
           }
         }
+        // Storage work awaited: the endpoint is read again, so a rotation (`graceMs: 0` revokes), a disable or a new
+        // url committed meanwhile applies to this attempt.
+        let { url, secrets } = p;
+        if (p.file || p.offload) {
+          const again = (await ctx.runQuery(unsafeRef<"query">("lib:prepare"), a)) as Prepared;
+          if (!again) return { skipped: true };
+          if ("hold" in again) return { held: true };
+          if ("refused" in again) return { refused: again.refused };
+          ({ url, secrets } = again);
+        }
         const timestamp = Math.floor(Date.now() / 1000);
-        const headers = { "content-type": "application/json", "user-agent": "Ember-Webhooks/1", ...(await webhookHeaders(p.secrets, p.msgId, timestamp, body)) };
+        const headers = { "content-type": "application/json", "user-agent": "Ember-Webhooks/1", ...(await webhookHeaders(secrets, p.msgId, timestamp, body)) };
         const started = Date.now();
         try {
-          const res = await fetch(p.url, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.timeout(p.timeoutMs) });
+          const res = await fetch(url, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.timeout(p.timeoutMs) });
           const text = await readCapped(res, p.maxResponseBytes).catch(() => "");
           const retryAfterMs = parseRetryAfter(res.headers.get("retry-after"), Date.now());
           return { status: res.status, durationMs: Date.now() - started, body: text, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) };
@@ -769,8 +810,19 @@ export const functions = {
         // The attempt did not go: it gets its number back (it used no retry) and waits, or goes now if the endpoint
         // can take it again by now (`release` ran before it was held, so it would not see it).
         if ("held" in report) return dispatch(ctx, { ...d, attempt: d.attempt - 1 }, e, s);
+        // Refused by the url policy: dead at once (a retry would be refused too), shown with why; the breaker is not
+        // the endpoint's answer, so it does not move.
+        if ("refused" in report) {
+          ctx.db.patch(d._id, { workId: undefined, updatedAt: ctx.now, status: "dead", lastError: report.refused, history: push(d.history, { at: ctx.now, attempt: d.attempt, event: "dead", error: report.refused }) });
+          ensureGc(ctx, s);
+          return;
+        }
         const outcome = report.error !== undefined ? classify(undefined) : classify(report.status, report.retryAfterMs);
         const wasProbe = e.probing === d._id;
+        // Half-open with its probe out: only the probe's outcome moves the breaker. An attempt sent before the breaker
+        // opened that reports now is recorded, but neither closes it (releasing the held ones under the probe) nor
+        // reopens it.
+        const probeOut = e.breaker.state === "halfOpen" && e.probing !== undefined && !wasProbe;
         const base = {
           workId: undefined,
           updatedAt: ctx.now,
@@ -783,7 +835,7 @@ export const functions = {
         if (outcome.kind === "delivered") {
           ctx.db.patch(d._id, { ...base, status: "delivered", deliveredAt: ctx.now, lastError: undefined, history: push(d.history, { ...entry, event: "delivered" }) });
           const reopened = e.breaker.state !== "closed" || e.breaker.failures > 0;
-          if (reopened) {
+          if (reopened && !probeOut) {
             if (e.probeJob) ctx.scheduler.cancel(e.probeJob);
             const next: Endpoint = { ...e, breaker: breakerOnSuccess(e.breaker), probeJob: undefined, probing: undefined };
             ctx.db.patch(e._id, { breaker: next.breaker, probeJob: undefined, probing: undefined });
@@ -795,7 +847,7 @@ export const functions = {
 
         const error = report.error ?? `HTTP ${report.status}`;
         // The breaker counts every failed attempt (a refusal too: the endpoint is not taking deliveries).
-        const breaker = breakerOnFailure(e.breaker, ctx.now, s.threshold, s.cooldownMs);
+        const breaker = probeOut ? { ...e.breaker, failures: e.breaker.failures + 1 } : breakerOnFailure(e.breaker, ctx.now, s.threshold, s.cooldownMs);
         const opened = breaker.state === "open" && e.breaker.state !== "open";
         ctx.db.patch(e._id, { breaker, ...(opened ? { probeJob: scheduleProbe(ctx, e, breaker) } : {}), ...(wasProbe ? { probing: undefined } : {}) });
 
@@ -845,9 +897,13 @@ export const functions = {
         if (e) release(ctx, e, settings(ctx));
       },
     }),
+    /** The next batch of a `replayDead`, after the last row the previous one replayed. */
     replayDeadRest: internalMutation({
-      args: { endpointId: v.id("endpoints") },
-      handler: (ctx, a) => void ctx.runMutation(unsafeRef<"mutation">("lib:replayDead"), { endpointId: a.endpointId }),
+      args: { endpointId: v.id("endpoints"), cursor: v.string() },
+      handler: (ctx, a) => {
+        const e = ctx.db.get(a.endpointId) as Endpoint | null;
+        if (e) replayDeadFrom(ctx, e, a.cursor);
+      },
     }),
     /** Deletes the deliveries of a deleted endpoint, `BATCH` per job. */
     purge: internalMutation({
@@ -914,7 +970,7 @@ function deliveriesPage(ctx: ReadCtx, status: DeliveryStatus | undefined, endpoi
   if (status !== undefined) {
     return ctx.db
       .query("deliveries")
-      .withIndex("by_status", (q) => q.eq("status", status))
+      .withIndex("by_status_created", (q) => q.eq("status", status))
       .order("desc")
       .paginate(opts) as { page: Delivery[]; isDone: boolean; continueCursor: string };
   }

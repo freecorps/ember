@@ -52,7 +52,8 @@ const event = await verifyWebhook(secret, request.headers, await request.text())
 Headers: `webhook-id` (the same on every attempt and replay, so dedupe on it), `webhook-timestamp` (seconds) and
 `webhook-signature: v1,<base64 HMAC-SHA256(id.timestamp.body)>`. After `rotateSecret`, the new secret signs, and the
 previous one also signs for the grace period (24 h by default). Older secrets still in their grace period keep
-signing until their own expiry (at most 5 sign at once; `graceMs: 0` revokes every old one). Both signatures go space-separated in
+signing until their own expiry (at most 5 sign at once; `graceMs: 0` revokes every old one, also for an attempt that was reading a large payload from R2:
+it reads the secrets again before it signs). Both signatures go space-separated in
 `webhook-signature`, as the Standard Webhooks spec defines, so a receiver holding either secret verifies.
 
 ## Delivery
@@ -60,16 +61,19 @@ signing until their own expiry (at most 5 sign at once; `graceMs: 0` revokes eve
 | Answer | What happens |
 | --- | --- |
 | 2xx | `delivered` |
-| network error, timeout (10 s), 408, 429, 5xx | `failed`, then the next retry: 5 s, 30 s, 2 min, 10 min, 1 h, 6 h, 24 h (±20%). A `Retry-After` replaces the delay. After the last one: `dead` (`retrySchedule: []`: no retry) |
+| network error, timeout (10 s), 408, 429, 5xx | `failed`, then the next retry: 5 s, 30 s, 2 min, 10 min, 1 h, 6 h, 24 h (±20%). A `Retry-After` (seconds or an HTTP date) replaces the delay. After the last one: `dead` (`retrySchedule: []`: no retry) |
 | any other status (3xx are not followed) | `dead` at once |
 
 - **Circuit breaker:** 10 consecutive failed attempts open an endpoint's breaker. While it is open, new deliveries
   and due retries wait as `pending` (held) and are not attempted. After the cooldown (1 min by default) one held
   delivery goes as a half-open probe. If it succeeds, the breaker closes and every held delivery goes. If it fails,
-  the breaker opens again. Attempts already queued check the breaker (and the enabled bit) when they start, so a
-  backlog does not reach the endpoint while the breaker is open.
+  the breaker opens again. Only the probe settles a half-open breaker: an older attempt that reports meanwhile is
+  recorded but neither closes nor reopens it. Attempts already queued check the breaker (and the enabled bit) when
+  they start, so a backlog does not reach the endpoint while the breaker is open.
+- **https at send time:** every attempt checks the url against the current `allowHttp`. An `http://` endpoint stored
+  while `allowHttp` was on is not sent once it is off: the delivery is `dead` with the reason in `lastError`.
 - **Replays:** `replay(deliveryId)` re-sends a dead, failed or delivered delivery. `replayDead(endpointId)` re-sends
-  every dead delivery of an endpoint. A replay keeps the same `webhook-id` and starts a new round of retries.
+  every dead delivery of an endpoint, oldest first, in batches of 100 that resume after the last one replayed. A replay keeps the same `webhook-id` and starts a new round of retries.
 - **Disabling an endpoint** makes `send` skip it and holds its retries. Enabling it closes the breaker and releases
   them.
 - **Limits:** payloads up to 1 MiB, stored once per send. Payloads over 8 KB move to R2 (`ctx.storage`) on their first
