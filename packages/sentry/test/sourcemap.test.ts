@@ -144,6 +144,18 @@ describe("Lru", () => {
     expect(idx.weight).toBeGreaterThanOrEqual(100_001 * 20);
   });
 
+  it("entries of sources/sourcesContent that are not strings count as absent: the weight stays a number, the LRU evicts", () => {
+    const bad = parseSourceMap({ version: 3, sources: ["a.js", 7], sourcesContent: [1, null], names: [], mappings: "AAAA" });
+    expect(Number.isFinite(bad.weight)).toBe(true);
+    expect(bad.lookup(1, 0)).toMatchObject({ source: "a.js", sourceLines: null });
+    expect(Number.isFinite(parseSourceMap({ version: 3, sources: ["a.js"], sourcesContent: {}, mappings: "AAAA" }).weight)).toBe(true);
+    const lru = new Lru<{ weight: number }>(10, 1000);
+    lru.set("bad", bad);
+    lru.set("big", { weight: 900 });
+    expect(Number.isFinite(lru.weight)).toBe(true);
+    expect(lru.size).toBe(1);
+  });
+
   it("cachedMap parses a map once per hash", async () => {
     const lru = new Lru<ReturnType<typeof parseSourceMap>>(4, 1 << 20);
     let fetches = 0;

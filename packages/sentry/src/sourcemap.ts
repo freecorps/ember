@@ -117,9 +117,10 @@ export function parseSourceMap(input: string | object): SourceMap {
   if (Array.isArray(raw.sections)) return indexMap(raw);
   if (typeof raw.mappings !== "string") throw new Error("source map: no mappings");
   const root = raw.sourceRoot ? raw.sourceRoot.replace(/\/?$/, "/") : "";
-  const sources = (raw.sources ?? []).map((s) => (s === null ? "" : root && !/^[a-z][a-z0-9+.-]*:|^\//i.test(s) ? root + s : s));
+  // Entries that are not strings (a malformed map) count as absent: no lookup returns them, the weight stays a number.
+  const sources = (raw.sources ?? []).map((s) => (typeof s !== "string" ? "" : root && !/^[a-z][a-z0-9+.-]*:|^\//i.test(s) ? root + s : s));
   const names = raw.names ?? [];
-  const contents = raw.sourcesContent ?? [];
+  const contents = Array.isArray(raw.sourcesContent) ? raw.sourcesContent : [];
   const split = new Map<number, string[]>();
   const lines = decodeMappings(raw.mappings);
   return {
@@ -153,7 +154,7 @@ const ARRAY_OVERHEAD = 64;
 function weightOf(lines: readonly LineSegments[], contents: ReadonlyArray<string | null>, sources: readonly string[], names: readonly string[]): number {
   let n = 0;
   for (const l of lines) n += l.byteLength + ARRAY_OVERHEAD;
-  for (const c of contents) if (c) n += c.length * 4 + ARRAY_OVERHEAD;
+  for (const c of contents) if (typeof c === "string") n += c.length * 4 + ARRAY_OVERHEAD;
   for (const x of sources) n += x.length * 2 + ARRAY_OVERHEAD;
   for (const x of names) n += (typeof x === "string" ? x.length * 2 : 0) + ARRAY_OVERHEAD;
   return n;
