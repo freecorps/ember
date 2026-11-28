@@ -67,8 +67,10 @@ describe("grouping and the batched write", () => {
   it("a custom fingerprint groups as asked; projects never share issues", async () => {
     const { consume, issues } = harness({ projects: [{ id: "web", keys: ["pubkey0123456789"], alerts: false }, { id: "api", keys: ["pubkey0123456789"], alerts: false }] });
     await consume([{ ...errorEvent(), fingerprint: ["checkout"] }, { ...errorEvent({ type: "X" }), fingerprint: ["checkout"] }]);
-    await consume([errorEvent()], "api");
-    expect((await issues()).map((i) => i.count).sort()).toEqual([1, 2]);
+    // The same fingerprint in another project: its own issue.
+    await consume([{ ...errorEvent({ type: "Y" }), fingerprint: ["checkout"] }], "api");
+    const rows = (await issues()) as Array<{ project?: string; count: number }>;
+    expect(rows.map((i) => [i.project, i.count]).sort()).toEqual([["api", 1], ["web", 2]]);
   });
 
   it("the batch goes to R2 as one object; each event reads back by range; Analytics Engine gets a point per event", async () => {
