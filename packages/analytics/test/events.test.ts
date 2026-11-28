@@ -141,6 +141,10 @@ describe("data points", () => {
     expect(() => checkLayout({ dimensions: Array.from({ length: 14 }, (_, i) => `d${i}`) })).toThrow(/13/);
     expect(() => checkLayout({ measures: Array.from({ length: 20 }, (_, i) => `m${i}`) })).toThrow(/19/);
     expect(() => checkLayout({ dimensions: ["a"], measures: ["a"] })).toThrow(/twice/);
+    // An empty slot (or a non-string) is refused; the literal name "undefined" is a valid prop.
+    expect(() => checkLayout({ dimensions: new Array<string>(1) })).toThrow(/invalid prop/);
+    expect(() => checkLayout({ measures: [3 as unknown as string] })).toThrow(/invalid prop/);
+    expect(() => checkLayout({ dimensions: ["undefined"] })).not.toThrow();
     expect(() => checkLayout({ dimensions: ["bad-name"] })).toThrow(/invalid prop/);
     expect(() => checkLayout({ dimensions: ["a", "b"], measures: ["c"] })).not.toThrow();
   });

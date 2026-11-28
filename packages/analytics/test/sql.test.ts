@@ -8,8 +8,9 @@ import {
   clearSqlCache,
   countsSql,
   funnelSql,
+  deploymentOf,
   lit,
-  NEVER,
+  NEVER_MS,
   overviewSql,
   parseFunnel,
   parseRetention,
@@ -92,9 +93,9 @@ describe("SQL inputs are checked, never interpolated raw", () => {
       expect(() => countsSql(scope, { bucket: bad as never })).toThrow(/minute, hour or day/);
       expect(() => retentionSql(scope, { period: bad as never })).toThrow(/day or week/);
       expect(() => retentionStart({ period: bad as never })).toThrow(/day or week/);
-      expect(() => parseRetention({ data: [{ cohort: 0, users: 1 }] }, { period: bad as never })).toThrow(/day or week/);
+      expect(() => parseRetention({ data: [{ cohort: 0, users: 1 }] }, { period: bad as never, now: 0 })).toThrow(/day or week/);
     }
-    expect(() => parseRetention({ data: [] }, { period: "month" as never })).toThrow(SqlInputError);
+    expect(() => parseRetention({ data: [] }, { period: "month" as never, now: 0 })).toThrow(SqlInputError);
   });
 
   test("valid names end up only inside literals, and the literal escaping holds on its own", () => {
@@ -114,6 +115,25 @@ describe("SQL inputs are checked, never interpolated raw", () => {
     expect(() => funnelSql(scope, { steps: ["a"] })).toThrow(/2 to 8/);
     expect(() => funnelSql(scope, { steps: Array.from({ length: 9 }, (_, i) => `s${i}`) })).toThrow(/2 to 8/);
     expect(() => funnelSql(scope, { steps: ["a", "b", "a"] })).toThrow(/twice/);
+    // A hole is refused (map would skip it, leaving an IN list with a gap and a step without its expression).
+    const holey = new Array<string>(2);
+    holey[0] = "view";
+    expect(() => funnelSql(scope, { steps: holey })).toThrow(/steps\[1\]/);
+    expect(() => countsSql(scope, { names: holey })).toThrow(/names\[1\]/);
+  });
+
+  test("deployments: staging and production sharing the account's default dataset read only their own rows", () => {
+    const prod = deploymentOf({ EMBER_PROJECT: "shop", EMBER_ENV: "production" });
+    const staging = deploymentOf({ EMBER_PROJECT: "shop", EMBER_ENV: "staging" });
+    expect([prod, staging]).toEqual(["shop/production", "shop/staging"]);
+    expect(deploymentOf({})).toBe("");
+    expect(deploymentOf({ EMBER_PROJECT: "a'b c", EMBER_ENV: "x" })).toBe("a_b_c/x");
+    for (const sql of [countsSql({ ...scope, deployment: prod }), overviewSql({ ...scope, deployment: prod }), funnelSql({ ...scope, deployment: prod }, { steps: ["a", "b"] }), retentionSql({ ...scope, deployment: prod })]) {
+      expect(sql).toContain("blob6 = 'shop/production:analytics'");
+      expect(sql).not.toContain("staging");
+    }
+    expect(countsSql({ ...scope, deployment: staging })).toContain("blob6 = 'shop/staging:analytics'");
+    expect(() => countsSql({ ...scope, deployment: "x' OR 1=1" })).toThrow(/deployment/);
   });
 });
 
@@ -124,8 +144,12 @@ describe("statement shapes", () => {
       expect(sql).toContain(ET);
       expect(sql).not.toMatch(/toUnixTimestamp\(timestamp\) -|toStartOfInterval\(timestamp|if\(blob1 = [^,]+, toUnixTimestamp\(timestamp\)/);
     }
-    // The arrival range is wider than the event range by the 1 h an event may be ahead of its arrival.
-    expect(overviewSql(scope)).toContain("timestamp >= toStartOfDay(NOW()) - INTERVAL '1' HOUR AND " + ET + " >= toUnixTimestamp(toStartOfDay(NOW()))");
+    // The day's bounds are in the text (a cached answer of yesterday never serves today): the arrival range starts the
+    // 1 h an event may be ahead of its arrival earlier, and an event of tomorrow is not counted today.
+    const day = Date.UTC(2026, 10, 26) / 1000;
+    expect(overviewSql(scope, { now: Date.UTC(2026, 10, 26, 23, 30) })).toContain(`toUnixTimestamp(timestamp) >= ${day - 3600} AND ${ET} >= ${day} AND ${ET} < ${day + 86400}`);
+    expect(overviewSql(scope, { now: Date.UTC(2026, 10, 27, 0, 0, 10) })).toContain(`${ET} >= ${day + 86400} AND`);
+    expect(overviewSql(scope)).not.toContain("NOW()");
   });
 
   test("users: a signed-in subject and an anonymous id with the same text are two users", () => {
@@ -158,14 +182,16 @@ describe("statement shapes", () => {
     expect(sql).toBe(
       [
         "SELECT",
-        `  countIf(t0 < ${NEVER}) AS step0,`,
-        `  countIf(t0 < ${NEVER} AND t1 >= t0 AND t1 - t0 <= 3600) AS step1,`,
-        `  countIf(t0 < ${NEVER} AND t1 >= t0 AND t2 >= t1 AND t2 - t0 <= 3600) AS step2`,
+        `  countIf(t0 < ${NEVER_MS}) AS step0,`,
+        `  countIf(t0 < ${NEVER_MS} AND t1 >= t0 AND t1 - t0 <= 3600000) AS step1,`,
+        `  countIf(t0 < ${NEVER_MS} AND t1 >= t0 AND t2 >= t1 AND t2 - t0 <= 3600000) AS step2`,
         "FROM (",
         "  SELECT if(blob2 != '', format('u:{}', blob2), format('a:{}', blob3)) AS uid,",
-        `    min(if(blob1 = 'view', ${ET}, ${NEVER})) AS t0,`,
-        `    min(if(blob1 = 'cart', ${ET}, ${NEVER})) AS t1,`,
-        `    min(if(blob1 = 'paid', ${ET}, ${NEVER})) AS t2`,
+        // Milliseconds (double1): a purchase at .100 and a view at .200 of the same second are not view → purchase, and
+        // a step 1 ms past the window is out.
+        `    min(if(blob1 = 'view', double1, ${NEVER_MS})) AS t0,`,
+        `    min(if(blob1 = 'cart', double1, ${NEVER_MS})) AS t1,`,
+        `    min(if(blob1 = 'paid', double1, ${NEVER_MS})) AS t2`,
         "  FROM ember_analytics",
         `  WHERE blob6 = 'analytics' AND timestamp > NOW() - INTERVAL '337' HOUR AND ${ET} > toUnixTimestamp(NOW()) - 1209600 AND index1 IN ('view', 'cart', 'paid') AND (blob2 != '' OR blob3 != '')`,
         "  GROUP BY uid",
@@ -260,6 +286,22 @@ describe("the SQL API and results", () => {
   test("API errors carry the status; a non-JSON answer is an error", async () => {
     await expect(runSql(recorded("unauthorized", 401).api, "SELECT 1")).rejects.toMatchObject({ name: "SqlApiError", status: 401 });
     await expect(runSql(recorded("<html>", 200).api, "SELECT 1")).rejects.toBeInstanceOf(SqlApiError);
+  });
+
+  test("a failed request or body read, and an answer without data rows, are SqlApiError 502 (never cached)", async () => {
+    const base = { accountId: "acc", token: "tok" };
+    const offline = (async () => Promise.reject(new TypeError("network down"))) as unknown as typeof fetch;
+    await expect(runSql({ ...base, fetch: offline }, "SELECT 1")).rejects.toMatchObject({ name: "SqlApiError", status: 502 });
+    const brokenBody = (async () => ({ ok: true, status: 200, text: async () => Promise.reject(new Error("reset")) })) as unknown as typeof fetch;
+    await expect(runSql({ ...base, fetch: brokenBody }, "SELECT 1")).rejects.toMatchObject({ name: "SqlApiError", status: 502 });
+    for (const bad of [{}, { data: {} }, { data: [1] }, { data: [[]] }, null]) {
+      await expect(runSql(recorded(bad).api, "SELECT 1")).rejects.toMatchObject({ name: "SqlApiError", status: 502 });
+    }
+    await expect(runSql(recorded({ data: [] }).api, "SELECT 1")).resolves.toEqual({ data: [] });
+    const { calls, api } = recorded({});
+    const cache: CacheLike = { match: async () => undefined, put: async () => undefined };
+    for (let i = 0; i < 2; i++) await expect(cachedSql(api, "SELECT 9", { ttlSeconds: 60, now: 1, cache })).rejects.toBeInstanceOf(SqlApiError);
+    expect(calls).toHaveLength(2);
   });
 
   test("cachedSql: the same statement within the TTL is one API call (memory, then the Cache API)", async () => {

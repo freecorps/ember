@@ -255,7 +255,7 @@ export function checkLayout(l: PointLayout): void {
   if (meas.length > MAX_MEASURES) throw new Error(`analytics: at most ${MAX_MEASURES} measures (double2..double20)`);
   const seen = new Set<string>();
   for (const k of [...dims, ...meas]) {
-    if (!PROP_KEY.test(k)) throw new Error(`analytics: invalid prop name ${JSON.stringify(k)} in dimensions/measures`);
+    if (typeof k !== "string" || !PROP_KEY.test(k)) throw new Error(`analytics: invalid prop name ${JSON.stringify(k)} in dimensions/measures`);
     if (seen.has(k)) throw new Error(`analytics: prop ${k} is declared twice in dimensions/measures`);
     seen.add(k);
   }

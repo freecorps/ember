@@ -39,15 +39,43 @@ export function eventName(x: unknown, what = "event"): string {
   return x;
 }
 
+/** A deployment (`<project>/<env>`, from `EMBER_PROJECT`/`EMBER_ENV`), as `deploymentOf` writes it. */
+export const DEPLOYMENT = /^[A-Za-z0-9_.-]{1,64}\/[A-Za-z0-9_.-]{1,64}$/;
+
 export interface Scope {
   dataset: string;
   install: string;
+  /**
+   * The deployment the rows belong to (`deploymentOf(env)`): Analytics Engine datasets are per account, so staging
+   * and production with the default dataset share one; "" or absent (no EMBER_PROJECT/EMBER_ENV: tests) matches rows
+   * written without one.
+   */
+  deployment?: string;
+}
+
+const SAFE = /[^A-Za-z0-9_.-]/g;
+/**
+ * `<project>/<env>` from the Worker's `EMBER_PROJECT`/`EMBER_ENV` (every `ember deploy` and `ember dev` set both), or ""
+ * without them. Characters outside `[A-Za-z0-9_.-]` become `_`: the same text on the write and the read side.
+ */
+export function deploymentOf(env: Record<string, unknown>): string {
+  const p = env.EMBER_PROJECT;
+  const e = env.EMBER_ENV;
+  if (typeof p !== "string" || !p || typeof e !== "string" || !e) return "";
+  return `${p.replace(SAFE, "_").slice(0, 64)}/${e.replace(SAFE, "_").slice(0, 64)}`;
+}
+
+/** What blob6 holds: `<project>/<env>:<install>`, or the install alone without a deployment. */
+export function installKey(install: string, deployment = ""): string {
+  return deployment ? `${deployment}:${install}` : install;
 }
 
 function from(s: Scope): { table: string; where: string[] } {
   if (typeof s.dataset !== "string" || !DATASET.test(s.dataset)) throw new SqlInputError(`invalid dataset name ${JSON.stringify(s.dataset)}`);
   if (typeof s.install !== "string" || !INSTALL.test(s.install)) throw new SqlInputError(`invalid install name ${JSON.stringify(s.install)}`);
-  return { table: s.dataset, where: [`blob6 = ${lit(s.install)}`] };
+  const dep = s.deployment ?? "";
+  if (typeof dep !== "string" || (dep !== "" && !DEPLOYMENT.test(dep))) throw new SqlInputError(`invalid deployment ${JSON.stringify(dep)}`);
+  return { table: s.dataset, where: [`blob6 = ${lit(installKey(s.install, dep))}`] };
 }
 
 /**
@@ -81,13 +109,16 @@ function lastSeconds(where: string[], seconds: number): void {
 }
 /** Sentinel time past any event (2100-01-01): "the user never did this step". */
 export const NEVER = 4102444800;
+/** `NEVER` in milliseconds (the funnel compares `double1`). */
+export const NEVER_MS = NEVER * 1000;
 
 const names = (xs: readonly string[]) => xs.map((n) => lit(n)).join(", ");
 
 function uniqueNames(xs: unknown, what: string, min: number, max: number): string[] {
   if (!Array.isArray(xs)) throw new SqlInputError(`${what} must be a list of event names`);
   if (xs.length < min || xs.length > max) throw new SqlInputError(`${what}: ${min} to ${max} events`);
-  const out = xs.map((x, i) => eventName(x, `${what}[${i}]`));
+  // Every index (`map` skips holes, which would then leave a gap in the IN list or a step without its expression).
+  const out = Array.from(xs as unknown[], (x, i) => eventName(x, `${what}[${i}]`));
   if (new Set(out).size !== out.length) throw new SqlInputError(`${what}: an event appears twice`);
   return out;
 }
@@ -142,10 +173,15 @@ export function topEventsSql(s: Scope, o: { sinceHours?: number; limit?: number 
   ].join("\n");
 }
 
-/** Events and distinct users since the start of today (UTC): `events`, `users`. */
-export function overviewSql(s: Scope): string {
+/**
+ * Events and distinct users of one UTC day (default today, by `now` in ms): `events`, `users`. The day's bounds are in
+ * the text, not `NOW()`, so a cached answer is never one of the day before, and an event of tomorrow (ahead by at most
+ * `MAX_FUTURE_MS`) is not counted today.
+ */
+export function overviewSql(s: Scope, o: { now?: number } = {}): string {
   const { table, where } = from(s);
-  where.push(`timestamp >= toStartOfDay(NOW()) - INTERVAL '${AHEAD_HOURS}' HOUR`, `${ET} >= toUnixTimestamp(toStartOfDay(NOW()))`);
+  const day = Math.floor(Math.floor((o.now ?? Date.now()) / 1000) / 86400) * 86400;
+  where.push(`toUnixTimestamp(timestamp) >= ${day - AHEAD_HOURS * 3600}`, `${ET} >= ${day}`, `${ET} < ${day + 86400}`);
   return [`SELECT SUM(_sample_interval) AS events, ${USERS} AS users`, `FROM ${table}`, `WHERE ${where.join(" AND ")}`].join("\n");
 }
 
@@ -175,12 +211,14 @@ export function funnelSql(s: Scope, o: FunnelOptions): string {
   const days = int(o.sinceDays ?? 7, 1, 90, "sinceDays");
   lastSeconds(where, days * 86400);
   where.push(`index1 IN (${names(steps)})`, HAS_UID);
-  const inner = steps.map((n, i) => `    min(if(blob1 = ${lit(n)}, ${ET}, ${NEVER})) AS t${i}`);
+  // Step times in milliseconds (`double1`), not ET's whole seconds: two steps in the same second keep their order, and
+  // the window edge is exact.
+  const inner = steps.map((n, i) => `    min(if(blob1 = ${lit(n)}, double1, ${NEVER_MS})) AS t${i}`);
   const outer = steps.map((_, k) => {
-    if (k === 0) return `  countIf(t0 < ${NEVER}) AS step0`;
-    const conds = [`t0 < ${NEVER}`];
+    if (k === 0) return `  countIf(t0 < ${NEVER_MS}) AS step0`;
+    const conds = [`t0 < ${NEVER_MS}`];
     for (let j = 1; j <= k; j++) conds.push(`t${j} >= t${j - 1}`);
-    conds.push(`t${k} - t0 <= ${win}`);
+    conds.push(`t${k} - t0 <= ${win * 1000}`);
     return `  countIf(${conds.join(" AND ")}) AS step${k}`;
   });
   return [
@@ -322,7 +360,11 @@ export interface RetentionResult {
   cohorts: RetentionCohort[];
 }
 
-export function parseRetention(body: SqlResponse, o: RetentionOptions = {}): RetentionResult {
+/**
+ * Reads a retention answer. Pass the same options, `now` included, given to `retentionSql`: the cohort labels come from
+ * that origin, so `now` is required here (two clock reads could fall on either side of a period boundary).
+ */
+export function parseRetention(body: SqlResponse, o: RetentionOptions & { now: number }): RetentionResult {
   const period = o.period ?? "week";
   checkPeriod(period);
   const n = int(o.periods ?? 8, 2, MAX_PERIODS, "periods");
@@ -393,14 +435,28 @@ export async function runSql(api: SqlApi, sql: string): Promise<SqlResponse> {
   const url = `${base.replace(/\/$/, "")}/accounts/${encodeURIComponent(api.accountId)}/analytics_engine/sql`;
   // `redirect: "manual"`: the bearer token never follows a redirect to another origin (older compatibility dates
   // forward `Authorization`); a 3xx is a non-2xx, so an error.
-  const res = await f(url, { method: "POST", redirect: "manual", headers: { authorization: `Bearer ${api.token}`, "content-type": "text/plain" }, body: sql });
-  const text = await res.text();
-  if (!res.ok) throw new SqlApiError(`Analytics Engine SQL API: ${res.status} ${text.slice(0, 300)}`, res.status);
+  // A request or body read that fails (network, reset) is a 502 like any other upstream failure: never cached.
+  let res: Response;
+  let text: string;
   try {
-    return JSON.parse(text) as SqlResponse;
+    res = await f(url, { method: "POST", redirect: "manual", headers: { authorization: `Bearer ${api.token}`, "content-type": "text/plain" }, body: sql });
+    text = await res.text();
+  } catch (e) {
+    throw new SqlApiError(`Analytics Engine SQL API: request failed (${e instanceof Error ? e.message : String(e)})`.slice(0, 300), 502);
+  }
+  if (!res.ok) throw new SqlApiError(`Analytics Engine SQL API: ${res.status} ${text.slice(0, 300)}`, res.status);
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
   } catch {
     throw new SqlApiError(`Analytics Engine SQL API: the answer is not JSON (${text.slice(0, 100)})`, 502);
   }
+  // The reports read `data`: an answer without a list of row objects is a failure, not an empty result to cache.
+  const data = (body as { data?: unknown } | null)?.data;
+  if (!Array.isArray(data) || !data.every((r) => typeof r === "object" && r !== null && !Array.isArray(r))) {
+    throw new SqlApiError(`Analytics Engine SQL API: the answer has no data rows (${text.slice(0, 100)})`, 502);
+  }
+  return body as SqlResponse;
 }
 
 // ------------------------------------------------------------------------------------------------ cache

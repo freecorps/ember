@@ -64,7 +64,9 @@ export const report = action({
   (`cf-connecting-ip`), or per signed-in user with `key: "user"` (anonymous callers still by IP). The key is never
   something the client picks (an anonymous id, an `x-forwarded-for`); over it, 429. With `limit` and `period` the component asks `ember deploy`
   for the binding; without them it uses one declared elsewhere (for example the rateLimit component's `bindings`).
-  Without `rateLimit`, only the size caps apply.
+  A binding that is not there yet (not deployed) is skipped with a warning: only the size caps apply. A binding that
+  is there but fails is **not** skipped: the route answers 503 (`retry-after: 10`) and writes nothing, and the client
+  keeps the batch for later. Without `rateLimit`, only the size caps apply.
 - Server side: `analytics.track(ctx, name, props)` / `trackMany` from actions. Mutations cannot do I/O: schedule an
   action from them.
 
@@ -73,14 +75,17 @@ export const report = action({
 | column | value |
 |---|---|
 | `index1` | event name |
-| `blob1` .. `blob6` | name, userId, anonymousId, source (`client`/`server`), country, install |
+| `blob1` .. `blob6` | name, userId, anonymousId, source (`client`/`server`), country, install key (`<EMBER_PROJECT>/<EMBER_ENV>:<install>`) |
 | `blob7` | JSON of the props no dimension or measure took (up to 2 KiB, whole props only) |
 | `blob8` .. `blob20` | the declared `dimensions`, in order |
 | `double1` | the event's time (ms) |
 | `double2` .. `double20` | the declared `measures`, in order |
 
 The dataset is `ember_analytics` and the binding `EMBER_ANALYTICS` by default (`dataset`, `binding` in the config);
-`ember deploy` creates the binding, `ember dev` simulates it.
+`ember deploy` creates the binding, `ember dev` simulates it. Datasets belong to the Cloudflare account, so staging and
+production on the default dataset write to the same one: the install key in `blob6` carries the deployment
+(`EMBER_PROJECT`/`EMBER_ENV`, set by every deploy) and every query filters on it, so each deployment's reports only
+see its own rows. Without the binding, the Analytics Engine write is skipped (warned once); an `archive` still runs.
 
 ## Queries
 
@@ -88,7 +93,9 @@ The dataset is `ember_analytics` and the binding `EMBER_ANALYTICS` by default (`
 SQL API with `EMBER_ANALYTICS_ACCOUNT_ID` (or the files bucket's `EMBER_R2_ACCOUNT_ID`) and the secret
 `EMBER_ANALYTICS_API_TOKEN` ("Account Analytics: Read"), read on the server only (`ember env set`). Results are cached
 for 60 s (`sql.cacheSeconds`) in the isolate and in the data center's Cache API. Without the env:
-`AnalyticsNotConfigured`; an API error: `AnalyticsQueryFailed`.
+`AnalyticsNotConfigured`; an API error (a non-2xx, a request that fails, an answer without a `data` list of rows):
+`AnalyticsQueryFailed`, never cached. Composing the exported helpers yourself: give `retentionSql` and
+`parseRetention` the same `now` (required by the parser), so the cohort labels match the statement.
 
 The SQL API has no bind parameters, so names are checked against a closed alphabet (no quote, no backslash) and then
 written as escaped literals; numbers are clamped integers. Analytics Engine SQL has no JOIN: a funnel counts, per user,

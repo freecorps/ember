@@ -167,6 +167,26 @@ describe("HTTP ingest (handleTrack)", () => {
     expect((await handleTrack(ctxOf({ rateLimit: { binding: "RL_MISSING" } }, { EMBER_ANALYTICS: ds }), post(body))).status).toBe(204);
     warn.mockRestore();
   });
+
+  test("rate limit: a deployed limiter that fails is not skipped (503 + Retry-After, nothing written)", async () => {
+    const ds = fakeDataset();
+    const broken = { limit: async () => Promise.reject(new Error("limiter down")) };
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = await handleTrack(ctxOf({ rateLimit: { binding: "RL_ANALYTICS" } }, { EMBER_ANALYTICS: ds, RL_ANALYTICS: broken }), post(JSON.stringify({ events: [{ name: "view" }] })));
+    err.mockRestore();
+    expect(res.status).toBe(503);
+    expect(res.headers.get("retry-after")).toBe("10");
+    expect(await res.json()).toMatchObject({ ok: false, error: { code: "rate_limit_unavailable" } });
+    expect(ds.points).toHaveLength(0);
+  });
+
+  test("deployments: blob6 carries EMBER_PROJECT/EMBER_ENV, so two deployments on one dataset stay apart", async () => {
+    const ds = fakeDataset();
+    const body = JSON.stringify({ events: [{ name: "view" }] });
+    await handleTrack(ctxOf({}, { EMBER_ANALYTICS: ds, EMBER_PROJECT: "shop", EMBER_ENV: "production" }), post(body));
+    await handleTrack(ctxOf({}, { EMBER_ANALYTICS: ds, EMBER_PROJECT: "shop", EMBER_ENV: "staging" }), post(body));
+    expect(ds.points.map((p) => p.blobs[5])).toEqual(["shop/production:analytics", "shop/staging:analytics"]);
+  });
 });
 
 describe("queries", () => {
@@ -250,8 +270,10 @@ describe("queries", () => {
   test("refresh without the SQL API: nothing queried, nothing written", async () => {
     const calls = sqlApi(() => ({ data: [] }));
     const { t } = setup();
-    const run = (t as unknown as { _action(n: string, a: unknown, s: string): Promise<unknown> })._action("@analytics/dashboard:refresh", {}, "global:main");
-    expect(await run).toMatchObject({ configured: false });
+    // Measured around the call: a measured zero (the refresh, its saveReport with onlyIfExists, wrote nothing).
+    const { value, stats } = await t.measure(() => (t as unknown as { _action(n: string, a: unknown, s: string): Promise<unknown> })._action("@analytics/dashboard:refresh", {}, "global:main"));
+    expect(value).toMatchObject({ configured: false });
+    expect(stats).toMatchObject({ rowsWritten: 0 });
     expect(calls).toHaveLength(0);
     // No report was saved.
     expect(await t.query(unsafeRef<"query">("@analytics/dashboard:overview"), {})).toMatchObject({ at: null, configured: false });

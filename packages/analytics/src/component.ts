@@ -24,7 +24,9 @@ import { BatchError, checkBatch, checkLayout, MAX_BODY_BYTES, MAX_EVENTS, parseB
 import {
   cachedSql,
   countsSql,
+  deploymentOf,
   funnelSql,
+  installKey,
   MAX_PERIODS,
   overviewSql,
   parseFunnel,
@@ -165,7 +167,8 @@ export interface IngestResult {
 export async function ingest(ctx: ActCtx, events: TrackedEvent[], source: "client" | "server", country: string): Promise<IngestResult> {
   const cfg = ctx.component.config ?? {};
   const ds = datasetOf(ctx);
-  const point = { install: ctx.component.name, source, country, dimensions: cfg.dimensions ?? [], measures: cfg.measures ?? [] };
+  // blob6 carries the deployment too: staging and production sharing the account's default dataset stay apart.
+  const point = { install: installKey(ctx.component.name, deploymentOf(ctx.env)), source, country, dimensions: cfg.dimensions ?? [], measures: cfg.measures ?? [] };
   if (ds) for (const e of events) ds.writeDataPoint(toDataPoint(e, point));
   let archived: string | null = null;
   if (cfg.archive) {
@@ -216,12 +219,21 @@ export async function handleTrack(ctx: ActCtx, request: Request): Promise<Respon
     // bucket) nor a header the client sets: Cloudflare writes cf-connecting-ip on every request it proxies.
     const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
     const key = cfg.rateLimit.key === "user" && identity ? `user:${identity.subject}` : `ip:${ip}`;
-    try {
-      const { ok } = await edgeLimit(ctx, cfg.rateLimit.binding, `analytics:${key}`);
-      if (!ok) return new Response(JSON.stringify({ ok: false, error: { code: "rate_limited", message: "too many events; retry later" } }), { status: 429, headers: { ...CORS, "content-type": "application/json", "retry-after": "10" } });
-    } catch (e) {
+    const binding = ctx.env[cfg.rateLimit.binding] as { limit?: unknown } | undefined;
+    if (!binding || typeof binding.limit !== "function") {
       // A missing binding (not deployed yet) must not drop the app's analytics: size caps still apply.
-      warnOnce(`rl:${cfg.rateLimit.binding}`, `ember-analytics: rate limit skipped: ${(e as Error).message}`);
+      warnOnce(`rl:${cfg.rateLimit.binding}`, `ember-analytics: rate limit skipped: no Rate Limiting binding ${cfg.rateLimit.binding}`);
+    } else {
+      let ok: boolean;
+      try {
+        ({ ok } = await edgeLimit(ctx, cfg.rateLimit.binding, `analytics:${key}`));
+      } catch (e) {
+        // A deployed limiter that fails: the limit is not skipped (fail closed). 503 + Retry-After: the client keeps
+        // the batch and sends it again later.
+        console.error(`ember-analytics: rate limit check failed: ${(e as Error).message}`);
+        return new Response(JSON.stringify({ ok: false, error: { code: "rate_limit_unavailable", message: "the rate limiter failed; retry later" } }), { status: 503, headers: { ...CORS, "content-type": "application/json", "retry-after": "10" } });
+      }
+      if (!ok) return new Response(JSON.stringify({ ok: false, error: { code: "rate_limited", message: "too many events; retry later" } }), { status: 429, headers: { ...CORS, "content-type": "application/json", "retry-after": "10" } });
     }
   }
   const cf = (request as Request & { cf?: { country?: unknown } }).cf;
@@ -256,7 +268,7 @@ const configured = (ctx: ActCtx) => {
   }
 };
 
-const scopeOf = (ctx: ActCtx) => ({ dataset: ctx.component.config?.dataset ?? DEFAULT_DATASET, install: ctx.component.name });
+const scopeOf = (ctx: ActCtx) => ({ dataset: ctx.component.config?.dataset ?? DEFAULT_DATASET, install: ctx.component.name, deployment: deploymentOf(ctx.env) });
 
 /** Builds (checked: `SqlInputError` → `ValidationError`) and runs one statement through the cache. */
 async function query(ctx: ActCtx, build: () => string): Promise<SqlResponse> {
@@ -327,7 +339,7 @@ async function refresh(ctx: ActCtx): Promise<Overview> {
     await ctx.runMutation(saveReport, { key: "overview", value, onlyIfExists: true });
     return value;
   }
-  const [today, top] = await Promise.all([query(ctx, () => overviewSql(scopeOf(ctx))), topEvents(ctx, { sinceHours: 24, limit: 20 })]);
+  const [today, top] = await Promise.all([query(ctx, () => overviewSql(scopeOf(ctx), { now: ctx.now })), topEvents(ctx, { sinceHours: 24, limit: 20 })]);
   const row = today.data?.[0] ?? {};
   const value: Overview = { eventsToday: n(row.events), usersToday: n(row.users), top, at: ctx.now, configured: true };
   await ctx.runMutation(saveReport, { key: "overview", value });
