@@ -256,6 +256,22 @@ try {
        if (env.items.length !== 1 || env.items[0].header.type !== "event") throw new Error("sentry envelope round trip");`,
     ]);
   });
+  await step("analytics + audit on node: components, the analytics client, SQL builders, the audit diff", () => {
+    run(NODE, [
+      "--input-type=module",
+      "-e",
+      `const an = await import("@freecorps/ember-analytics");
+       const cl = await import("@freecorps/ember-analytics/client");
+       const au = await import("@freecorps/ember-audit");
+       if (an.analytics?.name !== "analytics" || typeof an.Analytics !== "function" || typeof cl.createAnalytics !== "function") throw new Error("missing analytics exports");
+       if (!an.funnelSql({ dataset: "d", install: "analytics" }, { steps: ["a", "b"] }).includes("countIf")) throw new Error("funnelSql");
+       let refused = false; try { an.funnelSql({ dataset: "d", install: "analytics" }, { steps: ["a", "b' OR 1=1"] }); } catch { refused = true; }
+       if (!refused) throw new Error("an adversarial name was not refused");
+       if (au.audit?.name !== "audit" || typeof au.Audit !== "function" || typeof au.auditTriggers !== "function") throw new Error("missing audit exports");
+       if (JSON.stringify(au.auditDiff({ a: 1, p: "x" }, { a: 2, p: "y" }, { redact: ["p"] }).diff) !== '{"a":{"from":1,"to":2},"p":{"from":"[redacted]","to":"[redacted]"}}') throw new Error("auditDiff");
+       const gz = await au.gzipNdjson([{ n: 1n }]); if ((await au.gunzipNdjson(gz))[0].n !== 1n) throw new Error("NDJSON round trip");`,
+    ]);
+  });
   await step("auth/session-lookup on node: the origin's side of L14 imports alone and checks Ember's signature", () => {
     run(NODE, [
       "--input-type=module",

@@ -43,7 +43,7 @@ function componentLocal(project: string, components: LocalOptions["components"])
     // Miniflare simulates send_email: messages are logged and written under its temp dir (no real mail).
     for (const b of c.bindings ?? []) {
       if (b.type === "send_email") sendEmail.push({ ...(Object.fromEntries(Object.entries(b).filter(([k]) => k !== "type"))), name: b.name });
-      // Miniflare's local Analytics Engine: writes are accepted and dropped (there is no local SQL API).
+      // Analytics Engine datasets (the analytics component): Miniflare accepts the writes and keeps nothing.
       if (b.type === "analytics_engine" && typeof b.dataset === "string") analytics[b.name] = { dataset: b.dataset };
     }
   }
