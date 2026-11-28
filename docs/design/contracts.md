@@ -1276,7 +1276,8 @@ export const forClient = query({ args: { context: vFlagContext }, handler: (ctx,
 ### Webhooks (`@freecorps/ember-webhooks`, `/verify`) — PLAN §12
 Webhooks de saída. As tabelas ficam no shard de quem chama: um shard org guarda os endpoints e as entregas da org.
 ```ts
-export default defineApp().use(webhooks, { config?: { concurrency, retrySchedule, jitter, timeoutMs, breaker: { threshold, cooldownMs }, rotationGraceMs, offloadBytes, maxPayloadBytes, maxResponseBytes, retentionMs, allowHttp } });
+// `config` e todas as chaves dele são opcionais (`defineApp().use(webhooks)` basta); também: offloadBytes, maxPayloadBytes, maxResponseBytes, retentionMs
+export default defineApp().use(webhooks, { config: { concurrency: 10, retrySchedule: [5_000, 30_000], jitter: 0.2, timeoutMs: 10_000, breaker: { threshold: 10, cooldownMs: 60_000 }, rotationGraceMs: 86_400_000, allowHttp: false } });
 const hooks = new Webhooks(components.webhooks);
 hooks.send(ctx, "invoice.paid", { invoiceId })   // numa mutation: síncrono, na transação dela
 ```
