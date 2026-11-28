@@ -3,5 +3,5 @@
   "compilerOptions": { "outDir": ".tsbuild", "rootDir": ".", "types": ["node"], "erasableSyntaxOnly": true },
   "include": ["src", "test", "bin", "vitest.config.ts"],
   "exclude": ["test/fixtures"],
-  "references": [{ "path": "../values" }, { "path": "../server" }, { "path": "../auth" }, { "path": "../testing" }]
+  "references": [{ "path": "../values" }, { "path": "../server" }, { "path": "../auth" }, { "path": "../testing" }, { "path": "../expo-updates" }]
 }

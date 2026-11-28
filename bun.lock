@@ -232,6 +232,7 @@
       },
       "devDependencies": {
         "@freecorps/ember-dashboard": "workspace:*",
+        "@freecorps/ember-expo-updates": "workspace:*",
         "@freecorps/ember-migrations": "workspace:*",
         "@freecorps/ember-testing": "workspace:*",
         "wrangler": "^4.157.0",
@@ -313,6 +314,21 @@
         "expo-secure-store",
         "expo-task-manager",
       ],
+    },
+    "packages/expo-updates": {
+      "name": "@freecorps/ember-expo-updates",
+      "version": "0.9.0",
+      "dependencies": {
+        "@freecorps/ember-server": "workspace:*",
+        "@freecorps/ember-values": "workspace:*",
+      },
+      "devDependencies": {
+        "@cloudflare/vitest-plugin": "^1.5.1",
+        "@cloudflare/workers-types": "^5.20261104.1",
+        "@freecorps/ember-runtime": "workspace:*",
+        "@freecorps/ember-testing": "workspace:*",
+        "wrangler": "^4.157.0",
+      },
     },
     "packages/migrations": {
       "name": "@freecorps/ember-migrations",
@@ -925,6 +941,8 @@
     "@freecorps/ember-example-todo": ["@freecorps/ember-example-todo@workspace:examples/todo"],
 
     "@freecorps/ember-expo-push": ["@freecorps/ember-expo-push@workspace:packages/expo-push"],
+
+    "@freecorps/ember-expo-updates": ["@freecorps/ember-expo-updates@workspace:packages/expo-updates"],
 
     "@freecorps/ember-migrations": ["@freecorps/ember-migrations@workspace:packages/migrations"],
 
