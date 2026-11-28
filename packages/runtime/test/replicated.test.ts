@@ -226,8 +226,14 @@ describe(".replicated() source (global:main)", () => {
       const r = await drainBroadcast(driver, schema.manifest, opts(t));
       expect(r.failed).toBe(1);
       expect(t.state.get("org:a")!.rows.has(id)).toBe(true);
-      const b = broadcastStatus(driver, { target: "org:b" }).targets[0]!;
+      const status = broadcastStatus(driver, { target: "org:b" });
+      const b = status.targets[0]!;
       expect(b).toMatchObject({ attempts: 1, pending: 1, last_error: "org:b is down" });
+      // The dashboard's Replication screen: the log as the outbox, the oldest row org:b has not read, maxAttempts.
+      const at = Number(state.storage.sql.exec(`SELECT at FROM _ember_bcast_log ORDER BY seq DESC LIMIT 1`).one().at);
+      expect(b.oldest_at).toBe(at);
+      expect(status).toMatchObject({ maxAttempts: 10, outbox: { seq: status.seq, depth: 1, parked: 0, oldestAt: at } });
+      expect(broadcastStatus(driver, { target: "org:a" }).targets[0]).toMatchObject({ pending: 0, oldest_at: null });
       // The log is kept for org:b.
       expect(r.collected).toBe(0);
 

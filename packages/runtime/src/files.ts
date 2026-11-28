@@ -38,6 +38,7 @@ import {
   type ImageInput,
   type S3Config,
   type StorableData,
+  type StuckPage,
   type UploadOptions,
   type UploadTicket,
 } from "@freecorps/ember-server";
@@ -81,6 +82,16 @@ export interface FileRpc {
   fileOrphans(shard: string, keys: string[], claim: boolean): Promise<FileResult<Array<{ key: string; id: string | null }>>>;
   /** Drops the tombstones once their objects are deleted. */
   fileOrphansDone(shard: string, ids: string[]): Promise<FileResult<null>>;
+  /** Rows stuck short of `ready` older than the grace period (`FileStore.stuck`). Admin API level 18. */
+  fileStuck(shard: string, o: { graceMs: number; cursor?: string | null; limit?: number }): Promise<FileResult<StuckPage>>;
+  /** Queues unreferenced stuck rows for the GC, re-checked in one transaction (`FileStore.collectStuck`). */
+  fileStuckCollect(shard: string, ids: string[], o: { graceMs: number }): Promise<FileResult<StuckCollectResult>>;
+}
+
+/** What `fileStuckCollect` answers. */
+export interface StuckCollectResult {
+  queued: string[];
+  refused: Array<{ id: string; reason: "not_found" | "referenced" | "not_stuck" | "young" }>;
 }
 
 const str = (x: unknown): string | undefined => (typeof x === "string" && x ? x : undefined);
@@ -760,6 +771,61 @@ export async function sweepOrphans(bucket: R2Bucket, rpcOf: (shard: string) => F
       for (const x of objs) if (set.has(x.key)) out.orphans.push({ key: x.key, shard, size: x.size, uploaded: x.uploaded.getTime() });
     } catch (e) {
       out.skipped.push({ shard, keys: keys.length, code: (e as { code?: string }).code ?? "Error", message: (e as Error).message });
+    }
+  }
+  return out;
+}
+
+/** Keys per `files/orphans/delete` call. */
+export const ORPHAN_DELETE_MAX = 100;
+
+export interface OrphanDeleteResult {
+  /** Objects deleted (each had no `_files` row when its shard claimed it). */
+  deleted: Array<{ key: string; shard: string; size: number }>;
+  /**
+   * Keys left alone: `foreign` (not an Ember key), `gone` (no such object), `young` (newer than the grace period),
+   * `referenced` (a `_files` row has this key: the object is a file's, never an orphan).
+   */
+  refused: Array<{ key: string; reason: "foreign" | "gone" | "young" | "referenced" }>;
+  /** Shards that could not answer: their keys were left alone. */
+  skipped: Array<{ shard: string; keys: number; code: string; message: string }>;
+  graceMs: number;
+}
+
+/**
+ * Deletes the orphans an admin picked (dashboard "R2 orphans", admin `POST /api/_ember/files/orphans/delete`). Nothing
+ * from the listing is trusted: each key is checked again here (an Ember key of a valid shard, the object exists and is
+ * older than the grace period), then its shard claims it only if no `_files` row has that key (`deleteOrphans`, the
+ * same claim as the sweep), so a file that is referenced, or was uploaded again since the listing, is never deleted.
+ */
+export async function deleteOrphanKeys(bucket: R2Bucket, rpcOf: (shard: string) => FileRpc, validShard: (shard: string) => boolean, keys: readonly string[], o: { graceMs?: number; now?: number } = {}): Promise<OrphanDeleteResult> {
+  const now = o.now ?? Date.now();
+  const graceMs = o.graceMs ?? ORPHAN_GRACE_MS;
+  const out: OrphanDeleteResult = { deleted: [], refused: [], skipped: [], graceMs };
+  const byShard = new Map<string, Array<{ key: string; size: number }>>();
+  const unique = [...new Set(keys)];
+  const heads = await Promise.all(unique.map((key) => (emberObjectKey(key) ? bucket.head(key) : Promise.resolve(null))));
+  unique.forEach((key, i) => {
+    const owner = emberObjectKey(key);
+    const head = heads[i];
+    if (!owner || !validShard(owner.shard)) out.refused.push({ key, reason: "foreign" });
+    else if (!head) out.refused.push({ key, reason: "gone" });
+    else if (head.uploaded.getTime() > now - graceMs) out.refused.push({ key, reason: "young" });
+    else {
+      let list = byShard.get(owner.shard);
+      if (!list) byShard.set(owner.shard, (list = []));
+      list.push({ key, size: head.size });
+    }
+  });
+  for (const [shard, objs] of byShard) {
+    try {
+      const gone = new Set(await deleteOrphans(bucket, rpcOf(shard), shard, objs.map((x) => x.key)));
+      for (const x of objs) {
+        if (gone.has(x.key)) out.deleted.push({ key: x.key, shard, size: x.size });
+        else out.refused.push({ key: x.key, reason: "referenced" });
+      }
+    } catch (e) {
+      out.skipped.push({ shard, keys: objs.length, code: (e as { code?: string }).code ?? "Error", message: (e as Error).message });
     }
   }
   return out;

@@ -443,6 +443,83 @@ describe("files: objects no row references (orphan sweep)", () => {
     expect((await adminPost("files/orphans", { delete: "yes" })).status).toBe(400);
   });
 
+  it("deletes the orphans an admin picked, checking each key again: referenced, young, gone and foreign keys stay", async () => {
+    const shard = "org:orphan-pick";
+    const bucket = env.EMBER_FILES;
+    const kept = await adminPost(`files/upload?shard=${shard}`, "picked but referenced");
+    await mutate(shard, "files:add", { title: "kept", file: kept.body.value.id });
+    const keptKey = fileKey(shard, await sha(enc.encode("picked but referenced")));
+    const orphan = fileKey(shard, await sha(enc.encode("a real orphan")));
+    await bucket.put(orphan, "a real orphan");
+    const gone = fileKey(shard, await sha(enc.encode("never stored")));
+    const keys = [keptKey, orphan, gone, "other/thing"];
+    // The default grace (24 h): everything is too young, nothing is deleted.
+    const young = await adminPost("files/orphans/delete", { keys });
+    expect(young.status).toBe(200);
+    expect(young.body.value.deleted).toEqual([]);
+    expect(Object.fromEntries(young.body.value.refused.map((r: { key: string; reason: string }) => [r.key, r.reason]))).toEqual({ [keptKey]: "young", [orphan]: "young", [gone]: "gone", "other/thing": "foreign" });
+    // No grace: the orphan goes; the key a `_files` row has is never deleted (whatever the listing said).
+    const r = await adminPost("files/orphans/delete", { keys, graceMs: 0 });
+    expect(r.body.value.deleted).toEqual([{ key: orphan, shard, size: "a real orphan".length }]);
+    expect(r.body.value.refused).toContainEqual({ key: keptKey, reason: "referenced" });
+    expect(await bucket.head(orphan)).toBeNull();
+    expect(await bucket.head(keptKey)).not.toBeNull();
+    expect((await shardStub(shard).inspect()).files).toMatchObject({ deleting: 0 });
+    // Bad requests.
+    expect((await adminPost("files/orphans/delete", { keys: [] })).status).toBe(400);
+    expect((await adminPost("files/orphans/delete", { keys: Array.from({ length: 101 }, (_, i) => `k${i}`) })).status).toBe(400);
+    expect((await adminPost("files/orphans/delete", { keys: [1] })).status).toBe(400);
+    expect((await adminPost("files/orphans/delete", { keys, graceMs: -1 })).status).toBe(400);
+  });
+
+  it("lists `_files` rows stuck short of ready and queues only the unreferenced ones for the GC", async () => {
+    const shard = "org:stuck";
+    const adminGet = async (path: string) => {
+      const res = await SELF.fetch(`http://ember/api/_ember/${path}`, { headers: { authorization: "Bearer admin-secret" } });
+      return { status: res.status, body: (await res.json()) as any };
+    };
+    // An abandoned upload (pending, never PUT) and one a document references that then failed.
+    const abandoned = (await mutate(shard, "files:generate", { contentType: "text/plain", size: 7 })) as UploadTicket;
+    const used = (await mutate(shard, "files:generate", { contentType: "text/plain" })) as UploadTicket;
+    await mutate(shard, "files:add", { title: "uses a pending file", file: used.storageId });
+    await rpc(shard).fileFail(shard, used.storageId);
+    const fresh = (await mutate(shard, "files:generate", { contentType: "text/plain" })) as UploadTicket;
+    // Created two hours ago (past the pending hold: the ticket's TTL), the GC clock (`zero_since`) left alone.
+    await runInDurableObject(shardStub(shard), (_i, state) => {
+      state.storage.sql.exec(`UPDATE _files SET created_at = created_at - 7200000 WHERE id IN (?, ?)`, abandoned.storageId, used.storageId);
+    });
+    const page = await adminGet(`files/stuck?shard=${shard}&graceMs=0`);
+    expect(page.status).toBe(200);
+    const byId = Object.fromEntries(page.body.value.rows.map((r: { id: string }) => [r.id, r]));
+    expect(byId[abandoned.storageId]).toMatchObject({ state: "pending", refcount: 0, size: 7 });
+    expect(byId[used.storageId]).toMatchObject({ state: "failed", refcount: 1 });
+    // A pending upload younger than its ticket's hold is not stuck, whatever the grace.
+    expect(byId[fresh.storageId]).toBeUndefined();
+    expect(page.body.value.totals).toEqual({ count: 2, bytes: 7, referenced: 1 });
+    expect(page.body.value.rows[0]).not.toHaveProperty("token");
+    // The default grace (24 h): none of them.
+    expect((await adminGet(`files/stuck?shard=${shard}`)).body.value.rows).toEqual([]);
+    // Pages by id.
+    const first = await adminGet(`files/stuck?shard=${shard}&graceMs=0&limit=1`);
+    expect(first.body.value).toMatchObject({ done: false });
+    const second = await adminGet(`files/stuck?shard=${shard}&graceMs=0&limit=1&cursor=${first.body.value.cursor}`);
+    expect(second.body.value).toMatchObject({ done: true });
+    expect(second.body.value.totals).toBeUndefined();
+
+    const del = await adminPost("files/stuck/delete", { shard, ids: [abandoned.storageId, used.storageId, fresh.storageId, "_storage_nope"], graceMs: 0 });
+    expect(del.status).toBe(200);
+    expect(del.body.value.queued).toEqual([abandoned.storageId]);
+    expect(Object.fromEntries(del.body.value.refused.map((r: { id: string; reason: string }) => [r.id, r.reason]))).toEqual({ [used.storageId]: "referenced", [fresh.storageId]: "young", _storage_nope: "not_found" });
+    await runDurableObjectAlarm(shardStub(shard));
+    expect(await rpc(shard).fileMeta(shard, abandoned.storageId)).toBeNull();
+    expect(await rpc(shard).fileMeta(shard, used.storageId)).toMatchObject({ state: "failed", refcount: 1 });
+    // Bad requests.
+    expect((await adminGet("files/stuck?shard=bad")).status).toBe(400);
+    expect((await adminGet(`files/stuck?shard=${shard}&limit=0`)).status).toBe(400);
+    expect((await adminPost("files/stuck/delete", { shard, ids: [] })).status).toBe(400);
+    expect((await adminPost("files/stuck", {})).status).toBe(405);
+  });
+
   it("a claimed orphan (tombstone) refuses registering its key until the object is gone; a key with a row is never claimed", async () => {
     const shard = "org:orphan-claim";
     const bytes = enc.encode("claimed");

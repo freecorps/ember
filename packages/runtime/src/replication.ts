@@ -71,7 +71,21 @@ export type ReplicationTargetRow = {
   last_error: string | null;
   delivered_at: number | null;
   pending: number;
+  /** `created_at` of the oldest row still waiting for this target (null: none). */
+  oldest_at: number | null;
 };
+
+/** The whole outbox of a source, for inspection (admin `GET /api/_ember/replicas`). */
+export interface ReplicationOutbox {
+  /** The last seq the source assigned (a target's `last_seq` is how far it acknowledged). */
+  seq: number;
+  /** Rows waiting for delivery, every target. */
+  depth: number;
+  /** Rows parked (`dead = 1`) after `maxAttempts`, kept for inspection. */
+  parked: number;
+  /** `created_at` of the oldest waiting row (null: nothing waits). */
+  oldestAt: number | null;
+}
 
 export function ensureReplicationTables(sql: SqlStorage): void {
   for (const s of REPLICATION_DDL) sql.exec(s);
@@ -129,10 +143,16 @@ export function replicationTargets(sql: SqlStorage, o: { target?: string; limit?
   const params = o.target !== undefined ? [o.target] : [];
   return sql
     .exec(
-      `SELECT t.*, (SELECT COUNT(*) FROM ${REPLICATION_TABLE} r WHERE r.target = t.target AND r.dead = 0) AS pending FROM ${REPLICATION_TARGETS} t ${where} ORDER BY t.dead DESC, t.attempts DESC, t.target LIMIT ?`,
+      `SELECT t.*, (SELECT COUNT(*) FROM ${REPLICATION_TABLE} r WHERE r.target = t.target AND r.dead = 0) AS pending, (SELECT MIN(created_at) FROM ${REPLICATION_TABLE} r WHERE r.target = t.target AND r.dead = 0) AS oldest_at FROM ${REPLICATION_TARGETS} t ${where} ORDER BY t.dead DESC, t.attempts DESC, t.target LIMIT ?`,
       ...params, o.limit ?? 100,
     )
     .toArray() as unknown as ReplicationTargetRow[];
+}
+
+/** Depth, parked rows, oldest waiting row and the source's seq (one indexed pass over the outbox). */
+export function replicationOutbox(sql: SqlStorage): ReplicationOutbox {
+  const r = sql.exec(`SELECT COALESCE(SUM(dead = 0), 0) AS depth, COALESCE(SUM(dead = 1), 0) AS parked, MIN(CASE WHEN dead = 0 THEN created_at END) AS oldest FROM ${REPLICATION_TABLE}`).toArray()[0];
+  return { seq: currentSeq(sql), depth: Number(r?.depth ?? 0), parked: Number(r?.parked ?? 0), oldestAt: r?.oldest === null || r?.oldest === undefined ? null : Number(r.oldest) };
 }
 
 export interface ReplicationDrain {

@@ -13,7 +13,7 @@
 import { flattenFunctions, type ReplicaTableSpec } from "@freecorps/ember-server";
 import { authReplicaReader, replicaTablesOfSpec, type AuthReplicaSpec } from "./auth-replicas.ts";
 import { getEmberConfig, isValidShardName, type EmberEnv, type ReplicationSourceRpc } from "./config.ts";
-import { drainReplication, ensureReplicationTables, nextReplicationAt, replicationTargets, requestSnapshot, type ReplicationOptions, type ReplicationTargetRow } from "./replication.ts";
+import { drainReplication, ensureReplicationTables, nextReplicationAt, replicationOutbox, replicationTargets, requestSnapshot, type ReplicationOptions, type ReplicationOutbox, type ReplicationTargetRow } from "./replication.ts";
 import type { Shard } from "./shard.ts";
 import { shardStub } from "./stubs.ts";
 
@@ -106,6 +106,10 @@ export interface AuthReplicationStatus {
   convert: { failures: number; retryAt: number; error: string } | null;
   targets: ReplicationTargetRow[];
   next: number | null;
+  /** Admin API level 18: the outbox as a whole (depth, parked rows, oldest waiting row, the source's seq). */
+  outbox: ReplicationOutbox;
+  /** Attempts before a batch (or a resync) is parked. */
+  maxAttempts: number;
 }
 
 export interface AuthOutbox {
@@ -451,10 +455,11 @@ export function authOutbox(opts: AuthOutboxOptions = {}): AuthOutbox {
         /** Replication state: journal backlog and targets (pending, parked, errors). */
         async replicaStatus(shard?: string): Promise<AuthReplicationStatus> {
           const sql = this.ctx.storage.sql;
-          if (!reader) return { enabled: false, journal: 0, convert: null, targets: [], next: null };
+          const maxAttempts = opts.replication?.maxAttempts ?? 10;
+          if (!reader) return { enabled: false, journal: 0, convert: null, targets: [], next: null, outbox: { seq: 0, depth: 0, parked: 0, oldestAt: null }, maxAttempts };
           ensureReplication(sql);
           const journal = reader.journalCount(sql);
-          return { enabled: true, journal, convert: convertFailure(sql, true), targets: replicationTargets(sql, shard ? { target: shard } : {}), next: nextReplicationAt(sql) };
+          return { enabled: true, journal, convert: convertFailure(sql, true), targets: replicationTargets(sql, shard ? { target: shard } : {}), next: nextReplicationAt(sql), outbox: replicationOutbox(sql), maxAttempts };
         }
         /** Pending and parked rows (inspection, tests). */
         async outbox(): Promise<OutboxRow[]> {
