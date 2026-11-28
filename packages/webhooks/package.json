@@ -1,0 +1,67 @@
+{
+  "name": "@freecorps/ember-webhooks",
+  "version": "0.9.0",
+  "description": "Outbound webhooks for Ember: Standard Webhooks signatures (HMAC-SHA256, secret rotation), retries with backoff and jitter, a circuit breaker per endpoint, a dead-letter state and replays; deliveries queued in the caller's transaction and sent by a bounded workpool.",
+  "keywords": [
+    "ember",
+    "convex",
+    "cloudflare",
+    "workers",
+    "component",
+    "webhooks",
+    "standard-webhooks",
+    "hmac",
+    "retries",
+    "circuit-breaker"
+  ],
+  "homepage": "https://github.com/freecorps/ember/tree/main/packages/webhooks#readme",
+  "bugs": {
+    "url": "https://github.com/freecorps/ember/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/freecorps/ember.git",
+    "directory": "packages/webhooks"
+  },
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "@freecorps/ember-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./verify": {
+      "@freecorps/ember-source": "./src/verify.ts",
+      "types": "./dist/verify.d.ts",
+      "default": "./dist/verify.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run && vitest run -c vitest.workerd.config.ts"
+  },
+  "dependencies": {
+    "@freecorps/ember-server": "workspace:*",
+    "@freecorps/ember-values": "workspace:*",
+    "@freecorps/ember-workpool": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.5.1",
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@freecorps/ember-runtime": "workspace:*",
+    "@freecorps/ember-testing": "workspace:*",
+    "wrangler": "^4.157.0"
+  }
+}
