@@ -310,6 +310,15 @@ describe("status, regression and alerts", () => {
     expect((await consume([errorEvent({ type: "D" })])).alerts).toBe(1);
   });
 
+  it("maxPerHour: 0 sends no alert, the project's first included", async () => {
+    stubFetch();
+    const { t, consume } = harness({ alerts: { webhooks: [{ url: "https://hooks.test/x" }], maxPerHour: 0 } });
+    expect((await consume([errorEvent({ type: "A" })])).alerts).toBe(0);
+    expect((await consume([errorEvent({ type: "B" })])).alerts).toBe(0);
+    await t.finishScheduled();
+    expect(signed).toEqual([]);
+  });
+
   it("webhooks must be https (http only on localhost); redirects are not followed", async () => {
     const base = { projects: [{ id: "web", keys: ["pubkey0123456789"] }] };
     expect(() => checkConfig({ ...base, alerts: { webhooks: [{ url: "http://hooks.test/x" }] } })).toThrow(/must be an https:\/\/ URL/);

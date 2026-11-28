@@ -122,8 +122,10 @@ function takeAlertBudget(ctx: MCtx, project: string, max: number, now: number): 
   const hourStart = Math.floor(now / HOUR) * HOUR;
   const row = ctx.db.query("alertState").withIndex("by_project", (q) => q.eq("project", project)).first();
   if (!row) {
-    ctx.db.insert("alertState", { project, hourStart, sent: 1, suppressed: 0 });
-    return true;
+    // The first alert of the project goes by the same cap (`maxPerHour: 0` sends none).
+    const allowed = max > 0;
+    ctx.db.insert("alertState", { project, hourStart, sent: allowed ? 1 : 0, suppressed: allowed ? 0 : 1 });
+    return allowed;
   }
   const fresh = row.hourStart !== hourStart;
   const sent = fresh ? 0 : row.sent;
