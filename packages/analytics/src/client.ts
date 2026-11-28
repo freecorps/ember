@@ -97,7 +97,10 @@ export class AnalyticsClient {
   private aid: string;
   /** The flush running now: one request at a time (the timer, a full batch and `flush()` share it). */
   private flushing: Promise<void> | null = null;
-  /** Bytes of the keepalive fetch in flight (they count against the beacon budget). */
+  /**
+   * Bytes of the keepalive fetches in flight (they count against the beacon budget): the regular send's from the
+   * moment it chooses keepalive (before its token), and the `pagehide` fallback fetches' until they settle.
+   */
   private inFlightBytes = 0;
   /** Enqueue order of each event (not sent): a batch put back goes where it was, whatever order the answers come in. */
   private readonly seq = new WeakMap<QueuedEvent, number>();
@@ -260,7 +263,10 @@ export class AnalyticsClient {
     // whose quota a big body would pass: the browser would refuse it before the server could answer).
     if (bytes > MAX_BODY_BYTES && batch.length > 1) return "split";
     // keepalive (the send survives the page) only while it fits in the page's keepalive quota with what is in flight.
+    // The bytes are counted from this choice, not from the dispatch: a `pagehide` while the token is pending must
+    // already see them as spent (its beacons would otherwise take the room this send counts on).
     const keepalive = bytes + this.inFlightBytes <= BEACON_BUDGET_BYTES;
+    if (keepalive) this.inFlightBytes += bytes;
     this.sent++;
     // One deadline for the token and the request: a send that hangs is given up (aborted) and retried, so the flush
     // never stays held. A late answer of a given-up send changes nothing (the batch is already back in the queue).
@@ -280,24 +286,20 @@ export class AnalyticsClient {
         // Again after the await: a `reset()` while the token was pending makes this batch the previous visitor's.
         if (token && batch[0]?.anonymousId === this.aid) headers.authorization = `Bearer ${token}`;
       }
-      if (keepalive) this.inFlightBytes += bytes;
-      try {
-        // `redirect: "manual"`: a redirect is never followed (a 301 to a landing page would turn the POST into a GET
-        // and answer 200): it comes back as a 3xx or an opaque redirect (status 0), retried.
-        const sending = f(this.endpoint, { method: "POST", headers, body, keepalive, redirect: "manual", ...(ctrl ? { signal: ctrl.signal } : {}) });
-        sending.catch(() => undefined);
-        const r = await Promise.race([sending, timeout]);
-        if (r === "timeout") {
-          ctrl?.abort();
-          return "retry";
-        }
-        return outcomeOf(r.status);
-      } finally {
-        if (keepalive) this.inFlightBytes -= bytes;
+      // `redirect: "manual"`: a redirect is never followed (a 301 to a landing page would turn the POST into a GET
+      // and answer 200): it comes back as a 3xx or an opaque redirect (status 0), retried.
+      const sending = f(this.endpoint, { method: "POST", headers, body, keepalive, redirect: "manual", ...(ctrl ? { signal: ctrl.signal } : {}) });
+      sending.catch(() => undefined);
+      const r = await Promise.race([sending, timeout]);
+      if (r === "timeout") {
+        ctrl?.abort();
+        return "retry";
       }
+      return outcomeOf(r.status);
     } catch {
       return "retry";
     } finally {
+      if (keepalive) this.inFlightBytes -= bytes;
       clearTimeout(timer);
     }
   }
@@ -340,14 +342,21 @@ export class AnalyticsClient {
             this.requeue(batch);
             throw e;
           }
+          // Its body is in the page's keepalive quota until it settles: a regular send meanwhile counts it.
+          this.inFlightBytes += bytes;
+          const settled = () => (this.inFlightBytes -= bytes);
           // Back for the regular drain when not delivered, or refused whole with more than one event (the drain splits
           // it); a refused singleton is dropped, as the drain does.
           sending.then(
             (r) => {
+              settled();
               const o = outcomeOf(r.status);
               if (o === "retry" || (o === "split" && batch.length > 1)) this.requeue(batch);
             },
-            () => this.requeue(batch),
+            () => {
+              settled();
+              this.requeue(batch);
+            },
           );
         }
       } catch {

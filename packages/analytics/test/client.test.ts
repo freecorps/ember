@@ -281,6 +281,66 @@ describe("analytics client", () => {
     expect(a.pending).toBe(before);
   });
 
+  test("pagehide while the regular send waits for its token: its keepalive bytes already count against the budget", async () => {
+    const beacons: number[] = [];
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    vi.stubGlobal("navigator", { sendBeacon: (_u: string, d: Blob) => (beacons.push(d.size), true) });
+    const fetched: Array<{ bytes: number; keepalive?: boolean }> = [];
+    const fetch = (async (_u: string, init: RequestInit) => {
+      fetched.push({ bytes: new TextEncoder().encode(String(init.body)).length, ...(init.keepalive !== undefined ? { keepalive: init.keepalive } : {}) });
+      return new Response(null, { status: 204 });
+    }) as unknown as typeof globalThis.fetch;
+    let give!: (t: string) => void;
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 5, flushIntervalMs: 60_000, getToken: () => new Promise<string>((r) => (give = r)) });
+    const fat = Object.fromEntries(Array.from({ length: 20 }, (_, j) => [`p${j}`, "x".repeat(256)])); // ~5.5 KiB per event
+    for (let i = 0; i < 5; i++) a.track("e", fat); // a full batch: the regular send chooses keepalive, then waits
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 10; i++) a.track("e", fat); // two more batches of ~27 KiB
+    listeners.get("pagehide")!();
+    const regular = new TextEncoder().encode(JSON.stringify({ events: Array.from({ length: 5 }, () => ({ name: "e", props: fat, ts: 0, anonymousId: a.anonymousId })) })).length;
+    // Both beacons (~55 KiB) fit an empty budget; with the pending send's ~27 KiB reserved, only one does.
+    expect(beacons).toHaveLength(1);
+    expect(beacons[0]! + regular).toBeLessThanOrEqual(BEACON_BUDGET_BYTES);
+    expect(a.pending).toBe(5);
+    give("t");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetched[0]).toMatchObject({ keepalive: true });
+  });
+
+  test("without sendBeacon, the pagehide keepalive fetches in flight count: a regular send that would pass the quota goes without keepalive", async () => {
+    const listeners = new Map<string, () => void>();
+    vi.stubGlobal("document", {});
+    vi.stubGlobal("navigator", {});
+    vi.stubGlobal("addEventListener", (t: string, f: () => void) => void listeners.set(t, f));
+    vi.stubGlobal("removeEventListener", (t: string) => void listeners.delete(t));
+    const answers: Array<(r: Response) => void> = [];
+    const keepalives: Array<boolean | undefined> = [];
+    const fetch = vi.fn((_u: string, init: RequestInit) => {
+      keepalives.push(init.keepalive);
+      return new Promise<Response>((r) => answers.push(r));
+    }) as unknown as typeof globalThis.fetch;
+    const a = make({ url: "https://app.test", fetch, storage: null, batchSize: 5, flushIntervalMs: 60_000 });
+    const fat = Object.fromEntries(Array.from({ length: 20 }, (_, j) => [`p${j}`, "x".repeat(256)]));
+    for (let i = 0; i < 9; i++) a.track("e", fat);
+    listeners.get("pagehide")!(); // before the full batch's drain starts: two pending fallback fetches, ~49 KiB
+    expect(keepalives).toEqual([true, true]);
+    for (let i = 0; i < 5; i++) a.track("e", fat);
+    void a.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(keepalives).toEqual([true, true, false]); // ~27 KiB more would pass the quota
+    for (const r of answers.splice(0)) r(new Response(null, { status: 204 }));
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 5; i++) a.track("e", fat); // a full batch: the next drain
+    await vi.advanceTimersByTimeAsync(0);
+    expect(keepalives).toEqual([true, true, false, true]); // settled: the budget is back
+    answers.shift()!(new Response(null, { status: 204 }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(a.pending).toBe(0);
+  });
+
   test("pagehide: every beacon body is within what the server takes (32 KiB), whatever the batch size", () => {
     expect(MAX_BODY_BYTES).toBe(SERVER_MAX_BODY_BYTES);
     const beacons: Array<{ size: number }> = [];
